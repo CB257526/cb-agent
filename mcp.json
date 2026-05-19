@@ -6,6 +6,13 @@
       "env": {
         "AMAP_MAPS_API_KEY": "f44cd459aa131492392962411771694b"
       }
+    },
+    "12306-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "12306-mcp"
+      ]
     }
   }
 }
