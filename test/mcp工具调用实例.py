@@ -16,6 +16,7 @@ with open(r'cb-agent\mcp.json', 'r', encoding='utf-8') as f:
 
 # {'mcpServers': {'amap-maps': {'command': 'npx', 'args': ['-y', '@amap/amap-maps-mcp-server'], 'env': {'AMAP_MAPS_API_KEY': 'your_api_key'}}}}
 
+# 配置mcp工具
 server_cfg = mcp_site_file['mcpServers']['amap-maps']
 server_cmd = [server_cfg['command']] + server_cfg['args']
 tool = MCPTool(server_command=server_cmd, env=server_cfg['env'])
@@ -26,7 +27,7 @@ tool = MCPTool(server_command=server_cmd, env=server_cfg['env'])
 
 toolRegistry = ToolRegistry()
 
-# 获取该mcp服务器的所有工具
+# 获取该mcp服务器的所有工具并注册到toolRegistry中
 expanded_tools = tool.get_expanded_tools()
 for tool in expanded_tools:
     toolRegistry.register_tool(tool)
@@ -34,6 +35,7 @@ for tool in expanded_tools:
 # for tool in toolRegistry.get_tools_description_openai_schema():
 #     print(tool)
 
+# 根据高德地图的mcp工具帮忙查询北京的天气
 llmClient = CbAgentsLLM()
         
 exampleMessages = [

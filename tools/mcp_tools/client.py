@@ -220,7 +220,7 @@ class MCPClient:
         result = await self.client.list_tools()
 
         # 处理不同的返回格式
-        if hasattr(result, 'tools'):
+        if hasattr(result, 'tools'): #检查一个对象是否包含某个特定的属性
             tools = result.tools
         elif isinstance(result, list):
             tools = result

@@ -312,6 +312,11 @@ class MCPTool(Tool):
 
         将MCP服务器的每个工具包装成独立的Tool对象
 
+        遍历这个方法返回的列表，调用ToolRegistry.register_tool()方法注册每个工具。
+        expanded_tools = tool.get_expanded_tools()
+        for tool in expanded_tools:
+            toolRegistry.register_tool(tool)
+
         Returns:
             Tool对象列表
         """
