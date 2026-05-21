@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cb-agent"
+version = "0.1.0"
+description = "LLM Agent 框架"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pydantic",
+    "openai",
+    "python-dotenv",
+    "tiktoken",
+    "fastmcp",
+    "requests",
+]
+
+[project.optional-dependencies]
+embed = [
+    "sentence-transformers",
+    "torch",
+    "transformers",
+    "scikit-learn",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
