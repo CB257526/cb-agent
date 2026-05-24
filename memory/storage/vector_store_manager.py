@@ -170,7 +170,12 @@ class VectorStoreManager:
             return f"qdrant:{url}:{collection_name}"
         elif store_type == "zvec":
             # Zvec: 以 (path, collection_name) 区分
-            path = kwargs.get("path") or os.path.join(os.getcwd(), "zvec_data")
+            # 优先级: 显式 path 参数 > 环境变量 ZVEC_DATA_PATH > 默认 ./zvec_data
+            path = (
+                kwargs.get("path")
+                or os.getenv("ZVEC_DATA_PATH")
+                or os.path.join(os.getcwd(), "zvec_data")
+            )
             return f"zvec:{path}:{collection_name}"
         else:
             # 未来扩展: 其他后端
@@ -303,7 +308,11 @@ class VectorStoreManager:
             # ---- Zvec 后端 ----
             from .zvec_store import ZvecVectorStore
 
-            path = kwargs.get("path")
+            # 路径优先级: 显式 path 参数 > 环境变量 ZVEC_DATA_PATH > 默认 ./zvec_data
+            path = (
+                kwargs.get("path")
+                or os.getenv("ZVEC_DATA_PATH")
+            )
 
             return ZvecVectorStore(
                 path=path,

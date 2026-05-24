@@ -265,6 +265,7 @@ python app.py
 | `QDRANT_DISTANCE` | 距离度量 | `cosine` / `dot` / `euclidean` |
 | `QDRANT_HNSW_M` | HNSW M 参数 | `32` |
 | `QDRANT_SEARCH_EF` | 搜索深度 | `128` |
+| `ZVEC_DATA_PATH` | Zvec 数据存储根目录（仅当后端为 Zvec 时读取）。不设置则默认 `./zvec_data/` | `./zvec_data` |
 
 ### 4.3 单例 Key 规则
 
@@ -284,7 +285,11 @@ python app.py
 设置 `VECTOR_STORE_TYPE` 环境变量。不设置则默认 Zvec。
 
 ```bash
-# 默认 Zvec（什么都不用设）
+# 默认 Zvec（什么都不用设，数据存 ./zvec_data/）
+python app.py
+
+# Zvec + 自定义数据目录
+export ZVEC_DATA_PATH=/data/my_vectors
 python app.py
 
 # 切换到 Qdrant
@@ -706,7 +711,7 @@ class VectorStoreManager:
 
 ### Q: 数据存在哪里？
 
-- **Zvec**: `./zvec_data/{collection_name}/` （或自定义 path）
+- **Zvec**: `{ZVEC_DATA_PATH}/{collection_name}/`，默认 `./zvec_data/{collection_name}/`。路径可通过环境变量 `ZVEC_DATA_PATH` 或代码中的 `path` 参数指定。优先级: 显式传参 > 环境变量 > 默认值。
 - **Qdrant**: 由 Qdrant 服务管理（Docker volume 或云存储）
 
 ### Q: 如何迁移数据？
