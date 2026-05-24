@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 from ..base import BaseMemory, MemoryItem, MemoryConfig
 from ..storage import SQLiteDocumentStore, QdrantVectorStore
-from ..embedding import get_text_embedder, get_dimension
+from ..embedding import get_dimension
+from memory.embedding import get_text_embedder_model
 
 class Episode:
     """情景记忆中的单个情景"""
@@ -71,7 +72,7 @@ class EpisodicMemory(BaseMemory):
         self.doc_store = SQLiteDocumentStore(db_path=db_path)
 
         # 统一嵌入模型（多语言，默认384维）
-        self.embedder = get_text_embedder()
+        self.embedder = get_text_embedder_model()
 
         # 向量存储（Qdrant - 使用连接管理器避免重复连接）
         from ..storage.qdrant_store import QdrantConnectionManager
@@ -467,63 +468,152 @@ class EpisodicMemory(BaseMemory):
         episode_ids = self.sessions[session_id]
         return [e for e in self.episodes if e.episode_id in episode_ids]
     
-    def find_patterns(self, user_id: str = None, min_frequency: int = 2) -> List[Dict[str, Any]]:
-        """发现用户行为模式"""
-        # 检查缓存
-        cache_key = f"{user_id}_{min_frequency}"
-        if (cache_key in self.patterns_cache and 
-            self.last_pattern_analysis and 
-            (datetime.now() - self.last_pattern_analysis).hours < 1):
+    def find_patterns(
+        self,
+        user_id: str = None,
+        recent_n: int = 100,
+        batch_size: int = 20,
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """发现用户行为模式（LLM 驱动：先分片标注，再聚合总结）。
+
+        Args:
+            user_id: 用户过滤，None 表示不过滤
+            recent_n: 只取最近的 N 条 episodes 参与分析
+            batch_size: 每次 LLM 调用的批量大小
+            top_k: 高频标签截取数量
+        """
+        cache_key = f"{user_id}_{recent_n}"
+        if (
+            cache_key in self.patterns_cache
+            and self.last_pattern_analysis
+            and (datetime.now() - self.last_pattern_analysis).seconds < 3600
+        ):
             return self.patterns_cache[cache_key]
-        
-        # 过滤情景
+
+        # ---- Step 1: 数据采样 ----
         episodes = [e for e in self.episodes if user_id is None or e.user_id == user_id]
-        
-        # 简单的模式识别：基于内容关键词
-        keyword_patterns = {}
-        context_patterns = {}
-        
-        for episode in episodes:
-            # 提取关键词
-            words = episode.content.lower().split()
-            for word in words:
-                if len(word) > 3:  # 忽略短词
-                    keyword_patterns[word] = keyword_patterns.get(word, 0) + 1
-            
-            # 提取上下文模式
-            for key, value in episode.context.items():
-                pattern_key = f"{key}:{value}"
-                context_patterns[pattern_key] = context_patterns.get(pattern_key, 0) + 1
-        
-        # 筛选频繁模式
-        patterns = []
-        
-        for keyword, frequency in keyword_patterns.items():
-            if frequency >= min_frequency:
-                patterns.append({
-                    "type": "keyword",
-                    "pattern": keyword,
-                    "frequency": frequency,
-                    "confidence": frequency / len(episodes)
-                })
-        
-        for context_pattern, frequency in context_patterns.items():
-            if frequency >= min_frequency:
-                patterns.append({
-                    "type": "context",
-                    "pattern": context_pattern,
-                    "frequency": frequency,
-                    "confidence": frequency / len(episodes)
-                })
-        
-        # 按频率排序
-        patterns.sort(key=lambda x: x["frequency"], reverse=True)
-        
-        # 缓存结果
+        episodes.sort(key=lambda e: e.timestamp, reverse=True)
+        episodes = episodes[:recent_n]
+
+        if len(episodes) < 3:
+            return []  # 样本太少，不分析
+
+        # ---- Step 2: 批量语义标注 ----
+        try:
+            tag_counts = self._label_episodes(episodes, batch_size)
+        except Exception:
+            # LLM 不可用时回退到旧版关键词统计
+            return self._find_patterns_keyword_fallback(user_id)
+
+        if not tag_counts:
+            return []
+
+        # ---- Step 3: 频率统计 ----
+        freq_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+        # ---- Step 4: 模式深度总结 ----
+        summary = self._summarize_patterns(freq_tags, episodes[:30])
+
+        patterns = [
+            {"type": "summary", "content": summary},
+            {
+                "type": "tags",
+                "items": [{"tag": t, "count": c} for t, c in freq_tags],
+            },
+        ]
+
         self.patterns_cache[cache_key] = patterns
         self.last_pattern_analysis = datetime.now()
-        
         return patterns
+
+    # ---- LLM 辅助方法 ----
+
+    def _label_episodes(self, episodes: List[Episode], batch_size: int) -> Dict[str, int]:
+        """Step 2: 分片交给 LLM 打行为标签，返回标签频率字典。"""
+        from agent.cb_agent_basic import CbAgentsLLMBasic
+
+        llm = CbAgentsLLMBasic()
+        tag_counts: Dict[str, int] = {}
+
+        for i in range(0, len(episodes), batch_size):
+            batch = episodes[i : i + batch_size]
+
+            # 构造每条的摘要行
+            lines = []
+            for idx, ep in enumerate(batch):
+                ctx = ""
+                if ep.context:
+                    ctx_items = [f"{k}={v}" for k, v in list(ep.context.items())[:3]]
+                    ctx = " | " + ", ".join(ctx_items)
+                lines.append(f"[{idx}] {ep.content[:120]}{ctx}")
+
+            prompt = (
+                "你是一个用户行为分析师。下面是一批用户的操作记录，"
+                "请为每条记录提炼 1-3 个行为标签（中文，2-5 字），"
+                "例如：旅游规划、票务查询、技术学习、代码调试。\n\n"
+                "输出格式：每条一行，格式为 [编号] 标签1, 标签2, 标签3\n\n"
+                + "\n".join(lines)
+            )
+
+            result = llm.ask(
+                prompt,
+                system="你是一个精确的用户行为标签提取器。只输出标签，不输出任何解释。",
+                temperature=0.0,
+            )
+
+            # 解析 LLM 返回的标签
+            for line in result.split("\n"):
+                line = line.strip()
+                if not line or "[" not in line:
+                    continue
+                # 提取 ] 后面的部分
+                tag_part = line.split("]", 1)[-1].strip()
+                if not tag_part:
+                    continue
+                for tag in tag_part.split(","):
+                    tag = tag.strip()
+                    if tag:
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        return tag_counts
+
+    def _summarize_patterns(
+        self, freq_tags: List[tuple], sample_episodes: List[Episode]
+    ) -> str:
+        """Step 4: 将高频标签和原始上下文交给 LLM，生成人类可读的模式总结。"""
+        from agent.cb_agent_basic import CbAgentsLLMBasic
+
+        llm = CbAgentsLLMBasic()
+
+        tag_lines = "\n".join(f"- {tag}（出现 {cnt} 次）" for tag, cnt in freq_tags)
+        sample_lines = "\n".join(
+            f"- [{ep.timestamp.strftime('%m-%d %H:%M')}] {ep.content[:150]}"
+            for ep in sample_episodes[:20]
+        )
+
+        prompt = (
+            f"高频行为标签：\n{tag_lines}\n\n"
+            f"近期操作记录样本：\n{sample_lines}\n\n"
+            "请基于以上数据，用 3-5 句话总结用户的行为模式，"
+            "包括：偏好领域、时间规律、交互风格等。语言简洁。"
+        )
+
+        result = llm.ask(prompt, system="你是一个用户行为模式分析师。", temperature=0.0)
+        return result.strip()
+
+    def _find_patterns_keyword_fallback(self, user_id: str = None) -> List[Dict[str, Any]]:
+        """LLM 不可用时的关键词回退方案。"""
+        episodes = [e for e in self.episodes if user_id is None or e.user_id == user_id]
+        keyword_counts: Dict[str, int] = {}
+        for ep in episodes:
+            for word in ep.content.lower().split():
+                if len(word) > 3:
+                    keyword_counts[word] = keyword_counts.get(word, 0) + 1
+        freq = sorted(keyword_counts.items(), key=lambda x: x[1], reverse=True)[:15]
+        return [
+            {"type": "keyword", "items": [{"tag": w, "count": c} for w, c in freq if c >= 2]}
+        ]
     
     def get_timeline(self, user_id: str = None, limit: int = 50) -> List[Dict[str, Any]]:
         """获取时间线视图"""
