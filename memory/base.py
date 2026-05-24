@@ -7,7 +7,7 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pydantic import BaseModel
 
@@ -20,6 +20,8 @@ class MemoryItem(BaseModel):
     timestamp: datetime
     importance: float = 0.5
     metadata: Dict[str, Any] = {}
+    # 预计算的嵌入向量，add 时编码一次，retrieve 时直接拿来算相似度，避免重复编码
+    vector: Optional[List[float]] = None
 
     class Config:
         arbitrary_types_allowed = True

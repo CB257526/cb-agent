@@ -10,6 +10,7 @@
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
 import heapq
+import numpy as np
 
 from ..base import BaseMemory, MemoryItem, MemoryConfig
 from utils.common import count_tokens
@@ -43,34 +44,36 @@ class WorkingMemory(BaseMemory):
     
     def add(self, memory_item: MemoryItem) -> str:
         """添加工作记忆"""
-        # 过期清理
         self._expire_old_memories()
-        # 计算优先级（重要性 + 时间衰减）
+
+        # 预计算嵌入向量：add 时编码一次，后续 retrieve 直接复用，避免每次检索重复编码
+        if memory_item.vector is None:
+            try:
+                from memory.embedding import get_text_embedder_model
+                embedder = get_text_embedder_model()
+                vec = embedder.encode(memory_item.content)
+                memory_item.vector = vec.tolist() if hasattr(vec, 'tolist') else list(vec)
+            except Exception:
+                pass  # 嵌入模型不可用时跳过，检索时回退到关键词匹配
+
         priority = self._calculate_priority(memory_item)
-        
-        # 添加到堆中
         heapq.heappush(self.memory_heap, (-priority, memory_item.timestamp, memory_item))
         self.memories.append(memory_item)
-        
-        # 更新token计数
         self.current_tokens += count_tokens(memory_item.content)
-        
-        # 检查容量限制
         self._enforce_capacity_limits()
-        
         return memory_item.id
     
     def retrieve(self, query: str, limit: int = 5, user_id: str = None, **kwargs) -> List[MemoryItem]:
-        """检索工作记忆 - 混合语义向量检索和关键词匹配"""
-        # 过期清理
+        """检索工作记忆 - 使用嵌入模型做语义向量检索"""
+        # 1. 惰性清理：先踢掉过期的记忆，避免脏数据参与检索
         self._expire_old_memories()
         if not self.memories:
             return []
 
-        # 过滤已遗忘的记忆
+        # 2. 过滤已标记为"遗忘"的记忆（逻辑删除，不物理删除）
         active_memories = [m for m in self.memories if not m.metadata.get("forgotten", False)]
-        
-        # 按用户ID过滤（如果提供）
+
+        # 3. 多用户隔离：按 user_id 过滤，不跨用户检索
         filtered_memories = active_memories
         if user_id:
             filtered_memories = [m for m in active_memories if m.user_id == user_id]
@@ -78,76 +81,103 @@ class WorkingMemory(BaseMemory):
         if not filtered_memories:
             return []
 
-        # 尝试语义向量检索（如果有嵌入模型）
-        vector_scores = {}
-        try:
-            # 简单的语义相似度计算（使用TF-IDF或其他轻量级方法）
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.metrics.pairwise import cosine_similarity
-            import numpy as np
-            
-            # 准备文档
-            documents = [query] + [m.content for m in filtered_memories]
-            
-            # TF-IDF向量化
-            vectorizer = TfidfVectorizer(stop_words=None, lowercase=True)
-            tfidf_matrix = vectorizer.fit_transform(documents)
-            
-            # 计算相似度
-            query_vector = tfidf_matrix[0:1]
-            doc_vectors = tfidf_matrix[1:]
-            similarities = cosine_similarity(query_vector, doc_vectors).flatten()
-            
-            # 存储向量分数
-            for i, memory in enumerate(filtered_memories):
-                vector_scores[memory.id] = similarities[i]
-                
-        except Exception as e:
-            # 如果向量检索失败，回退到关键词匹配
-            vector_scores = {}
+        # 4. 语义检索：编码 query 和所有候选记忆，用余弦相似度排序
+        scored_memories = self._semantic_retrieve(query, filtered_memories)
 
-        # 计算最终分数
+        # 5. 按最终得分降序排列，截取 top-N 返回
+        scored_memories.sort(key=lambda x: x[0], reverse=True)
+        return [memory for _, memory in scored_memories[:limit]]
+
+    def _semantic_retrieve(self, query: str, memories: List[MemoryItem]) -> List[tuple]:
+        """使用嵌入模型计算语义相似度，失败时回退到关键词匹配"""
+        try:
+            from memory.embedding import get_text_embedder_model
+
+            embedder = get_text_embedder_model()
+
+            # 只编码 query（记忆的向量在 add 时已预计算并缓存）
+            query_vec = embedder.encode(query)
+
+            # 收集已缓存的记忆向量，缺失的当场补编码
+            vecs = []
+            for m in memories:
+                if m.vector is not None:
+                    vecs.append(np.array(m.vector))
+                else:
+                    vecs.append(embedder.encode(m.content))
+
+            memory_vecs = np.array(vecs)
+
+            # L2 归一化后点积 = 余弦相似度（+1e-8 防止除零）
+            query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+            memory_norms = memory_vecs / (np.linalg.norm(memory_vecs, axis=1, keepdims=True) + 1e-8)
+            similarities = np.dot(memory_norms, query_norm)
+
+            query_lower = query.lower()
+            scored = []
+            for i, memory in enumerate(memories):
+                # 语义分数：嵌入向量余弦相似度（主信号）
+                semantic_score = float(similarities[i])
+
+                # 关键词加分：精确子串命中 +0.15，分词重叠 +0.1（辅助信号）
+                content_lower = memory.content.lower()
+                keyword_boost = 0.0
+                if query_lower in content_lower:
+                    keyword_boost = 0.15
+                else:
+                    query_words = set(query_lower.split())
+                    content_words = set(content_lower.split())
+                    overlap = query_words & content_words
+                    if overlap:
+                        keyword_boost = len(overlap) / len(query_words | content_words) * 0.1
+
+                # 基础相关性 = 语义分数 + 关键词加分
+                base_relevance = semantic_score + keyword_boost
+
+                # 时间衰减：越久远的记忆权重越低（指数衰减）
+                time_decay = self._calculate_time_decay(memory.timestamp)
+                base_relevance *= time_decay
+
+                # 重要性加权：用户/系统标记的重要记忆获得加成（0.8~1.2 倍）
+                importance_weight = 0.8 + (memory.importance * 0.4)
+                final_score = base_relevance * importance_weight
+
+                if final_score > 0:
+                    scored.append((final_score, memory))
+
+            return scored
+
+        except Exception:
+            # 嵌入模型不可用时回退到纯关键词匹配
+            return self._keyword_retrieve(query, memories)
+
+    def _keyword_retrieve(self, query: str, memories: List[MemoryItem]) -> List[tuple]:
+        """关键词匹配回退 — 不依赖嵌入模型，纯文本匹配"""
         query_lower = query.lower()
-        scored_memories = []
-        
-        for memory in filtered_memories:
+        scored = []
+        for memory in memories:
             content_lower = memory.content.lower()
-            
-            # 获取向量分数（如果有）
-            vector_score = vector_scores.get(memory.id, 0.0)
-            
-            # 关键词匹配分数
-            keyword_score = 0.0
+            # 完全子串匹配：query 完整出现在 content 中的比例
             if query_lower in content_lower:
                 keyword_score = len(query_lower) / len(content_lower)
             else:
-                # 分词匹配
+                # 分词交集匹配：query 和 content 的词语重叠度（Jaccard 系数 x0.8）
                 query_words = set(query_lower.split())
                 content_words = set(content_lower.split())
-                intersection = query_words.intersection(content_words)
-                if intersection:
-                    keyword_score = len(intersection) / len(query_words.union(content_words)) * 0.8
+                overlap = query_words & content_words
+                if overlap:
+                    keyword_score = len(overlap) / len(query_words | content_words) * 0.8
+                else:
+                    keyword_score = 0.0
 
-            # 混合分数：向量检索 + 关键词匹配
-            if vector_score > 0:
-                base_relevance = vector_score * 0.7 + keyword_score * 0.3
-            else:
-                base_relevance = keyword_score
-            
-            # 时间衰减
-            time_decay = self._calculate_time_decay(memory.timestamp)
-            base_relevance *= time_decay
-            
-            # 重要性权重
-            importance_weight = 0.8 + (memory.importance * 0.4)
-            final_score = base_relevance * importance_weight
-            
-            if final_score > 0:
-                scored_memories.append((final_score, memory))
+            if keyword_score > 0:
+                # 与语义检索使用相同的时间衰减和重要性加权公式
+                time_decay = self._calculate_time_decay(memory.timestamp)
+                importance_weight = 0.8 + (memory.importance * 0.4)
+                final_score = keyword_score * time_decay * importance_weight
+                scored.append((final_score, memory))
 
-        # 按分数排序并返回
-        scored_memories.sort(key=lambda x: x[0], reverse=True)
-        return [memory for _, memory in scored_memories[:limit]]
+        return scored
     
     def update(
         self,
@@ -160,22 +190,28 @@ class WorkingMemory(BaseMemory):
         for memory in self.memories:
             if memory.id == memory_id:
                 old_tokens = count_tokens(memory.content)
-                
+
                 if content is not None:
                     memory.content = content
-                    # 更新token计数
                     new_tokens = count_tokens(content)
                     self.current_tokens = self.current_tokens - old_tokens + new_tokens
-                
+                    # 内容变了，重新编码向量以保证检索时拿到的向量与实际内容一致
+                    memory.vector = None
+                    try:
+                        from memory.embedding import get_text_embedder_model
+                        embedder = get_text_embedder_model()
+                        vec = embedder.encode(content)
+                        memory.vector = vec.tolist() if hasattr(vec, 'tolist') else list(vec)
+                    except Exception:
+                        pass
+
                 if importance is not None:
                     memory.importance = importance
-                
+
                 if metadata is not None:
                     memory.metadata.update(metadata)
-                
-                # 重新计算优先级并更新堆
+
                 self._update_heap_priority(memory)
-                
                 return True
         return False
     
