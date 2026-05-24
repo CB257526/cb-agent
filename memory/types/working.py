@@ -109,9 +109,11 @@ class WorkingMemory(BaseMemory):
             memory_vecs = np.array(vecs)
 
             # L2 归一化后点积 = 余弦相似度（+1e-8 防止除零）
+            # 计算L2 范数归一化 v = v / ||v||_2   ||v||_2 = sqrt(sum(v_i^2))
             query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
             memory_norms = memory_vecs / (np.linalg.norm(memory_vecs, axis=1, keepdims=True) + 1e-8)
-            similarities = np.dot(memory_norms, query_norm)
+            # 计算余弦相似度：v_i * v_j / ||v_i||_2 * ||v_j||_2
+            similarities = np.dot(memory_norms, query_norm)  #列向量 (m x 1)，包含了查询句与所有记忆的相似度得分
 
             query_lower = query.lower()
             scored = []
