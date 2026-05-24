@@ -78,22 +78,28 @@ from agent.cb_agents import CbAgentsLLM
 
 
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+# from sklearn.feature_extraction.text import TfidfVectorizer
+# from sklearn.metrics.pairwise import cosine_similarity
+# import numpy as np
 
-# 准备文档
-documents = ["手机"] + ["手机是一个电子设备", "手机可以用于打电话", "手机可以用于发送短信","华为手机是一个品牌","小米手机"]
+# # 准备文档
+# documents = ["手机"] + ["手机是一个电子设备", "手机可以用于打电话", "手机可以用于发送短信","华为手机是一个品牌","小米手机"]
 
-# TF-IDF向量化
-vectorizer = TfidfVectorizer(stop_words=None, lowercase=True)
-tfidf_matrix = vectorizer.fit_transform(documents)
-print(tfidf_matrix)
-# 计算相似度
-query_vector = tfidf_matrix[0:1]
-doc_vectors = tfidf_matrix[1:]
-print(query_vector)
-print(doc_vectors)
+# # TF-IDF向量化
+# vectorizer = TfidfVectorizer(stop_words=None, lowercase=True)
+# tfidf_matrix = vectorizer.fit_transform(documents)
+# print(tfidf_matrix)
+# # 计算相似度
+# query_vector = tfidf_matrix[0:1]
+# doc_vectors = tfidf_matrix[1:]
+# print(query_vector)
+# print(doc_vectors)
 
-similarities = cosine_similarity(query_vector, doc_vectors).flatten()
-print(similarities)
+# similarities = cosine_similarity(query_vector, doc_vectors).flatten()
+# print(similarities)
+
+
+
+from agent.cb_agent_basic import CbAgentsLLMBasic
+agent = CbAgentsLLMBasic()
+print(agent.ask(prompt="你好,你是谁？"))

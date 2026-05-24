@@ -15,7 +15,7 @@ import math
 import numpy as np
 
 from ..base import BaseMemory, MemoryItem, MemoryConfig
-from ..embedding import get_text_embedder, get_dimension
+from ..embedding import get_text_embedder_model, get_dimension
 from ...core.database_config import get_database_config
 
 # 配置日志
@@ -124,7 +124,7 @@ class SemanticMemory(BaseMemory):
     def _init_embedding_model(self):
         """初始化统一嵌入模型（由 embedding_provider 管理）。"""
         try:
-            self.embedding_model = get_text_embedder()
+            self.embedding_model = get_text_embedder_model()
             # 轻量健康检查与日志
             try:
                 test_vec = self.embedding_model.encode("health_check")
