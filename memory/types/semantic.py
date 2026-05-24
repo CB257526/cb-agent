@@ -147,24 +147,24 @@ class SemanticMemory(BaseMemory):
             qdrant_config = db_config.get_qdrant_config() or {}
             qdrant_config["vector_size"] = get_dimension()
             self.vector_store = VectorStoreManager.get_instance(**qdrant_config)
-            logger.info(f"✅ {self.vector_store.store_type} 向量数据库初始化完成")
-            
-            # 初始化Neo4j图数据库
-            from ..storage.neo4j_store import Neo4jGraphStore
+            logger.info(f"向量数据库初始化完成: {self.vector_store.store_type}")
+
+            # 初始化图数据库（通过 GraphStoreManager 统一管理，支持 Neo4j / SQLite 等后端）
+            from ..storage.graph_store_manager import GraphStoreManager
             neo4j_config = db_config.get_neo4j_config()
-            self.graph_store = Neo4jGraphStore(**neo4j_config)
-            logger.info("✅ Neo4j图数据库初始化完成")
-            
+            self.graph_store = GraphStoreManager.get_instance(**neo4j_config)
+            logger.info(f"图数据库初始化完成: {self.graph_store.store_type}")
+
             # 验证连接
             vector_health = self.vector_store.health_check()
             graph_health = self.graph_store.health_check()
-            
+
             if not vector_health:
-                logger.warning("⚠️ Qdrant连接异常，部分功能可能受限")
+                logger.warning(f"{self.vector_store.store_type} 连接异常，部分功能可能受限")
             if not graph_health:
-                logger.warning("⚠️ Neo4j连接异常，图搜索功能可能受限")
-            
-            logger.info(f"🏥 数据库健康状态: Qdrant={'✅' if vector_health else '❌'}, Neo4j={'✅' if graph_health else '❌'}")
+                logger.warning(f"{self.graph_store.store_type} 连接异常，图搜索功能可能受限")
+
+            logger.info(f"数据库健康状态: 向量={'OK' if vector_health else 'FAIL'}, 图={'OK' if graph_health else 'FAIL'}")
             
         except Exception as e:
             logger.error(f"❌ 数据库初始化失败: {e}")

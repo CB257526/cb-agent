@@ -13,7 +13,10 @@ from .vector_store_base import VectorStoreBase
 from .vector_store_manager import VectorStoreManager
 from .qdrant_store import QdrantVectorStore, QdrantConnectionManager
 from .zvec_store import ZvecVectorStore
+from .graph_store_base import GraphStoreBase
+from .graph_store_manager import GraphStoreManager
 from .neo4j_store import Neo4jGraphStore
+from .sqlite_graph_store import SQLiteGraphStore
 from .document_store import DocumentStore, SQLiteDocumentStore
 
 __all__ = [
@@ -22,7 +25,10 @@ __all__ = [
     "QdrantVectorStore",
     "QdrantConnectionManager",
     "ZvecVectorStore",
+    "GraphStoreBase",
+    "GraphStoreManager",
     "Neo4jGraphStore",
+    "SQLiteGraphStore",
     "DocumentStore",
     "SQLiteDocumentStore",
 ]
