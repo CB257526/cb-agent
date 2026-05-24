@@ -17,7 +17,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from ..base import BaseMemory, MemoryItem, MemoryConfig
-from ..storage import SQLiteDocumentStore, QdrantVectorStore
+from ..storage import SQLiteDocumentStore, QdrantVectorStore, VectorStoreManager
 from ..embedding import get_dimension
 from memory.embedding import get_text_embedder_model
 
@@ -74,16 +74,20 @@ class EpisodicMemory(BaseMemory):
         # 统一嵌入模型（多语言，默认384维）
         self.embedder = get_text_embedder_model()
 
-        # 向量存储（Qdrant - 使用连接管理器避免重复连接）
-        from ..storage.qdrant_store import QdrantConnectionManager
+        # 向量存储（通过 VectorStoreManager 统一管理，支持 Qdrant / Zvec 等后端）
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
-        self.vector_store = QdrantConnectionManager.get_instance(
+        collection_name = os.getenv("QDRANT_COLLECTION", "hello_agents_vectors")
+        vector_dim = get_dimension(getattr(self.embedder, 'dimension', 384))
+        distance = os.getenv("QDRANT_DISTANCE", "cosine")
+
+        self.vector_store = VectorStoreManager.get_instance(
+            # 若设置了 QDRANT_URL / QDRANT_API_KEY 则自动走 qdrant，否则走 VECTOR_STORE_TYPE 环境变量（默认 zvec）
             url=qdrant_url,
             api_key=qdrant_api_key,
-            collection_name=os.getenv("QDRANT_COLLECTION", "hello_agents_vectors"),
-            vector_size=get_dimension(getattr(self.embedder, 'dimension', 384)),
-            distance=os.getenv("QDRANT_DISTANCE", "cosine")
+            collection_name=collection_name,
+            vector_size=vector_dim,
+            distance=distance,
         )
     
     def add(self, memory_item: MemoryItem) -> str:

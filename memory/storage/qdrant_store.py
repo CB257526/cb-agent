@@ -11,11 +11,13 @@ from typing import Dict, List, Optional, Any, Union
 import numpy as np
 from datetime import datetime
 
+from .vector_store_base import VectorStoreBase
+
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.http import models
     from qdrant_client.http.models import (
-        Distance, VectorParams, PointStruct, 
+        Distance, VectorParams, PointStruct,
         Filter, FieldCondition, MatchValue, SearchRequest
     )
     QDRANT_AVAILABLE = True
@@ -67,11 +69,45 @@ class QdrantConnectionManager:
             
         return cls._instances[key]
 
-class QdrantVectorStore:
-    """Qdrant向量数据库存储实现"""
-    
+class QdrantVectorStore(VectorStoreBase):
+    """Qdrant向量数据库存储实现
+
+    实现 VectorStoreBase 的全部抽象方法，封装 Qdrant 客户端 API。
+
+    架构角色:
+      这是 VectorStoreBase 在 Qdrant 后端的具体实现。
+      它与 ZvecVectorStore 共享完全相同的接口，可以无缝互换。
+
+    Qdrant 特点:
+      - 客户端-服务器架构，需要运行 Qdrant 服务（Docker 或云）。
+      - 支持分布式部署，可扩展到十亿级向量。
+      - Payload 是灵活的 JSON，无需预定义 Schema。
+      - 过滤使用 Python 对象模型（Filter/FieldCondition），而非字符串表达式。
+    """
+
+    # ================================================================
+    # VectorStoreBase 要求的三个只读属性
+    # ================================================================
+    # 这些属性通过 @property 实现，值在 __init__ 中存入私有变量。
+    # 上层代码通过 store.collection_name / store.vector_size / store.store_type 访问。
+
+    @property
+    def collection_name(self) -> str:
+        """集合名称，只读。等价于 Qdrant 的 collection name。"""
+        return self._collection_name
+
+    @property
+    def vector_size(self) -> int:
+        """向量维度，只读。创建 collection 时写入，之后不可变。"""
+        return self._vector_size
+
+    @property
+    def store_type(self) -> str:
+        """存储类型标识，固定返回 "qdrant"。用于日志和统计。"""
+        return "qdrant"
+
     def __init__(
-        self, 
+        self,
         url: Optional[str] = None,
         api_key: Optional[str] = None,
         collection_name: str = "hello_agents_vectors",
@@ -81,50 +117,78 @@ class QdrantVectorStore:
         **kwargs
     ):
         """
-        初始化Qdrant向量存储 (支持云API)
-        
+        初始化Qdrant向量存储 (支持本地、自定义URL、云服务三种模式)。
+
+        === 初始化流程 ===
+
+        1. 保存配置参数到实例变量。
+        2. 读取 HNSW/搜索相关的环境变量调优参数。
+        3. 映射距离度量字符串到 Qdrant Distance 枚举。
+        4. 调用 _initialize_client() 建立连接 + 确保 collection 存在。
+
+        === 三种连接模式 ===
+
+          url + api_key → Qdrant 云服务 (https://cloud.qdrant.io)
+          url           → 自定义部署 (自建服务器)
+          都不传         → 本地 localhost:6333 (Docker 运行)
+
+        === 向量维度契约 ===
+
+        vector_size 必须与嵌入模型输出维度一致:
+          - all-MiniLM-L6-v2 → 384
+          - text-embedding-3-small → 1536
+          - qwen3-embedding → 用户配置
+        写入时会对每条向量做维度校验。
+
         Args:
-            url: Qdrant云服务URL (如果为None则使用本地)
-            api_key: Qdrant云服务API密钥
-            collection_name: 集合名称
-            vector_size: 向量维度
-            distance: 距离度量方式 (cosine, dot, euclidean)
-            timeout: 连接超时时间
+            url: Qdrant 服务 URL (云服务或自定义部署)。None 则用本地。
+            api_key: Qdrant 云服务 API 密钥。
+            collection_name: 集合名称。不同记忆类型使用不同 collection。
+            vector_size: 向量维度。
+            distance: 距离度量 (cosine, dot, euclidean)。
+            timeout: 网络请求超时时间（秒）。
         """
         if not QDRANT_AVAILABLE:
             raise ImportError(
                 "qdrant-client未安装。请运行: pip install qdrant-client>=1.6.0"
             )
-        
+
+        # ---- 保存配置 ----
         self.url = url
         self.api_key = api_key
-        self.collection_name = collection_name
-        self.vector_size = vector_size
+        self._collection_name = collection_name   # 私有变量，供 property 返回
+        self._vector_size = vector_size           # 私有变量，供 property 返回
         self.timeout = timeout
-        # HNSW/Query params via env
+
+        # ---- HNSW / 搜索参数（可通过环境变量覆盖默认值） ----
+        # hnsw_m: HNSW 图中每个节点的最大连接数（越大越精确但越占内存，默认32）
         try:
             self.hnsw_m = int(os.getenv("QDRANT_HNSW_M", "32"))
         except Exception:
             self.hnsw_m = 32
+        # hnsw_ef_construct: 索引构建时的搜索深度（越大越精确但构建越慢，默认256）
         try:
             self.hnsw_ef_construct = int(os.getenv("QDRANT_HNSW_EF_CONSTRUCT", "256"))
         except Exception:
             self.hnsw_ef_construct = 256
+        # search_ef: 查询时的搜索深度（越大召回率越高但越慢，默认128）
         try:
             self.search_ef = int(os.getenv("QDRANT_SEARCH_EF", "128"))
         except Exception:
             self.search_ef = 128
+        # search_exact: 是否使用精确搜索（默认关闭，使用近似搜索）
         self.search_exact = os.getenv("QDRANT_SEARCH_EXACT", "0") == "1"
-        
-        # 距离度量映射
+
+        # ---- 距离度量映射 ----
+        # 统一接口使用字符串 (cosine/dot/euclidean)，转为 Qdrant 枚举
         distance_map = {
-            "cosine": Distance.COSINE,
-            "dot": Distance.DOT,
-            "euclidean": Distance.EUCLID,
+            "cosine": Distance.COSINE,      # 余弦相似度（推荐用于文本嵌入）
+            "dot": Distance.DOT,            # 点积/内积
+            "euclidean": Distance.EUCLID,   # 欧几里得距离
         }
         self.distance = distance_map.get(distance.lower(), Distance.COSINE)
-        
-        # 初始化客户端
+
+        # ---- 建立连接 ----
         self.client = None
         self._initialize_client()
         
@@ -407,18 +471,18 @@ class QdrantVectorStore:
     
     def delete_vectors(self, ids: List[str]) -> bool:
         """
-        删除向量
-        
+        删除向量（按主键ID）
+
         Args:
             ids: 要删除的向量ID列表
-        
+
         Returns:
             bool: 是否成功
         """
         try:
             if not ids:
                 return True
-                
+
             operation_info = self.client.delete(
                 collection_name=self.collection_name,
                 points_selector=models.PointIdsList(
@@ -426,39 +490,89 @@ class QdrantVectorStore:
                 ),
                 wait=True
             )
-            
-            logger.info(f"✅ 成功删除 {len(ids)} 个向量")
+
+            logger.info(f"成功删除 {len(ids)} 个向量")
             return True
-            
+
         except Exception as e:
-            logger.error(f"❌ 删除向量失败: {e}")
+            logger.error(f"删除向量失败: {e}")
             return False
-    
-    def clear_collection(self) -> bool:
+
+    def delete_by_filter(self, where: Dict[str, Any]) -> bool:
         """
-        清空集合
-        
+        按条件过滤删除向量（VectorStoreBase 抽象方法实现）。
+
+        这是基类要求的通用过滤删除接口。与 delete_memories 的关系:
+          - delete_by_filter: 通用接口，接受任意过滤条件。
+          - delete_memories:  业务便捷方法，专用于按 memory_id 删除。
+
+        实现细节:
+          1. 遍历 where 字典的每个 key-value。
+          2. 如果 value 是 list → 构建 should (OR) 过滤器，单独一条 delete 调用。
+          3. 如果 value 是标量 → 累积到 conditions 中，最后用 must (AND) 一次删除。
+          4. 同时包含 list 和标量时会分多次调用（Qdrant 不支持混合逻辑的单一 filter）。
+
+        Args:
+            where: 过滤条件字典。
+                   例如 {"memory_type": "episodic"} → 删除所有情景记忆。
+                   例如 {"memory_id": ["id1", "id2"]} → 批量删除指定记忆。
+
         Returns:
-            bool: 是否成功
+            bool: 是否成功。
         """
         try:
-            # 删除并重新创建集合
-            self.client.delete_collection(collection_name=self.collection_name)
-            self._ensure_collection()
-            
-            logger.info(f"✅ 成功清空Qdrant集合: {self.collection_name}")
+            if not where:
+                return True
+
+            conditions = []
+            for key, value in where.items():
+                if isinstance(value, list):
+                    # 多值匹配：使用 should (OR)
+                    self.client.delete(
+                        collection_name=self.collection_name,
+                        points_selector=models.FilterSelector(
+                            filter=Filter(should=[
+                                FieldCondition(key=key, match=MatchValue(value=v))
+                                for v in value
+                            ])
+                        ),
+                        wait=True,
+                    )
+                elif isinstance(value, (str, int, float, bool)):
+                    conditions.append(
+                        FieldCondition(key=key, match=MatchValue(value=value))
+                    )
+
+            if conditions:
+                self.client.delete(
+                    collection_name=self.collection_name,
+                    points_selector=models.FilterSelector(
+                        filter=Filter(must=conditions)
+                    ),
+                    wait=True,
+                )
+
+            logger.info(f"按条件删除成功: {where}")
             return True
-            
+
         except Exception as e:
-            logger.error(f"❌ 清空集合失败: {e}")
+            logger.error(f"按条件删除失败: {e}")
             return False
-    
+
     def delete_memories(self, memory_ids: List[str]):
         """
-        删除指定记忆（通过payload中的 memory_id 过滤删除）
-        
+        删除指定记忆（覆盖基类默认实现，使用 Qdrant 原生 should 过滤器）。
+
         注意：由于写入时可能将非UUID的点ID转换为UUID，这里不再依赖点ID，
         而是通过payload中的memory_id来匹配删除，确保一致性。
+
+        与基类默认实现的区别:
+          基类默认实现调用 self.delete_by_filter({"memory_id": memory_ids})，
+          这里直接使用 Qdrant 原生 Filter(should=...) + FilterSelector，
+          单次 API 调用即可完成批量删除，更高效。
+
+        Args:
+            memory_ids: 要删除的记忆 ID 列表（业务层 memory_id，非点 ID）。
         """
         try:
             if not memory_ids:
@@ -474,10 +588,29 @@ class QdrantVectorStore:
                 points_selector=models.FilterSelector(filter=query_filter),
                 wait=True,
             )
-            logger.info(f"✅ 成功按memory_id删除 {len(memory_ids)} 个Qdrant向量")
+            logger.info(f"成功按memory_id删除 {len(memory_ids)} 个Qdrant向量")
         except Exception as e:
-            logger.error(f"❌ 删除记忆失败: {e}")
+            logger.error(f"删除记忆失败: {e}")
             raise
+
+    def clear_collection(self) -> bool:
+        """
+        清空集合
+
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            # 删除并重新创建集合
+            self.client.delete_collection(collection_name=self.collection_name)
+            self._ensure_collection()
+
+            logger.info(f"成功清空Qdrant集合: {self.collection_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"清空集合失败: {e}")
+            return False
     
     def get_collection_info(self) -> Dict[str, Any]:
         """

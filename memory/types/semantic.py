@@ -142,12 +142,12 @@ class SemanticMemory(BaseMemory):
             # 获取数据库配置
             db_config = get_database_config()
             
-            # 初始化Qdrant向量数据库（使用连接管理器避免重复连接）
-            from ..storage.qdrant_store import QdrantConnectionManager
+            # 初始化向量数据库（通过 VectorStoreManager 统一管理，支持 Qdrant / Zvec 等后端）
+            from ..storage.vector_store_manager import VectorStoreManager
             qdrant_config = db_config.get_qdrant_config() or {}
             qdrant_config["vector_size"] = get_dimension()
-            self.vector_store = QdrantConnectionManager.get_instance(**qdrant_config)
-            logger.info("✅ Qdrant向量数据库初始化完成")
+            self.vector_store = VectorStoreManager.get_instance(**qdrant_config)
+            logger.info(f"✅ {self.vector_store.store_type} 向量数据库初始化完成")
             
             # 初始化Neo4j图数据库
             from ..storage.neo4j_store import Neo4jGraphStore

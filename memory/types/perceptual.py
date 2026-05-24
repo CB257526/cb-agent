@@ -111,16 +111,16 @@ class PerceptualMemory(BaseMemory):
             self._clap_processor = None
             self._audio_dim = self.vector_dim
 
-        # 向量存储（Qdrant）— 按模态拆分集合，避免维度冲突，使用连接管理器避免重复连接
-        from ..storage.qdrant_store import QdrantConnectionManager
+        # 向量存储 — 按模态拆分集合，避免维度冲突，通过 VectorStoreManager 统一管理
+        from ..storage.vector_store_manager import VectorStoreManager
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
         base_collection = os.getenv("QDRANT_COLLECTION", "hello_agents_vectors")
         distance = os.getenv("QDRANT_DISTANCE", "cosine")
-        
-        self.vector_stores: Dict[str, QdrantVectorStore] = {}
+
+        self.vector_stores: Dict[str, Any] = {}
         # 文本集合
-        self.vector_stores["text"] = QdrantConnectionManager.get_instance(
+        self.vector_stores["text"] = VectorStoreManager.get_instance(
             url=qdrant_url,
             api_key=qdrant_api_key,
             collection_name=f"{base_collection}_perceptual_text",
@@ -128,7 +128,7 @@ class PerceptualMemory(BaseMemory):
             distance=distance
         )
         # 图像集合（若CLIP不可用，维度退化为text维度）
-        self.vector_stores["image"] = QdrantConnectionManager.get_instance(
+        self.vector_stores["image"] = VectorStoreManager.get_instance(
             url=qdrant_url,
             api_key=qdrant_api_key,
             collection_name=f"{base_collection}_perceptual_image",
@@ -136,7 +136,7 @@ class PerceptualMemory(BaseMemory):
             distance=distance
         )
         # 音频集合（若CLAP不可用，维度退化为text维度）
-        self.vector_stores["audio"] = QdrantConnectionManager.get_instance(
+        self.vector_stores["audio"] = VectorStoreManager.get_instance(
             url=qdrant_url,
             api_key=qdrant_api_key,
             collection_name=f"{base_collection}_perceptual_audio",
