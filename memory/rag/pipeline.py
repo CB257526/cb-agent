@@ -4,9 +4,11 @@ import hashlib
 import sqlite3
 import time
 import json
+from pathlib import Path
 from memory.embedding import get_text_embedder_model, get_dimension
 from ..storage.vector_store_manager import VectorStoreManager
 from ..storage.graph_store_manager import GraphStoreManager
+from utils.multimodal import MultimodalProcessor
 
 
 def _get_markitdown_instance():
@@ -546,10 +548,241 @@ def build_graph_from_chunks(chunks: List[Dict]) -> None:
                 pass
 
 
-def _preprocess_markdown_for_embedding(text: str) -> str:
+# ============================================================
+# 图片/音频模态的索引与搜索
+# ============================================================
+
+# 全局多模态处理器实例（懒加载）
+_multimodal_processor = None
+
+
+def _get_multimodal_processor() -> MultimodalProcessor:
+    """获取或创建多模态处理器单例"""
+    global _multimodal_processor
+    if _multimodal_processor is None:
+        _multimodal_processor = MultimodalProcessor()
+    return _multimodal_processor
+
+
+def index_image(
+    file_path: str,
+    store = None,
+    rag_namespace: str = "default",
+) -> int:
+    """处理单张图片：OCR 识别 → 分块 → 嵌入 → 入库
+
+    流程:
+    1. 调用视觉 LLM 对图片进行 OCR + 视觉描述
+    2. 将识别结果作为文本分块
+    3. 嵌入后存入向量存储，元数据标注 modality="image" 和原始文件路径
+
+    参数:
+        file_path: 图片文件路径
+        store: 向量存储实例，None 时自动创建
+        rag_namespace: 命名空间
+
+    返回:
+        入库的分块数量，失败时返回 0
     """
-    Preprocess markdown text for better embedding quality.
-    Removes excessive markup while preserving semantic content.
+    processor = _get_multimodal_processor()
+    result = processor.process_image(file_path)
+    if not result["text"]:
+        print(f"[RAG] 图片 OCR 未产出文本: {file_path}")
+        return 0
+
+    # 将识别文本作为一个分块，附加图片元数据
+    chunk_content = result["text"]
+    # 生成唯一文档 ID：文件路径 + 内容哈希
+    doc_id = hashlib.md5(f"{file_path}|{len(chunk_content)}".encode('utf-8')).hexdigest()
+    content_hash = hashlib.md5(chunk_content.encode('utf-8')).hexdigest()
+    chunk_id = hashlib.md5(f"{doc_id}|0|{len(chunk_content)}|{content_hash}".encode('utf-8')).hexdigest()
+
+    chunk = {
+        "id": chunk_id,
+        "content": chunk_content,
+        "metadata": {
+            "source_path": file_path,
+            "file_ext": os.path.splitext(file_path)[1].lower(),
+            "doc_id": doc_id,
+            "lang": "zh",
+            "start": 0,
+            "end": len(chunk_content),
+            "content_hash": content_hash,
+            "namespace": rag_namespace,
+            "source": "rag",
+            "external": True,
+            "format": "ocr_text",
+            # ── 多模态特有元数据 ──
+            "modality": "image",
+            "original_file_path": str(Path(file_path).absolute()),
+            "mime_type": result["metadata"].get("mime_type", ""),
+            "file_size": result["metadata"].get("file_size", 0),
+        },
+    }
+
+    index_chunks(store=store, chunks=[chunk], rag_namespace=rag_namespace)
+    print(f"[RAG] 图片已索引: {os.path.basename(file_path)} → {len(chunk_content)} 字符")
+    return 1
+
+
+def index_audio(
+    file_path: str,
+    store = None,
+    rag_namespace: str = "default",
+) -> int:
+    """处理单个音频：ASR 转录 → 分块 → 嵌入 → 入库
+
+    流程:
+    1. 调用语音识别 LLM 对音频进行转录
+    2. 将转录文本分块
+    3. 嵌入后存入向量存储，元数据标注 modality="audio" 和原始文件路径
+
+    参数:
+        file_path: 音频文件路径
+        store: 向量存储实例，None 时自动创建
+        rag_namespace: 命名空间
+
+    返回:
+        入库的分块数量，失败时返回 0
+    """
+    processor = _get_multimodal_processor()
+    result = processor.process_audio(file_path)
+    if not result["text"]:
+        print(f"[RAG] 音频 ASR 未产出文本: {file_path}")
+        return 0
+
+    chunk_content = result["text"]
+    doc_id = hashlib.md5(f"{file_path}|{len(chunk_content)}".encode('utf-8')).hexdigest()
+    content_hash = hashlib.md5(chunk_content.encode('utf-8')).hexdigest()
+    chunk_id = hashlib.md5(f"{doc_id}|0|{len(chunk_content)}|{content_hash}".encode('utf-8')).hexdigest()
+
+    chunk = {
+        "id": chunk_id,
+        "content": chunk_content,
+        "metadata": {
+            "source_path": file_path,
+            "file_ext": os.path.splitext(file_path)[1].lower(),
+            "doc_id": doc_id,
+            "lang": "zh",
+            "start": 0,
+            "end": len(chunk_content),
+            "content_hash": content_hash,
+            "namespace": rag_namespace,
+            "source": "rag",
+            "external": True,
+            "format": "asr_text",
+            # ── 多模态特有元数据 ──
+            "modality": "audio",
+            "original_file_path": str(Path(file_path).absolute()),
+            "mime_type": result["metadata"].get("mime_type", ""),
+            "file_size": result["metadata"].get("file_size", 0),
+        },
+    }
+
+    index_chunks(store=store, chunks=[chunk], rag_namespace=rag_namespace)
+    print(f"[RAG] 音频已索引: {os.path.basename(file_path)} → {len(chunk_content)} 字符")
+    return 1
+
+
+def load_and_index_images(
+    file_paths: List[str],
+    store = None,
+    rag_namespace: str = "default",
+) -> int:
+    """批量处理图片：遍历文件列表，逐个 OCR 后入库
+
+    返回:
+        成功入库的图片总数
+    """
+    if store is None:
+        store = _create_default_vector_store()
+
+    total = 0
+    for path in file_paths:
+        if not os.path.exists(path):
+            print(f"[RAG] 图片文件不存在: {path}")
+            continue
+        try:
+            n = index_image(file_path=path, store=store, rag_namespace=rag_namespace)
+            total += n
+        except Exception as e:
+            print(f"[RAG] 图片索引失败 ({path}): {e}")
+
+    print(f"[RAG] 批量图片索引完成: {total} 张")
+    return total
+
+
+def load_and_index_audio(
+    file_paths: List[str],
+    store = None,
+    rag_namespace: str = "default",
+) -> int:
+    """批量处理音频：遍历文件列表，逐个 ASR 转录后入库
+
+    返回:
+        成功入库的音频总数
+    """
+    if store is None:
+        store = _create_default_vector_store()
+
+    total = 0
+    for path in file_paths:
+        if not os.path.exists(path):
+            print(f"[RAG] 音频文件不存在: {path}")
+            continue
+        try:
+            n = index_audio(file_path=path, store=store, rag_namespace=rag_namespace)
+            total += n
+        except Exception as e:
+            print(f"[RAG] 音频索引失败 ({path}): {e}")
+
+    print(f"[RAG] 批量音频索引完成: {total} 个")
+    return total
+
+
+def search_images(
+    query: str,
+    store = None,
+    top_k: int = 8,
+    rag_namespace: Optional[str] = None,
+    score_threshold: Optional[float] = None,
+) -> List[Dict]:
+    """搜索图片知识库：在 modality="image" 的数据中做向量检索
+
+    返回结果中 metadata["original_file_path"] 即为原始图片的绝对路径，
+    可供 Agent 直接返回给用户查看。
+    """
+    return search_vectors(
+        store=store, query=query, top_k=top_k,
+        rag_namespace=rag_namespace, only_rag_data=False,
+        modality="image", score_threshold=score_threshold,
+    )
+
+
+def search_audio(
+    query: str,
+    store = None,
+    top_k: int = 8,
+    rag_namespace: Optional[str] = None,
+    score_threshold: Optional[float] = None,
+) -> List[Dict]:
+    """搜索音频知识库：在 modality="audio" 的数据中做向量检索
+
+    返回结果中 metadata["original_file_path"] 即为原始音频的绝对路径，
+    可供 Agent 直接返回给用户。
+    """
+    return search_vectors(
+        store=store, query=query, top_k=top_k,
+        rag_namespace=rag_namespace, only_rag_data=False,
+        modality="audio", score_threshold=score_threshold,
+    )
+
+
+def _preprocess_markdown_for_embedding(text: str) -> str:
+    """为嵌入质量做 Markdown 文本预处理
+
+    去除 Markdown 标记符号（##、**、` 等），保留纯语义文本，
+    避免冗余的格式化字符干扰嵌入向量的语义质量。
     """
     import re
     
@@ -734,7 +967,7 @@ def index_chunks(
             "content": ch["content"],
             "data_source": "rag_pipeline",
             "rag_namespace": rag_namespace,
-            "is_rag_data": True,
+            "is_rag_data": "true",
         }
         meta.update(ch.get("metadata", {}))
         metas.append(meta)
@@ -792,6 +1025,7 @@ def search_vectors(
     top_k: int = 8,
     rag_namespace: Optional[str] = None,
     only_rag_data: bool = True,
+    modality: Optional[str] = None,
     score_threshold: Optional[float] = None
 ) -> List[Dict]:
     """向量检索：将查询编码后在向量存储中搜索最相似的 RAG 分块
@@ -805,6 +1039,7 @@ def search_vectors(
         top_k: 返回结果数（默认 8）
         rag_namespace: 命名空间过滤，None 时不按命名空间过滤
         only_rag_data: 是否仅搜索 RAG 数据（默认 True）
+        modality: 模态过滤（"text"/"image"/"audio"），None 时不限制
         score_threshold: 最低相似度阈值，None 时不限制
 
     返回:
@@ -821,10 +1056,12 @@ def search_vectors(
     # ── 构建 RAG 数据过滤条件 ──
     where = {"memory_type": "rag_chunk"}
     if only_rag_data:
-        where["is_rag_data"] = True
+        where["is_rag_data"] = "true"
         where["data_source"] = "rag_pipeline"
     if rag_namespace:
         where["rag_namespace"] = rag_namespace
+    if modality:
+        where["modality"] = modality
 
     try:
         return store.search_similar(
@@ -835,47 +1072,6 @@ def search_vectors(
         )
     except Exception as e:
         print(f"[RAG] 向量搜索失败: {e}")
-        return []
-
-
-def search_vectors(
-    store = None, 
-    query: str = "", 
-    top_k: int = 8, 
-    rag_namespace: Optional[str] = None, 
-    only_rag_data: bool = True, 
-    score_threshold: Optional[float] = None
-) -> List[Dict]:
-    """
-    Search RAG vectors using unified embedding and Qdrant.
-    """
-    if not query:
-        return []
-    
-    # Create default store if not provided
-    if store is None:
-        store = _create_default_vector_store()
-    
-    # Embed query with unified embedder
-    qv = embed_query(query)
-    
-    # Build filter for RAG data
-    where = {"memory_type": "rag_chunk"}
-    if only_rag_data:
-        where["is_rag_data"] = True
-        where["data_source"] = "rag_pipeline"
-    if rag_namespace:
-        where["rag_namespace"] = rag_namespace
-    
-    try:
-        return store.search_similar(
-            query_vector=qv, 
-            limit=top_k, 
-            score_threshold=score_threshold, 
-            where=where
-        )
-    except Exception as e:
-        print(f"[WARNING] RAG search failed: {e}")
         return []
 
 
@@ -972,7 +1168,7 @@ def search_vectors_expanded(
     # ── RAG 数据过滤条件 ──
     where = {"memory_type": "rag_chunk"}
     if only_rag_data:
-        where["is_rag_data"] = True
+        where["is_rag_data"] = "true"
         where["data_source"] = "rag_pipeline"
     if rag_namespace:
         where["rag_namespace"] = rag_namespace

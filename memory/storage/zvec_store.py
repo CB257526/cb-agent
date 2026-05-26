@@ -199,6 +199,27 @@ def _build_zvec_schema(
                 name="payload_json",
                 data_type=zvec.DataType.STRING,
             ),
+            # RAG 管线专用字段（索引字段，用于过滤查询）
+            zvec.FieldSchema(
+                name="is_rag_data",
+                data_type=zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema(
+                name="data_source",
+                data_type=zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema(
+                name="rag_namespace",
+                data_type=zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
+            zvec.FieldSchema(
+                name="modality",
+                data_type=zvec.DataType.STRING,
+                index_param=zvec.InvertIndexParam(),
+            ),
         ],
         # ---- 向量字段 ----
         vectors=[
@@ -221,6 +242,7 @@ def _build_zvec_schema(
 _SCALAR_FIELD_NAMES = {
     "memory_id", "user_id", "memory_type",
     "content", "importance", "timestamp", "payload_json",
+    "is_rag_data", "data_source", "rag_namespace", "modality",
 }
 
 
@@ -418,6 +440,11 @@ class ZvecVectorStore(VectorStoreBase):
             "content": str(meta.get("content", "")),
             "importance": float(meta.get("importance", 0.5)),
             "timestamp": int(meta.get("timestamp", 0)),
+            # RAG 管线专用字段
+            "is_rag_data": str(meta.get("is_rag_data", "")),
+            "data_source": str(meta.get("data_source", "")),
+            "rag_namespace": str(meta.get("rag_namespace", "")),
+            "modality": str(meta.get("modality", "")),
         }
 
         # 不在固定字段中的额外数据 → payload_json（JSON 序列化）
@@ -446,6 +473,11 @@ class ZvecVectorStore(VectorStoreBase):
             "content": fields.get("content", ""),
             "importance": fields.get("importance", 0.5),
             "timestamp": fields.get("timestamp", 0),
+            # RAG 管线专用字段
+            "is_rag_data": fields.get("is_rag_data", ""),
+            "data_source": fields.get("data_source", ""),
+            "rag_namespace": fields.get("rag_namespace", ""),
+            "modality": fields.get("modality", ""),
         }
 
         # 还原 payload_json 中的额外字段

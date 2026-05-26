@@ -1,22 +1,23 @@
-"""RAG工具 - 检索增强生成
+"""RAG工具 - 检索增强生成（多模态支持）
 
-为HelloAgents框架提供简洁易用的RAG能力：
-- 🔄 数据流程：用户数据 → 文档解析 → 向量化存储 → 智能检索 → LLM增强问答
-- 📚 多格式支持：PDF、Word、Excel、PPT、图片、音频、网页等
-- 🧠 智能问答：自动检索相关内容，注入提示词，生成准确答案
-- 🏷️ 命名空间：支持多项目隔离，便于管理不同知识库
+为 HelloAgents 框架提供多模态 RAG 能力：
 
-使用示例：
-```python
-# 1. 初始化RAG工具
-rag = RAGTool()
+文本模态:
+  - add_document: 添加文档（PDF、Word、Markdown、代码等）→ MarkItDown 解析 → 向量化
+  - search:       搜索文本知识库
+  - ask:          基于知识库的智能问答
 
-# 2. 添加文档
-rag.run({"action": "add_document", "file_path": "document.pdf"})
+图片模态:
+  - add_images:   添加图片 → OCR 视觉识别 → 向量化
+  - search_images: 搜索图片描述/文字
 
-# 3. 智能问答
-answer = rag.run({"action": "ask", "question": "什么是机器学习？"})
-```
+音频模态:
+  - add_audio:    添加音频 → ASR 语音转录 → 向量化
+  - search_audio: 搜索音频转录文本
+
+通用:
+  - 命名空间隔离、统计、清空
+  - 自动适配 Zvec/SQLite/Qdrant/Neo4j 等后端
 """
 
 from typing import Dict, Any, List, Optional
@@ -24,7 +25,13 @@ import os
 import time
 
 from tools.tool import Tool, ToolParameter
-from memory.rag.pipeline import create_rag_pipeline
+from memory.rag.pipeline import (
+    create_rag_pipeline,
+    load_and_index_images,
+    load_and_index_audio,
+    search_images as pipeline_search_images,
+    search_audio as pipeline_search_audio,
+)
 from agent.cb_agents import CbAgentsLLM
 
 class RAGTool(Tool):
@@ -79,12 +86,12 @@ class RAGTool(Tool):
             self.llm = CbAgentsLLM()
 
             self.initialized = True
-            print(f"✅ RAG工具初始化成功: namespace={self.rag_namespace}, collection={self.collection_name}")
-            
+            print(f"[RAG] 初始化成功: namespace={self.rag_namespace}, collection={self.collection_name}")
+
         except Exception as e:
             self.initialized = False
             self.init_error = str(e)
-            print(f"❌ RAG工具初始化失败: {e}")
+            print(f"[RAG] 初始化失败: {e}")
 
     def _get_pipeline(self, namespace: Optional[str] = None) -> Dict[str, Any]:
         """获取指定命名空间的 RAG 管道，若不存在则自动创建"""
@@ -110,7 +117,8 @@ class RAGTool(Tool):
             return False
 
         action = parameters["action"]
-        valid_actions = {"add_document", "add_text", "ask", "search", "stats", "clear"}
+        valid_actions = {"add_document", "add_text", "add_images", "add_audio",
+                         "ask", "search", "search_images", "search_audio", "stats", "clear"}
         if action not in valid_actions:
             return False
 
@@ -121,7 +129,13 @@ class RAGTool(Tool):
         elif action == "add_text":
             if not parameters.get("text"):
                 return False
-        elif action in ("ask", "search"):
+        elif action == "add_images":
+            if not parameters.get("file_path") and not parameters.get("file_paths"):
+                return False
+        elif action == "add_audio":
+            if not parameters.get("file_path") and not parameters.get("file_paths"):
+                return False
+        elif action in ("ask", "search", "search_images", "search_audio"):
             if not parameters.get("question") and not parameters.get("query"):
                 return False
 
@@ -161,15 +175,28 @@ class RAGTool(Tool):
             ToolParameter(
                 name="action",
                 type="string",
-                description="操作类型：add_document(添加文档), add_text(添加文本), ask(智能问答), search(搜索), stats(统计), clear(清空)",
+                description=(
+                    "操作类型："
+                    "add_document(添加文本文档-PDF/Word等), add_text(添加文本), "
+                    "add_images(添加图片-OCR识别), add_audio(添加音频-ASR转录), "
+                    "ask(智能问答), search(搜索文本), "
+                    "search_images(搜索图片), search_audio(搜索音频), "
+                    "stats(统计), clear(清空)"
+                ),
                 required=True
             ),
-            
+
             # 内容参数
             ToolParameter(
                 name="file_path",
                 type="string",
-                description="文档文件路径（支持PDF、Word、Excel、PPT、图片、音频等多种格式）",
+                description="文件路径（add_document/add_images/add_audio 均可使用）",
+                required=False
+            ),
+            ToolParameter(
+                name="file_paths",
+                type="array",
+                description="批量文件路径列表（add_images/add_audio 批量处理时使用）",
                 required=False
             ),
             ToolParameter(
@@ -235,16 +262,25 @@ class RAGTool(Tool):
                 return self._add_document(**kwargs)
             elif action == "add_text":
                 return self._add_text(**kwargs)
+            elif action == "add_images":
+                return self._add_images(**kwargs)
+            elif action == "add_audio":
+                return self._add_audio(**kwargs)
             elif action == "ask":
                 return self._ask(**kwargs)
             elif action == "search":
                 return self._search(**kwargs)
+            elif action == "search_images":
+                return self._search_images(**kwargs)
+            elif action == "search_audio":
+                return self._search_audio(**kwargs)
             elif action == "stats":
                 return self._get_stats(namespace=kwargs.get("namespace"))
             elif action == "clear":
                 return self._clear_knowledge_base(**kwargs)
             else:
-                available_actions = ["add_document", "add_text", "ask", "search", "stats", "clear"]
+                available_actions = ["add_document", "add_text", "add_images", "add_audio",
+                                     "ask", "search", "search_images", "search_audio", "stats", "clear"]
                 return f"❌ 不支持的操作: {action}\n✅ 可用操作: {', '.join(available_actions)}"
                 
         except Exception as e:
@@ -358,6 +394,180 @@ class RAGTool(Tool):
         except Exception as e:
             return f"❌ 添加文本失败: {str(e)}"
     
+    def _add_images(self, file_path: str = None, file_paths: List[str] = None, namespace: Optional[str] = None, **kwargs) -> str:
+        """添加图片到知识库（OCR 视觉识别 → 向量化入库）
+
+        单张图片用 file_path，批量用 file_paths（也可传 file_path 兼容单张）。
+        调用视觉 LLM 对图片进行文字识别和视觉描述，将结果文本嵌入后存入向量库。
+        原始图片的绝对路径保存在元数据中，搜索时可返回供用户查看。
+        """
+        try:
+            paths = file_paths or ([file_path] if file_path else [])
+            if not paths:
+                return "❌ 请提供图片文件路径（file_path）或批量路径列表（file_paths）"
+
+            # 验证文件存在性和格式
+            valid_paths = []
+            invalid_paths = []
+            image_exts = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
+            for p in paths:
+                if not os.path.exists(p):
+                    invalid_paths.append(f"{p} (文件不存在)")
+                elif os.path.splitext(p)[1].lower() not in image_exts:
+                    invalid_paths.append(f"{p} (不支持的图片格式)")
+                else:
+                    valid_paths.append(p)
+
+            if invalid_paths:
+                print(f"[RAG] 跳过无效图片: {invalid_paths}")
+
+            if not valid_paths:
+                return f"❌ 没有有效的图片文件可处理\n跳过的文件: {', '.join(invalid_paths)}"
+
+            t0 = time.time()
+            total = load_and_index_images(
+                file_paths=valid_paths,
+                store=None,
+                rag_namespace=namespace or self.rag_namespace,
+            )
+            t1 = time.time()
+
+            if total == 0:
+                return f"⚠️ 未能从图片中识别到文字内容"
+
+            return (
+                f"✅ 图片已添加到知识库\n"
+                f"📊 处理数量: {total}/{len(valid_paths)} 张\n"
+                f"⏱️ 处理时间: {int((t1 - t0) * 1000)}ms\n"
+                f"📝 命名空间: {namespace or self.rag_namespace}"
+            )
+
+        except Exception as e:
+            return f"❌ 添加图片失败: {str(e)}"
+
+    def _add_audio(self, file_path: str = None, file_paths: List[str] = None, namespace: Optional[str] = None, **kwargs) -> str:
+        """添加音频到知识库（ASR 语音转录 → 向量化入库）
+
+        单个音频用 file_path，批量用 file_paths。
+        调用语音识别 LLM 对音频进行转录，将转录文本嵌入后存入向量库。
+        原始音频的绝对路径保存在元数据中，搜索时可返回供用户查看。
+        """
+        try:
+            paths = file_paths or ([file_path] if file_path else [])
+            if not paths:
+                return "❌ 请提供音频文件路径（file_path）或批量路径列表（file_paths）"
+
+            valid_paths = []
+            invalid_paths = []
+            audio_exts = {'.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.wma'}
+            for p in paths:
+                if not os.path.exists(p):
+                    invalid_paths.append(f"{p} (文件不存在)")
+                elif os.path.splitext(p)[1].lower() not in audio_exts:
+                    invalid_paths.append(f"{p} (不支持的音频格式)")
+                else:
+                    valid_paths.append(p)
+
+            if invalid_paths:
+                print(f"[RAG] 跳过无效音频: {invalid_paths}")
+
+            if not valid_paths:
+                return f"❌ 没有有效的音频文件可处理\n跳过的文件: {', '.join(invalid_paths)}"
+
+            t0 = time.time()
+            total = load_and_index_audio(
+                file_paths=valid_paths,
+                store=None,
+                rag_namespace=namespace or self.rag_namespace,
+            )
+            t1 = time.time()
+
+            if total == 0:
+                return f"⚠️ 未能从音频中转录到文字内容"
+
+            return (
+                f"✅ 音频已添加到知识库\n"
+                f"📊 处理数量: {total}/{len(valid_paths)} 个\n"
+                f"⏱️ 处理时间: {int((t1 - t0) * 1000)}ms\n"
+                f"📝 命名空间: {namespace or self.rag_namespace}"
+            )
+
+        except Exception as e:
+            return f"❌ 添加音频失败: {str(e)}"
+
+    def _search_images(self, query: str = None, question: str = None, limit: int = 5, min_score: float = 0.1, namespace: Optional[str] = None, **kwargs) -> str:
+        """搜索图片知识库
+
+        在 OCR 识别的图片文本描述中做向量检索，返回匹配的图片文本内容
+        以及原始图片路径（metadata["original_file_path"]），供 Agent 展示给用户。
+        """
+        try:
+            q = query or question
+            if not q or not q.strip():
+                return "❌ 搜索查询不能为空"
+
+            results = pipeline_search_images(
+                query=q.strip(),
+                store=None,
+                top_k=limit,
+                rag_namespace=namespace or self.rag_namespace,
+                score_threshold=min_score if min_score > 0 else None,
+            )
+
+            if not results:
+                return f"🔍 图片知识库中未找到与 '{q}' 相关的内容"
+
+            return self._format_multimodal_results("图片", q, results)
+
+        except Exception as e:
+            return f"❌ 搜索图片失败: {str(e)}"
+
+    def _search_audio(self, query: str = None, question: str = None, limit: int = 5, min_score: float = 0.1, namespace: Optional[str] = None, **kwargs) -> str:
+        """搜索音频知识库
+
+        在 ASR 转录的音频文本中做向量检索，返回匹配的转录文本内容
+        以及原始音频路径（metadata["original_file_path"]），供 Agent 展示给用户。
+        """
+        try:
+            q = query or question
+            if not q or not q.strip():
+                return "❌ 搜索查询不能为空"
+
+            results = pipeline_search_audio(
+                query=q.strip(),
+                store=None,
+                top_k=limit,
+                rag_namespace=namespace or self.rag_namespace,
+                score_threshold=min_score if min_score > 0 else None,
+            )
+
+            if not results:
+                return f"🔍 音频知识库中未找到与 '{q}' 相关的内容"
+
+            return self._format_multimodal_results("音频", q, results)
+
+        except Exception as e:
+            return f"❌ 搜索音频失败: {str(e)}"
+
+    def _format_multimodal_results(self, modality_label: str, query: str, results: List[Dict]) -> str:
+        """格式化多模态搜索结果，突出原始文件路径供 Agent 使用"""
+        lines = [f"🔍 {modality_label}搜索结果 ({len(results)} 条):"]
+        for i, r in enumerate(results, 1):
+            meta = r.get("metadata", {})
+            score = r.get("score", 0.0)
+            content = (meta.get("content", "") or "")[:200]
+            original_path = meta.get("original_file_path", meta.get("source_path", "未知"))
+            mime_type = meta.get("mime_type", "")
+
+            lines.append(f"\n{i}. {os.path.basename(original_path)} (相似度: {score:.3f})")
+            lines.append(f"   路径: {original_path}")
+            if mime_type:
+                lines.append(f"   格式: {mime_type}")
+            if content:
+                lines.append(f"   内容: {content}...")
+
+        return "\n".join(lines)
+
     def _search(self, query: str, limit: int = 5, min_score: float = 0.1, enable_advanced_search: bool = True, max_chars: int = 1200, include_citations: bool = True, namespace: Optional[str] = None, **kwargs) -> str:
         """搜索知识库"""
         try:
@@ -503,9 +713,13 @@ class RAGTool(Tool):
             
             # 5. 调用 LLM 生成答案
             llm_start = time.time()
-            answer,tool_calls = self.llm.think(enhanced_prompt)
+            answer, tool_calls = self.llm.think(enhanced_prompt)
             llm_time = int((time.time() - llm_start) * 1000)
-            
+
+            # 兼容 answer 为 ChatCompletionMessage 对象的情况
+            if answer is not None and not isinstance(answer, str):
+                answer = getattr(answer, "content", "") or str(answer)
+
             if not answer or not answer.strip():
                 return "❌ LLM未能生成有效答案，请稍后重试"
             

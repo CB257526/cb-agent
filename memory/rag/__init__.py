@@ -1,11 +1,22 @@
-"""RAG（检索增强生成）模块
+"""RAG（检索增强生成）模块 — 多模态支持
 
-整合 GraphRAG 能力，通过统一管理器适配多后端：
+通过统一管理器适配多后端，支持文本/图片/音频三模态：
 
-- 文档加载/分块：PDF、Office、图片、音频等多格式 → Markdown → 智能分段
-- 向量存储：VectorStoreManager 统一管理，默认 Zvec，可选 Qdrant
-- 图存储：GraphStoreManager 统一管理，默认 SQLite，可选 Neo4j
-- 检索/排序/合并：多路召回、图信号增强、Cross-Encoder 重排序
+文本:
+  - load_and_chunk_texts / index_chunks: 文档加载 → 分块 → 嵌入 → 入库
+  - search_vectors: 向量检索
+
+图片:
+  - index_image / load_and_index_images: OCR 识别 → 嵌入 → 入库
+  - search_images: 图片知识库检索
+
+音频:
+  - index_audio / load_and_index_audio: ASR 转录 → 嵌入 → 入库
+  - search_audio: 音频知识库检索
+
+存储后端:
+  - 向量: VectorStoreManager (默认 Zvec, 可选 Qdrant)
+  - 图: GraphStoreManager (默认 SQLite, 可选 Neo4j)
 """
 
 from ..embedding import (
@@ -23,15 +34,21 @@ from .pipeline import (
     load_and_chunk_texts,
     build_graph_from_chunks,
     index_chunks,
+    index_image,
+    index_audio,
+    load_and_index_images,
+    load_and_index_audio,
     embed_query,
     search_vectors,
+    search_images,
+    search_audio,
+    search_vectors_expanded,
     rank,
     merge_snippets,
     rerank_with_cross_encoder,
     expand_neighbors_from_pool,
     compute_graph_signals_from_pool,
     merge_snippets_grouped,
-    search_vectors_expanded,
     compress_ranked_items,
     tldr_summarize,
 )
@@ -55,15 +72,21 @@ __all__ = [
     "load_and_chunk_texts",
     "build_graph_from_chunks",
     "index_chunks",
+    "index_image",
+    "index_audio",
+    "load_and_index_images",
+    "load_and_index_audio",
     "embed_query",
     "search_vectors",
+    "search_images",
+    "search_audio",
+    "search_vectors_expanded",
     "rank",
     "merge_snippets",
     "rerank_with_cross_encoder",
     "expand_neighbors_from_pool",
     "compute_graph_signals_from_pool",
     "merge_snippets_grouped",
-    "search_vectors_expanded",
     "compress_ranked_items",
     "tldr_summarize",
 ]
