@@ -49,6 +49,94 @@ class MemoryTool(Tool):
         self.current_session_id = None
         self.conversation_count = 0
 
+    def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
+        """验证工具参数
+
+        检查 action 是否为有效操作，以及各操作所需的参数是否齐全、合法。
+        """
+        # action 是唯一必需参数
+        if "action" not in parameters or not parameters["action"]:
+            return False
+
+        action = parameters["action"]
+        valid_actions = {"add", "search", "summary", "stats", "update", "remove", "forget", "consolidate", "clear_all"}
+        if action not in valid_actions:
+            return False
+
+        # 按 action 校验必要参数
+        if action == "add":
+            content = parameters.get("content", "")
+            if not content and not parameters.get("file_path"):
+                # 纯文件感知记忆允许 content 为空（以 file_path 作为数据源）
+                return False
+
+        elif action == "search":
+            query = parameters.get("query", "")
+            if not query:
+                return False
+
+        elif action in ("update", "remove"):
+            if not parameters.get("memory_id"):
+                return False
+
+        # 通用参数合法性校验（可选参数的值范围）
+        importance = parameters.get("importance")
+        if importance is not None:
+            try:
+                imp = float(importance)
+                if imp < 0.0 or imp > 1.0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        limit = parameters.get("limit")
+        if limit is not None:
+            try:
+                lim = int(limit)
+                if lim < 1:
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        memory_type = parameters.get("memory_type")
+        if memory_type is not None:
+            if memory_type not in ("working", "episodic", "semantic", "perceptual"):
+                return False
+
+        strategy = parameters.get("strategy")
+        if strategy is not None:
+            if strategy not in ("importance_based", "time_based", "capacity_based"):
+                return False
+
+        threshold = parameters.get("threshold")
+        if threshold is not None:
+            try:
+                t = float(threshold)
+                if t < 0.0 or t > 1.0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        max_age_days = parameters.get("max_age_days")
+        if max_age_days is not None:
+            try:
+                mad = int(max_age_days)
+                if mad < 1:
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        importance_threshold = parameters.get("importance_threshold")
+        if importance_threshold is not None:
+            try:
+                it = float(importance_threshold)
+                if it < 0.0 or it > 1.0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        return True
+
     def run(self, parameters: Dict[str, Any]) -> str:
         """执行工具 - Tool基类要求的接口
 

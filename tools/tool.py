@@ -18,6 +18,11 @@ class Tool(ABC):
         """获取工具参数定义"""
         pass
 
+    @abstractmethod
+    def validate_parameters(self,parameters: Dict[str, Any]) -> bool:
+        """验证工具参数"""
+        pass
+
     def to_openai_schema(self) -> Dict[str, Any]:
         """转换为 OpenAI function calling schema 格式
 

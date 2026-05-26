@@ -2,7 +2,7 @@ from tools.tool import Tool  # 工具类需要实现的基类
 from tools.toolRegistry import ToolRegistry  # 工具注册表 提供工具注册与调用功能
 from tools.toolParameter import ToolParameter  # 工具参数定义
 import os
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from dotenv import load_dotenv
 load_dotenv()
 class SearchTool(Tool):
@@ -49,6 +49,8 @@ class SearchTool(Tool):
 
     def run(self, input_dict: dict[str, Any]) -> str: # 实现run方法
         """执行智能搜索"""
+        if not self.validate_parameters(input_dict):
+            return "❌ 参数验证失败"
         query = input_dict.get("query", "")
         if not query.strip():
             return "❌ 错误:搜索查询不能为空"
@@ -128,3 +130,9 @@ class SearchTool(Tool):
         return [
             ToolParameter(name="query", type="string", description="要搜索的关键词", required=True)
         ]
+    
+    def validate_parameters(self,parameters: Dict[str, Any]) -> None:
+        """验证工具参数"""
+        if "query" not in parameters or not parameters["query"].strip():
+            return False
+        return True
