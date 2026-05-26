@@ -17,7 +17,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from ..base import BaseMemory, MemoryItem, MemoryConfig
-from ..storage import SQLiteDocumentStore, QdrantVectorStore, VectorStoreManager
+from ..storage import SQLiteDocumentStore, VectorStoreManager
 from ..embedding import get_dimension
 from memory.embedding import get_text_embedder_model
 
@@ -133,7 +133,7 @@ class EpisodicMemory(BaseMemory):
             }
         )
 
-        # 2) 向量索引（Qdrant）
+        # 2) 向量索引
         try:
             embedding = self.embedder.encode(memory_item.content)
             if hasattr(embedding, "tolist"):
@@ -166,8 +166,8 @@ class EpisodicMemory(BaseMemory):
         # 结构化过滤候选（来自权威库）
         candidate_ids: Optional[set] = None
         if time_range is not None or importance_threshold is not None:
-            start_ts = int(time_range[0].timestamp()) if time_range else None
-            end_ts = int(time_range[1].timestamp()) if time_range else None
+            start_ts = int(time_range[0].timestamp()) if time_range and time_range[0] else None
+            end_ts = int(time_range[1].timestamp()) if time_range and time_range[1] else None
             docs = self.doc_store.search_memories(
                 user_id=user_id,
                 memory_type="episodic",
@@ -254,7 +254,6 @@ class EpisodicMemory(BaseMemory):
 
         # 若向量检索无结果，回退到简单关键词匹配（内存缓存）
         if not results:
-            fallback = super()._generate_id  # 占位以避免未使用警告
             query_lower = query.lower()
             for ep in self._filter_episodes(user_id, session_id, time_range):
                 if query_lower in ep.content.lower():
@@ -437,7 +436,11 @@ class EpisodicMemory(BaseMemory):
                 user_id=episode.user_id,
                 timestamp=episode.timestamp,
                 importance=episode.importance,
-                metadata=episode.metadata
+                metadata={
+                    "session_id": episode.session_id,
+                    "context": episode.context,
+                    "outcome": episode.outcome,
+                }
             )
             memory_items.append(memory_item)
         return memory_items

@@ -16,7 +16,7 @@ import numpy as np
 
 from ..base import BaseMemory, MemoryItem, MemoryConfig
 from ..embedding import get_text_embedder_model, get_dimension
-from ...core.database_config import get_database_config
+from core.database_config import get_database_config
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -892,45 +892,91 @@ class SemanticMemory(BaseMemory):
         memory = self._find_memory_by_id(memory_id)
         if not memory:
             return False
-        
+
         try:
             if content is not None:
-                # 重新生成嵌入和提取实体
+                # 重新生成嵌入
                 embedding = self.embedding_model.encode(content)
                 self.memory_embeddings[memory_id] = embedding
-                
+
                 # 清理旧的实体关系
                 old_entities = memory.metadata.get("entities", [])
                 self._cleanup_entities_and_relations(old_entities)
-                
+
                 # 提取新的实体和关系
                 memory.content = content
                 entities = self._extract_entities(content)
                 relations = self._extract_relations(content, entities)
-                
-                # 更新知识图谱
+
+                # 同步到本地缓存
                 for entity in entities:
                     self._add_or_update_entity(entity)
                 for relation in relations:
                     self._add_or_update_relation(relation)
-                
+
                 # 更新元数据
                 memory.metadata["entities"] = [e.entity_id for e in entities]
                 memory.metadata["relations"] = [
                     f"{r.from_entity}-{r.relation_type}-{r.to_entity}" for r in relations
                 ]
-                
+
+                # 持久化新嵌入向量到向量数据库
+                try:
+                    self.vector_store.add_vectors(
+                        vectors=[embedding.tolist()],
+                        metadata=[{
+                            "memory_id": memory_id,
+                            "user_id": memory.user_id,
+                            "content": content,
+                            "memory_type": memory.memory_type,
+                            "timestamp": int(memory.timestamp.timestamp()),
+                            "importance": memory.importance,
+                            "entities": memory.metadata.get("entities", []),
+                            "entity_count": len(entities),
+                            "relation_count": len(relations),
+                        }],
+                        ids=[memory_id],
+                    )
+                except Exception:
+                    pass
+
+                # 持久化新实体和关系到图数据库
+                if self.graph_store:
+                    try:
+                        for entity in entities:
+                            self.graph_store.add_entity(
+                                entity_id=entity.entity_id,
+                                name=entity.name,
+                                entity_type=entity.entity_type,
+                                properties={
+                                    "memory_id": memory_id,
+                                    "importance": memory.importance,
+                                },
+                            )
+                        for relation in relations:
+                            self.graph_store.add_relationship(
+                                from_entity_id=relation.from_entity,
+                                to_entity_id=relation.to_entity,
+                                relationship_type=relation.relation_type,
+                                properties={
+                                    "strength": relation.strength,
+                                    "memory_id": memory_id,
+                                },
+                            )
+                    except Exception:
+                        pass
+
             if importance is not None:
                 memory.importance = importance
-            
+
             if metadata is not None:
                 memory.metadata.update(metadata)
-                
-                return True
-            
+
+            return True
+
         except Exception as e:
-            logger.error(f"❌ 更新记忆失败: {e}")
-        return False
+            logger.error(f"更新记忆失败: {e}")
+            return False
     
     def remove(self, memory_id: str) -> bool:
         """删除语义记忆"""
@@ -950,11 +996,11 @@ class SemanticMemory(BaseMemory):
             self.semantic_memories.remove(memory)
             if memory_id in self.memory_embeddings:
                 del self.memory_embeddings[memory_id]
-                
-                return True
-            
+
+            return True
+
         except Exception as e:
-            logger.error(f"❌ 删除记忆失败: {e}")
+            logger.error(f"删除记忆失败: {e}")
         return False
     
     def _cleanup_entities_and_relations(self, entity_ids: List[str]):
@@ -1033,8 +1079,8 @@ class SemanticMemory(BaseMemory):
             logger.info("🧹 语义记忆系统已完全清空")
             
         except Exception as e:
-            logger.error(f"❌ 清空语义记忆失败: {e}")
-            # 即使数据库清空失败，也要清空本地缓存
+            logger.error(f"清空语义记忆失败: {e}")
+        # 无论如何都要清空本地缓存（即使数据库清空失败）
         self.semantic_memories.clear()
         self.memory_embeddings.clear()
         self.entities.clear()

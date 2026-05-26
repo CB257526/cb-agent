@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 本地数据库文件
+zvec_data/
+graph_data/
+memory_data/
+
+# 测试生成的临时目录
+test_mem_fix/
+test_zvec_data/
+test_zvec_manager/
+test_zvec_props/
+test_zvec_errors/
+test_graph_data/
+test_mem_debug/

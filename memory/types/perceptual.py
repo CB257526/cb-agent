@@ -17,8 +17,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 from ..base import BaseMemory, MemoryItem, MemoryConfig
-from ..storage import SQLiteDocumentStore, QdrantVectorStore
-from ..embedding import get_text_embedder, get_dimension
+from ..storage import SQLiteDocumentStore
+from ..embedding import get_text_embedder_model, get_dimension
 
 class Perception:
     """感知数据实体"""
@@ -78,7 +78,7 @@ class PerceptualMemory(BaseMemory):
         self.doc_store = SQLiteDocumentStore(db_path=db_path)
 
         # 嵌入维度（与统一文本嵌入保持一致）
-        self.text_embedder = get_text_embedder()
+        self.text_embedder = get_text_embedder_model()
         self.vector_dim = get_dimension(getattr(self.text_embedder, 'dimension', 384))
 
         # 可选加载：图像CLIP与音频CLAP（缺依赖则优雅降级为哈希编码）
@@ -326,7 +326,8 @@ class PerceptualMemory(BaseMemory):
             try:
                 perception = self._encode_perception(raw or "", modality, memory_id)
                 payload = self.doc_store.get_memory(memory_id) or {}
-                self.vector_store.add_vectors(
+                store = self._get_vector_store_for_modality(modality)
+                store.add_vectors(
                     vectors=[perception.encoding],
                     metadata=[{
                         "memory_id": memory_id,
@@ -696,7 +697,7 @@ class PerceptualMemory(BaseMemory):
             except Exception:
                 pass
 
-    def _get_vector_store_for_modality(self, modality: Optional[str]) -> QdrantVectorStore:
+    def _get_vector_store_for_modality(self, modality: Optional[str]):
         mod = (modality or "text").lower()
         return self.vector_stores.get(mod, self.vector_stores["text"])
 

@@ -323,27 +323,27 @@ class WorkingMemory(BaseMemory):
         forgotten_count = 0
         current_time = datetime.now()
         
-        to_remove = []
-        
+        to_remove = set()
+
         # 始终先执行TTL过期（分钟级）
         cutoff_ttl = current_time - timedelta(minutes=self.max_age_minutes)
         for memory in self.memories:
             if memory.timestamp < cutoff_ttl:
-                to_remove.append(memory.id)
-        
+                to_remove.add(memory.id)
+
         if strategy == "importance_based":
             # 删除低重要性记忆
             for memory in self.memories:
                 if memory.importance < threshold:
-                    to_remove.append(memory.id)
-        
+                    to_remove.add(memory.id)
+
         elif strategy == "time_based":
             # 删除过期记忆（工作记忆通常以小时计算）
             cutoff_time = current_time - timedelta(hours=max_age_days * 24)
             for memory in self.memories:
                 if memory.timestamp < cutoff_time:
-                    to_remove.append(memory.id)
-        
+                    to_remove.add(memory.id)
+
         elif strategy == "capacity_based":
             # 删除超出容量的记忆
             if len(self.memories) > self.max_capacity:
@@ -354,7 +354,7 @@ class WorkingMemory(BaseMemory):
                 )
                 excess_count = len(self.memories) - self.max_capacity
                 for memory in sorted_memories[:excess_count]:
-                    to_remove.append(memory.id)
+                    to_remove.add(memory.id)
         
         # 执行删除
         for memory_id in to_remove:
