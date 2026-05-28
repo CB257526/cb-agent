@@ -9,6 +9,7 @@ class ConstantLLM:
             "reasoning_effort": "reasoning_effort",
             "json_output": True,
             "max_tokens": 1000000,
+            "image_ability": False,
         },
         "deepseek-v4-pro": {
             "is_tool": True,
@@ -16,6 +17,15 @@ class ConstantLLM:
             "reasoning_effort": "reasoning_effort",
             "json_output": True,
             "max_tokens": 1000000,
+            "image_ability": False,
+        },
+        "mimo-v2.5-pro": {
+            "is_tool": True,
+            "is_reasoning": True,
+            "reasoning_effort": "reasoning_content",
+            "json_output": True,
+            "max_tokens": 1000000,
+            "image_ability": True,
         }
 
     }
