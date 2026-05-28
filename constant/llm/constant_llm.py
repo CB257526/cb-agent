@@ -6,7 +6,6 @@ class ConstantLLM:
         "deepseek-v4-flash": {
             "is_tool": True,
             "is_reasoning": True,
-            "reasoning_effort": "reasoning_effort",
             "json_output": True,
             "max_tokens": 1000000,
             "image_ability": False,
@@ -14,7 +13,6 @@ class ConstantLLM:
         "deepseek-v4-pro": {
             "is_tool": True,
             "is_reasoning": True,
-            "reasoning_effort": "reasoning_effort",
             "json_output": True,
             "max_tokens": 1000000,
             "image_ability": False,
@@ -22,7 +20,6 @@ class ConstantLLM:
         "mimo-v2.5-pro": {
             "is_tool": True,
             "is_reasoning": True,
-            "reasoning_effort": "reasoning_content",
             "json_output": True,
             "max_tokens": 1000000,
             "image_ability": True,
