@@ -105,7 +105,11 @@ from agent.cb_agents import CbAgentsLLM
 # print(agent.ask(prompt="你好,你是谁？"))
 
 
-from markitdown import MarkItDown
-md = MarkItDown()
-result = md.convert(r"C:\Users\cb135\Desktop\cbAgent\source\屏幕截图 2026-05-26 164742.png")
-print(result.text_content)
+# from markitdown import MarkItDown
+# md = MarkItDown()
+# result = md.convert(r"C:\Users\cb135\Desktop\cbAgent\source\屏幕截图 2026-05-26 164742.png")
+# print(result.text_content)
+
+from skills import SkillManager
+manager = SkillManager()
+print(manager.build_skills_overview())

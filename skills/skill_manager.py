@@ -44,9 +44,10 @@ class SkillManager:
         """
         if skills_dir is None:
             # 默认使用项目根目录下的 .cbagent/skills/
-            skills_dir = Path(__file__).parent.parent / ".cbagent" / "skills"
+            # 使用 resolve() 确保无论 __file__ 是相对还是绝对路径都能正确定位
+            skills_dir = Path(__file__).resolve().parent.parent / ".cbagent" / "skills"
 
-        self._skills_dir = Path(skills_dir)
+        self._skills_dir = Path(skills_dir).resolve()
         self._skills: dict[str, Skill] = {}
 
         # 使用频率追踪: name -> 时间戳列表
