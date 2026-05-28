@@ -9,11 +9,15 @@
 5. [目录结构规范](#5-目录结构规范)
 6. [三级加载机制](#6-三级加载机制)
 7. [变量替换系统](#7-变量替换系统)
-8. [API 参考](#8-api-参考)
-9. [工具集成](#9-工具集成)
-10. [端到端使用示例](#10-端到端使用示例)
-11. [创建自定义 Skill](#11-创建自定义-skill)
-12. [设计决策与权衡](#12-设计决策与权衡)
+8. [条件激活](#8-条件激活)
+9. [预算控制与使用追踪](#9-预算控制与使用追踪)
+10. [热重载](#10-热重载)
+11. [API 参考](#11-api-参考)
+12. [工具集成](#12-工具集成)
+13. [端到端使用示例](#13-端到端使用示例)
+14. [创建自定义 Skill](#14-创建自定义-skill)
+15. [设计决策与权衡](#15-设计决策与权衡)
+16. [v2 更新日志](#16-v2-更新日志)
 
 ---
 
@@ -189,6 +193,9 @@ when_to_use: 当用户要求做 X、Y、Z 时使用此 Skill
 | `disable-model-invocation` | bool | false | 禁止 LLM 自动调用 |
 | `license` | string | null | 许可证信息 |
 | `compatibility` | string | null | 依赖或兼容性说明 |
+| `paths` | list | null | 条件激活的 glob 模式，仅在操作匹配文件时激活 Skill |
+| `aliases` | list | null | Skill 的备用名称，可通过别名调用 |
+| `version` | string | null | Skill 版本号，如 `"1.0"`、`"2.3.1"` |
 
 #### 字段格式示例
 
@@ -449,9 +456,157 @@ skill.render(args='--filename="data.csv" --format="json"')
 
 ---
 
-## 8. API 参考
+## 8. 条件激活
 
-### 8.1 Skill 类
+### 8.1 概念
+
+条件激活允许 Skill 声明 glob 模式，仅在用户操作匹配文件时出现在 L1 概览中。这可以减少无关 Skill 的噪音，提高 LLM 的选择准确率。
+
+**声明 `paths` 的 Skill**：仅在文件路径匹配时激活。
+
+**未声明 `paths` 的 Skill**：始终激活（向后兼容）。
+
+### 8.2 使用 `paths` frontmatter
+
+```yaml
+---
+name: pdf
+description: 处理PDF文件的各类操作
+paths:
+  - "*.pdf"
+  - "*.PDF"
+---
+```
+
+支持多种格式：
+- 逗号分隔：`paths: "*.py, *.ts, *.js"`
+- YAML 列表：`paths:\n  - "*.py"\n  - "*.ts"`
+- 支持 `**` 递归匹配：`paths: "src/**/*.ts"`
+
+### 8.3 工作原理
+
+`SkillManager.build_skills_overview(file_paths=["/tmp/app.pdf"])` 被调用时：
+
+1. 对每个 Skill 调用 `matches_paths(file_paths)`
+2. 使用 Python `fnmatch` 进行 glob 匹配
+3. 先匹配完整路径，再匹配文件名
+4. `paths=None` 的 Skill 始终返回 `True`
+
+### 8.4 提取文件路径
+
+`SkillManager.extract_file_paths(messages)` 从最近 5 条对话消息中提取文件路径，供条件激活过滤使用。
+
+```python
+# 使用示例
+file_paths = SkillManager.extract_file_paths(messages)
+overview = manager.build_skills_overview(file_paths=file_paths)
+```
+
+---
+
+## 9. 预算控制与使用追踪
+
+### 9.1 预算控制 L1 概览
+
+L1 概览注入到每次对话的系统提示词中，消耗上下文窗口。`build_skills_overview` 限制输出在 `max_chars` 以内（默认 2000 字符，约 500 tokens，即 200K 上下文窗口的 1%）。
+
+**三级降级策略**：
+
+| 级别 | 格式 | 触发条件 |
+|------|------|----------|
+| full | `- name: description — when_to_use` | 总长度 ≤ max_chars |
+| compact | `- name: 截断到80字符的 description` | full 超出预算 |
+| name_only | `- name` | compact 超出预算 |
+
+```python
+# 默认使用
+overview = manager.build_skills_overview()
+
+# 自定义预算
+overview = manager.build_skills_overview(max_chars=1000)
+
+# 按模型上下文窗口计算
+overview = manager.build_skills_overview_for_model(
+    model_context_window=100000  # 100K tokens
+)
+```
+
+### 9.2 使用频率追踪
+
+系统自动记录 Skill 调用，按使用频率排序 L1 列表，常用 Skill 优先展示。
+
+**追踪机制**：
+- `SkillTool.run()` 中自动调用 `record_usage(name)`
+- 60 秒防抖：同一 Skill 60 秒内多次调用只记录一次
+- 30 天清理：超过 30 天的记录自动删除
+
+**排序算法**：指数衰减，7 天半衰期。
+
+```
+score = Σ exp(-decay * age)
+decay = ln(2) / 7天
+```
+
+- 7 天前使用 1 次：score ≈ 0.5
+- 今天使用 1 次：score ≈ 1.0
+- 从未使用：score = 0.0
+
+在 `build_skills_overview` 和 `match_skill` 中，候选 Skill 按 score 降序排列。
+
+### 9.3 API
+
+```python
+# 记录使用（SkillTool 自动调用，通常无需手动调用）
+manager.record_usage("pdf")
+
+# 获取分数
+score = manager.get_usage_score("pdf")  # -> float
+
+# 预算概览
+overview = manager.build_skills_overview(
+    file_paths=["/tmp/app.pdf"],
+    max_chars=2000,
+)
+
+# 按模型上下文窗口计算
+overview = manager.build_skills_overview_for_model(
+    model_context_window=200000,
+    file_paths=["/tmp/app.pdf"],
+)
+```
+
+---
+
+## 10. 热重载
+
+### 10.1 概念
+
+Skill 开发过程中，修改 SKILL.md 后无需重启应用。系统通过比较文件的 mtime 自动检测变更并重载。
+
+### 10.2 使用
+
+```python
+# 在每次对话轮次前调用
+if manager.check_for_changes():
+    print("Skill 文件已更新，已自动重载")
+```
+
+`check_for_changes()` 做以下工作：
+1. 遍历 skills_dir 下的每个子目录
+2. 比较 SKILL.md 的当前 mtime 与缓存值
+3. 如有变更，清空 skills 字典并重新扫描
+
+### 10.3 性能
+
+- 每次调用只做 `stat()` 系统调用，非常轻量
+- 无需守护线程或文件监视器
+- 无额外依赖（不依赖 watchdog 等库）
+
+---
+
+## 11. API 参考
+
+### 11.1 Skill 类
 
 ```python
 from skills import Skill
@@ -476,7 +631,7 @@ skill.get_scripts()           # -> dict[str, Path]: 脚本路径
 skill.get_agents()            # -> dict[str, str]: 子 Agent 指令
 ```
 
-### 8.2 SkillManager 类
+### 11.2 SkillManager 类
 
 ```python
 from skills import SkillManager
@@ -505,7 +660,7 @@ manager.load_skill_reference("pdf", "reference")   # -> str: 单个参考文档�
 manager.match_skill("帮我处理PDF")        # -> str|None: 匹配的 Skill 名称
 ```
 
-### 8.3 SkillExecutor 类
+### 11.3 SkillExecutor 类
 
 ```python
 from skills import SkillExecutor
@@ -531,9 +686,9 @@ executor.run_script_with_context(
 
 ---
 
-## 9. 工具集成
+## 12. 工具集成
 
-### 9.1 SkillTool
+### 12.1 SkillTool
 
 让 LLM 通过 function calling 调用 Skill。
 
@@ -571,7 +726,7 @@ tool.run({"skill": "pdf", "args": "--filename=report.pdf"})
 
 **返回值**：SKILL.md 正文（不含参考文档），或指定的参考文档内容
 
-### 9.2 RunSkillScriptTool
+### 12.2 RunSkillScriptTool
 
 让 LLM 执行 Skill 捆绑的 Python 脚本。
 
@@ -598,9 +753,9 @@ registry.register_tool(tool)
 
 ---
 
-## 10. 端到端使用示例
+## 13. 端到端使用示例
 
-### 10.1 基本使用
+### 13.1 基本使用
 
 ```python
 from skills import SkillManager, SkillExecutor
@@ -636,7 +791,7 @@ messages = [
 )
 ```
 
-### 10.2 完整 Agent 循环
+### 13.2 完整 Agent 循环
 
 ```python
 from skills import SkillManager, SkillExecutor
@@ -695,7 +850,7 @@ while True:
     messages.append({"role": "assistant", "content": msg})
 ```
 
-### 10.3 手动加载 Skill
+### 13.3 手动加载 Skill
 
 ```python
 from skills import SkillManager
@@ -721,9 +876,9 @@ agents = skill.get_agents()       # {"grader": "..."}
 
 ---
 
-## 11. 创建自定义 Skill
+## 14. 创建自定义 Skill
 
-### 11.1 最简示例
+### 14.1 最简示例
 
 创建文件 `.cbagent/skills/hello/SKILL.md`：
 
@@ -741,7 +896,7 @@ when_to_use: 当用户说"你好"、"hello"或初次见面时
 然后询问有什么可以帮助的，并简要介绍你的能力。
 ```
 
-### 11.2 带参数的 Skill
+### 14.2 带参数的 Skill
 
 创建文件 `.cbagent/skills/code-review/SKILL.md`：
 
@@ -786,7 +941,7 @@ allowed-tools:
 - script_name: static_analysis
 ```
 
-### 11.3 带脚本的 Skill
+### 14.3 带脚本的 Skill
 
 创建目录结构：
 
@@ -860,7 +1015,7 @@ if __name__ == "__main__":
     main()
 ```
 
-### 11.4 Skill 创建清单
+### 14.4 Skill 创建清单
 
 - [ ] 创建目录 `.cbagent/skills/<skill-name>/`
 - [ ] 编写 `SKILL.md`，包含必需的 `name` 和 `description`
@@ -872,9 +1027,9 @@ if __name__ == "__main__":
 
 ---
 
-## 12. 设计决策与权衡
+## 15. 设计决策与权衡
 
-### 12.1 为什么用 SkillTool 而不是被动注入？
+### 15.1 为什么用 SkillTool 而不是被动注入？
 
 **方案对比**：
 
@@ -886,17 +1041,17 @@ if __name__ == "__main__":
 
 **结论**：SkillTool 让 LLM 根据 L1 概览自主判断是否需要调用某个 Skill，比任何自动匹配算法都更准确，且与 function-calling 架构天然契合。
 
-### 12.2 为什么不引入 PyYAML？
+### 15.2 为什么不引入 PyYAML？
 
 Frontmatter 格式只有 6 个已知字段，且都是简单的 key-value 或列表。逐行解析足以满足需求，避免引入额外依赖。
 
-### 12.3 三级加载的必要性
+### 15.3 三级加载的必要性
 
 - **L1 必须始终注入**：否则 LLM 不知道有哪些 Skill 可用
 - **L2 按需加载**：一个 Skill 的完整内容可能有数百行，全部注入会浪费上下文
 - **L3 资源独立**：脚本通过工具执行，文档按需读取
 
-### 12.4 变量替换 vs 模板引擎
+### 15.4 变量替换 vs 模板引擎
 
 使用简单的字符串替换而非 Jinja2 等模板引擎：
 
@@ -904,10 +1059,65 @@ Frontmatter 格式只有 6 个已知字段，且都是简单的 key-value 或列
 - 减少依赖
 - 简单可预测
 
-### 12.5 降级匹配保留
+### 15.5 降级匹配保留
+
+### 15.6 布尔值解析规则变更（v2）
+
+v2 收紧布尔解析：只接受 `true` / `"true"`。旧版接受的 `yes`、`1`、`on` 不再视为 `True`。对齐 Claude Code 的做法，避免意外激活。
+
+如确实需要 `true` 语义，请使用 `true` 格式（不加引号）或 `"true"` 格式（加引号）。
+
+### 15.7 条件激活 vs 始终注入
+
+条件激活 (`paths`) 可以减少 L1 噪音，但需要正确声明路径模式。对于通用 Skill（如问候 Skill）不应声明 paths，始终激活即可。
+
+### 15.8 预算控制的必要性
+
+随着 Skill 数量增长，L1 列表可能占用大量上下文。1% 上下文窗口预算（约 500 tokens）确保 Skill 列表不会挤压对话空间。三级降级策略在极端情况下仍保证可用性。
 
 `match_skill()` 方法保留作为无 function-calling 场景的降级方案：
 
 - 某些模型不支持 function calling
 - 某些场景需要预判 Skill 以优化提示词构建
 - 关键词匹配零成本，可作为快速预筛选
+
+---
+
+## 16. v2 更新日志
+
+### 新增字段
+
+| 字段 | 说明 |
+|------|------|
+| `paths` | 条件激活的 glob 模式列表，仅在操作匹配文件时激活 Skill |
+| `aliases` | 备用名称列表，可通过别名调用 Skill |
+| `version` | Skill 版本号字符串 |
+
+### 新增功能
+
+| 功能 | 位置 | 说明 |
+|------|------|------|
+| 条件激活 | `Skill.matches_paths()` | 基于 fnmatch 的 glob 匹配，支持路径和文件名两种匹配方式 |
+| 预算控制 L1 | `SkillManager.build_skills_overview(max_chars=N)` | 三级降级：full → compact → name_only |
+| 按模型窗口计算 | `SkillManager.build_skills_overview_for_model(context_window=N)` | 自动按 1% 上下文窗口计算 max_chars |
+| 文件路径提取 | `SkillManager.extract_file_paths(messages)` | 从对话消息中提取文件路径用于条件激活 |
+| 使用频率追踪 | `SkillManager.record_usage(name)` | 60s 防抖，30 天清理 |
+| 使用分数计算 | `SkillManager.get_usage_score(name)` | 7 天半衰期指数衰减，L1 按分数排序 |
+| 热重载 | `SkillManager.check_for_changes()` | 基于 mtime 的轮询检测，无额外依赖 |
+| 别名匹配 | `SkillManager.match_skill()` | 关键词匹配同时检查 aliases |
+| 别名查找 | `SkillManager.get_skill(name)` | 通过别名查找 Skill |
+
+### 行为变更
+
+| 变更 | 旧行为 | 新行为 |
+|------|--------|--------|
+| 布尔解析 | `true`/`yes`/`1`/`"true"` 均视为 True | 仅 `true` / `"true"` 视为 True |
+| L1 排序 | 按发现顺序 | 按使用分数降序 |
+| `match_skill` 排序 | 按发现顺序匹配 | 按使用分数降序，优先推荐常用 Skill |
+
+### 与旧版的兼容性
+
+- 现有 Skill 无需修改，`paths=None` 的 Skill 始终激活
+- `build_skills_overview()` 无参数调用完全兼容旧版行为（默认 max_chars=2000）
+- 不记录使用则分数为 0.0，排序结果不变
+- 旧版接受的 `yes`/`1`/`on` 不再解析为 True，但现有的 pdf 和 skill-creator 均未使用布尔字段

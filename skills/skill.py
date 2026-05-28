@@ -3,6 +3,7 @@
 表示一个从 SKILL.md 解析出来的 Skill，包含元数据、正文和资源访问方法。
 """
 
+import fnmatch
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,13 +30,44 @@ class Skill:
     license: Optional[str] = None
     metadata: Optional[dict] = None
     compatibility: Optional[str] = None
+    paths: Optional[list] = None           # glob 模式，条件激活
+    aliases: Optional[list] = None         # 别名
+    version: Optional[str] = None          # 版本号
 
-    def to_metadata_string(self) -> str:
-        """L1 表示：用于系统提示词中的 Skill 列表"""
+    def to_metadata_string(self, detail: str = "full") -> str:
+        """L1 表示：用于系统提示词中的 Skill 列表
+
+        detail 级别:
+        - "full": name + description + when_to_use
+        - "compact": name + 截断的 description
+        - "name_only": 仅名称
+        """
+        if detail == "name_only":
+            return f"- {self.name}"
+
+        if detail == "compact":
+            desc = self.description[:80] + "..." if len(self.description) > 80 else self.description
+            return f"- {self.name}: {desc}"
+
+        # full
         parts = [f"- {self.name}: {self.description}"]
         if self.when_to_use:
             parts.append(f" — {self.when_to_use}")
         return "".join(parts)
+
+    def matches_paths(self, file_paths: list) -> bool:
+        """检查给定文件路径是否匹配此 Skill 的激活模式
+
+        如果 paths 为 None（未声明），Skill 始终激活（向后兼容）。
+        如果 paths 已声明，至少一个 file_path 需匹配至少一个 pattern。
+        """
+        if self.paths is None:
+            return True
+        for pattern in self.paths:
+            for fpath in file_paths:
+                if fnmatch.fnmatch(fpath, pattern) or fnmatch.fnmatch(Path(fpath).name, pattern):
+                    return True
+        return False
 
     def render(self, args: str = "") -> str:
         """渲染最终提示词，执行变量替换

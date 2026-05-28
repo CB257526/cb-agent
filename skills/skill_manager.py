@@ -2,9 +2,19 @@
 
 负责发现、解析、加载和匹配 Skill。
 从 .cbagent/skills/ 目录扫描 SKILL.md 文件，解析 frontmatter 和正文。
+
+优化特性（v2）:
+- 条件激活: paths frontmatter 声明 glob 模式，仅操作匹配文件时激活 Skill
+- 预算控制: L1 概览限制在上下文窗口的 1%，三级降级（完整→紧凑→仅名称）
+- 使用追踪: 记录调用频率，7天半衰期指数衰减排序
+- 别名支持: aliases frontmatter 注册备用名称
+- 热重载: 基于 mtime 的文件变更检测
 """
 
+import math
 import re
+import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +25,8 @@ from .skill import Skill
 KNOWN_FIELDS = {
     'name', 'description', 'when_to_use', 'allowed-tools',
     'arguments', 'argument-hint', 'model', 'user-invocable',
-    'disable-model-invocation', 'license', 'metadata', 'compatibility'
+    'disable-model-invocation', 'license', 'metadata', 'compatibility',
+    'paths', 'aliases', 'version'
 }
 
 
@@ -38,6 +49,14 @@ class SkillManager:
         self._skills_dir = Path(skills_dir)
         self._skills: dict[str, Skill] = {}
 
+        # 使用频率追踪: name -> 时间戳列表
+        self._usage: dict[str, list[float]] = defaultdict(list)
+        # 防抖: name -> 上次记录时间
+        self._last_record_time: dict[str, float] = {}
+
+        # 热重载: SKILL.md 路径 -> 上次 mtime
+        self._last_mtime_cache: dict[str, float] = {}
+
         # 启动时自动扫描发现
         self._discover_skills()
 
@@ -55,9 +74,17 @@ class SkillManager:
                 continue
 
             try:
+                # 记录 mtime 用于热重载检测
+                self._last_mtime_cache[str(skill_md)] = skill_md.stat().st_mtime
+
                 skill = self._parse_skill_file(skill_md)
                 if skill:
                     self._skills[skill.name] = skill
+                    # 注册别名（共享同一 Skill 对象引用）
+                    if skill.aliases:
+                        for alias in skill.aliases:
+                            if alias not in self._skills:
+                                self._skills[alias] = skill
             except Exception as e:
                 # 解析失败跳过，不影响其他 skill
                 print(f"⚠️ 解析 Skill 失败 ({skill_md}): {e}")
@@ -90,10 +117,15 @@ class SkillManager:
         # 解析列表类型字段
         allowed_tools = self._parse_list_field(fields.get("allowed-tools"))
         arguments = self._parse_list_field(fields.get("arguments"))
+        paths = self._parse_list_field(fields.get("paths"))
+        aliases = self._parse_list_field(fields.get("aliases"))
 
-        # 解析布尔字段
+        # 解析布尔字段（收紧规则：只接受 true / "true"）
         user_invocable = self._parse_bool(fields.get("user-invocable"), True)
         disable_model_invocation = self._parse_bool(fields.get("disable-model-invocation"), False)
+
+        # 版本号
+        version = fields.get("version", "").strip() or None
 
         return Skill(
             name=name,
@@ -110,6 +142,9 @@ class SkillManager:
             license=fields.get("license", "").strip() or None,
             metadata=None,  # metadata 暂不解析复杂结构
             compatibility=fields.get("compatibility", "").strip() or None,
+            paths=paths,
+            aliases=aliases,
+            version=version,
         )
 
     @staticmethod
@@ -131,19 +166,23 @@ class SkillManager:
         """解析 frontmatter 字段
 
         不使用 PyYAML，逐行解析简单的 key: value 格式。
-        支持多行列表值（以 - 开头的行）。
+        支持多行列表值（以 - 开头的行）和 YAML > 折叠标量。
         """
         fields = {}
         current_key = None
         current_list = None
+        in_folded = False       # > 折叠标量中
+        folded_lines = []       # 收集折叠标量的行
 
         for line in frontmatter.split('\n'):
             stripped = line.strip()
             if not stripped:
+                if in_folded:
+                    folded_lines.append("")  # 保留空行以便段分隔
                 continue
 
             # 检查是否是列表项
-            if stripped.startswith('- ') and current_key:
+            if stripped.startswith('- ') and current_key and not in_folded:
                 if current_list is None:
                     current_list = []
                 current_list.append(stripped[2:].strip())
@@ -153,7 +192,15 @@ class SkillManager:
             # 检查是否是 key: value 行
             match = re.match(r'^([\w-]+)\s*:\s*(.*)$', stripped)
             if match:
-                # 如果之前有列表，重置
+                # 结束之前的折叠标量
+                if in_folded and current_key:
+                    # 用空格连接非空行（YAML 折叠标量语义）
+                    fields[current_key] = " ".join(
+                        l.strip() for l in folded_lines if l.strip()
+                    )
+                    in_folded = False
+                    folded_lines = []
+
                 current_key = match.group(1).strip()
                 value = match.group(2).strip()
 
@@ -162,16 +209,28 @@ class SkillManager:
                    (value.startswith("'") and value.endswith("'")):
                     value = value[1:-1]
 
-                if value:
+                if value == ">":
+                    # YAML 折叠标量：后续行用空格拼接
+                    in_folded = True
+                    folded_lines = []
+                    current_list = None
+                elif value:
                     fields[current_key] = value
                     current_list = None
                 else:
                     # 值为空，可能是多行列表的开始
                     current_list = None
             else:
-                # 续行（长文本 description 的换行情况）
-                if current_key and current_key in fields:
+                if in_folded:
+                    folded_lines.append(stripped)
+                elif current_key and current_key in fields:
                     fields[current_key] += " " + stripped
+
+        # 结束任何残留的折叠标量
+        if in_folded and current_key:
+            fields[current_key] = " ".join(
+                l.strip() for l in folded_lines if l.strip()
+            )
 
         return fields
 
@@ -189,14 +248,58 @@ class SkillManager:
 
     @staticmethod
     def _parse_bool(value, default: bool = False) -> bool:
-        """解析布尔类型字段"""
+        """解析布尔类型字段
+
+        收紧规则：只接受 true / "true"（对齐 Claude Code）。
+        不再接受 yes/1/on 等非标准值。
+        """
         if value is None:
             return default
         if isinstance(value, bool):
             return value
         if isinstance(value, str):
-            return value.strip().lower() in ("true", "yes", "1")
+            return value.strip().lower() == "true"
         return default
+
+    # ==================== 使用频率追踪 ====================
+
+    def record_usage(self, name: str):
+        """记录 Skill 调用，60s 防抖
+
+        Args:
+            name: Skill 名称
+        """
+        now = time.time()
+        last = self._last_record_time.get(name, 0)
+        if now - last < 60:
+            return  # 防抖
+        self._last_record_time[name] = now
+        self._usage[name].append(now)
+        # 清理 30 天前的记录
+        cutoff = now - 30 * 86400
+        self._usage[name] = [t for t in self._usage[name] if t > cutoff]
+
+    def get_usage_score(self, name: str) -> float:
+        """计算使用分数（7天半衰期指数衰减）
+
+        最近使用权重大，7天前半衰。最低分 0.1（不完全归零）。
+
+        Args:
+            name: Skill 名称
+
+        Returns:
+            衰减后的使用分数
+        """
+        if name not in self._usage:
+            return 0.0
+        now = time.time()
+        half_life = 7 * 86400  # 7 天
+        decay = 0.693 / half_life  # ln(2) / half_life
+        score = 0.0
+        for ts in self._usage[name]:
+            age = now - ts
+            score += math.exp(-decay * age)
+        return score
 
     # ==================== 公共 API ====================
 
@@ -205,11 +308,48 @@ class SkillManager:
         return list(self._skills.values())
 
     def get_skill(self, name: str) -> Optional[Skill]:
-        """按名称获取 Skill"""
+        """按名称获取 Skill（支持别名查找）"""
         return self._skills.get(name)
 
-    def build_skills_overview(self) -> str:
+    @staticmethod
+    def extract_file_paths(messages: list) -> list:
+        """从对话消息中提取文件路径
+
+        用于 paths 条件激活过滤。
+
+        Args:
+            messages: 对话消息列表
+
+        Returns:
+            提取到的文件路径列表
+        """
+        paths = []
+        # 匹配常见文件路径模式
+        path_pattern = re.compile(
+            r'''(?:^|[\s"'(\[<])((?:[A-Za-z]:\\|/)?[\w\-./\\]+\.\w{1,10})(?:$|[\s"'.,;)\]>])'''
+        )
+        for msg in messages[-5:]:  # 仅最近 5 条消息
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                for match in path_pattern.finditer(content):
+                    paths.append(match.group(1))
+        return paths
+
+    def build_skills_overview(
+        self,
+        file_paths: Optional[list] = None,
+        max_chars: int = 2000,
+    ) -> str:
         """构建 L1 提示词片段，用于系统提示词注入
+
+        支持条件激活过滤和预算控制。三级降级：
+        1. full -- 完整 description + when_to_use
+        2. compact -- name + 截断 description
+        3. name_only -- 仅名称
+
+        Args:
+            file_paths: 当前操作的文件路径，用于条件激活过滤
+            max_chars: 最大字符数预算（约上下文窗口 1% 对应约 500 tokens）
 
         Returns:
             格式化的 Skill 列表字符串
@@ -217,14 +357,70 @@ class SkillManager:
         if not self._skills:
             return ""
 
+        # 按使用分数降序排列
+        skills_by_score = sorted(
+            self._skills.values(),
+            key=lambda s: self.get_usage_score(s.name),
+            reverse=True,
+        )
+
+        # 去重（别名共享同一对象引用）
+        seen = set()
+        candidates = []
+        for skill in skills_by_score:
+            if skill.name in seen:
+                continue
+            seen.add(skill.name)
+            # 条件激活过滤
+            if file_paths and not skill.matches_paths(file_paths):
+                continue
+            candidates.append(skill)
+
+        if not candidates:
+            return ""
+
+        # 尝试 full 级别
+        for detail in ("full", "compact", "name_only"):
+            result = SkillManager._format_overview(candidates, detail)
+            if len(result) <= max_chars:
+                return result
+
+        # 极限预算：只列名称
+        return SkillManager._format_overview(candidates, "name_only")
+
+    @staticmethod
+    def _format_overview(candidates: list, detail: str) -> str:
+        """格式化 Skill 列表
+
+        Args:
+            candidates: 候选 Skill 列表
+            detail: 详细级别 (full/compact/name_only)
+        """
         lines = ["<available-skills>", "以下 Skill 可通过 Skill 工具调用：", ""]
-        for skill in self._skills.values():
-            lines.append(skill.to_metadata_string())
+        for skill in candidates:
+            lines.append(skill.to_metadata_string(detail))
         lines.append("")
         lines.append("当用户请求匹配某个 Skill 的使用场景时，使用 Skill 工具调用对应的 Skill。")
         lines.append("</available-skills>")
-
         return "\n".join(lines)
+
+    def build_skills_overview_for_model(
+        self,
+        model_context_window: int = 200_000,
+        file_paths: Optional[list] = None,
+    ) -> str:
+        """根据模型上下文窗口计算预算并构建 L1 概览
+
+        Args:
+            model_context_window: 模型的上下文窗口大小（token 数）
+            file_paths: 当前操作的文件路径
+
+        Returns:
+            格式化的 Skill 列表字符串
+        """
+        # 约 4 字符/token，预算 = 上下文窗口的 1%
+        max_chars = int(model_context_window * 0.01 * 4)
+        return self.build_skills_overview(file_paths=file_paths, max_chars=max_chars)
 
     def load_skill_content(self, name: str, args: str = "") -> str:
         """加载 Skill 的 L2 内容（仅 SKILL.md 正文）
@@ -254,7 +450,7 @@ class SkillManager:
         if refs:
             ref_names = ", ".join(refs.keys())
             parts.append("")
-            parts.append(f"[可用参考文档: {ref_names} — 如需查看，调用 load_skill_reference 加载]")
+            parts.append(f"[可用参考文档: {ref_names} -- 如需查看，调用 load_skill_reference 加载]")
 
         return "\n".join(parts)
 
@@ -293,11 +489,23 @@ class SkillManager:
 
         user_lower = user_message.lower()
 
-        # 优先匹配 when_to_use，其次匹配 description
+        # 按使用分数排序，优先推荐常用 Skill
+        candidates = sorted(
+            self._skills.values(),
+            key=lambda s: self.get_usage_score(s.name),
+            reverse=True,
+        )
+
+        # 去重（别名共享对象）
+        seen = set()
         best_match = None
         best_score = 0
 
-        for skill in self._skills.values():
+        for skill in candidates:
+            if skill.name in seen:
+                continue
+            seen.add(skill.name)
+
             score = 0
             # 检查 when_to_use 中的关键词
             if skill.when_to_use:
@@ -316,11 +524,55 @@ class SkillManager:
             if skill.name in user_lower:
                 score += 5
 
+            # 检查别名
+            if skill.aliases:
+                for alias in skill.aliases:
+                    if alias in user_lower:
+                        score += 5
+
             if score > best_score:
                 best_score = score
                 best_match = skill.name
 
         return best_match if best_score > 0 else None
+
+    # ==================== 热重载 ====================
+
+    def check_for_changes(self) -> bool:
+        """检查 SKILL.md 文件是否被修改，如有变更则自动重载
+
+        基于 mtime 的轮询检测，无额外依赖。
+        可在每次对话轮次前调用。
+
+        Returns:
+            True 如果检测到变更并已重载
+        """
+        if not self._skills_dir.is_dir():
+            return False
+
+        changed = False
+        for skill_dir in self._skills_dir.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+
+            try:
+                mtime = skill_md.stat().st_mtime
+                key = str(skill_md)
+                cached = self._last_mtime_cache.get(key, 0)
+                if mtime > cached:
+                    self._last_mtime_cache[key] = mtime
+                    changed = True
+            except OSError:
+                continue
+
+        if changed:
+            self._skills.clear()
+            self._discover_skills()
+
+        return changed
 
     @staticmethod
     def _extract_keywords(text: str) -> list:

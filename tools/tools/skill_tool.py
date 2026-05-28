@@ -62,6 +62,9 @@ class SkillTool(Tool):
         if skill.disable_model_invocation:
             return f"[ERROR] Skill '{skill_name}' 已禁用模型自动调用，请用户通过 /{skill_name} 手动触发"
 
+        # 记录使用
+        self.skill_manager.record_usage(skill_name)
+
         # 如果指定了 document，加载对应的参考文档
         if document:
             return self.skill_manager.load_skill_reference(skill_name, document)
