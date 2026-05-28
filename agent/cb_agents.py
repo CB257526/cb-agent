@@ -120,6 +120,7 @@ class CbAgentsLLM:
 
         content = message.content if message.content else ""
         tool_calls = message.tool_calls if message.tool_calls else []
+        tool_calls = [tool.model_dump() for tool in tool_calls] # 将每个tool对象转换为字典格式
         """
         "tool_calls": [
             {
