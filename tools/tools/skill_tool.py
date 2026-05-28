@@ -40,16 +40,17 @@ class SkillTool(Tool):
         """执行工具
 
         Args:
-            parameters: 必须包含 skill(名称)，可选 args(参数)
+            parameters: 必须包含 skill(名称)，可选 args(参数)、document(文档名)
 
         Returns:
-            Skill 的 L2 内容（正文 + 参考文档）
+            Skill 正文或指定的参考文档内容
         """
         if not self.validate_parameters(parameters):
             return "[ERROR] 参数验证失败：缺少 skill 名称"
 
         skill_name = parameters["skill"].strip()
         args = parameters.get("args", "")
+        document = parameters.get("document", "").strip()
 
         # 查找 Skill
         skill = self.skill_manager.get_skill(skill_name)
@@ -61,9 +62,12 @@ class SkillTool(Tool):
         if skill.disable_model_invocation:
             return f"[ERROR] Skill '{skill_name}' 已禁用模型自动调用，请用户通过 /{skill_name} 手动触发"
 
-        # 加载 L2 内容
-        content = self.skill_manager.load_skill_content(skill_name, args)
-        return content
+        # 如果指定了 document，加载对应的参考文档
+        if document:
+            return self.skill_manager.load_skill_reference(skill_name, document)
+
+        # 否则加载 SKILL.md 正文
+        return self.skill_manager.load_skill_content(skill_name, args)
 
     def get_parameters(self) -> List[ToolParameter]:
         """获取工具参数定义"""
@@ -78,6 +82,13 @@ class SkillTool(Tool):
                 name="args",
                 type="string",
                 description="传给 Skill 的参数字符串，可选",
+                required=False,
+                default=""
+            ),
+            ToolParameter(
+                name="document",
+                type="string",
+                description="要加载的参考文档名称（不含 .md 扩展名），如 'forms'、'reference'。省略则加载 SKILL.md 正文",
                 required=False,
                 default=""
             ),

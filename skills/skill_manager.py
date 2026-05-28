@@ -227,36 +227,57 @@ class SkillManager:
         return "\n".join(lines)
 
     def load_skill_content(self, name: str, args: str = "") -> str:
-        """加载 Skill 的 L2 内容（body + references）
+        """加载 Skill 的 L2 内容（仅 SKILL.md 正文）
+
+        参考文档不在此处加载。SKILL.md 正文中通常会指引 LLM
+        按需读取特定参考文档（如"如需高级功能请参阅 REFERENCE.md"），
+        LLM 判断需要时通过 load_skill_reference() 单独加载。
 
         Args:
             name: Skill 名称
             args: 用户传入的参数
 
         Returns:
-            完整的 L2 内容字符串
+            Skill 正文内容字符串（不含参考文档）
         """
         skill = self.get_skill(name)
         if not skill:
-            return f"❌ 未找到名为 '{name}' 的 Skill"
+            return f"未找到名为 '{name}' 的 Skill"
 
         # 渲染正文（变量替换）
         body = skill.render(args)
 
-        # 组装输出
+        # 列出可用的参考文档名称，提示 LLM 可按需加载
+        refs = skill.get_references()
         parts = [f"## Skill: {skill.name}", "", body]
 
-        # 添加 references
-        refs = skill.get_references()
         if refs:
+            ref_names = ", ".join(refs.keys())
             parts.append("")
-            parts.append("## 参考文档")
-            for ref_name, ref_content in refs.items():
-                parts.append("")
-                parts.append(f"### {ref_name}")
-                parts.append(ref_content)
+            parts.append(f"[可用参考文档: {ref_names} — 如需查看，调用 load_skill_reference 加载]")
 
         return "\n".join(parts)
+
+    def load_skill_reference(self, name: str, reference_name: str) -> str:
+        """加载 Skill 的单个参考文档
+
+        Args:
+            name: Skill 名称
+            reference_name: 参考文档名称（不含 .md 扩展名）
+
+        Returns:
+            参考文档内容，或错误信息
+        """
+        skill = self.get_skill(name)
+        if not skill:
+            return f"未找到名为 '{name}' 的 Skill"
+
+        refs = skill.get_references()
+        if reference_name not in refs:
+            available = list(refs.keys())
+            return f"Skill '{name}' 中未找到参考文档 '{reference_name}'。可用文档: {', '.join(available)}"
+
+        return refs[reference_name]
 
     def match_skill(self, user_message: str) -> Optional[str]:
         """关键词匹配 Skill（降级方案，用于无 function-calling 的场景）

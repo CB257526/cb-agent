@@ -112,7 +112,7 @@ my-skill/
 ### 3.3 执行流程
 
 ```
-用户: "帮我处理这个PDF文件 /tmp/app.pdf"
+用户: "帮我填写这个PDF表单 /tmp/app.pdf"
          │
          ▼
 系统提示词中包含 L1 概览 (LLM 看到可用的 Skill 列表)
@@ -121,16 +121,26 @@ my-skill/
 LLM 判断: 用户请求匹配 "pdf" Skill
          │
          ▼
-LLM 调用: skill(name="pdf", args="/tmp/app.pdf")
+LLM 调用: skill(name="pdf")
          │
          ▼
-SkillTool 返回 L2 内容 (SKILL.md 正文 + 参考文档)
+SkillTool 返回 SKILL.md 正文 (7595 字符)
+  正文写着: "If you need to fill out a PDF form, read FORMS.md"
          │
          ▼
-LLM 阅读指令，按步骤执行:
-  1. 使用 pypdf 读取 PDF
-  2. 使用 pdfplumber 提取表格
-  3. 如需执行脚本，调用 run_skill_script(...)
+LLM 判断: 用户要填写表单，需要查看 FORMS.md
+         │
+         ▼
+LLM 调用: skill(name="pdf", document="forms")
+         │
+         ▼
+SkillTool 返回 forms.md 内容 (11854 字符)
+         │
+         ▼
+LLM 按 forms.md 的指令执行:
+  1. 调用 run_skill_script 检查 PDF 是否有可填写字段
+  2. 分析表单结构
+  3. 使用 pypdf/pdf-lib 填写表单
 ```
 
 ---
@@ -305,15 +315,13 @@ L1 内容在每次请求时注入系统提示词，让 LLM 知道有哪些 Skill
 
 **注入位置**：系统提示词的末尾
 
-### 6.2 L2: 内容（按需加载）
+### 6.2 L2: 正文（按需加载）
 
-当 LLM 调用 `SkillTool` 时，返回 L2 内容。
+当 LLM 调用 `SkillTool` 时，**只返回 SKILL.md 正文**（经过变量替换），不包含参考文档。
 
 **生成方式**：`SkillManager.load_skill_content(name, args)`
 
-**返回内容**：
-- SKILL.md 正文（经过变量替换）
-- 所有参考文档（*.md，除 SKILL.md 外）
+**设计理由**：SKILL.md 正文中通常会指引 LLM 按需读取特定参考文档（如 "如需高级功能请参阅 REFERENCE.md"、"如需填写表单请阅读 FORMS.md"）。LLM 阅读正文后自行判断是否需要加载参考文档，避免一次性加载全部内容浪费 token。
 
 **返回格式**：
 
@@ -323,26 +331,57 @@ L1 内容在每次请求时注入系统提示词，让 LLM 知道有哪些 Skill
 # PDF Processing Guide
 
 ## Overview
-...
+This guide covers essential PDF processing operations...
+For advanced features, see REFERENCE.md. If you need to fill out a PDF form, read FORMS.md.
 
-## 参考文档
-
-### forms
-(PDF 表单填写指南内容)
-
-### reference
-(高级 PDF 处理参考内容)
+[可用参考文档: forms, reference — 如需查看，调用 Skill 工具并指定 document 参数]
 ```
 
-### 6.3 L3: 资源（按需加载）
+### 6.3 参考文档（按需加载）
 
-L3 资源在 LLM 需要时通过工具调用加载。
+当 LLM 判断需要查看某个参考文档时，通过 SkillTool 的 `document` 参数加载。
+
+**调用方式**：`skill(name="pdf", document="forms")`
+
+**生成方式**：`SkillManager.load_skill_reference(name, reference_name)`
+
+**返回内容**：指定的单个参考文档的完整内容。
+
+### 6.4 L3: 资源（按需加载）
 
 | 资源类型 | 访问方式 | 说明 |
 |----------|----------|------|
 | scripts/*.py | `RunSkillScriptTool` | 通过子进程执行 |
 | agents/*.md | `Skill.get_agents()` | 子 Agent 指令 |
 | assets/* | `Skill.skill_dir / "assets"` | 文件路径引用 |
+
+### 6.5 加载流程示例
+
+```
+用户: "帮我填写这个PDF表单 /tmp/app.pdf"
+  │
+  ▼
+LLM 看到 L1 概览，判断匹配 "pdf" Skill
+  │
+  ▼
+LLM 调用: skill(name="pdf")
+  │         返回 SKILL.md 正文 (7595 字符)
+  │         正文写着: "If you need to fill out a PDF form, read FORMS.md"
+  │
+  ▼
+LLM 判断需要表单填写指南
+  │
+  ▼
+LLM 调用: skill(name="pdf", document="forms")
+  │         返回 forms.md (11854 字符)
+  │
+  ▼
+LLM 按 forms.md 的指令，调用 run_skill_script 执行脚本
+```
+
+**Token 对比**：
+- 旧方案（一次性加载）：44156 字符
+- 新方案（按需加载）：7595 + 11854 = 19449 字符（节省 56%）
 
 ---
 
@@ -455,8 +494,12 @@ manager.get_skill("pdf")                  # -> Skill|None: 按名称获取
 
 # 内容生成
 manager.build_skills_overview()           # -> str: L1 概览
-manager.load_skill_content("pdf")         # -> str: L2 内容
-manager.load_skill_content("pdf", args="file.pdf")  # -> str: 带参数的 L2 内容
+manager.load_skill_content("pdf")         # -> str: L2 正文（不含参考文档）
+manager.load_skill_content("pdf", args="file.pdf")  # -> str: 带参数的 L2 正文
+
+# 参考文档加载
+manager.load_skill_reference("pdf", "forms")       # -> str: 单个参考文档内容
+manager.load_skill_reference("pdf", "reference")   # -> str: 单个参考文档内容
 
 # 匹配（降级方案）
 manager.match_skill("帮我处理PDF")        # -> str|None: 匹配的 Skill 名称
@@ -511,8 +554,22 @@ registry.register_tool(tool)
 |------|------|------|------|
 | `skill` | string | 是 | Skill 名称 |
 | `args` | string | 否 | 传给 Skill 的参数 |
+| `document` | string | 否 | 要加载的参考文档名称（不含 .md）。省略则加载 SKILL.md 正文 |
 
-**返回值**：Skill 的 L2 内容（正文 + 参考文档）
+**调用示例**：
+
+```python
+# 加载 SKILL.md 正文
+tool.run({"skill": "pdf"})
+
+# 加载指定参考文档
+tool.run({"skill": "pdf", "document": "forms"})
+
+# 带参数加载
+tool.run({"skill": "pdf", "args": "--filename=report.pdf"})
+```
+
+**返回值**：SKILL.md 正文（不含参考文档），或指定的参考文档内容
 
 ### 9.2 RunSkillScriptTool
 

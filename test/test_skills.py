@@ -56,14 +56,14 @@ def test_skills_overview():
 
 
 def test_load_skill_content():
-    """测试 L2 内容加载"""
+    """测试 L2 内容加载（仅正文，不含参考文档）"""
     print("=" * 60)
     print("测试 3: L2 Skill 内容加载")
     print("=" * 60)
 
     manager = SkillManager()
 
-    # 测试加载 pdf skill
+    # 测试加载 pdf skill（只加载 SKILL.md 正文）
     content = manager.load_skill_content("pdf")
     print(f"pdf skill 内容长度: {len(content)} 字符")
     print(f"前 200 字符:\n{content[:200]}")
@@ -71,7 +71,20 @@ def test_load_skill_content():
 
     assert "## Skill: pdf" in content, "内容应包含 Skill 标题"
     assert "PDF Processing Guide" in content, "内容应包含正文"
-    assert "## 参考文档" in content, "内容应包含参考文档部分"
+    assert "可用参考文档" in content, "内容应提示可用的参考文档"
+
+    # 测试加载指定参考文档
+    ref_content = manager.load_skill_reference("pdf", "forms")
+    print(f"forms 参考文档长度: {len(ref_content)} 字符")
+    print()
+
+    assert len(ref_content) > 100, "参考文档应有内容"
+
+    # 测试加载不存在的参考文档
+    err = manager.load_skill_reference("pdf", "nonexistent")
+    print(f"不存在的文档: {err}")
+    assert "未找到" in err
+
     print("[PASS] L2 Skill 内容加载测试通过\n")
 
 
@@ -90,10 +103,15 @@ def test_skill_tool():
     print(f"参数: {list(schema['function']['parameters']['properties'].keys())}")
     print()
 
-    # 测试调用 pdf skill
+    # 测试调用 pdf skill（只加载正文）
     result = tool.run({"skill": "pdf"})
     print(f"调用 pdf skill 结果长度: {len(result)} 字符")
     print(f"前 200 字符:\n{result[:200]}")
+    print()
+
+    # 测试加载指定参考文档
+    result_ref = tool.run({"skill": "pdf", "document": "forms"})
+    print(f"加载 forms 文档长度: {len(result_ref)} 字符")
     print()
 
     # 测试调用不存在的 skill
@@ -102,6 +120,7 @@ def test_skill_tool():
     print()
 
     assert "## Skill: pdf" in result
+    assert len(result_ref) > 100
     assert "未找到" in result2
     print("[PASS] SkillTool 测试通过\n")
 
