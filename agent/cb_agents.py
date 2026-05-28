@@ -56,7 +56,7 @@ class CbAgentsLLM:
             }
         }
 
-        return: [message,tool_calls_info]
+        return: {'answer': str, 'reason': str, 'tool_calls': List[Dict[str, Any]]}
         """
         print(f"🧠 正在调用 {self.model} 模型...")
         try:
@@ -118,28 +118,29 @@ class CbAgentsLLM:
         # \n\n想到了可以用简洁的句式回答，先确认用户提到的版本信息，再说明我的创建者。不需要展开其他功能或细节，避免信息冗余。')
 
 
+        content = message.content if message.content else ""
+        tool_calls = message.tool_calls if message.tool_calls else []
+        """
+        "tool_calls": [
+            {
+                "id": "call_abc123",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"Beijing\"}"
+                }
+            }
+        ]
+        """
+        # 提取思考字段如果有，没有的话就使用content代替
+        if message.reasoning_content:
+            reason = message.reasoning_content
+        else:
+            reason = content
+
         
         # 情况1：模型直接回复文本，没有调用工具
-        if message.content and not message.tool_calls:
-            return [message,None] # 直接回复文本，没有调用工具
-        
-        # 情况2：模型调用了工具
-        if message.tool_calls:
-            tool_calls_info = []
-            for tool_call in message.tool_calls:
-                tool_info = {
-                    "id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "arguments": json.loads(tool_call.function.arguments)
-                }
-                tool_calls_info.append(tool_info)
-                #print(f"🔧 模型调用工具: {tool_info['name']}({tool_info['arguments']})")
-            
-            # 返回结构化的工具调用信息与模型的响应(thought)
-            return [message,tool_calls_info] 
-        
-        # 情况3：空响应（理论上不会发生）
-        return [None,None]
+        return {'answer': content, 'reason': reason, 'tool_calls': tool_calls} # 直接回复文本，没有调用工具
     
     def _auto_detect_provider(self, api_key: Optional[str], base_url: Optional[str]) -> str:
         """
