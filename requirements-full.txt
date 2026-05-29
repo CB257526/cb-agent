@@ -1,0 +1,39 @@
+# cb-agent 完整依赖（含全部可选模块）
+# 包含本地 embedding（torch / sentence-transformers）、多模态 RAG、Qdrant、Neo4j、PDF skill、Web 搜索
+# 体积较大（含 torch 后约 GB 级），按需安装
+#
+# 安装方式：
+#     pip install -r requirements-full.txt
+# 或者：
+#     pip install -e ".[full]"
+#
+# 部分版本号根据当前开发环境锁定，便于复现；其余用 ">=" 让 pip 选最新兼容版
+
+# ---------- core ----------
+-r requirements.txt
+
+# ---------- 本地 embedding / NLP ----------
+sentence-transformers>=2.7
+torch>=2.0
+transformers>=4.40
+scikit-learn>=1.3
+spacy>=3.7
+
+# ---------- 多模态 RAG ----------
+Pillow>=10.0
+librosa>=0.10
+markitdown>=0.0.1
+
+# ---------- 向量库 / 图库 ----------
+zvec>=0.4
+qdrant-client>=1.9
+neo4j>=5.20
+
+# ---------- PDF skill 脚本 ----------
+pdfplumber>=0.11
+pdf2image>=1.17
+pypdf>=4.0
+
+# ---------- Web 搜索 ----------
+tavily-python>=0.3
+google-search-results>=2.4
