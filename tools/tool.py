@@ -50,7 +50,9 @@ class Tool(ABC):
 
             # 如果是数组类型，添加 items 定义
             if param.type == "array":
-                prop["items"] = {"type": "string"}  # 默认字符串数组
+                # 优先使用 ToolParameter 自定义的 items schema；
+                # 未指定则兜底为字符串数组，向后兼容旧工具。
+                prop["items"] = param.items if param.items else {"type": "string"}
 
             properties[param.name] = prop
 

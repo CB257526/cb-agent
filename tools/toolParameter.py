@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Any, List
+from typing import Any, List, Dict, Optional
 
 class ToolParameter(BaseModel):
     """工具参数定义(函数中的其中一个参数)"""
@@ -8,6 +8,9 @@ class ToolParameter(BaseModel):
     description: str  # 参数描述
     required: bool = True  # 是否必填
     default: Any = None  # 默认值
+    # 当 type=="array" 时可指定 items 的 JSON Schema；为 None 时按字符串数组兜底。
+    # 例：items={"type": "object", "properties": {...}, "required": [...]}
+    items: Optional[Dict[str, Any]] = None
 
 
 # 示例

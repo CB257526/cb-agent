@@ -505,3 +505,22 @@ class MCPTool(Tool):
                 required=False
             )
         ]
+
+    def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
+        """轻量参数校验。
+
+        - action 必须存在且是已知动作（兼容 run() 中"无 action 但有 tool_name 自动推断为 call_tool"的逻辑）
+        - 不做参数类型/取值的深度校验，交给 MCP 服务器侧
+        """
+        if not isinstance(parameters, dict):
+            return False
+        valid_actions = {
+            "list_tools", "call_tool",
+            "list_resources", "read_resource",
+            "list_prompts", "get_prompt",
+        }
+        action = str(parameters.get("action", "")).strip().lower()
+        if not action:
+            # 允许 run() 自动推断为 call_tool 的场景
+            return "tool_name" in parameters
+        return action in valid_actions

@@ -214,11 +214,31 @@ class TodoTool(Tool):
                 name="todos",
                 type="array",
                 description=(
-                    "待办任务列表。每项包含 id(唯一标识), content(任务描述), "
+                    "待办任务列表。每项是对象，包含 id(唯一标识), content(任务描述), "
                     "status(pending/in_progress/completed/cancelled)。"
                     "省略则读取当前列表。"
                 ),
-                required=False
+                required=False,
+                # 显式声明 items 为对象，避免被 to_openai_schema 兜底成字符串数组
+                items={
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "任务唯一标识，如 '1'、'task-a'",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "任务描述",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": list(VALID_STATUSES),
+                            "description": "任务状态，默认 pending",
+                        },
+                    },
+                    "required": ["id", "content"],
+                },
             ),
             ToolParameter(
                 name="merge",

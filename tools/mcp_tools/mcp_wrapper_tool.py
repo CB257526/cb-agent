@@ -97,6 +97,18 @@ class MCPWrappedTool(Tool):
         """
         return self._parameters
 
+    def validate_parameters(self, params: Dict[str, Any]) -> bool:
+        """轻量参数校验：仅检查必填字段是否齐全。
+
+        类型/取值范围交给 MCP 服务器自己校验，避免在客户端做重复且容易过严的检查。
+        """
+        if not isinstance(params, dict):
+            return False
+        for p in self._parameters:
+            if p.required and p.name not in params:
+                return False
+        return True
+
     def run(self, params: Dict[str, Any]) -> str:
         """
         执行MCP工具
