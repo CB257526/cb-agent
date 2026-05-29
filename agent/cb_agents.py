@@ -95,53 +95,92 @@ class CbAgentsLLM:
 
 
     # 2 支持Function Calling
-    def _think_with_Function_Calling(self, messages: List[Dict[str, str]], temperature: float = 0, tools: Optional[List[Dict]] = None) -> List[Any]:
-        """支持函数调用的模型调用 自动处理函数调用逻辑
+    def _think_with_Function_Calling(self, messages: List[Dict[str, str]], temperature: float = 0, tools: Optional[List[Dict]] = None) -> Dict[str, Any]:
+        """支持函数调用的模型调用（流式）。
+
+        OpenAI 协议在 stream=True 下，tool_calls 会按 index 分块下发：
+            delta.tool_calls = [
+              {"index": 0, "id": "...", "type": "function",
+               "function": {"name": "...", "arguments": "..."}},
+              ...
+            ]
+        每个分片可能只带 name 的一部分或 arguments json 的一段，必须按 index 累积。
+        content / reasoning_content 同样按 delta 增量拼接。
         """
-        #TODO 实现支持函数调用的模型调用逻辑
-        # 第一步：调用模型（非流式，因为需要解析 tool_calls）
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=temperature,
             tools=tools,
-            tool_choice="auto",  # 模型自主决定是否调用工具
-            #extra_body={"thinking": {"type": "disabled"}}
+            tool_choice="auto",
+            stream=True,
         )
-        #print(f"原始响应: {response}")
-        message = response.choices[0].message
-        #message=ChatCompletionMessage(content='我是Claude，由Anthropic开发的大语言模型。是的，版本是Opus-4.7。有什么可以帮你的吗？', 
-        # refusal=None, role='assistant', annotations=None, audio=None, 
-        # function_call=None, tool_calls=None, 
-        # reasoning_content='嗯，用户问了一个简单的自我介绍问题“你是谁”。这是一个非常基础的身份询问。
-        # \n\n我需要直接、清晰地说明自己的身份和来源。我是由Anthropic开发的大语言模型，名字是Claude，版本是Opus-4.7。
-        # \n\n想到了可以用简洁的句式回答，先确认用户提到的版本信息，再说明我的创建者。不需要展开其他功能或细节，避免信息冗余。')
 
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        # 按 index 累积 tool_calls 分片
+        tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
 
-        content = message.content if message.content else ""
-        tool_calls = message.tool_calls if message.tool_calls else []
-        tool_calls = [tool.model_dump() for tool in tool_calls] # 将每个tool对象转换为字典格式
-        """
-        "tool_calls": [
-            {
-                "id": "call_abc123",
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "arguments": "{\"city\": \"Beijing\"}"
-                }
-            }
-        ]
-        """
-        # 提取思考字段如果有，没有的话就使用content代替
-        if message.reasoning_content:
-            reason = message.reasoning_content
-        else:
-            reason = content
+        # 控制可见正文的打印：只有真正开始吐 content 时才打 "assistant > " 前缀
+        printed_prefix = False
 
-        
-        # 情况1：模型直接回复文本，没有调用工具
-        return {'answer': content, 'reason': reason, 'tool_calls': tool_calls} # 直接回复文本，没有调用工具
+        for chunk in response:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+
+            # 1) 普通 content：直接流式打到终端
+            piece = getattr(delta, "content", None) or ""
+            if piece:
+                if not printed_prefix:
+                    print("\nassistant > ", end="", flush=True)
+                    printed_prefix = True
+                print(piece, end="", flush=True)
+                content_parts.append(piece)
+
+            # 2) reasoning_content（DeepSeek thinking 等）：只累计不直接打，
+            #    交给上层 run_agent 渲染成 "Thought for Xs" 块
+            r_piece = getattr(delta, "reasoning_content", None) or ""
+            if r_piece:
+                reasoning_parts.append(r_piece)
+
+            # 3) tool_calls 分片：按 index 累积
+            tc_chunks = getattr(delta, "tool_calls", None) or []
+            for tc in tc_chunks:
+                idx = tc.index if tc.index is not None else 0
+                slot = tool_calls_by_index.setdefault(
+                    idx,
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if tc.id:
+                    slot["id"] = tc.id
+                if tc.type:
+                    slot["type"] = tc.type
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["function"]["name"] += fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["function"]["arguments"] += fn.arguments
+
+        if printed_prefix:
+            print()  # 流式正文末尾补换行
+
+        content = "".join(content_parts)
+        reasoning_content = "".join(reasoning_parts) or None
+        # 按 index 排序，输出形如 [{id, type, function:{name, arguments}}, ...]
+        tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+
+        return {
+            "answer": content,
+            "reason": reasoning_content if reasoning_content else content,
+            "tool_calls": tool_calls,
+            "reasoning_content": reasoning_content,
+        }
     
     def _auto_detect_provider(self, api_key: Optional[str], base_url: Optional[str]) -> str:
         """
