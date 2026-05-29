@@ -58,6 +58,8 @@ from tools.tools.search import SearchTool
 from tools.tools.skill_tool import SkillTool
 from tools.tools.run_skill_script_tool import RunSkillScriptTool
 from tools.tools.todo_tool import TodoTool
+from tools.tools.bash_tool import BashTool
+from tools.tools.bash_prompt import get_bash_prompt
 
 try:
     from tools.mcp_tools.mcptools_add import load_mcp_tools
@@ -103,6 +105,7 @@ def _c(code: str) -> str:
 _BOLD = _c("1")
 _DIM = _c("2")
 _RESET = _c("0")
+_RED = _c("31")
 _GREEN = _c("32")
 _YELLOW = _c("33")
 _MAGENTA = _c("35")
@@ -192,6 +195,88 @@ def _render_thought(reason: str, elapsed_seconds: Optional[float] = None) -> str
     return f"{head}\n{indented}"
 
 
+def _render_bash_output(tool_result: str) -> Optional[str]:
+    """把 bash 工具的 JSON 输出渲染成彩色面板。
+
+    命令分类不同显示策略：
+    - silent: 成功时只一行 "Done."，无输出
+    - search/read: 输出可折叠（由 dump 机制处理）
+    - 错误: 红字 stderr
+    - 警告: 黄字前缀
+    解析失败返回 None，走默认截断预览。
+    """
+    try:
+        data = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or "stdout" not in data:
+        return None
+
+    stdout = (data.get("stdout") or "").rstrip()
+    stderr = (data.get("stderr") or "").rstrip()
+    exit_code = data.get("exit_code", 0)
+    is_error = data.get("is_error", exit_code != 0)
+    classification = data.get("classification", {}) or {}
+    kind = classification.get("kind", "normal")
+    semantic = data.get("semantic")
+    interrupted = data.get("interrupted", False)
+    timed_out = data.get("timeout", False)
+    background = data.get("background", False)
+
+    lines = []
+
+    # 后台模式
+    if background:
+        task_id = data.get("background_task_id", "?")
+        lines.append(f"{_DIM}{_CYAN}  ⟳ 后台运行中 (task {task_id}){_RESET}")
+        return "\n".join(lines)
+
+    # 超时 / 中断
+    if timed_out:
+        lines.append(f"{_BOLD}{_YELLOW}  ⏱ 命令超时{_RESET}")
+    if interrupted:
+        lines.append(f"{_YELLOW}  ✗ 命令被中断{_RESET}")
+
+    # silent 命令成功 → 简洁一行
+    if kind == "silent" and not is_error and not timed_out and not interrupted:
+        lines.append(f"  {_DIM}Done.{_RESET}")
+        return "\n".join(lines) if lines else None
+
+    # 错误输出
+    if is_error and not timed_out and not interrupted:
+        stderr_preview = (stderr or f"exit code {exit_code}")[:200]
+        lines.append(f"  {_BOLD}{_RED}✗ {stderr_preview}{_RESET}")
+
+    # 语义化退出码
+    if not is_error and semantic:
+        lines.append(f"  {_DIM}({semantic.get('message', '')}){_RESET}")
+
+    # stdout（截取前 500 字符到面板，完整输出存在于 tool_result 传给模型）
+    if stdout:
+        preview = stdout[:500]
+        trimmed = "..." if len(stdout) > 500 else ""
+        for line in preview.split("\n"):
+            lines.append(f"  {_DIM}{line}{_RESET}")
+        if trimmed:
+            lines.append(f"  {_GRAY}... [{len(stdout)} 字符, 已截断显示]{_RESET}")
+
+    # stderr 警告级（非致命）
+    if stderr and not is_error:
+        for line in stderr.split("\n")[:5]:
+            lines.append(f"  {_YELLOW}{line}{_RESET}")
+
+    if not lines:
+        return None
+
+    # 折叠标记：search/read/list 类命令
+    if kind in ("search", "read", "list"):
+        label = {"search": "搜索结果", "read": "读取内容", "list": "目录列表"}.get(kind, "输出")
+        header = f"{_BOLD}{_MAGENTA}  ▸ {label}{_RESET}"
+        lines.insert(0, header)
+
+    return "\n".join(lines)
+
+
 # ---------- 主类 ----------
 
 
@@ -267,6 +352,7 @@ class AgentRunner:
             SearchTool(),
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),
+            BashTool(),
         ]:
             try:
                 self.registry.register_tool(tool)
@@ -432,7 +518,7 @@ class AgentRunner:
             self.history.append(Message.create_assistant_message(final_answer))
 
     def _build_system_instructions(self) -> str:
-        """组装系统指令：角色 + 已注册工具清单 + Skill 概览。
+        """组装系统指令：角色 + 已注册工具清单 + Bash 使用规范 + Skill 概览。
 
         工具清单从 ToolRegistry 动态拉取，避免与实际注册情况脱节。
         """
@@ -453,6 +539,15 @@ class AgentRunner:
             "调用工具时选最直接的那个，避免连续多轮无意义调用。",
             "回答用中文，简明扼要。",
         ])
+
+        # Bash 工具使用规范（参考 Claude Code prompt.ts 的设计）
+        try:
+            bash_prompt = get_bash_prompt()
+            if bash_prompt:
+                parts.append("")
+                parts.append(bash_prompt)
+        except Exception:
+            pass
 
         # Skill 概览（按使用频率 + 上下文预算自动降级，由 SkillManager 处理）
         try:
@@ -564,8 +659,13 @@ class AgentRunner:
                 except Exception as e:
                     tool_result = f"[ERROR] 工具 {tool_name} 抛异常: {e}"
 
-                # todo 工具：用彩色面板替代单行预览；其它工具仍走截断预览
-                rendered = _render_todo_panel(tool_result) if tool_name == "todo" else None
+                # todo/bash 工具：用彩色面板替代单行预览；其它工具仍走截断预览
+                if tool_name == "todo":
+                    rendered = _render_todo_panel(tool_result)
+                elif tool_name == "bash":
+                    rendered = _render_bash_output(tool_result)
+                else:
+                    rendered = None
                 if rendered:
                     print(rendered)
                 else:
