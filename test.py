@@ -110,6 +110,36 @@ from agent.cb_agents import CbAgentsLLM
 # result = md.convert(r"C:\Users\cb135\Desktop\cbAgent\source\屏幕截图 2026-05-26 164742.png")
 # print(result.text_content)
 
-from skills import SkillManager
-manager = SkillManager()
-print(manager.build_skills_overview())
+# from skills import SkillManager
+# manager = SkillManager()
+# print(manager.build_skills_overview())
+
+
+from tools.tools.memory_tool import MemoryTool
+from tools.tools.rag_tool import RAGTool
+from context import ContextBuilder, ContextConfig
+from core.message import Message
+
+builder = ContextBuilder(
+    memory_tool=MemoryTool(),
+    rag_tool=RAGTool(),
+    config=ContextConfig(max_tokens=8000, min_relevance=0.05),
+)
+
+user_query = "数据库连接超时怎么办"
+
+# 一行拿到 OpenAI 风格 messages
+messages = builder.to_messages(
+    user_query=user_query,
+    system_instructions="你是资深 DBA",
+    conversation_history=[
+        Message.create_user_message("我们项目用的 PostgreSQL"),
+        Message.create_assistant_message("好的，记下了"),
+    ],
+)
+
+# 直接喂给 LLM
+llm = CbAgentsLLM()
+result = llm.think(messages)
+print("\n=== 模型回答 ===")
+print(result.get("answer") if isinstance(result, dict) else result)

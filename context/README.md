@@ -128,9 +128,10 @@ from tools.tools.memory_tool import MemoryTool
 from tools.tools.rag_tool import RAGTool
 from context import ContextBuilder, ContextConfig
 
+# MemoryTool / RAGTool 都自带合理默认值，按需传参即可
 builder = ContextBuilder(
-    memory_tool=MemoryTool(...),
-    rag_tool=RAGTool(...),
+    memory_tool=MemoryTool(),
+    rag_tool=RAGTool(),
     config=ContextConfig(max_tokens=8000, min_relevance=0.05),
 )
 ctx = builder.build(user_query="...", conversation_history=[...])
@@ -166,7 +167,45 @@ ctx = builder.build(user_query="...", additional_packets=[extra])
 `additional_packets` 在 Gather 阶段末尾追加，与其它来源的 packet 一视同仁
 （同样要过 min_relevance、MMR、预算）。
 
-### 3.5 调试：`build_detailed` / `abuild_detailed`
+### 3.5 直接拿到 OpenAI messages：`to_messages` / `ato_messages`
+
+`build()` 返回的是一段拼好的 prompt 字符串。OpenAI 协议要的是
+`messages=[{"role": ..., "content": ...}, ...]` 列表，
+所以多数场景下你需要的是 `to_messages`：
+
+```python
+from agent.cb_agents import CbAgentsLLM
+
+builder = ContextBuilder(memory_tool=MemoryTool(), rag_tool=RAGTool())
+
+messages = builder.to_messages(
+    user_query="数据库连接超时怎么办",
+    system_instructions="你是资深 DBA",
+    conversation_history=[
+        Message.create_user_message("我们项目用的 PostgreSQL"),
+        Message.create_assistant_message("好的，记下了"),
+    ],
+)
+# messages 形如：
+# [
+#   {"role": "system",  "content": "<完整的 GSSC 拼装结果>"},
+#   {"role": "user",    "content": "数据库连接超时怎么办"},
+# ]
+
+llm = CbAgentsLLM()
+result = llm.think(messages)
+print(result["answer"])
+```
+
+异步版：`messages = await builder.ato_messages(user_query=..., ...)`，
+内部走 `abuild`，memory/rag 检索并发触发。
+
+> 约定：`user_query` 在 system 的 `[Task]` 节出现一次，user message 里再出现一次。
+> 这是冗余但符合 OpenAI 风格的写法 —— 多数厂商对"最后一条 user 消息为当前问题"
+> 的格式表现更稳。如果你只想要一条 message，直接用 `build()` 拿字符串塞进
+> `[{"role": "user", "content": ctx}]` 即可。
+
+### 3.6 调试：`build_detailed` / `abuild_detailed`
 
 需要看是哪些片段被丢弃、是否触发了截断时使用：
 
@@ -240,6 +279,11 @@ class ContextResult:
 #### `build_detailed(...) -> ContextResult` / `abuild_detailed(...) -> ContextResult`
 
 返回完整 `ContextResult`，包含被丢弃片段及原因。生产环境若开 debug 日志可记录这个对象。
+
+#### `to_messages(...) -> List[Dict[str, str]]` / `ato_messages(...) -> List[Dict[str, str]]`
+
+OpenAI messages 协议适配。返回 `[{role: system, content: <ctx>}, {role: user, content: <user_query>}]`，
+直接喂给 `CbAgentsLLM.think(messages)` 即可。`ato_messages` 是异步版（走 `abuild`）。
 
 ### 5.2 Gather 阶段
 

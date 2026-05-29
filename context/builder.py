@@ -245,6 +245,51 @@ class ContextBuilder:
         )
         return result.context
 
+    # ---------- OpenAI messages 适配 ----------
+
+    def to_messages(
+        self,
+        user_query: str,
+        conversation_history: Optional[List[Message]] = None,
+        system_instructions: Optional[str] = None,
+        additional_packets: Optional[List[ContextPacket]] = None,
+    ) -> List[Dict[str, str]]:
+        """构建上下文并直接转成 OpenAI 风格的 messages 列表。
+
+        约定：整段拼好的 prompt 放在一条 system message 里，user_query 再作为
+        最后一条 user message 出现一次（冗余但符合 OpenAI 风格，多数厂商对
+        "最后一条 user 消息为当前问题" 这种格式表现更稳）。
+        """
+        ctx = self.build(
+            user_query=user_query,
+            conversation_history=conversation_history,
+            system_instructions=system_instructions,
+            additional_packets=additional_packets,
+        )
+        return [
+            {"role": "system", "content": ctx},
+            {"role": "user", "content": user_query},
+        ]
+
+    async def ato_messages(
+        self,
+        user_query: str,
+        conversation_history: Optional[List[Message]] = None,
+        system_instructions: Optional[str] = None,
+        additional_packets: Optional[List[ContextPacket]] = None,
+    ) -> List[Dict[str, str]]:
+        """`to_messages` 的异步版本（走 `abuild`，memory/rag 并发触发）。"""
+        ctx = await self.abuild(
+            user_query=user_query,
+            conversation_history=conversation_history,
+            system_instructions=system_instructions,
+            additional_packets=additional_packets,
+        )
+        return [
+            {"role": "system", "content": ctx},
+            {"role": "user", "content": user_query},
+        ]
+
     def build_detailed(
         self,
         user_query: str,

@@ -383,6 +383,37 @@ def test_perf_count_tokens():
     _check(avg_us < 1000, f"平均 < 1ms / 次 (实际 {avg_us:.1f}μs)")
 
 
+def test_to_messages():
+    print("=" * 60)
+    print("测试 11: to_messages / ato_messages 适配 OpenAI 协议")
+    print("=" * 60)
+
+    memory = _MockMemoryTool(search_results={"__default__": "记忆: x"})
+    rag = _MockRagTool(result="RAG: y")
+    builder = ContextBuilder(
+        memory_tool=memory,
+        rag_tool=rag,
+        config=ContextConfig(max_tokens=4000, min_relevance=0.0),
+    )
+
+    # 同步
+    msgs = builder.to_messages(
+        user_query="数据库连接超时怎么办",
+        system_instructions="你是 DBA",
+    )
+    _check(isinstance(msgs, list) and len(msgs) == 2, "返回 2 条 message")
+    _check(msgs[0]["role"] == "system", "第一条是 system")
+    _check(msgs[1]["role"] == "user", "第二条是 user")
+    _check("[Task]" in msgs[0]["content"], "system content 含完整 prompt 结构")
+    _check("你是 DBA" in msgs[0]["content"], "system_instructions 进入 system content")
+    _check(msgs[1]["content"] == "数据库连接超时怎么办", "user content 是原始 query")
+
+    # 异步
+    amsgs = asyncio.run(builder.ato_messages(user_query="问题 X"))
+    _check(amsgs[0]["role"] == "system" and amsgs[1]["role"] == "user", "异步返回结构正确")
+    _check(amsgs[1]["content"] == "问题 X", "异步 user content 是原始 query")
+
+
 def main():
     test_helpers()
     print()
@@ -403,6 +434,8 @@ def main():
     test_memory_tool_failure_isolated()
     print()
     test_perf_count_tokens()
+    print()
+    test_to_messages()
 
     print()
     print("=" * 60)
