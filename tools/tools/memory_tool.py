@@ -289,7 +289,9 @@ class MemoryTool(Tool):
             )
 
             if not results:
-                return f"🔍 未找到与 '{query}' 相关的记忆"
+                # 命中 0 条时返回空串而非人类提示语，便于上游（如 ContextBuilder）
+                # 用 None/空串契约判定无结果，避免下游做字面匹配
+                return ""
 
             # 格式化结果
             formatted_results = []

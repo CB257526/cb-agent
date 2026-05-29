@@ -515,7 +515,8 @@ class RAGTool(Tool):
             )
 
             if not results:
-                return f"🔍 图片知识库中未找到与 '{q}' 相关的内容"
+                # 空命中返回空串，由调用方判定无结果
+                return ""
 
             return self._format_multimodal_results("图片", q, results)
 
@@ -542,7 +543,8 @@ class RAGTool(Tool):
             )
 
             if not results:
-                return f"🔍 音频知识库中未找到与 '{q}' 相关的内容"
+                # 空命中返回空串，由调用方判定无结果
+                return ""
 
             return self._format_multimodal_results("音频", q, results)
 
@@ -593,7 +595,8 @@ class RAGTool(Tool):
                 )
             
             if not results:
-                return f"🔍 未找到与 '{query}' 相关的内容"
+                # 空命中返回空串，由调用方判定无结果
+                return ""
             
             # 格式化搜索结果
             search_result = ["搜索结果："]
