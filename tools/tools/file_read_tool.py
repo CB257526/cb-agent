@@ -8,6 +8,9 @@
 设计目标是配合 BashTool 的输出落盘：模型拿到 output_file 后用
 file_read(path=..., tail=200) 拉尾部，避免再起一次 bash 跑 tail。
 
+读取成功后会向 ReadStateRegistry 登记 (path, mtime)，供 FileWriteTool
+做 staleness check 用——避免覆盖 linter/用户在 read 之后做的并发改动。
+
 不处理：二进制（默认 utf-8 解码 + replace 错误），多文件，glob，符号链接。
 """
 
@@ -18,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from tools.tool import Tool, ToolParameter
+from tools.tools.file_state import get_read_state_registry
 
 
 MAX_OUTPUT_BYTES = 100 * 1024  # 100KB
@@ -87,7 +91,9 @@ class FileReadTool(Tool):
 
         p = Path(parameters["path"]).expanduser()
         if not p.is_absolute():
-            p = Path.cwd() / p
+            # 相对路径用 BashSession.cwd（与其它工具一致），导入放函数内避免循环依赖
+            from tools.tools.bash_session import get_session
+            p = Path(get_session().cwd) / p
         if not p.exists():
             return json.dumps(
                 {"error": f"文件不存在: {p}", "content": ""},
@@ -119,6 +125,9 @@ class FileReadTool(Tool):
                 {"error": f"读取失败: {e}", "content": ""},
                 ensure_ascii=False,
             )
+
+        # 给 FileWriteTool 的 staleness check 留下记录：路径 + 当时 mtime
+        get_read_state_registry().mark_read(p)
 
         lines = text.splitlines()
         total_lines = len(lines)
