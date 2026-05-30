@@ -59,6 +59,8 @@ from tools.tools.skill_tool import SkillTool
 from tools.tools.run_skill_script_tool import RunSkillScriptTool
 from tools.tools.todo_tool import TodoTool
 from tools.tools.bash_tool import BashTool
+from tools.tools.bash_task_tool import BashTaskTool
+from tools.tools.bash_permission_tool import BashPermissionTool
 from tools.tools.bash_prompt import get_bash_prompt
 
 try:
@@ -291,7 +293,7 @@ class AgentRunner:
     """
 
     # 工具调用循环最大轮数，防止模型陷入死循环
-    MAX_TOOL_ROUNDS = 8
+    MAX_TOOL_ROUNDS = 20
 
     def __init__(self, use_mcp: bool = True, ctx_enabled: bool = True):
         self.use_mcp = use_mcp and _HAS_MCP
@@ -353,6 +355,8 @@ class AgentRunner:
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),
             BashTool(),
+            BashTaskTool(),
+            BashPermissionTool(),
         ]:
             try:
                 self.registry.register_tool(tool)
@@ -484,6 +488,8 @@ class AgentRunner:
         """处理一次用户输入：构 messages → think → 工具循环 → 落历史。"""
         # 每次新用户输入都重置 dump 增量游标，让本轮第一次能打全量
         self._dump_seen_count = 0
+        # 拉取后台任务完成通知，挂到 user_query 前作为系统提示
+        user_query = self._prepend_background_notifications(user_query)
         # 系统指令（项目角色定位 + Skill 概览）
         system_instructions = self._build_system_instructions()
 
@@ -517,6 +523,33 @@ class AgentRunner:
         if final_answer:
             self.history.append(Message.create_assistant_message(final_answer))
 
+    def _prepend_background_notifications(self, user_query: str) -> str:
+        """每轮 think 前，把"上轮还在跑、本轮已经结束"的后台任务结果作为系统提示
+        塞到 user_query 前面。让模型知道结果已就绪，可主动用 bash_task(action=output)
+        拉详情。
+
+        见 [[bash_background]] 的 drain_notifications 行为约定。
+        """
+        try:
+            from tools.tools.bash_background import get_background_registry
+            done = get_background_registry().drain_notifications()
+        except Exception:
+            return user_query
+        if not done:
+            return user_query
+        lines = ["<system-reminder>", "[后台任务完成通知]"]
+        for t in done:
+            lines.append(
+                f"- task_id={t.id} status={t.status} exit={t.exit_code} "
+                f"cmd={t.command!r} output={t.output_path}"
+            )
+        lines.append(
+            "请在回答用户前主动用 bash_task(action=output, task_id=...) "
+            "拉一下完成任务的结果，告知用户。"
+        )
+        lines.append("</system-reminder>")
+        return "\n".join(lines) + "\n\n" + user_query
+
     def _build_system_instructions(self) -> str:
         """组装系统指令：角色 + 已注册工具清单 + Bash 使用规范 + Skill 概览。
 
@@ -524,6 +557,7 @@ class AgentRunner:
         """
         parts = [
             "你是 cb-agent 的智能助手。下面列出当前可用的能力，按需调用：",
+            "遇到复杂的问题是请务必调用todo工具",
             "",
         ]
 

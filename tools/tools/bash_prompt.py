@@ -11,7 +11,7 @@
 - sleep 限制
 """
 
-from tools.tools.bash_utils import get_platform_hint
+from tools.tools.bash_shell import get_platform_hint
 
 BASH_SYSTEM_PROMPT = """# Bash 工具使用规范
 
@@ -42,9 +42,68 @@ Bash 工具用于执行 Shell 命令。但在以下场景，优先使用本项�
 - `;` 仅用于需要串行但不关心前面命令失败与否的场景
 - 不要用换行分隔多个命令（带引号的字符串内换行除外）
 
+## 用户确认（弹窗）
+
+bash 工具默认是**严格模式**：除了只读命令（pwd / ls / dir / cat / head / tail / grep / find / git status|log|diff、docker ps、kubectl get 等）之外，**所有命令第一次都会弹窗让用户确认**。这是预期行为，不是 bug。
+
+弹窗时用户可选：
+- 允许这一次：本次放行，下次同命令仍要再弹
+- 总是允许 "<前缀>" 在此目录：写到项目级 allowlist，同前缀同 cwd 直接放行
+- 总是允许 "<前缀>" 在所有目录：写到全局 allowlist
+- 拒绝：本次返回 `[权限拒绝]`
+
+实践建议：
+- 不要试图组合命令绕过弹窗（例如 `ls && python x.py`），任一段非只读都会弹
+- 看到 `permission_unavailable: true` 说明 stdin 不是 tty（无法弹窗），命令被自动拒绝；告知用户在交互终端下重试
+- 如果用户已经为同前缀加过 allowlist，后续相同命令静默通过，不会再有弹窗记录
+
+## 确认 allowlist 是否真的写入了
+
+bash 返回 JSON 里有 `permission` 字段，结构：
+```
+{"decision": "allow"|"deny",
+ "reason": "命中 allowlist" | "本次允许" | "已加入项目级 allowlist" | ...,
+ "matched_rule": {prefix, scope, cwd, added_at} 或 null,
+ "permission_unavailable": false}
+```
+判断规则：
+- `matched_rule` 非空 → 命令通过 allowlist 放行（用户之前选过 [2]/[3] 加进了规则）
+- `matched_rule` 为空 + `reason` 含"本次允许" → **没**写入 allowlist，下次还会弹
+- `matched_rule` 为空 + `reason` 含"只读" → 命令本身就在只读白名单里
+- 不要凭"命令成功了"就向用户宣称"已加入 allowlist"，要看 matched_rule 是否真有规则
+
+## 用户授权（bash_permission 工具）
+
+当用户用自然语言授权（"以后 X 不要再问我"、"授权 npm install"、"撤销 python 授权"），不要等弹窗，直接调 `bash_permission` 工具：
+- `bash_permission(action="grant", prefix="python", scope="cwd")` —— 在当前目录授权 python
+- `bash_permission(action="grant", prefix="npm install", scope="global")` —— 全局授权 npm install
+- `bash_permission(action="revoke", prefix="python", scope="cwd")` —— 撤销当前目录的 python 授权
+- `bash_permission(action="list")` —— 列所有规则
+- `bash_permission(action="check", prefix="python")` —— 在执行前自检某条规则是否已生效
+
+prefix 的写法：
+- 单 token 命令（python / mkdir / mv）写命令名
+- 多动词命令（git push / npm install / docker build）写两段，与弹窗显示的前缀保持一致
+
+注意：高危前缀（rm / Remove-Item / curl / wget / sudo / iex 等）禁止通过本工具写入，只能走弹窗。这是为了防止意外把破坏性命令加入 allowlist。
+
 ## 后台执行
 
-长时间命令（npm install、docker build、pip install 等）使用 `run_in_background: true`。你会收到完成通知，不需要轮询。
+长时间命令（npm install、docker build、pip install 等）使用 `run_in_background: true`。返回的 `background_task_id` 是后续操作句柄。
+
+完成通知：当后台任务结束后，下一轮对话开头你会收到一条 `[后台任务完成通知]`，里面有 task_id / status / exit / output 路径。看到这条通知后，**主动**用 `bash_task(action=output, task_id=...)` 拉一下结果，不要等用户问。
+
+主动查询：在通知出现前，需要中途看进度可以调 `bash_task(action=list)` 看所有任务，或 `bash_task(action=output, task_id=...)` 拉当前已写入的输出。`bash_task(action=wait, task_id=..., timeout=...)` 是阻塞等结束。`bash_task(action=kill, task_id=...)` 杀进程。
+
+## 大输出处理
+
+不要自己用 `>`、`Out-File`、`Tee-Object` 重定向输出到文件。让命令直接往 stdout 打，bash 工具会自动处理：
+
+- 输出 ≤100KB：直接在 `stdout` 字段返回
+- 输出 >1MB：完整原文落盘到 `output_file` 路径，`stdout` 字段只保留首尾片段并标记 `output_truncated=true`；后续用 `file_read(path=<output_file>, tail=N)` 或 `head=N`、`start_line/end_line` 拉感兴趣的部分
+- 后台任务：完整输出始终写在 `output_file`（task 返回里），用 `bash_task(action=output, ...)` 拿尾部，需要全文用 `file_read`
+
+特别是 PowerShell：用 `>` 默认会写 UTF-16-LE BOM 文件，再读会乱码。永远让 bash 工具替你管落盘。
 
 ## Git 安全协议
 

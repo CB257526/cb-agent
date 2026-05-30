@@ -1,12 +1,14 @@
 """Shell 命令执行工具
 
 为 Agent 提供直接与操作系统交互的能力：执行命令、读取输出、处理超时和异常。
-参考 Claude Code BashTool 的设计思路。
+参考 Claude Code BashTool 设计：
 
 模块拆分：
 - bash_security.py   危险命令检测（致命拦截 + 警告）
 - bash_semantics.py  退出码语义解释
-- bash_utils.py      命令分类（search/read/list/silent）
+- bash_classify.py   命令分类（search/read/list/silent）
+- bash_shell.py      shell 检测、命令包装、平台提示
+- bash_session.py    持久化 cwd 的会话状态机
 - bash_prompt.py     注入给模型的系统提示词
 """
 
@@ -17,35 +19,82 @@ import signal
 import subprocess
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from tools.tool import Tool, ToolParameter
-from tools.tools.bash_security import check_fatal, check_warnings
+from tools.tools.bash_security import check_fatal, check_warnings, parse_pipeline
 from tools.tools.bash_semantics import lookup_semantic
-from tools.tools.bash_utils import classify_command, get_shell, wrap_command
+from tools.tools.bash_classify import classify_command
+from tools.tools.bash_shell import get_shell, wrap_command
+from tools.tools.bash_session import BashSession, get_session
+from tools.tools.bash_output import process_output, default_output_dir
+from tools.tools.bash_background import get_background_registry
+from tools.tools.bash_permission import (
+    Decision, PermissionGate, extract_prefix, get_permission_gate,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _gate_result_to_dict(gate_res) -> Optional[Dict[str, Any]]:
+    """把 GateResult 拍平成 JSON 可读字段，给模型用。
+
+    None / 子 agent 路径 → None
+    其他 → {decision, reason, matched_rule, permission_unavailable}
+
+    matched_rule 非空 → 模型可断言"已加入 allowlist"或"命中既有 allowlist"
+    matched_rule 为空 + reason="本次允许" → "用户选了允许这一次"，下次会再问
+    """
+    if gate_res is None:
+        return None
+    return {
+        "decision": gate_res.decision.value,
+        "reason": gate_res.reason,
+        "matched_rule": (
+            gate_res.matched_rule.to_dict() if gate_res.matched_rule else None
+        ),
+        "permission_unavailable": gate_res.permission_unavailable,
+    }
 
 
 class BashTool(Tool):
     """Shell 命令执行工具。
 
     允许 Agent 执行操作系统命令，读取文件内容、搜索代码、管理进程等。
-    内置危险命令检测（致命拦截 + 警告）和退出码语义解释。
+    内置危险命令检测（致命拦截 + 警告）、退出码语义解释、cwd 持久化。
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        session: Optional[BashSession] = None,
+        permission: Optional[PermissionGate] = None,
+        is_subagent: bool = False,
+    ):
         super().__init__(
             name="bash",
             description=(
                 "执行 Shell 命令并返回输出。"
                 "用于：文件操作、代码搜索（grep/find）、程序执行、系统管理、Git 操作等。"
                 "支持超时控制和后台执行。"
+                "工作目录在多次调用之间持久化，cd 命令会被记住。"
+                "高危命令（force push、TRUNCATE 等）会触发用户确认弹窗。"
             ),
         )
+        # 子 agent 用独立 session 视图，避免污染主 agent 的 cwd
+        if session is not None:
+            self._session = session
+        elif is_subagent:
+            parent = get_session()
+            self._session = BashSession(initial_cwd=parent.cwd, is_subagent=True)
+        else:
+            self._session = get_session()
+
+        self._permission = permission or get_permission_gate()
+        self._is_subagent = is_subagent
+
         self._last_command = ""
         self._last_elapsed = 0.0
-        self._background_tasks: Dict[str, subprocess.Popen] = {}
+        # 后台任务托管在 BackgroundRegistry（进程级单例）
 
     # ========== Tool ABC ==========
 
@@ -59,6 +108,9 @@ class BashTool(Tool):
         if timeout is not None:
             if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 600000:
                 return False
+        cwd = parameters.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            return False
         return True
 
     def get_parameters(self) -> list:
@@ -98,12 +150,24 @@ class BashTool(Tool):
                 required=False,
                 default=False,
             ),
+            ToolParameter(
+                name="cwd",
+                type="string",
+                description=(
+                    "可选，本次调用的工作目录覆盖（仅本次生效，不影响后续调用）。"
+                    "可用相对路径（相对当前 session cwd）或绝对路径。"
+                    "正常情况下使用 cd 切换更直观。"
+                ),
+                required=False,
+            ),
         ]
 
     def run(self, parameters: Dict[str, Any]) -> str:
         """执行 Shell 命令。
 
-        流程：验证参数 → 安全检测 → 选 shell → 执行 → 输出限制 → 语义解释 → 返回 JSON。
+        流程：
+            验证 → 安全检测 → session.compose（注入 cd + cwd marker）→
+            选 shell + wrap → Popen → 解析 marker → 输出限制 → 语义解释 → JSON
         """
         if not self.validate_parameters(parameters):
             return json.dumps({
@@ -113,6 +177,7 @@ class BashTool(Tool):
         command = parameters["command"].strip()
         timeout = parameters.get("timeout", 120000) / 1000.0
         run_in_background = bool(parameters.get("run_in_background", False))
+        override_cwd = parameters.get("cwd")
 
         # 安全检测
         fatal = check_fatal(command)
@@ -122,56 +187,82 @@ class BashTool(Tool):
                 "stdout": "",
                 "stderr": fatal,
                 "exit_code": -1,
+                "cwd": self._session.cwd,
                 "interrupted": False,
                 "timeout": False,
+                "is_error": True,
                 "semantic": "fatal",
+                "background": False,
+                "classification": classify_command(command),
+                "permission": None,
             }, ensure_ascii=False)
 
         warnings = check_warnings(command)
+
+        # 权限决策：所有命令都过 gate.evaluate
+        # - 子 agent 模式下永远 ALLOW（无人值守，没法弹窗，warnings 进字段透传给父 agent）
+        # - 主 agent 模式下：fatal 上游已拦；只读命令直接 ALLOW；warnings 或非只读 → 弹窗
+        gate_res = None
+        if not self._is_subagent:
+            segments = parse_pipeline(command)
+            gate_res = self._permission.evaluate(
+                command, segments, warnings, self._session.cwd,
+            )
+            if gate_res.decision == Decision.ASK:
+                # 取第一段命令作为弹窗前缀
+                prefix = ""
+                for argv in segments:
+                    p = extract_prefix(argv)
+                    if p:
+                        prefix = p
+                        break
+                gate_res = self._permission.prompt_user(
+                    command, prefix, gate_res.reason, self._session.cwd,
+                )
+            if gate_res.decision == Decision.DENY:
+                logger.warning("bash: 权限拒绝 — %s", gate_res.reason)
+                return json.dumps({
+                    "stdout": "",
+                    "stderr": f"[权限拒绝] {gate_res.reason}",
+                    "exit_code": -1,
+                    "cwd": self._session.cwd,
+                    "interrupted": False,
+                    "timeout": False,
+                    "is_error": True,
+                    "semantic": None,
+                    "background": False,
+                    "classification": classify_command(command),
+                    "permission_unavailable": gate_res.permission_unavailable,
+                    "warnings": warnings,
+                    "permission": _gate_result_to_dict(gate_res),
+                }, ensure_ascii=False)
+
         self._last_command = command
         t0 = time.perf_counter()
-        shell = get_shell()
-        # Windows: chcp 65001 先切到 UTF-8，中文才不乱码
-        all_cmd = wrap_command(command)
 
-        # 后台
+        # session 包装：注入 cd <cwd> 前缀 + cwd marker 后缀
+        composed = self._session.compose(command, override_cwd=override_cwd)
+        shell = get_shell()
+        all_cmd = wrap_command(composed)
+
+        # 后台分支：暂沿用旧字典实现，commit 6 抽出到 BackgroundRegistry
         if run_in_background:
-            task_id = str(uuid.uuid4())[:8]
-            try:
-                proc = subprocess.Popen(
-                    shell + [all_cmd],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace",
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-                )
-                self._background_tasks[task_id] = proc
-            except Exception as e:
-                return json.dumps({
-                    "stdout": "", "stderr": f"后台启动失败: {e}",
-                    "exit_code": -1, "interrupted": False, "timeout": False,
-                    "background": False,
-                }, ensure_ascii=False)
-            return json.dumps({
-                "stdout": "(后台运行中)",
-                "stderr": "",
-                "exit_code": 0,
-                "interrupted": False,
-                "timeout": False,
-                "background": True,
-                "background_task_id": task_id,
-            }, ensure_ascii=False)
+            return self._run_background(command, shell, all_cmd, warnings, gate_res)
 
         # 前台同步
         proc = None
         interrupted = False
         timed_out = False
+        stdout = ""
+        stderr = ""
+        exit_code = -1
 
         try:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             preexec_fn = None if os.name == "nt" else (
                 lambda: signal.signal(signal.SIGPIPE, signal.SIG_DFL))
             proc = subprocess.Popen(
-                shell + [command],
+                shell + [all_cmd],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=creationflags, preexec_fn=preexec_fn,
@@ -193,8 +284,10 @@ class BashTool(Tool):
                 except Exception:
                     stdout, stderr = "", "[进程已终止，输出丢失]"
                 finally:
-                    try: proc.kill()
-                    except Exception: pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
             else:
                 stdout, stderr = "", "[超时]"
             exit_code = -1
@@ -208,13 +301,19 @@ class BashTool(Tool):
 
         self._last_elapsed = time.perf_counter() - t0
 
-        # 输出限制
-        MAX_STDOUT = 100_000
-        MAX_STDERR = 20_000
-        if stdout and len(stdout) > MAX_STDOUT:
-            stdout = stdout[:MAX_STDOUT] + f"\n\n... [{len(stdout) - MAX_STDOUT} 字符已截断] ..."
-        if stderr and len(stderr) > MAX_STDERR:
-            stderr = stderr[:MAX_STDERR] + f"\n... [{len(stderr) - MAX_STDERR} 字符已截断] ..."
+        # 解析并消费 cwd marker（更新 session._cwd，并从 stdout 剔除 marker 行）
+        # 只在用户原始命令显式包含 cd/pushd/Set-Location 时才允许写回，
+        # 防止"未声明的 cd 副作用"污染主 session（例：`cd nonexistent; ls` 链式失败漂移）
+        stdout, _ = self._session.consume_cwd_marker(stdout or "", original_command=command)
+
+        # 输出处理：内存截断 + 视情况落盘到 ./.cbagent/bash_outputs/<task_id>.log
+        task_id = uuid.uuid4().hex[:12]
+        processed = process_output(
+            stdout or "",
+            stderr or "",
+            output_dir=default_output_dir(),
+            task_id=task_id,
+        )
 
         # 退出码语义
         semantic = lookup_semantic(command, exit_code)
@@ -222,22 +321,63 @@ class BashTool(Tool):
         if semantic and semantic["status"] == "ok":
             is_error = False
 
-        # 警告前缀
-        if warnings and stdout:
-            stdout = "\n".join(warnings) + "\n" + stdout
-        elif warnings:
-            stdout = "\n".join(warnings)
-
         return json.dumps({
-            "stdout": stdout or "",
-            "stderr": stderr or "",
+            "stdout": processed.stdout,
+            "stderr": processed.stderr,
             "exit_code": exit_code,
+            "cwd": self._session.cwd,
             "interrupted": interrupted,
             "timeout": timed_out,
             "is_error": is_error,
             "semantic": semantic,
             "background": False,
             "classification": classify_command(command),
+            "warnings": warnings,
+            "output_truncated": processed.output_truncated,
+            "output_file": processed.output_file,
+            "permission": _gate_result_to_dict(gate_res),
+        }, ensure_ascii=False)
+
+    # ========== 后台执行（走 BackgroundRegistry） ==========
+
+    def _run_background(self, command, shell, all_cmd, warnings, gate_res=None) -> str:
+        registry = get_background_registry()
+        task_id = uuid.uuid4().hex[:12]
+        try:
+            task = registry.spawn(
+                task_id=task_id,
+                command=command,
+                argv=shell + [all_cmd],
+                cwd=self._session.cwd,
+            )
+        except Exception as e:
+            return json.dumps({
+                "stdout": "", "stderr": f"后台启动失败: {e}",
+                "exit_code": -1, "cwd": self._session.cwd,
+                "interrupted": False, "timeout": False, "is_error": True,
+                "background": False,
+                "classification": classify_command(command),
+                "warnings": warnings,
+                "permission": _gate_result_to_dict(gate_res),
+            }, ensure_ascii=False)
+        return json.dumps({
+            "stdout": (
+                f"(后台运行中) task_id={task.id}\n"
+                f"输出文件: {task.output_path}\n"
+                "可用 bash_task(action=output|wait|list|kill) 查询。"
+            ),
+            "stderr": "",
+            "exit_code": 0,
+            "cwd": self._session.cwd,
+            "interrupted": False,
+            "timeout": False,
+            "is_error": False,
+            "background": True,
+            "background_task_id": task.id,
+            "output_file": task.output_path,
+            "classification": classify_command(command),
+            "warnings": warnings,
+            "permission": _gate_result_to_dict(gate_res),
         }, ensure_ascii=False)
 
 
