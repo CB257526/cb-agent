@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# cb-agent 运行时产物
+.cbagent/
+
 # C extensions
 *.so
 

@@ -23,6 +23,7 @@ dependencies = [
     "colorama>=0.4.6",        # Windows 终端 ANSI 兜底
     "pyyaml>=6.0",            # Skill SKILL.md frontmatter
     "langdetect>=1.0.9",      # ContextBuilder / RAG 语言检测
+    "bashlex>=0.18",          # BashTool 命令 AST 解析（POSIX shell）
 ]
 
 # full：完整能力，把所有可选模块的依赖一并装上

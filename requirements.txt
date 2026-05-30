@@ -19,3 +19,4 @@ requests>=2.31
 colorama>=0.4.6
 pyyaml>=6.0
 langdetect>=1.0.9
+bashlex>=0.18
