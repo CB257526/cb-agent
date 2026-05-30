@@ -61,6 +61,7 @@ from tools.tools.todo_tool import TodoTool
 from tools.tools.bash_tool import BashTool
 from tools.tools.bash_task_tool import BashTaskTool
 from tools.tools.bash_permission_tool import BashPermissionTool
+from tools.tools.file_read_tool import FileReadTool
 from tools.tools.bash_prompt import get_bash_prompt
 
 try:
@@ -357,6 +358,7 @@ class AgentRunner:
             BashTool(),
             BashTaskTool(),
             BashPermissionTool(),
+            FileReadTool(),
         ]:
             try:
                 self.registry.register_tool(tool)
