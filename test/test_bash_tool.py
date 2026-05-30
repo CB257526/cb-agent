@@ -600,5 +600,134 @@ class TestBashPermissionTool(unittest.TestCase):
         ))
 
 
+class TestFileWrite(unittest.TestCase):
+    """FileWriteTool：创建 / staleness / 原子写入 / UNC。"""
+
+    def setUp(self):
+        from tools.tools.file_state import get_read_state_registry
+        get_read_state_registry().clear()
+        reset_session()
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _tools(self):
+        from tools.tools.file_write_tool import FileWriteTool
+        return FileReadTool(), FileWriteTool()
+
+    def test_create_new_file(self):
+        _, w = self._tools()
+        target = self.tmp / "sub" / "a.txt"
+        res = json.loads(w.run({"path": str(target), "content": "hello"}))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["type"], "create")
+        self.assertEqual(target.read_text(encoding="utf-8"), "hello")
+        self.assertEqual(res["lines_added"], 1)
+        self.assertEqual(res["lines_removed"], 0)
+
+    def test_overwrite_requires_prior_read(self):
+        """已有文件没读过 → 拒绝覆盖。"""
+        _, w = self._tools()
+        target = self.tmp / "exists.txt"
+        target.write_text("old", encoding="utf-8")
+        res = json.loads(w.run({"path": str(target), "content": "new"}))
+        self.assertIn("error", res)
+        self.assertTrue(res.get("needs_read_first"))
+        # 文件应保持不变
+        self.assertEqual(target.read_text(encoding="utf-8"), "old")
+
+    def test_overwrite_after_read_succeeds(self):
+        r, w = self._tools()
+        target = self.tmp / "exists.txt"
+        target.write_text("old\nline2", encoding="utf-8")
+        # 先读
+        json.loads(r.run({"path": str(target)}))
+        # 再写
+        res = json.loads(w.run({
+            "path": str(target),
+            "content": "brand\nnew\ncontent",
+        }))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["type"], "update")
+        self.assertEqual(target.read_text(encoding="utf-8"), "brand\nnew\ncontent")
+
+    def test_staleness_detected(self):
+        """读过之后文件被外部改了 → 拒绝写。"""
+        r, w = self._tools()
+        target = self.tmp / "stale.txt"
+        target.write_text("v1", encoding="utf-8")
+        json.loads(r.run({"path": str(target)}))
+        # 模拟外部修改：mtime 必然往后走
+        time.sleep(0.05)
+        target.write_text("v2-外部改的", encoding="utf-8")
+        res = json.loads(w.run({"path": str(target), "content": "v3"}))
+        self.assertIn("error", res)
+        self.assertTrue(res.get("stale"))
+        # 文件保持外部改后的内容
+        self.assertEqual(target.read_text(encoding="utf-8"), "v2-外部改的")
+
+    def test_unc_rejected(self):
+        _, w = self._tools()
+        for unc in [r"\\server\share\x.txt", "//server/share/x.txt"]:
+            res = json.loads(w.run({"path": unc, "content": "x"}))
+            self.assertIn("error", res, f"UNC {unc} 应被拒绝")
+
+    def test_size_limit(self):
+        from tools.tools.file_write_tool import MAX_WRITE_BYTES
+        _, w = self._tools()
+        target = self.tmp / "big.txt"
+        big = "x" * (MAX_WRITE_BYTES + 1)
+        res = json.loads(w.run({"path": str(target), "content": big}))
+        self.assertIn("error", res)
+        self.assertFalse(target.exists())
+
+    def test_relative_path_uses_session_cwd(self):
+        _, w = self._tools()
+        sess = get_session()
+        sess._cwd = str(self.tmp)
+        res = json.loads(w.run({"path": "rel.txt", "content": "ok"}))
+        self.assertTrue(res["ok"])
+        self.assertTrue((self.tmp / "rel.txt").exists())
+
+    def test_atomic_no_partial_on_disk_failure(self):
+        """模拟 fsync 抛错：tmp 应被清理，目标文件不应留下半个写入。"""
+        from unittest.mock import patch as _patch
+        _, w = self._tools()
+        target = self.tmp / "atom.txt"
+        with _patch("os.fsync", side_effect=OSError("disk full")):
+            res = json.loads(w.run({"path": str(target), "content": "x"}))
+        self.assertIn("error", res)
+        self.assertFalse(target.exists())
+        # tmp 文件不应残留
+        leftover = list(self.tmp.glob(".cbagent_write_*"))
+        self.assertEqual(leftover, [])
+
+    def test_validate_parameters(self):
+        _, w = self._tools()
+        self.assertFalse(w.validate_parameters({}))
+        self.assertFalse(w.validate_parameters({"path": "x"}))
+        self.assertFalse(w.validate_parameters({"content": "x"}))
+        self.assertFalse(w.validate_parameters({"path": 1, "content": "x"}))
+        self.assertTrue(w.validate_parameters({"path": "x", "content": ""}))
+
+
+class TestReadStateRegistry(unittest.TestCase):
+    def test_mark_and_get(self):
+        from tools.tools.file_state import ReadStateRegistry
+        reg = ReadStateRegistry()
+        tmp = Path(tempfile.mkdtemp()) / "x.txt"
+        tmp.write_text("hi", encoding="utf-8")
+        self.assertIsNone(reg.get_read_mtime(tmp))
+        reg.mark_read(tmp)
+        m = reg.get_read_mtime(tmp)
+        self.assertIsNotNone(m)
+        self.assertEqual(m, tmp.stat().st_mtime_ns)
+
+    def test_mark_nonexistent_silent(self):
+        from tools.tools.file_state import ReadStateRegistry
+        reg = ReadStateRegistry()
+        ghost = Path(tempfile.mkdtemp()) / "ghost.txt"
+        reg.mark_read(ghost)  # 不应抛
+        self.assertIsNone(reg.get_read_mtime(ghost))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
