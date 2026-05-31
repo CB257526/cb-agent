@@ -2,9 +2,13 @@
 
 为Agent提供任务管理能力，用于分解复杂任务、跟踪进度、在长对话中保持专注。
 状态保存在内存中，每个Agent实例一份。
+
+并发安全：TodoStore.write/read/format_for_injection 全部用 self._lock 保护。
+配合 ToolExecutor 工具并发场景，避免两个 todo_write 同时改 _items 丢条目。
 """
 
 import json
+import threading
 from typing import Dict, Any, List, Optional
 
 from tools.tool import Tool, ToolParameter
@@ -19,10 +23,14 @@ class TodoStore:
     每个Agent实例对应一个TodoStore。
     任务按列表顺序排列，位置即优先级。
     每个任务包含: id, content, status
+
+    线程安全：所有公共方法在 self._lock 内整段执行，避免并发 write 时
+    "读旧 _items → 改本地副本 → 写回"中间被另一个 write 插入丢条目。
     """
 
     def __init__(self):
         self._items: List[Dict[str, str]] = []
+        self._lock = threading.Lock()
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """写入待办任务，返回写入后的完整列表
@@ -31,72 +39,76 @@ class TodoStore:
             todos: 任务列表，每项为 {id, content, status}
             merge: False=替换整个列表, True=按id更新已有项并追加新项
         """
-        if not merge:
-            self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
-        else:
-            existing = {item["id"]: item for item in self._items}
-            for t in self._dedupe_by_id(todos):
-                item_id = str(t.get("id", "")).strip()
-                if not item_id:
-                    continue
-                if item_id in existing:
-                    if "content" in t and t["content"]:
-                        existing[item_id]["content"] = str(t["content"]).strip()
-                    if "status" in t and t["status"]:
-                        status = str(t["status"]).strip().lower()
-                        if status in VALID_STATUSES:
-                            existing[item_id]["status"] = status
-                else:
-                    validated = self._validate(t)
-                    existing[validated["id"]] = validated
-                    self._items.append(validated)
-            # 重建列表，保持原有顺序
-            seen = set()
-            rebuilt = []
-            for item in self._items:
-                current = existing.get(item["id"], item)
-                if current["id"] not in seen:
-                    rebuilt.append(current)
-                    seen.add(current["id"])
-            self._items = rebuilt
-        return self.read()
+        with self._lock:
+            if not merge:
+                self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
+            else:
+                existing = {item["id"]: item for item in self._items}
+                for t in self._dedupe_by_id(todos):
+                    item_id = str(t.get("id", "")).strip()
+                    if not item_id:
+                        continue
+                    if item_id in existing:
+                        if "content" in t and t["content"]:
+                            existing[item_id]["content"] = str(t["content"]).strip()
+                        if "status" in t and t["status"]:
+                            status = str(t["status"]).strip().lower()
+                            if status in VALID_STATUSES:
+                                existing[item_id]["status"] = status
+                    else:
+                        validated = self._validate(t)
+                        existing[validated["id"]] = validated
+                        self._items.append(validated)
+                # 重建列表，保持原有顺序
+                seen = set()
+                rebuilt = []
+                for item in self._items:
+                    current = existing.get(item["id"], item)
+                    if current["id"] not in seen:
+                        rebuilt.append(current)
+                        seen.add(current["id"])
+                self._items = rebuilt
+            return [item.copy() for item in self._items]
 
     def read(self) -> List[Dict[str, str]]:
         """返回当前列表的副本"""
-        return [item.copy() for item in self._items]
+        with self._lock:
+            return [item.copy() for item in self._items]
 
     def has_items(self) -> bool:
         """检查是否有任务"""
-        return bool(self._items)
+        with self._lock:
+            return bool(self._items)
 
     def format_for_injection(self) -> Optional[str]:
         """渲染待办列表，用于上下文压缩后注入
 
         只注入 pending/in_progress 的任务，避免压缩后重复已完成的工作。
         """
-        if not self._items:
-            return None
+        with self._lock:
+            if not self._items:
+                return None
 
-        markers = {
-            "completed": "[x]",
-            "in_progress": "[>]",
-            "pending": "[ ]",
-            "cancelled": "[~]",
-        }
+            markers = {
+                "completed": "[x]",
+                "in_progress": "[>]",
+                "pending": "[ ]",
+                "cancelled": "[~]",
+            }
 
-        active_items = [
-            item for item in self._items
-            if item["status"] in ("pending", "in_progress")
-        ]
-        if not active_items:
-            return None
+            active_items = [
+                item for item in self._items
+                if item["status"] in ("pending", "in_progress")
+            ]
+            if not active_items:
+                return None
 
-        lines = ["[你的活跃任务列表已在上下文压缩中保留]"]
-        for item in active_items:
-            marker = markers.get(item["status"], "[?]")
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
+            lines = ["[你的活跃任务列表已在上下文压缩中保留]"]
+            for item in active_items:
+                marker = markers.get(item["status"], "[?]")
+                lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
 
-        return "\n".join(lines)
+            return "\n".join(lines)
 
     @staticmethod
     def _validate(item: Dict[str, Any]) -> Dict[str, str]:
