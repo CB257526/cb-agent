@@ -130,7 +130,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             toolName: e.name,
             toolArgs: e.arguments,
             toolDone: false,
-            collapsed: true,
+            collapsed: false,
           }]);
           break;
         }

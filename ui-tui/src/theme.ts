@@ -37,7 +37,7 @@ export const theme = {
   bashBorder: "#5c6370",
 
   /** assistant Byline 标识颜色 */
-  claude: "#bb9af7",
+  agent: "#bb9af7",
 } as const;
 
 export type ThemeKey = keyof typeof theme;

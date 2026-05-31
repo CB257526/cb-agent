@@ -27,7 +27,7 @@ export function Banner({ model, cwd }: { model: string; cwd: string }) {
       <Box marginTop={0}>
         <Text dimColor>
           <Byline>
-            <Text color={theme.claude} bold>{model}</Text>
+            <Text color={theme.agent} bold>{model}</Text>
             <Text>{shortCwd}</Text>
             <Text>Ctrl-O for log</Text>
             <Text>/ for commands</Text>

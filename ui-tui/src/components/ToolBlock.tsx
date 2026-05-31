@@ -5,11 +5,21 @@ import { StatusIcon } from "./StatusIcon.js";
 import { theme } from "../theme.js";
 
 /**
- * 工具调用块。折叠时显示 `⏵ name(args 摘要)  ✓ 0.02s`，展开时多显示完整 args 和 result。
+ * 工具调用块。
  *
- * cb-agent 工具结果是 JSON 字符串，长度可能从 50 字到几千字不等——这里只截前 600 字，
- * 完整内容用户可以从 stderr 日志或者 result.* 文件查。
+ * 折叠态：⏵ name(args 摘要)  ✓ 0.02s
+ * 展开态（默认）：上方一行标题 + 一个外框，框内分两段——
+ *   IN  : 完整 args（JSON 漂亮打印 / bash 命令直接显示）
+ *   OUT : 工具结果，截前 800 字
+ *
+ * cb-agent 工具结果是 JSON 字符串或 shell stdout/stderr，长度可能从 50 字到几千字。
+ * 这里截 800 字给一个"看得见但不刷屏"的预览，完整内容用户可以从 stderr 日志或
+ * result.* 文件查。
  */
+
+const RESULT_MAX = 800;
+const ARGS_MAX = 400;
+
 export function ToolBlock({ item }: { item: ChatItem }) {
   const argsBrief = summarizeArgs(item.toolArgs);
   const status = item.toolDone
@@ -18,19 +28,55 @@ export function ToolBlock({ item }: { item: ChatItem }) {
       : <Text color={theme.success}><StatusIcon status="success" withSpace />{item.toolDuration?.toFixed(2)}s</Text>
     : <Text color={theme.warning}><StatusIcon status="loading" withSpace />running</Text>;
 
+  // 折叠态：保持原来的紧凑单行
+  if (item.collapsed) {
+    return (
+      <Box flexDirection="column" marginY={0}>
+        <Box>
+          <Text color={theme.suggestion}>⏵ </Text>
+          <Text bold>{item.toolName}</Text>
+          <Text dimColor>({argsBrief})  </Text>
+          {status}
+        </Box>
+      </Box>
+    );
+  }
+
+  // 展开态：标题 + IN/OUT 框
+  const argsFull = formatArgsFull(item.toolArgs);
+  const result = item.toolResult ?? "";
+  const hasResult = result.length > 0;
+
   return (
     <Box flexDirection="column" marginY={0}>
       <Box>
-        <Text color={theme.suggestion}>⏵ </Text>
-        <Text bold>{item.toolName}</Text>
-        <Text dimColor>({argsBrief})  </Text>
+        <Text color={theme.suggestion}>● </Text>
+        <Text bold color={theme.suggestion}>{item.toolName}</Text>
+        <Text dimColor>  ({argsBrief})  </Text>
         {status}
       </Box>
-      {!item.collapsed && item.toolResult && (
-        <Box marginLeft={2} flexDirection="column" borderStyle="single" borderColor={theme.bashBorder} paddingX={1}>
-          <Text dimColor>{truncate(item.toolResult, 600)}</Text>
-        </Box>
-      )}
+      <Box marginLeft={2} flexDirection="column" borderStyle="single" borderColor={theme.bashBorder} paddingX={1}>
+        {argsFull && (
+          <Box flexDirection="row">
+            <Box width={5}><Text dimColor>IN</Text></Box>
+            <Box flexDirection="column" flexGrow={1}>
+              {truncate(argsFull, ARGS_MAX).split("\n").map((line, i) => (
+                <Text key={i}>{line}</Text>
+              ))}
+            </Box>
+          </Box>
+        )}
+        {hasResult && (
+          <Box flexDirection="row" marginTop={argsFull ? 1 : 0}>
+            <Box width={5}><Text dimColor>OUT</Text></Box>
+            <Box flexDirection="column" flexGrow={1}>
+              {truncate(result, RESULT_MAX).split("\n").map((line, i) => (
+                <Text key={i} color={item.toolError ? theme.error : undefined}>{line}</Text>
+              ))}
+            </Box>
+          </Box>
+        )}
+      </Box>
     </Box>
   );
 }
@@ -51,6 +97,25 @@ function formatValue(v: unknown): string {
   if (Array.isArray(v)) return `[${v.length}]`;
   if (typeof v === "object" && v !== null) return "{...}";
   return String(v);
+}
+
+/**
+ * 完整参数渲染：
+ * - 单字段且为字符串（最常见的 bash command / 命令行）→ 直出原文
+ * - 其他 → JSON.stringify(2) 漂亮打印
+ */
+function formatArgsFull(args?: Record<string, unknown>): string {
+  if (!args) return "";
+  const entries = Object.entries(args);
+  if (entries.length === 0) return "";
+  if (entries.length === 1 && typeof entries[0][1] === "string") {
+    return entries[0][1] as string;
+  }
+  try {
+    return JSON.stringify(args, null, 2);
+  } catch {
+    return String(args);
+  }
 }
 
 function truncate(s: string, max: number): string {

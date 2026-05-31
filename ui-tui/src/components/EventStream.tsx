@@ -51,7 +51,7 @@ function renderItem(
     return (
       <Box flexDirection="column" paddingLeft={2}>
         <Box>
-          <Text color={theme.claude} bold>claude  </Text>
+          <Text color={theme.agent} bold>cbagent  </Text>
         </Box>
         <Box>
           <Text>{item.text}</Text>
