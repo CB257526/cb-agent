@@ -24,6 +24,7 @@ export type EventType =
   | "background_notification"
   | "ask_user_question"
   | "ask_user_question_answered"
+  | "todo_list_updated"
   | "gateway_ready";  // gateway 自定义，不在 events.py 里
 
 export interface BaseEvent {
@@ -127,6 +128,17 @@ export interface AskUserQuestionAnswered extends BaseEvent {
   cancelled: boolean;
 }
 
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+}
+
+export interface TodoListUpdated extends BaseEvent {
+  type: "todo_list_updated";
+  items: TodoItem[];
+}
+
 export type AgentEvent =
   | TextDelta
   | ReasoningDelta
@@ -141,11 +153,12 @@ export type AgentEvent =
   | GatewayReady
   | AskUserQuestion
   | AskUserQuestionAnswered
+  | TodoListUpdated
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========
 
-export type Role = "user" | "assistant" | "tool" | "system" | "ask_question";
+export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought";
 
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */
 export interface ChatItem {
@@ -170,4 +183,6 @@ export interface ChatItem {
   answerLabels?: string[];
   answerOther?: string;
   answerCancelled?: boolean;
+  // todo（todo role 用）：每次 todo 写入产生一个新 item，items 是该次写入后的全量列表
+  todoItems?: TodoItem[];
 }

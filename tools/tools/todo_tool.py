@@ -12,6 +12,8 @@ import threading
 from typing import Dict, Any, List, Optional
 
 from tools.tool import Tool, ToolParameter
+from agent.event_bus import EventBus
+from agent.events import TodoListUpdated
 
 # 有效的任务状态
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
@@ -146,7 +148,7 @@ class TodoTool(Tool):
     - 按id合并更新
     """
 
-    def __init__(self):
+    def __init__(self, event_bus: Optional[EventBus] = None):
         super().__init__(
             name="todo",
             description=(
@@ -155,6 +157,9 @@ class TodoTool(Tool):
             )
         )
         self.store = TodoStore()
+        # 可选事件总线：写入后 emit TodoListUpdated 让 UI 单独渲染面板。
+        # None 时不发事件（旧 CLI / 单测路径），保持原行为。
+        self._bus = event_bus
 
     def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
         """验证工具参数"""
@@ -199,6 +204,13 @@ class TodoTool(Tool):
 
         if todos is not None:
             items = self.store.write(todos, merge)
+            # 写入操作才广播；纯读取不发事件（避免重复刷面板）
+            if self._bus is not None:
+                try:
+                    self._bus.emit(TodoListUpdated(items=[i.copy() for i in items]))
+                except Exception:
+                    # bus 故障不影响工具结果；执行器还会捕一层
+                    pass
         else:
             items = self.store.read()
 

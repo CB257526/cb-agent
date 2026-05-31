@@ -94,6 +94,33 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           break;
         }
 
+        case "reasoning_delta": {
+          // 思考流：增量拼接到最近一个 thought item；遇到非 thought（如 assistant
+          // 文本已经开始 / 工具块插进来）就开新的一块，让 thought 始终独立成段
+          const delta = (ev as any).delta as string;
+          setItems((prev) => {
+            const last = prev[prev.length - 1];
+            if (last && last.role === "thought") {
+              const updated = { ...last, text: last.text + delta };
+              return [...prev.slice(0, -1), updated];
+            }
+            return [...prev, { id: nextId(), role: "thought", text: delta }];
+          });
+          break;
+        }
+
+        case "todo_list_updated": {
+          // 按用户偏好：每次写入都新增一张卡片，不去重 / 替换
+          const e = ev as any;
+          setItems((prev) => [...prev, {
+            id: nextId(),
+            role: "todo",
+            text: "",
+            todoItems: e.items ?? [],
+          }]);
+          break;
+        }
+
         case "tool_start": {
           const e = ev as any;
           setItems((prev) => [...prev, {

@@ -200,6 +200,24 @@ class AskUserQuestionAnswered:
     type: str = field(default="ask_user_question_answered", init=False)
 
 
+# ========== Todo 事件 ==========
+
+
+@dataclass
+class TodoListUpdated:
+    """todo 工具写入后的结构化广播；UI 用它单独渲染 todo 面板，
+    避免靠解析 tool_complete 的 JSON 字符串。
+
+    items: list of {id: str, content: str, status: str}
+        status ∈ {pending, in_progress, completed, cancelled}
+    每次都是**全量列表**（不是 diff），UI 直接整片替换/追加一张新卡片。
+    """
+    items: List[Dict[str, str]]
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="todo_list_updated", init=False)
+
+
 # ========== Union 类型（订阅者用 isinstance 区分）==========
 
 
@@ -218,6 +236,7 @@ Event = Union[
     BackgroundNotification,
     AskUserQuestion,
     AskUserQuestionAnswered,
+    TodoListUpdated,
 ]
 
 

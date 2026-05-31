@@ -4,6 +4,7 @@ import { ChatItem } from "../types.js";
 import { ToolBlock } from "./ToolBlock.js";
 import { Pane } from "./Pane.js";
 import { AskQuestionPanel } from "./AskQuestionPanel.js";
+import { TodoPanel } from "./TodoPanel.js";
 import { theme } from "../theme.js";
 
 interface Props {
@@ -60,6 +61,22 @@ function renderItem(
   }
   if (item.role === "tool") {
     return <ToolBlock item={item} />;
+  }
+  if (item.role === "todo") {
+    return <TodoPanel items={item.todoItems ?? []} />;
+  }
+  if (item.role === "thought") {
+    // dim 灰显的"思考流"块；折叠机制简单——长度过长会自然换行，前端不主动截
+    return (
+      <Box flexDirection="column" paddingLeft={2}>
+        <Box>
+          <Text dimColor italic>💭 thinking</Text>
+        </Box>
+        <Box>
+          <Text dimColor>{item.text}</Text>
+        </Box>
+      </Box>
+    );
   }
   if (item.role === "ask_question") {
     // 仅给当前 active 的问题接 onAnswer；其他（已答 / 旧的）传 undefined → 转纯展示

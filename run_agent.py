@@ -217,7 +217,7 @@ class AgentRunner:
         for tool in [
             self._memory_tool,
             self._rag_tool,
-            TodoTool(),
+            TodoTool(event_bus=self.event_bus),
             SearchTool(),
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),
