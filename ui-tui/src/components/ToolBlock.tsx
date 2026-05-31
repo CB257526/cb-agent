@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useMemo } from "react";
 import { Box, Text } from "ink";
 import { ChatItem } from "../types.js";
 import { StatusIcon } from "./StatusIcon.js";
@@ -20,7 +20,7 @@ import { theme } from "../theme.js";
 const RESULT_MAX = 800;
 const ARGS_MAX = 400;
 
-export function ToolBlock({ item }: { item: ChatItem }) {
+export const ToolBlock = React.memo(function ToolBlock({ item }: { item: ChatItem }) {
   const argsBrief = summarizeArgs(item.toolArgs);
   const status = item.toolDone
     ? item.toolError
@@ -43,10 +43,17 @@ export function ToolBlock({ item }: { item: ChatItem }) {
   }
 
   // 展开态：标题 + IN/OUT 框
-  const argsFull = formatArgsFull(item.toolArgs);
+  const argsFull = useMemo(() => formatArgsFull(item.toolArgs), [item.toolArgs]);
   const result = item.toolResult ?? "";
-  const display = extractDisplay(result);
-  const renderResult = display ?? result;
+  const renderResult = useMemo(() => extractDisplay(result) ?? result, [result]);
+  const argsLines = useMemo(
+    () => (argsFull ? truncate(argsFull, ARGS_MAX).split("\n") : []),
+    [argsFull],
+  );
+  const resultLines = useMemo(
+    () => (renderResult ? truncate(renderResult, RESULT_MAX).split("\n") : []),
+    [renderResult],
+  );
   const hasResult = renderResult.length > 0;
 
   return (
@@ -62,7 +69,7 @@ export function ToolBlock({ item }: { item: ChatItem }) {
           <Box flexDirection="row">
             <Box width={5}><Text dimColor>IN</Text></Box>
             <Box flexDirection="column" flexGrow={1}>
-              {truncate(argsFull, ARGS_MAX).split("\n").map((line, i) => (
+              {argsLines.map((line, i) => (
                 <Text key={i}>{line}</Text>
               ))}
             </Box>
@@ -72,7 +79,7 @@ export function ToolBlock({ item }: { item: ChatItem }) {
           <Box flexDirection="row" marginTop={argsFull ? 1 : 0}>
             <Box width={5}><Text dimColor>OUT</Text></Box>
             <Box flexDirection="column" flexGrow={1}>
-              {truncate(renderResult, RESULT_MAX).split("\n").map((line, i) => (
+              {resultLines.map((line, i) => (
                 <Text key={i} color={item.toolError ? theme.error : undefined}>{line}</Text>
               ))}
             </Box>
@@ -81,7 +88,7 @@ export function ToolBlock({ item }: { item: ChatItem }) {
       </Box>
     </Box>
   );
-}
+});
 
 function summarizeArgs(args?: Record<string, unknown>): string {
   if (!args) return "";

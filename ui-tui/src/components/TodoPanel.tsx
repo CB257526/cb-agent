@@ -24,7 +24,7 @@ const MARK = {
   cancelled: "⊠",
 } as const;
 
-export function TodoPanel({ items }: { items: TodoItem[] }) {
+export const TodoPanel = React.memo(function TodoPanel({ items }: { items: TodoItem[] }) {
   return (
     <Box flexDirection="column">
       <Box>
@@ -40,7 +40,7 @@ export function TodoPanel({ items }: { items: TodoItem[] }) {
       </Box>
     </Box>
   );
-}
+});
 
 function TodoRow({ item }: { item: TodoItem }) {
   const mark = MARK[item.status] ?? "·";

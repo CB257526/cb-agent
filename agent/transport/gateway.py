@@ -34,6 +34,7 @@ import asyncio
 import logging
 import sys
 import threading
+import time
 from typing import Any, Dict, Optional, TextIO
 
 from agent.cancel import CancelToken
@@ -90,6 +91,7 @@ class Gateway:
         self._chat_task: Optional[asyncio.Task] = None
         self._busy = False  # 同一时间只允许一个 chat
         self._busy_lock = threading.Lock()
+        self._evcount: Dict[str, int] = {}
 
         # 订阅所有事件 → 写 transport
         # subscribe 不传 type 表示订阅全部
@@ -98,11 +100,24 @@ class Gateway:
     # ---------- agent → UI ----------
 
     def _on_event(self, event: Event) -> None:
+        _t = time.perf_counter()
         msg = make_event_message(event)
         ok = self.transport.write(msg)
+        _elapsed = time.perf_counter() - _t
+        ev_type = getattr(event, "type", "?")
+        # reasoning/text_delta 量大，每 50 个采样 + 慢的（>50ms）一定打
+        cnt = self._evcount.get(ev_type, 0) + 1
+        self._evcount[ev_type] = cnt
+        if _elapsed >= 0.05:
+            logger.warning("GW_EVT_SLOW type=%s n=%d write_elapsed=%.3fs", ev_type, cnt, _elapsed)
+        elif ev_type in ("reasoning_delta", "text_delta"):
+            if cnt % 50 == 1:
+                logger.warning("GW_EVT type=%s n=%d write_elapsed=%.3fs", ev_type, cnt, _elapsed)
+        else:
+            logger.warning("GW_EVT type=%s n=%d write_elapsed=%.3fs", ev_type, cnt, _elapsed)
         if not ok:
             # peer 关了，没办法挽救；后续事件继续 write 也都会立即失败
-            logger.warning("transport closed while emitting %s", getattr(event, "type", "?"))
+            logger.warning("transport closed while emitting %s", ev_type)
 
     # ---------- UI → agent ----------
 
@@ -287,6 +302,8 @@ class Gateway:
             other_text=other_text if isinstance(other_text, str) else None,
             cancelled=cancelled,
         )
+        logger.warning("GATEWAY_TRACE answer_question qid=%s labels=%r delivered=%s",
+            qid, labels, delivered)
         self.transport.write(make_response(rpc_id, result={"delivered": delivered}))
 
     # ---------- 启动 ----------

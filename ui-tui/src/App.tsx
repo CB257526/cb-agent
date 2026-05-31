@@ -19,7 +19,7 @@
 
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
-import { Transport } from "./transport.js";
+import { Transport, uiTrace } from "./transport.js";
 import { AgentEvent, ChatItem } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
@@ -64,6 +64,57 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
+  // 流式 delta 的频率统计（用于诊断卡顿）
+  const _deltaCounts = useRef<{ reasoning: number; text: number }>({ reasoning: 0, text: 0 });
+
+  // 流式增量节流：DeepSeek thinking/text 一秒能发几十条 chunk，每条都 setItems
+  // 会导致 ink 整树重渲 + stdout ANSI 全屏重画 → 事件循环压不过来 → stdin pipe
+  // 反压回 Python，整条链路就卡住。把高频 delta 累积到 ref，每 ~60ms flush 一次。
+  const _pendingDelta = useRef<{ reasoning: string; text: string }>({ reasoning: "", text: "" });
+  const _flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushDelta = useCallback(() => {
+    _flushTimer.current = null;
+    const r = _pendingDelta.current.reasoning;
+    const t = _pendingDelta.current.text;
+    _pendingDelta.current = { reasoning: "", text: "" };
+    if (!r && !t) return;
+    setItems((prev) => {
+      let next = prev;
+      if (r) {
+        const last = next[next.length - 1];
+        if (last && last.role === "thought") {
+          next = [...next.slice(0, -1), { ...last, text: last.text + r }];
+        } else {
+          next = [...next, { id: nextId(), role: "thought", text: r }];
+        }
+      }
+      if (t) {
+        const last = next[next.length - 1];
+        if (last && last.role === "assistant") {
+          next = [...next.slice(0, -1), { ...last, text: last.text + t }];
+        } else {
+          next = [...next, { id: nextId(), role: "assistant", text: t }];
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  const scheduleFlush = useCallback(() => {
+    if (_flushTimer.current !== null) return;
+    _flushTimer.current = setTimeout(flushDelta, 60);
+  }, [flushDelta]);
+
+  // 在边界事件（tool_start / done / round_end / ask_user_question 等）前要立即 flush，
+  // 否则攒着的 reasoning 文本会被排到工具卡片后面，时序错乱
+  const flushNow = useCallback(() => {
+    if (_flushTimer.current !== null) {
+      clearTimeout(_flushTimer.current);
+    }
+    flushDelta();
+  }, [flushDelta]);
+
   const appendSystem = useCallback((text: string, color: "red" | "yellow" | "gray" = "gray") => {
     setItems((prev) => [...prev, { id: nextId(), role: "system", text }]);
   }, []);
@@ -83,14 +134,12 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
         case "text_delta": {
           const delta = (ev as any).delta as string;
-          setItems((prev) => {
-            const last = prev[prev.length - 1];
-            if (last && last.role === "assistant") {
-              const updated = { ...last, text: last.text + delta };
-              return [...prev.slice(0, -1), updated];
-            }
-            return [...prev, { id: nextId(), role: "assistant", text: delta }];
-          });
+          const cn = ++_deltaCounts.current.text;
+          if (cn === 1 || cn % 30 === 0) {
+            uiTrace(`text_delta n=${cn} items_len=${itemsRef.current.length}`);
+          }
+          _pendingDelta.current.text += delta;
+          scheduleFlush();
           break;
         }
 
@@ -98,19 +147,18 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           // 思考流：增量拼接到最近一个 thought item；遇到非 thought（如 assistant
           // 文本已经开始 / 工具块插进来）就开新的一块，让 thought 始终独立成段
           const delta = (ev as any).delta as string;
-          setItems((prev) => {
-            const last = prev[prev.length - 1];
-            if (last && last.role === "thought") {
-              const updated = { ...last, text: last.text + delta };
-              return [...prev.slice(0, -1), updated];
-            }
-            return [...prev, { id: nextId(), role: "thought", text: delta }];
-          });
+          const cn = ++_deltaCounts.current.reasoning;
+          if (cn === 1 || cn % 30 === 0) {
+            uiTrace(`reasoning_delta n=${cn} items_len=${itemsRef.current.length}`);
+          }
+          _pendingDelta.current.reasoning += delta;
+          scheduleFlush();
           break;
         }
 
         case "todo_list_updated": {
           // 按用户偏好：每次写入都新增一张卡片，不去重 / 替换
+          flushNow();
           const e = ev as any;
           setItems((prev) => [...prev, {
             id: nextId(),
@@ -122,6 +170,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         }
 
         case "tool_start": {
+          flushNow();
           const e = ev as any;
           setItems((prev) => [...prev, {
             id: nextId(),
@@ -136,6 +185,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         }
 
         case "tool_complete": {
+          flushNow();
           const e = ev as any;
           setItems((prev) => {
             // 从后往前找最近一个未完成的同 name 工具（cb-agent call_id 不在 ToolStart 上裸传，
@@ -166,21 +216,27 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         }
 
         case "done":
+          flushNow();
+          uiTrace(`done items_len=${itemsRef.current.length} reasoning_n=${_deltaCounts.current.reasoning} text_n=${_deltaCounts.current.text}`);
+          _deltaCounts.current = { reasoning: 0, text: 0 };
           setBusy(false);
           setRound(0);
           break;
 
         case "error":
+          flushNow();
           appendSystem(`✗ ${(ev as any).where}: ${(ev as any).message}`);
           setBusy(false);
           break;
 
         case "cancelled":
+          flushNow();
           appendSystem(`⏸ 已中断 (${(ev as any).where})`);
           setBusy(false);
           break;
 
         case "ask_user_question": {
+          flushNow();
           const e = ev as any;
           setItems((prev) => [...prev, {
             id: nextId(),
@@ -199,6 +255,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         }
 
         case "ask_user_question_answered": {
+          flushNow();
           const e = ev as any;
           setItems((prev) => {
             for (let i = prev.length - 1; i >= 0; i--) {
@@ -252,6 +309,10 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       transport.removeListener("protocolError", onProtoErr);
       transport.removeListener("exit", onExit);
       transport.removeListener("stderr", onStderr);
+      if (_flushTimer.current !== null) {
+        clearTimeout(_flushTimer.current);
+        _flushTimer.current = null;
+      }
     };
   }, [transport, exit, appendSystem]);
 

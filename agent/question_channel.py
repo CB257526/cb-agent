@@ -14,12 +14,16 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from agent.cancel import get_current_cancel_token
 from agent.event_bus import EventBus
 from agent.events import AskUserQuestion, AskUserQuestionAnswered
 from agent.question_registry import QuestionRegistry
+
+_logger = logging.getLogger(__name__)
 
 
 class QuestionChannel:
@@ -39,6 +43,8 @@ class QuestionChannel:
         """
         qid = self._registry.new_question_id()
         self._registry.register(qid)
+        _t = time.perf_counter()
+        _logger.warning("QCHAN_TRACE qid=%s emit AskUserQuestion", qid)
 
         self._bus.emit(AskUserQuestion(
             question_id=qid,
@@ -56,6 +62,9 @@ class QuestionChannel:
             slot = self._registry.wait_for_answer(qid, cancel_event=cancel_event)
         finally:
             self._registry.discard(qid)
+
+        _logger.warning("QCHAN_TRACE qid=%s wait done cancelled=%s waited=%.2fs",
+            qid, slot.cancelled, time.perf_counter()-_t)
 
         self._bus.emit(AskUserQuestionAnswered(
             question_id=qid,

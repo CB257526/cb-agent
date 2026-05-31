@@ -28,14 +28,14 @@ type Block =
 
 interface Span { text: string; bold?: boolean; italic?: boolean; code?: boolean }
 
-export function Markdown({ text }: { text: string }) {
+export const Markdown = React.memo(function Markdown({ text }: { text: string }) {
   const blocks = parseBlocks(text);
   return (
     <Box flexDirection="column">
       {blocks.map((b, i) => <BlockView key={i} b={b} />)}
     </Box>
   );
-}
+});
 
 // ---------- 解析 ----------
 

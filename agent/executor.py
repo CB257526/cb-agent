@@ -247,6 +247,7 @@ class ToolExecutor:
                 call_id=call_id, name=name, arguments=args, round_idx=round_idx,
             ))
 
+        logger.warning("EXEC_TRACE call_id=%s name=%s args=%r start", call_id, name, str(args)[:120])
         start = time.perf_counter()
         is_error = False
         try:
@@ -259,6 +260,8 @@ class ToolExecutor:
             )
             is_error = True
         duration = time.perf_counter() - start
+        logger.warning("EXEC_TRACE call_id=%s name=%s done duration=%.2fs is_error=%s",
+            call_id, name, duration, is_error)
 
         if self._bus is not None:
             self._bus.emit(ToolComplete(

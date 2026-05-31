@@ -81,15 +81,32 @@ function renderItem(
     // 仅给当前 active 的问题接 onAnswer；其他（已答 / 旧的）传 undefined → 转纯展示
     const isActive = !!activeQuestionId && item.questionId === activeQuestionId && !item.answered;
     return (
-      <AskQuestionPanel
+      <AskQuestionRow
         item={item}
-        onAnswer={
-          isActive && onAnswerQuestion
-            ? (p) => onAnswerQuestion(item.questionId!, p)
-            : undefined
-        }
+        isActive={isActive}
+        onAnswerQuestion={onAnswerQuestion}
       />
     );
   }
   return <Text dimColor>{item.text}</Text>;
 }
+
+const AskQuestionRow = React.memo(function AskQuestionRow({
+  item,
+  isActive,
+  onAnswerQuestion,
+}: {
+  item: ChatItem;
+  isActive: boolean;
+  onAnswerQuestion?: Props["onAnswerQuestion"];
+}) {
+  const onAnswer = React.useMemo(
+    () =>
+      isActive && onAnswerQuestion
+        ? (p: { selected_labels: string[]; other_text?: string; cancelled?: boolean }) =>
+            onAnswerQuestion(item.questionId!, p)
+        : undefined,
+    [isActive, onAnswerQuestion, item.questionId],
+  );
+  return <AskQuestionPanel item={item} onAnswer={onAnswer} />;
+});

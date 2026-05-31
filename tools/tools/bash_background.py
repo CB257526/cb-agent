@@ -96,6 +96,7 @@ class BackgroundRegistry:
         try:
             popen = subprocess.Popen(
                 argv,
+                stdin=subprocess.DEVNULL,
                 stdout=log_fp,
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags,

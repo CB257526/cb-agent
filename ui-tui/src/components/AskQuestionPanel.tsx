@@ -28,7 +28,7 @@ interface Props {
 
 const OTHER_LABEL = "Other";
 
-export function AskQuestionPanel({ item, onAnswer }: Props) {
+export const AskQuestionPanel = React.memo(function AskQuestionPanel({ item, onAnswer }: Props) {
   const pending = !item.answered;
   const options: AskQuestionOption[] = item.options ?? [];
   const multi = !!item.multiSelect;
@@ -175,4 +175,4 @@ export function AskQuestionPanel({ item, onAnswer }: Props) {
       ) : null}
     </Box>
   );
-}
+});

@@ -1,5 +1,7 @@
 import os
 import threading
+import logging
+import time
 from openai import OpenAI
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Any
@@ -11,6 +13,8 @@ from agent.events import (
 )
 # 加载 .env 文件中的环境变量
 load_dotenv()
+
+_llm_logger = logging.getLogger("agent.cb_agents")
 
 
 def _usage_to_dict(usage: Any) -> Optional[Dict[str, int]]:
@@ -223,9 +227,18 @@ class CbAgentsLLM:
         # 控制可见正文的打印：只有真正开始吐 content 时才打 "assistant > " 前缀
         printed_prefix = False
 
+        _t0 = time.perf_counter()
+        _chunk_n = 0
+        _r_chars = 0
+        _c_chars = 0
+        _last_log = _t0
+        _llm_logger.warning("LLM_TRACE round=%s stream begin", round_idx)
+
         for chunk in response:
+            _chunk_n += 1
             # cancel 检查放最前面：保证下一 chunk 边界能优雅退出
             if cancel_event is not None and cancel_event.is_set():
+                _llm_logger.warning("LLM_TRACE round=%s cancelled at chunk=%d", round_idx, _chunk_n)
                 if event_bus is not None:
                     event_bus.emit(Cancelled(where="llm_stream", round_idx=round_idx))
                 break
@@ -242,6 +255,7 @@ class CbAgentsLLM:
             # 1) 普通 content：直接流式打到终端（无 bus 时）或经 bus 派发
             piece = getattr(delta, "content", None) or ""
             if piece:
+                _c_chars += len(piece)
                 if event_bus is None:
                     if not printed_prefix:
                         print("\nassistant > ", end="", flush=True)
@@ -260,6 +274,7 @@ class CbAgentsLLM:
             #    交给上层 run_agent 渲染成 "Thought for Xs" 块
             r_piece = getattr(delta, "reasoning_content", None) or ""
             if r_piece:
+                _r_chars += len(r_piece)
                 reasoning_parts.append(r_piece)
                 reasoning_accumulated += r_piece
                 if event_bus is not None:
@@ -291,6 +306,20 @@ class CbAgentsLLM:
                         slot["function"]["name"] += fn.name
                     if getattr(fn, "arguments", None):
                         slot["function"]["arguments"] += fn.arguments
+
+            # 每 0.5s 打一次进度（避免 chunk 太密日志爆）
+            _now = time.perf_counter()
+            if _now - _last_log >= 0.5:
+                _llm_logger.warning(
+                    "LLM_TRACE round=%s chunks=%d r_chars=%d c_chars=%d t+%.2fs",
+                    round_idx, _chunk_n, _r_chars, _c_chars, _now - _t0,
+                )
+                _last_log = _now
+
+        _llm_logger.warning(
+            "LLM_TRACE round=%s stream end chunks=%d r_chars=%d c_chars=%d total=%.2fs",
+            round_idx, _chunk_n, _r_chars, _c_chars, time.perf_counter() - _t0,
+        )
 
         if event_bus is None and printed_prefix:
             print()  # 流式正文末尾补换行（旧行为）
