@@ -22,13 +22,19 @@ ContextBuilder / ToolRegistry / Executor / LLM 都从外部传入，便于测试
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
+from agent.cancel import (
+    CancelToken,
+    set_current_cancel_token,
+    reset_current_cancel_token,
+)
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import (
-    BackgroundNotification, Done, Error, RoundEnd, RoundStart,
+    BackgroundNotification, Cancelled, Done, Error, RoundEnd, RoundStart,
 )
 from agent.executor import ToolExecutor
 from context import ContextBuilder
@@ -78,14 +84,62 @@ class AgentSession:
         self.history_window = history_window
         self.messages_snapshot_hook = messages_snapshot_hook
         self.history: List[Message] = []
+        # 当前正在跑的 chat 的 cancel token；REPL 收 Ctrl-C 时调它的 .cancel()
+        # 没在 chat 中时为 None
+        self.current_cancel_token: Optional[CancelToken] = None
 
     # ---------- 公共入口 ----------
 
-    def chat(self, user_query: str) -> str:
+    def chat(
+        self,
+        user_query: str,
+        cancel_token: Optional[CancelToken] = None,
+    ) -> str:
         """处理一次用户输入，返回最终答案字符串。
 
         全程经 self.event_bus 派发事件，本方法不直接输出任何字符。
+
+        Args:
+            cancel_token: 可选取消令牌。调 .cancel() 后：
+              - LLM 流式：下一个 chunk 边界停下，emit Cancelled(where=llm_stream)
+              - 工具循环：当前工具跑完后停下（不打断已运行工具），emit Cancelled
+                + RoundEnd(final=True)，返回已积累的部分答案
+              - 进入新一轮 think 之前会 abort 整个循环
+            没传则新建一个空 token——chat 内部自己用，不会被外部触发。
+
+        中断后 chat() 仍正常返回（不抛 KeyboardInterrupt），让 REPL 平稳回到
+        输入态。Cancelled 事件已通过 event_bus 通知前端"被中断了"。
         """
+        token = cancel_token if cancel_token is not None else CancelToken()
+        self.current_cancel_token = token
+        # 让工具内部 get_current_cancel_token() 拿到这个 token；
+        # ToolExecutor 的并发分支会 copy_context 给 worker 用同一份 ContextVar
+        ctx_token = set_current_cancel_token(token)
+        try:
+            return self._chat_impl(user_query, token)
+        finally:
+            reset_current_cancel_token(ctx_token)
+            self.current_cancel_token = None
+
+    async def chat_async(
+        self,
+        user_query: str,
+        cancel_token: Optional[CancelToken] = None,
+    ) -> str:
+        """chat() 的 asyncio 包装。
+
+        chat 内部走 OpenAI SDK 流式同步迭代器，不能原生 await，这里用
+        asyncio.to_thread 把它丢到默认线程池。
+
+        中断方式：
+          - 推荐：直接调 cancel_token.cancel()。chat 在 worker 线程会按
+            现有 token 检查路径在 chunk 边界 / 工具间停下，正常 return。
+          - **不要**对返回的 task 调 task.cancel()——asyncio 只会让 await
+            点抛 CancelledError，下面那个线程仍在跑（线程池不可中断）。
+        """
+        return await asyncio.to_thread(self.chat, user_query, cancel_token)
+
+    def _chat_impl(self, user_query: str, token: CancelToken) -> str:
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
         user_query = self._prepend_background_notifications(user_query)
 
@@ -110,7 +164,7 @@ class AgentSession:
             else None
         )
 
-        rounds_used, final_answer = self._tool_loop(messages, tools_schema)
+        rounds_used, final_answer = self._tool_loop(messages, tools_schema, token)
 
         # 历史落盘（用 user_query 不是整段 system，避免膨胀）
         self.history.append(Message.create_user_message(user_query))
@@ -121,6 +175,7 @@ class AgentSession:
         self.event_bus.emit(Done(
             final_answer=final_answer,
             rounds_used=rounds_used,
+            cancelled=token.is_cancelled(),
         ))
         return final_answer
 
@@ -133,18 +188,33 @@ class AgentSession:
         self,
         messages: List[Dict[str, Any]],
         tools_schema: Optional[List[Dict[str, Any]]],
+        token: CancelToken,
     ) -> tuple[int, str]:
         """工具调用主循环。返回 (rounds_used, final_answer)。
 
         每轮：
-        1. emit RoundStart
-        2. llm.think(event_bus=self.event_bus, round_idx=round_idx)
-        3. 若有 tool_calls：assistant 消息回灌 → executor.execute 并发/串行 →
-           tool 消息回灌 → emit RoundEnd(has_tool_calls=True)
-        4. 若没 tool_calls：emit RoundEnd(final=True)，返回 answer
-        5. 超过 MAX_TOOL_ROUNDS 仍未收敛 → emit Error 并兜底返回提示
+        1. 检查 token：进新一轮前已被 cancel → 立刻收尾
+        2. emit RoundStart
+        3. llm.think(event_bus=self.event_bus, cancel_event=token.event)
+        4. 若有 tool_calls：assistant 回灌 → executor.execute → tool 回灌
+           → emit RoundEnd(has_tool_calls=True)。期间 token 被 set 后，
+           ToolExecutor 在工具间会跳过未跑的并 emit Cancelled
+        5. 若没 tool_calls：emit RoundEnd(final=True)，返回 answer
+        6. 超过 MAX_TOOL_ROUNDS 仍未收敛 → emit Error 并兜底
         """
+        partial_answer = ""  # 中断时已经流式打了一部分答案，要回传给前端
         for round_idx in range(1, self.MAX_TOOL_ROUNDS + 1):
+            # 进入新一轮前先看 token
+            if token.is_cancelled():
+                self.event_bus.emit(Cancelled(
+                    where="session_loop", round_idx=round_idx,
+                ))
+                self.event_bus.emit(RoundEnd(
+                    round_idx=max(round_idx - 1, 1),
+                    has_tool_calls=False, final=True,
+                ))
+                return round_idx - 1 if round_idx > 1 else 1, partial_answer
+
             self.event_bus.emit(RoundStart(
                 round_idx=round_idx,
                 max_rounds=self.MAX_TOOL_ROUNDS,
@@ -159,6 +229,7 @@ class AgentSession:
                 messages,
                 tools=tools_schema,
                 event_bus=self.event_bus,
+                cancel_event=token.event,
                 round_idx=round_idx,
             )
 
@@ -184,6 +255,16 @@ class AgentSession:
             answer = result.get("answer", "") or ""
             tool_calls = result.get("tool_calls") or []
             reasoning = result.get("reasoning_content")
+            # 流式中途被 cancel：cb_agents 已 emit Cancelled，answer 是已收的部分
+            if answer:
+                partial_answer = answer
+
+            # 流式过程中被 cancel → 不再发起新一轮工具调用，直接收尾
+            if token.is_cancelled():
+                self.event_bus.emit(RoundEnd(
+                    round_idx=round_idx, has_tool_calls=False, final=True,
+                ))
+                return round_idx, answer
 
             if not tool_calls:
                 self.event_bus.emit(RoundEnd(
@@ -203,7 +284,10 @@ class AgentSession:
             messages.append(assistant_msg)
 
             # 调度执行（事件由 ToolExecutor 自己 emit ToolStart/ToolComplete）
-            results = self.executor.execute(tool_calls, round_idx=round_idx)
+            # token 透传给 executor：串行/并发模式下都在工具间做 cancel 检查
+            results = self.executor.execute(
+                tool_calls, round_idx=round_idx, cancel_token=token,
+            )
             for call, exec_result in zip(tool_calls, results):
                 messages.append({
                     "role": "tool",

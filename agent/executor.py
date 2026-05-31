@@ -29,8 +29,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from agent.cancel import CancelToken
 from agent.event_bus import EventBus
-from agent.events import ToolComplete, ToolStart
+from agent.events import Cancelled, ToolComplete, ToolStart
 
 logger = logging.getLogger(__name__)
 
@@ -148,19 +149,36 @@ class ToolExecutor:
         self,
         tool_calls: List[Dict[str, Any]],
         round_idx: int = 0,
+        cancel_token: Optional[CancelToken] = None,
     ) -> List[ToolCallResult]:
         """执行一批 tool_calls，返回**保持 tool_calls 输入顺序**的结果列表。
 
         消息回灌的顺序必须跟模型 tool_calls 里一致（OpenAI 协议要求每个
         tool_call_id 对应一个 tool 消息），这里返回结果保序，方便 AgentSession
         直接 zip。
+
+        cancel_token 行为：
+          - 串行：在每个工具开始前看一眼。已被 cancel 则剩余 tool_calls 全部
+            填一个"已取消"的占位结果（保留 call_id 让回灌不破协议）
+          - 并行：所有 future 都正常 submit / 等回；submit 之前最后一次看
+            token——已 cancel 就一个都不发，全部填占位。已 submit 的工具不
+            被强制中止（线程池不可中断；这跟 LLM 流式不一样，工具进程要靠它
+            自己的超时机制处理硬中断）
         """
         if not tool_calls:
             return []
 
+        # submit 前最后一次窗口：已 cancel 就直接全部占位
+        if cancel_token is not None and cancel_token.is_cancelled():
+            if self._bus is not None:
+                self._bus.emit(Cancelled(where="executor", round_idx=round_idx))
+            return [
+                self._cancelled_placeholder(tc) for tc in tool_calls
+            ]
+
         if should_parallelize(tool_calls):
-            return self._execute_parallel(tool_calls, round_idx)
-        return self._execute_serial(tool_calls, round_idx)
+            return self._execute_parallel(tool_calls, round_idx, cancel_token)
+        return self._execute_serial(tool_calls, round_idx, cancel_token)
 
     # ---------- 串行 ----------
 
@@ -168,8 +186,19 @@ class ToolExecutor:
         self,
         tool_calls: List[Dict[str, Any]],
         round_idx: int,
+        cancel_token: Optional[CancelToken],
     ) -> List[ToolCallResult]:
-        return [self._run_one(tc, round_idx) for tc in tool_calls]
+        results: List[ToolCallResult] = []
+        cancel_emitted = False
+        for tc in tool_calls:
+            if cancel_token is not None and cancel_token.is_cancelled():
+                if self._bus is not None and not cancel_emitted:
+                    self._bus.emit(Cancelled(where="executor", round_idx=round_idx))
+                    cancel_emitted = True
+                results.append(self._cancelled_placeholder(tc))
+                continue
+            results.append(self._run_one(tc, round_idx))
+        return results
 
     # ---------- 并行 ----------
 
@@ -177,6 +206,7 @@ class ToolExecutor:
         self,
         tool_calls: List[Dict[str, Any]],
         round_idx: int,
+        cancel_token: Optional[CancelToken],
     ) -> List[ToolCallResult]:
         # 每个 worker 拿一份 ctx 副本：同一个 contextvars.Context 不能并发
         # 多次 ctx.run（会抛 "context already entered"）。我们在主线程抓
@@ -196,6 +226,8 @@ class ToolExecutor:
             }
             for fut, idx in futs.items():
                 results[idx] = fut.result()
+        # 这里不主动看 cancel_token：所有 future 已经 submit，让它们自然
+        # 结束更安全；token 是否被 set 由 cb_agents / session 在外层处理
         return [r for r in results if r is not None]
 
     # ---------- 单条 ----------
@@ -238,6 +270,31 @@ class ToolExecutor:
         return ToolCallResult(
             call_id=call_id, name=name, arguments=args,
             result=result, duration_seconds=duration, is_error=is_error,
+        )
+
+    # ---------- cancel 占位 ----------
+
+    def _cancelled_placeholder(self, tool_call: Dict[str, Any]) -> ToolCallResult:
+        """生成一个"被取消"的占位 ToolCallResult。
+
+        OpenAI 协议要求每个 tool_call_id 必须有对应的 tool 消息回灌，否则
+        下一轮 think 直接 400。这里用 is_error=True + 简短 JSON 既保留
+        协议合法性，也告诉模型"这个工具因用户取消没跑"。
+        """
+        call_id = tool_call.get("id", "") or f"call_{uuid.uuid4().hex[:8]}"
+        name = tool_call.get("function", {}).get("name", "")
+        raw_args = tool_call.get("function", {}).get("arguments", "{}")
+        args = _parse_arguments(raw_args)
+        return ToolCallResult(
+            call_id=call_id,
+            name=name,
+            arguments=args,
+            result=json.dumps(
+                {"cancelled": True, "reason": "user requested cancel"},
+                ensure_ascii=False,
+            ),
+            duration_seconds=0.0,
+            is_error=True,
         )
 
 

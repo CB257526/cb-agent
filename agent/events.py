@@ -123,6 +123,7 @@ class Done:
     """整个 chat 调用结束（最终回答已就绪）。"""
     final_answer: str
     rounds_used: int
+    cancelled: bool = False
     timestamp: float = field(default_factory=_now)
     type: str = field(default="done", init=False)
 

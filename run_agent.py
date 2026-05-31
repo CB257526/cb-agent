@@ -30,9 +30,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import traceback
 from typing import Any, Dict, List
@@ -262,13 +264,39 @@ class AgentRunner:
     # ---------- REPL ----------
 
     def run(self) -> None:
+        """同步入口，内部跑一个 asyncio loop。
+
+        为什么不直接 sync：要在用户按 Ctrl-C 时**取消当前 chat 但不退进程**。
+        sync REPL 下 input() 阻塞主线程，KeyboardInterrupt 直接抛出 input
+        外面，没办法区分"用户在输入态按 Ctrl-C 想退出"和"用户在 chat 中按
+        Ctrl-C 想中断这次回答"。
+
+        async 实现：input() 用 asyncio.to_thread 跑在 worker，主 loop 同时
+        监听 signal。chat 跑在另一个线程（chat_async），收到 SIGINT 时调
+        session.current_cancel_token.cancel()，chat 自然收尾后 await 返回。
+        """
+        try:
+            asyncio.run(self._run_async())
+        except KeyboardInterrupt:
+            # 输入态下的二次 Ctrl-C 兜底
+            print()
+            _info("再见")
+
+    async def _run_async(self) -> None:
         _section("交互模式")
-        print("输入问题与我对话，输入 /help 看命令，/quit 退出。\n")
+        print(
+            "输入问题与我对话，输入 /help 看命令，/quit 退出。\n"
+            "对话进行中按 Ctrl-C 中断当前回答（不退出进程）；空闲时按 Ctrl-C 或 /quit 退出。\n"
+        )
 
         while True:
             try:
-                user_input = input("you > ").strip()
-            except (EOFError, KeyboardInterrupt):
+                user_input = (await asyncio.to_thread(input, "you > ")).strip()
+            except EOFError:
+                print()
+                _info("再见")
+                return
+            except KeyboardInterrupt:
                 print()
                 _info("再见")
                 return
@@ -282,13 +310,40 @@ class AgentRunner:
                 else:
                     return  # /quit
 
-            # 每次新用户输入都重置 dump 增量游标
             self._dump_seen_count = 0
-            try:
-                self.session.chat(user_input)
-            except Exception as e:
-                _err(f"本轮对话异常: {e}")
-                traceback.print_exc()
+            await self._run_chat(user_input)
+
+    async def _run_chat(self, user_input: str) -> None:
+        """跑一次 chat，期间安装临时 SIGINT handler 实现"中断而不退出"。"""
+        from agent.cancel import CancelToken
+
+        token = CancelToken()
+        prev_handler = signal.getsignal(signal.SIGINT)
+
+        def _on_sigint(_signum, _frame):
+            # signal handler 在主线程执行；调 token.cancel() 不阻塞
+            # cb_agents 流式循环每个 chunk 看 token.is_set()，下一个 chunk 边界停
+            # 这里不直接 print；让 CLIRenderer 在收到 Cancelled 事件时打 ✗
+            token.cancel()
+
+        try:
+            signal.signal(signal.SIGINT, _on_sigint)
+        except (ValueError, OSError):
+            # 某些环境（如非主线程、无控制台）signal.signal 会失败
+            # 退化到无 Ctrl-C 中断；不影响其它路径
+            prev_handler = None
+
+        try:
+            await self.session.chat_async(user_input, cancel_token=token)
+        except Exception as e:
+            _err(f"本轮对话异常: {e}")
+            traceback.print_exc()
+        finally:
+            if prev_handler is not None:
+                try:
+                    signal.signal(signal.SIGINT, prev_handler)
+                except (ValueError, OSError):
+                    pass
 
     def _handle_command(self, line: str) -> bool:
         """斜杠命令分派。返回 True 继续 REPL，False 退出。"""
