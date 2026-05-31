@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -115,10 +116,16 @@ def _err(msg: str) -> None:
 class AgentRunner:
     """装配所有依赖、跑 REPL。运行时的渲染交给 CLIRenderer，逻辑在 AgentSession。"""
 
-    def __init__(self, use_mcp: bool = True, ctx_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        use_mcp: bool = True,
+        ctx_enabled: bool = True,
+        attach_cli_renderer: bool = True,
+    ) -> None:
         self.use_mcp = use_mcp and _HAS_MCP
         self.ctx_enabled = ctx_enabled
         self.dump_messages = True
+        self._attach_cli_renderer = attach_cli_renderer
         # dump 增量游标：每次 chat() 开始重置，让本轮第一次能打全量
         self._dump_seen_count = 0
 
@@ -169,9 +176,12 @@ class AgentRunner:
             messages_snapshot_hook=self._on_messages_snapshot,
         )
 
-        # 6. CLI 渲染器（订阅事件 → stdout）
-        self.renderer = CLIRenderer(self.event_bus)
-        self.renderer.attach()
+        # 6. CLI 渲染器（订阅事件 → stdout）。gateway 模式下不挂，由 transport 转发事件
+        if self._attach_cli_renderer:
+            self.renderer = CLIRenderer(self.event_bus)
+            self.renderer.attach()
+        else:
+            self.renderer = None
 
         # 同时订阅 Done 事件，方便 REPL 自己拿到 final_answer / rounds_used
         self._last_done: Done | None = None
@@ -420,7 +430,50 @@ class AgentRunner:
 
 
 def main() -> None:
-    runner = AgentRunner(use_mcp=True, ctx_enabled=True)
+    parser = argparse.ArgumentParser(
+        prog="cb-agent",
+        description="cb-agent 命令行入口。默认进 CLI 交互；--transport jsonrpc 切到 stdio 网关模式给外部 UI 用。",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["cli", "jsonrpc"],
+        default="cli",
+        help="cli=REPL 直接打印；jsonrpc=stdio NDJSON 网关模式",
+    )
+    parser.add_argument(
+        "--no-mcp", action="store_true",
+        help="跳过 MCP 工具注册（调试加速）",
+    )
+    parser.add_argument(
+        "--no-ctx", action="store_true",
+        help="禁用 ContextBuilder（裸跑，记忆/RAG 不参与拼 system）",
+    )
+    args = parser.parse_args()
+
+    use_mcp = not args.no_mcp
+    ctx_enabled = not args.no_ctx
+
+    if args.transport == "jsonrpc":
+        # gateway 模式：先把 stdout 切到 stderr，AgentRunner 启动期 print 不会污染协议
+        # 真 stdout 留给 Gateway 写 JSON 用
+        real_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        runner = AgentRunner(
+            use_mcp=use_mcp,
+            ctx_enabled=ctx_enabled,
+            attach_cli_renderer=False,
+        )
+        from agent.transport import Gateway, StdioTransport
+        gw = Gateway(
+            session=runner.session,
+            event_bus=runner.event_bus,
+            transport=StdioTransport(stdin=sys.stdin, stdout=real_stdout),
+            redirect_stdout_to_stderr=False,  # 上面已经切过了
+        )
+        gw.serve_forever()
+        return
+
+    runner = AgentRunner(use_mcp=use_mcp, ctx_enabled=ctx_enabled)
     runner.run()
 
 
