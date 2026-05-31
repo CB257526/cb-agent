@@ -22,21 +22,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { AgentEvent } from "./types.js";
 
-// 临时调试：UI 端关键事件 trace 写到独立文件，不污染屏幕
-const _uiTraceLog = (() => {
-  try {
-    const dir = join(homedir(), ".cb-agent", "logs");
-    mkdirSync(dir, { recursive: true });
-    return createWriteStream(join(dir, `ui-trace-${Date.now()}.log`), { flags: "a" });
-  } catch {
-    return null;
-  }
-})();
-function uiTrace(line: string): void {
-  if (_uiTraceLog) _uiTraceLog.write(`${new Date().toISOString()} ${line}\n`);
-}
-export { uiTrace };
-
 export interface TransportOptions {
   /** Python 解释器路径。默认环境变量 CB_AGENT_PYTHON 或 "python"。 */
   python?: string;
@@ -69,7 +54,6 @@ export class Transport extends EventEmitter {
   private stderrBuf = "";
   private rpcCounter = 0;
   private stderrLogPath: string;
-  private _evCount: Record<string, number> = {};
 
   constructor(opts: TransportOptions = {}) {
     super();
@@ -139,22 +123,8 @@ export class Transport extends EventEmitter {
       return;
     }
     if (msg && msg.method === "event" && msg.params) {
-      const ev = msg.params as AgentEvent;
-      const t = (ev as any).type;
-      if (t === "tool_start" || t === "tool_complete" || t === "ask_user_question" || t === "ask_user_question_answered") {
-        uiTrace(`recv ${t} ${JSON.stringify(ev).slice(0, 300)}`);
-      } else if (t === "reasoning_delta" || t === "text_delta") {
-        const c = (this._evCount[t] = (this._evCount[t] ?? 0) + 1);
-        if (c % 30 === 1) {
-          const acc = (ev as any).accumulated as string | undefined;
-          uiTrace(`recv ${t} n=${c} acc_len=${acc?.length ?? 0}`);
-        }
-      } else {
-        uiTrace(`recv ${t}`);
-      }
-      this.emit("event", ev);
+      this.emit("event", msg.params as AgentEvent);
     } else if (msg && (msg.id !== undefined && msg.id !== null)) {
-      uiTrace(`recv response id=${msg.id} ${JSON.stringify({ result: msg.result, error: msg.error }).slice(0, 200)}`);
       this.emit("response", msg.id, { result: msg.result, error: msg.error });
     }
     // 其它消息（notification 但非 event）静默丢弃
@@ -164,9 +134,6 @@ export class Transport extends EventEmitter {
   private sendRpc(method: string, params: Record<string, unknown> = {}): string {
     const id = `r${++this.rpcCounter}`;
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-    if (method === "session.answer_question" || method === "prompt.submit" || method === "session.cancel") {
-      uiTrace(`send ${method} id=${id} ${JSON.stringify(params).slice(0, 200)}`);
-    }
     this.proc.stdin.write(msg);
     return id;
   }

@@ -241,9 +241,6 @@ class BashTool(Tool):
             验证 → 安全检测 → session.compose（注入 cd + cwd marker）→
             选 shell + wrap → Popen → 解析 marker → 输出限制 → 语义解释 → JSON
         """
-        _trace_id = uuid.uuid4().hex[:6]
-        _t_enter = time.perf_counter()
-        logger.warning("BASH_TRACE[%s] enter run() command=%r", _trace_id, parameters.get("command", "")[:100])
         if not self.validate_parameters(parameters):
             return json.dumps({
                 "error": "参数验证失败", "stdout": "", "stderr": "",
@@ -282,12 +279,9 @@ class BashTool(Tool):
         gate_res = None
         if not self._is_subagent:
             segments = parse_pipeline(command)
-            logger.warning("BASH_TRACE[%s] before gate.evaluate t+%.2fs", _trace_id, time.perf_counter()-_t_enter)
             gate_res = self._permission.evaluate(
                 command, segments, warnings, self._session.cwd,
             )
-            logger.warning("BASH_TRACE[%s] after gate.evaluate decision=%s t+%.2fs",
-                _trace_id, gate_res.decision.value, time.perf_counter()-_t_enter)
             if gate_res.decision == Decision.ASK:
                 # 取第一段命令作为弹窗前缀
                 prefix = ""
@@ -299,8 +293,6 @@ class BashTool(Tool):
                 gate_res = self._permission.prompt_user(
                     command, prefix, gate_res.reason, self._session.cwd,
                 )
-                logger.warning("BASH_TRACE[%s] after prompt_user decision=%s t+%.2fs",
-                    _trace_id, gate_res.decision.value, time.perf_counter()-_t_enter)
             if gate_res.decision == Decision.DENY:
                 logger.warning("bash: 权限拒绝 — %s", gate_res.reason)
                 return json.dumps({
@@ -346,8 +338,6 @@ class BashTool(Tool):
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             preexec_fn = None if os.name == "nt" else (
                 lambda: signal.signal(signal.SIGPIPE, signal.SIG_DFL))
-            logger.warning("BASH_TRACE[%s] before Popen shell=%s t+%.2fs",
-                _trace_id, shell, time.perf_counter()-_t_enter)
             proc = subprocess.Popen(
                 shell + [all_cmd],
                 stdin=subprocess.DEVNULL,
@@ -355,16 +345,10 @@ class BashTool(Tool):
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=creationflags, preexec_fn=preexec_fn,
             )
-            logger.warning("BASH_TRACE[%s] Popen returned pid=%s t+%.2fs",
-                _trace_id, proc.pid, time.perf_counter()-_t_enter)
             stdout, stderr = proc.communicate(timeout=timeout)
-            logger.warning("BASH_TRACE[%s] communicate done rc=%s t+%.2fs",
-                _trace_id, proc.returncode, time.perf_counter()-_t_enter)
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
             timed_out = True
-            logger.warning("BASH_TRACE[%s] TimeoutExpired after %ss t+%.2fs",
-                _trace_id, timeout, time.perf_counter()-_t_enter)
             if proc:
                 try:
                     if os.name == "nt":

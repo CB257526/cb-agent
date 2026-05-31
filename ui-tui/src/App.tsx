@@ -19,7 +19,7 @@
 
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
-import { Transport, uiTrace } from "./transport.js";
+import { Transport } from "./transport.js";
 import { AgentEvent, ChatItem } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
@@ -63,9 +63,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   // useRef 给事件 handler 用，否则闭包里拿到的是旧 setItems
   const itemsRef = useRef(items);
   itemsRef.current = items;
-
-  // 流式 delta 的频率统计（用于诊断卡顿）
-  const _deltaCounts = useRef<{ reasoning: number; text: number }>({ reasoning: 0, text: 0 });
 
   // 流式增量节流：DeepSeek thinking/text 一秒能发几十条 chunk，每条都 setItems
   // 会导致 ink 整树重渲 + stdout ANSI 全屏重画 → 事件循环压不过来 → stdin pipe
@@ -134,10 +131,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
         case "text_delta": {
           const delta = (ev as any).delta as string;
-          const cn = ++_deltaCounts.current.text;
-          if (cn === 1 || cn % 30 === 0) {
-            uiTrace(`text_delta n=${cn} items_len=${itemsRef.current.length}`);
-          }
           _pendingDelta.current.text += delta;
           scheduleFlush();
           break;
@@ -147,10 +140,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           // 思考流：增量拼接到最近一个 thought item；遇到非 thought（如 assistant
           // 文本已经开始 / 工具块插进来）就开新的一块，让 thought 始终独立成段
           const delta = (ev as any).delta as string;
-          const cn = ++_deltaCounts.current.reasoning;
-          if (cn === 1 || cn % 30 === 0) {
-            uiTrace(`reasoning_delta n=${cn} items_len=${itemsRef.current.length}`);
-          }
           _pendingDelta.current.reasoning += delta;
           scheduleFlush();
           break;
@@ -217,8 +206,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
         case "done":
           flushNow();
-          uiTrace(`done items_len=${itemsRef.current.length} reasoning_n=${_deltaCounts.current.reasoning} text_n=${_deltaCounts.current.text}`);
-          _deltaCounts.current = { reasoning: 0, text: 0 };
           setBusy(false);
           setRound(0);
           break;
