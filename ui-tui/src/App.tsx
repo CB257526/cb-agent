@@ -26,8 +26,13 @@ import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
 import { ActivityPanel } from "./components/ActivityPanel.js";
 import { Banner } from "./components/Banner.js";
+import { HistoryStore } from "./historyStore.js";
 
 const STDERR_RING_MAX = 200;  // 内存里最多留 200 行，超出从头丢
+
+// 单例：历史只在进程内加载一次
+const historyStore = new HistoryStore();
+historyStore.load();
 
 let _idCounter = 0;
 const nextId = () => `i${++_idCounter}`;
@@ -191,11 +196,22 @@ export function App({ transport }: { transport: Transport }) {
 
   const handleSubmit = useCallback((text: string) => {
     if (!text.trim() || busy) return;
+    // 斜杠命令不入历史；命令系统在 C3 接管时会先于这里拦截，这里再做一道兜底
+    if (!text.startsWith("/")) {
+      historyStore.push(text);
+    }
     setItems((prev) => [...prev, { id: nextId(), role: "user", text }]);
     setInput("");
     setBusy(true);
     transport.sendPrompt(text);
   }, [busy, transport]);
+
+  /** ↑/↓ 翻历史的回调：idx 0 = 最新一条，递增 = 更老。null 表示越界 */
+  const getHistoryAt = useCallback((idx: number): string | null => {
+    const all = historyStore.all();
+    if (idx < 0 || idx >= all.length) return null;
+    return all[all.length - 1 - idx];
+  }, []);
 
   return (
     <Box flexDirection="column" padding={1}>
@@ -217,6 +233,7 @@ export function App({ transport }: { transport: Transport }) {
           onChange={setInput}
           onSubmit={handleSubmit}
           disabled={busy}
+          getHistoryAt={getHistoryAt}
         />
         <Box marginTop={1}>
           <StatusBar
