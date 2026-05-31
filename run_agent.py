@@ -46,6 +46,8 @@ if sys.platform == "win32":
         pass
 
 from agent.cb_agents import CbAgentsLLM
+from agent.event_bus import EventBus
+from agent.executor import ToolExecutor
 from context import ContextBuilder, ContextConfig
 from core.message import Message
 from skills.skill_manager import SkillManager
@@ -318,6 +320,17 @@ class AgentRunner:
         self._register_native_tools()
         if self.use_mcp:
             self._register_mcp_tools()
+
+        # 2.5 事件总线 + 工具调度器
+        # EventBus 当前只服务 ToolExecutor 的 ToolStart/ToolComplete 事件；
+        # cb_agents 流式仍走旧 print 路径（_tool_loop 调 think 时不传 bus）。
+        # 等 Stage 3 拆 CLIRenderer 时再把 LLM 流式也接入。
+        self.event_bus = EventBus()
+        self.executor = ToolExecutor(
+            runner=self.registry.execute_tool,
+            event_bus=self.event_bus,
+            max_workers=4,
+        )
 
         # 3. 上下文构建器（复用 memory/rag 实例）
         self.builder = ContextBuilder(
@@ -679,23 +692,21 @@ class AgentRunner:
                 assistant_msg["reasoning_content"] = reasoning
             messages.append(assistant_msg)
 
-            # 顺序执行每个 tool_call
-            for call in tool_calls:
+            # 调度执行：纯读批次自动并发，含写工具批次串行。结果保持输入顺序。
+            for call, exec_result in zip(
+                tool_calls,
+                self.executor.execute(tool_calls, round_idx=round_idx),
+            ):
                 tool_call_id = call.get("id", "")
-                fn = call.get("function") or {}
-                tool_name = fn.get("name", "")
-                raw_args = fn.get("arguments", "{}")
+                tool_name = exec_result.name
+                args = exec_result.arguments
+                tool_result = exec_result.result
 
-                try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                except json.JSONDecodeError:
-                    args = {"_raw": raw_args}
-
-                print(f"  → 调用工具 {tool_name}({_short_args(args)})")
-                try:
-                    tool_result = self.registry.execute_tool(tool_name, args)
-                except Exception as e:
-                    tool_result = f"[ERROR] 工具 {tool_name} 抛异常: {e}"
+                concurrent_tag = (
+                    " [并发]" if len(tool_calls) > 1 and not exec_result.is_error
+                    and self._was_parallel(tool_calls) else ""
+                )
+                print(f"  → 调用工具 {tool_name}({_short_args(args)}){concurrent_tag}")
 
                 # todo/bash 工具：用彩色面板替代单行预览；其它工具仍走截断预览
                 if tool_name == "todo":
@@ -720,6 +731,11 @@ class AgentRunner:
 
         _err(f"工具调用超过 {self.MAX_TOOL_ROUNDS} 轮，强制终止")
         return "（工具调用次数过多，已终止本轮）"
+
+    def _was_parallel(self, tool_calls: List[Dict[str, Any]]) -> bool:
+        """判断 ToolExecutor 这一批是否走了并发分支，仅用于打印 [并发] 标签。"""
+        from agent.executor import should_parallelize
+        return should_parallelize(tool_calls)
 
 
 def _short_args(args: Dict[str, Any], limit: int = 80) -> str:
