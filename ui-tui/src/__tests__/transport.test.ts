@@ -15,11 +15,12 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
 // 用反射改造 Transport：跳过 spawn，直接喂数据到 handleStdout
-function makeFakeTransport(): { t: Transport; feed: (s: string) => void; events: any[]; responses: any[]; errors: any[] } {
+function makeFakeTransport(): { t: Transport; feed: (s: string) => void; feedErr: (s: string) => void; events: any[]; responses: any[]; errors: any[]; stderrLines: string[] } {
   const t = Object.create(Transport.prototype);
   EventEmitter.call(t);
   // 复制 Transport 构造的内部状态
   (t as any).stdoutBuf = "";
+  (t as any).stderrBuf = "";
   (t as any).rpcCounter = 0;
   (t as any).stderrLogPath = "/dev/null";
   (t as any).proc = null;
@@ -27,12 +28,15 @@ function makeFakeTransport(): { t: Transport; feed: (s: string) => void; events:
   const events: any[] = [];
   const responses: any[] = [];
   const errors: any[] = [];
+  const stderrLines: string[] = [];
   t.on("event", (e: any) => events.push(e));
   t.on("response", (id: any, body: any) => responses.push({ id, body }));
   t.on("protocolError", (raw: string, err: Error) => errors.push({ raw, err }));
+  t.on("stderr", (line: string) => stderrLines.push(line));
 
   const feed = (s: string) => (t as any).handleStdout(s);
-  return { t, feed, events, responses, errors };
+  const feedErr = (s: string) => (t as any).handleStderr(s);
+  return { t, feed, feedErr, events, responses, errors, stderrLines };
 }
 
 describe("Transport NDJSON parser", () => {
@@ -83,5 +87,39 @@ describe("Transport NDJSON parser", () => {
     const { feed, events } = makeFakeTransport();
     feed("\n\n\n");
     expect(events).toHaveLength(0);
+  });
+});
+
+describe("Transport stderr line splitter", () => {
+  it("emits one event per line, preserves content", () => {
+    const { feedErr, stderrLines } = makeFakeTransport();
+    feedErr("first\nsecond\n");
+    expect(stderrLines).toEqual(["first", "second"]);
+  });
+
+  it("buffers across chunk boundary", () => {
+    const { feedErr, stderrLines } = makeFakeTransport();
+    feedErr("partia");
+    expect(stderrLines).toEqual([]);
+    feedErr("l line\nnext\n");
+    expect(stderrLines).toEqual(["partial line", "next"]);
+  });
+
+  it("strips trailing CR (Windows-style \\r\\n)", () => {
+    const { feedErr, stderrLines } = makeFakeTransport();
+    feedErr("hello\r\nworld\r\n");
+    expect(stderrLines).toEqual(["hello", "world"]);
+  });
+
+  it("emits empty lines (so panel keeps visual spacing)", () => {
+    const { feedErr, stderrLines } = makeFakeTransport();
+    feedErr("a\n\nb\n");
+    expect(stderrLines).toEqual(["a", "", "b"]);
+  });
+
+  it("does not emit a partial last line until newline arrives", () => {
+    const { feedErr, stderrLines } = makeFakeTransport();
+    feedErr("no newline yet");
+    expect(stderrLines).toEqual([]);
   });
 });

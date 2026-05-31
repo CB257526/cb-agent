@@ -24,6 +24,9 @@ import { AgentEvent, ChatItem } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
+import { ActivityPanel } from "./components/ActivityPanel.js";
+
+const STDERR_RING_MAX = 200;  // 内存里最多留 200 行，超出从头丢
 
 let _idCounter = 0;
 const nextId = () => `i${++_idCounter}`;
@@ -40,6 +43,8 @@ export function App({ transport }: { transport: Transport }) {
   const [promptTokens, setPromptTokens] = useState(0);
   const [completionTokens, setCompletionTokens] = useState(0);
   const [protocolErrors, setProtocolErrors] = useState(0);
+  const [stderrLines, setStderrLines] = useState<string[]>([]);
+  const [showActivity, setShowActivity] = useState(false);
 
   // useRef 给事件 handler 用，否则闭包里拿到的是旧 setItems
   const itemsRef = useRef(items);
@@ -149,17 +154,27 @@ export function App({ transport }: { transport: Transport }) {
       setTimeout(() => exit(), 300);
     };
 
+    const onStderr = (line: string) => {
+      setStderrLines((prev) => {
+        const next = prev.length >= STDERR_RING_MAX ? prev.slice(-STDERR_RING_MAX + 1) : prev.slice();
+        next.push(line);
+        return next;
+      });
+    };
+
     transport.on("event", onEvent);
     transport.on("protocolError", onProtoErr);
     transport.on("exit", onExit);
+    transport.on("stderr", onStderr);
     return () => {
       transport.removeListener("event", onEvent);
       transport.removeListener("protocolError", onProtoErr);
       transport.removeListener("exit", onExit);
+      transport.removeListener("stderr", onStderr);
     };
   }, [transport, exit, appendSystem]);
 
-  // 键盘事件：Ctrl-C 在 busy 时中断，空闲时退出
+  // 键盘事件：Ctrl-C 在 busy 时中断/空闲时退出；Ctrl-O 切换后端日志面板
   useInput((inputChar, key) => {
     if (key.ctrl && inputChar === "c") {
       if (busy) {
@@ -168,6 +183,8 @@ export function App({ transport }: { transport: Transport }) {
         transport.quit();
         setTimeout(() => exit(), 200);
       }
+    } else if (key.ctrl && inputChar === "o") {
+      setShowActivity((v) => !v);
     }
   });
 
@@ -186,6 +203,14 @@ export function App({ transport }: { transport: Transport }) {
       </Box>
 
       <EventStream items={items} />
+
+      <Box marginTop={1}>
+        <ActivityPanel
+          lines={stderrLines}
+          visible={showActivity}
+          logFile={transport.stderrLogFile}
+        />
+      </Box>
 
       <Box marginTop={1} flexDirection="column">
         <PromptInput

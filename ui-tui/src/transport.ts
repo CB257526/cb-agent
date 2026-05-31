@@ -39,6 +39,8 @@ export interface TransportEvents {
   exit: (code: number | null) => void;
   /** 协议解析失败、stdout 出现非 JSON 行——通常是 Python 端漏了 stdout 重定向 */
   protocolError: (raw: string, err: Error) => void;
+  /** Python 端的 stderr 一行（不含末尾换行）。同时还在写日志文件，事件只是给 UI 实时面板用。 */
+  stderr: (line: string) => void;
 }
 
 export declare interface Transport {
@@ -49,6 +51,7 @@ export declare interface Transport {
 export class Transport extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams;
   private stdoutBuf = "";
+  private stderrBuf = "";
   private rpcCounter = 0;
   private stderrLogPath: string;
 
@@ -72,10 +75,15 @@ export class Transport extends EventEmitter {
     this.proc.stdout.setEncoding("utf-8");
     this.proc.stdout.on("data", (chunk: string) => this.handleStdout(chunk));
 
-    // stderr: 转发到日志文件，不干扰 UI
+    // stderr: 同时做两件事
+    //   1. 全量写日志文件（保留最完整记录，事故归档）
+    //   2. 行缓冲解析后 emit stderr 事件（UI 实时面板用，行内不带换行）
     const logStream = createWriteStream(this.stderrLogPath, { flags: "a" });
     this.proc.stderr.setEncoding("utf-8");
-    this.proc.stderr.pipe(logStream);
+    this.proc.stderr.on("data", (chunk: string) => {
+      logStream.write(chunk);
+      this.handleStderr(chunk);
+    });
 
     this.proc.on("exit", (code) => this.emit("exit", code));
     this.proc.on("error", (err) => {
@@ -91,6 +99,18 @@ export class Transport extends EventEmitter {
       this.stdoutBuf = this.stdoutBuf.slice(nl + 1);
       if (!line) continue;
       this.handleLine(line);
+    }
+  }
+
+  private handleStderr(chunk: string): void {
+    this.stderrBuf += chunk;
+    let nl: number;
+    while ((nl = this.stderrBuf.indexOf("\n")) !== -1) {
+      // 保留原文本（不 trim 内容空格，只去末尾 \r），空行也 emit 让面板视觉间距正确
+      let line = this.stderrBuf.slice(0, nl);
+      this.stderrBuf = this.stderrBuf.slice(nl + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      this.emit("stderr", line);
     }
   }
 
