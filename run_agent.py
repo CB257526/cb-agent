@@ -137,7 +137,10 @@ class AgentRunner:
         self.llm = CbAgentsLLM()
         _info(f"模型: {self.llm.model}  function_calling={self.llm.is_Function_Calling}")
 
-        # 2. 工具注册表
+        # 2. 事件总线（要在工具注册前建好，TodoTool 等工具构造期就要拿到）
+        self.event_bus = EventBus()
+
+        # 3. 工具注册表
         self.registry = ToolRegistry()
         self._memory_tool: MemoryTool = None  # type: ignore[assignment]
         self._rag_tool: RAGTool = None        # type: ignore[assignment]
@@ -146,8 +149,7 @@ class AgentRunner:
         if self.use_mcp:
             self._register_mcp_tools()
 
-        # 3. 事件总线 + 工具调度器
-        self.event_bus = EventBus()
+        # 4. 工具调度器（依赖 event_bus）
         self.executor = ToolExecutor(
             runner=self.registry.execute_tool,
             event_bus=self.event_bus,
