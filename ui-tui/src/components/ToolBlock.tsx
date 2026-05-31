@@ -1,6 +1,8 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { ChatItem } from "../types.js";
+import { StatusIcon } from "./StatusIcon.js";
+import { theme } from "../theme.js";
 
 /**
  * 工具调用块。折叠时显示 `⏵ name(args 摘要)  ✓ 0.02s`，展开时多显示完整 args 和 result。
@@ -12,21 +14,21 @@ export function ToolBlock({ item }: { item: ChatItem }) {
   const argsBrief = summarizeArgs(item.toolArgs);
   const status = item.toolDone
     ? item.toolError
-      ? <Text color="red">✗ {item.toolDuration?.toFixed(2)}s</Text>
-      : <Text color="green">✓ {item.toolDuration?.toFixed(2)}s</Text>
-    : <Text color="yellow">… running</Text>;
+      ? <Text color={theme.error}><StatusIcon status="error" withSpace />{item.toolDuration?.toFixed(2)}s</Text>
+      : <Text color={theme.success}><StatusIcon status="success" withSpace />{item.toolDuration?.toFixed(2)}s</Text>
+    : <Text color={theme.warning}><StatusIcon status="loading" withSpace />running</Text>;
 
   return (
     <Box flexDirection="column" marginY={0}>
       <Box>
-        <Text color="cyan">⏵ </Text>
+        <Text color={theme.suggestion}>⏵ </Text>
         <Text bold>{item.toolName}</Text>
-        <Text color="gray">({argsBrief})  </Text>
+        <Text dimColor>({argsBrief})  </Text>
         {status}
       </Box>
       {!item.collapsed && item.toolResult && (
-        <Box marginLeft={2} flexDirection="column">
-          <Text color="gray">{truncate(item.toolResult, 600)}</Text>
+        <Box marginLeft={2} flexDirection="column" borderStyle="single" borderColor={theme.bashBorder} paddingX={1}>
+          <Text dimColor>{truncate(item.toolResult, 600)}</Text>
         </Box>
       )}
     </Box>

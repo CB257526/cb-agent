@@ -1,5 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
+import { theme } from "../theme.js";
 
 export interface ActivityPanelProps {
   lines: string[];
@@ -20,20 +21,20 @@ export function ActivityPanel({ lines, visible, maxLines = 12, logFile }: Activi
   if (!visible) {
     return (
       <Box>
-        <Text color="gray">ⓘ Ctrl-O 显示后端日志（{lines.length} 行可用）</Text>
+        <Text dimColor>ⓘ Ctrl-O 显示后端日志（{lines.length} 行可用）</Text>
       </Box>
     );
   }
 
   const tail = lines.slice(-maxLines);
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}>
+    <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1}>
       <Box justifyContent="space-between">
-        <Text color="cyan" bold>后端日志（最近 {tail.length}/{lines.length} 行）</Text>
-        <Text color="gray">Ctrl-O 隐藏</Text>
+        <Text color={theme.suggestion} bold>后端日志（最近 {tail.length}/{lines.length} 行）</Text>
+        <Text dimColor>Ctrl-O 隐藏</Text>
       </Box>
       {tail.length === 0 ? (
-        <Text color="gray">（暂无）</Text>
+        <Text dimColor>（暂无）</Text>
       ) : (
         tail.map((line, i) => (
           <Text key={i} color={colorize(line)} wrap="truncate-end">{line || " "}</Text>
@@ -41,7 +42,7 @@ export function ActivityPanel({ lines, visible, maxLines = 12, logFile }: Activi
       )}
       {logFile && (
         <Box marginTop={1}>
-          <Text color="gray" wrap="truncate-middle">完整日志：{logFile}</Text>
+          <Text dimColor wrap="truncate-middle">完整日志：{logFile}</Text>
         </Box>
       )}
     </Box>
@@ -50,8 +51,8 @@ export function ActivityPanel({ lines, visible, maxLines = 12, logFile }: Activi
 
 function colorize(line: string): string | undefined {
   // 简单按内容上色：错误/警告醒目一点，启动期信息灰一点
-  if (/error|exception|traceback|✗/i.test(line)) return "red";
-  if (/warn/i.test(line)) return "yellow";
-  if (/^\[.*\]/.test(line)) return "gray";  // 形如 [info] 的 section 标记
+  if (/error|exception|traceback|✗/i.test(line)) return theme.error;
+  if (/warn/i.test(line)) return theme.warning;
+  if (/^\[.*\]/.test(line)) return "gray";
   return undefined;
 }

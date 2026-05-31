@@ -18,13 +18,14 @@
  */
 
 import React, { useEffect, useState, useCallback, useRef } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
 import { AgentEvent, ChatItem } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
 import { ActivityPanel } from "./components/ActivityPanel.js";
+import { Banner } from "./components/Banner.js";
 
 const STDERR_RING_MAX = 200;  // 内存里最多留 200 行，超出从头丢
 
@@ -198,9 +199,7 @@ export function App({ transport }: { transport: Transport }) {
 
   return (
     <Box flexDirection="column" padding={1}>
-      <Box marginBottom={1}>
-        <Text color="cyan" bold>cb-agent · {model}</Text>
-      </Box>
+      <Banner model={model} cwd={process.cwd()} />
 
       <EventStream items={items} />
 
