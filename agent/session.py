@@ -37,6 +37,7 @@ from agent.events import (
     BackgroundNotification, Cancelled, Done, Error, RoundEnd, RoundStart,
 )
 from agent.executor import ToolExecutor
+from agent.question_registry import QuestionRegistry
 from context import ContextBuilder
 from core.message import Message
 from skills.skill_manager import SkillManager
@@ -87,6 +88,9 @@ class AgentSession:
         # 当前正在跑的 chat 的 cancel token；REPL 收 Ctrl-C 时调它的 .cancel()
         # 没在 chat 中时为 None
         self.current_cancel_token: Optional[CancelToken] = None
+        # AskUserQuestionTool 用：工具线程 register+wait，gateway 在 RPC 里
+        # submit_answer。整个进程一份，session 持有给 gateway/tool 共享。
+        self.question_registry: QuestionRegistry = QuestionRegistry()
 
     # ---------- 公共入口 ----------
 

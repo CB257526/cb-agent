@@ -53,6 +53,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [protocolErrors, setProtocolErrors] = useState(0);
   const [stderrLines, setStderrLines] = useState<string[]>([]);
   const [showActivity, setShowActivity] = useState(false);
+  // 当前等待用户作答的问题 id：决定 EventStream 把输入路由给哪个 panel；
+  // 同时 PromptInput 在问答期 disabled，避免误打字提交 prompt
+  const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
 
   // / 命令面板：input 以 '/' 开头时自动显示，picker 自己读 input.slice(1) 作 query
   const slashActive = input.startsWith("/") && !busy;
@@ -149,6 +152,46 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           appendSystem(`⏸ 已中断 (${(ev as any).where})`);
           setBusy(false);
           break;
+
+        case "ask_user_question": {
+          const e = ev as any;
+          setItems((prev) => [...prev, {
+            id: nextId(),
+            role: "ask_question",
+            text: "",
+            questionId: e.question_id,
+            question: e.question,
+            options: e.options,
+            multiSelect: e.multi_select,
+            recommendedIndex: e.recommended_index,
+            allowOther: e.allow_other,
+            answered: false,
+          }]);
+          setActiveQuestionId(e.question_id);
+          break;
+        }
+
+        case "ask_user_question_answered": {
+          const e = ev as any;
+          setItems((prev) => {
+            for (let i = prev.length - 1; i >= 0; i--) {
+              const it = prev[i];
+              if (it.role === "ask_question" && it.questionId === e.question_id) {
+                const updated: ChatItem = {
+                  ...it,
+                  answered: true,
+                  answerLabels: e.selected_labels ?? [],
+                  answerOther: e.other_text ?? undefined,
+                  answerCancelled: !!e.cancelled,
+                };
+                return [...prev.slice(0, i), updated, ...prev.slice(i + 1)];
+              }
+            }
+            return prev;
+          });
+          setActiveQuestionId((curr) => (curr === e.question_id ? null : curr));
+          break;
+        }
 
         default:
           break;
@@ -249,11 +292,24 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     return all[all.length - 1 - idx];
   }, []);
 
+  const handleAnswerQuestion = useCallback(
+    (questionId: string, params: { selected_labels: string[]; other_text?: string; cancelled?: boolean }) => {
+      transport.answerQuestion({ question_id: questionId, ...params });
+      // 不立刻清 activeQuestionId：等 ask_user_question_answered 事件回来再清，
+      // 避免重复发或在网络/进程慢时面板提前消失
+    },
+    [transport],
+  );
+
   return (
     <Box flexDirection="column" padding={1}>
       <Banner model={model} cwd={process.cwd()} />
 
-      <EventStream items={items} />
+      <EventStream
+        items={items}
+        onAnswerQuestion={handleAnswerQuestion}
+        activeQuestionId={activeQuestionId}
+      />
 
       <Box marginTop={1}>
         <ActivityPanel
@@ -275,9 +331,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           value={input}
           onChange={setInput}
           onSubmit={handleSubmit}
-          disabled={busy}
+          disabled={busy || activeQuestionId !== null}
           getHistoryAt={getHistoryAt}
-          delegateNavKeys={slashActive}
+          delegateNavKeys={slashActive || activeQuestionId !== null}
         />
         <Box marginTop={1}>
           <StatusBar

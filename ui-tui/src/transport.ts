@@ -174,6 +174,17 @@ export class Transport extends EventEmitter {
     return this.requestRpc("session.list_tools");
   }
 
+  /** 用户回答 AskUserQuestionTool 的提问。selected_labels 单选给一个，多选给多个。
+   * cancelled=true 表示用户取消（按 Esc/中断）；后端会让工具返回 cancelled 结果。 */
+  answerQuestion(params: {
+    question_id: string;
+    selected_labels: string[];
+    other_text?: string;
+    cancelled?: boolean;
+  }): string {
+    return this.sendRpc("session.answer_question", params as unknown as Record<string, unknown>);
+  }
+
   quit(): string {
     return this.sendRpc("session.quit");
   }

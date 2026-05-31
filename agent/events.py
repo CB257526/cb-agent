@@ -165,6 +165,41 @@ class BackgroundNotification:
     type: str = field(default="background_notification", init=False)
 
 
+# ========== 用户问答（AskUserQuestionTool） ==========
+
+
+@dataclass
+class AskUserQuestion:
+    """工具向用户发起一个多选/单选问题，等待用户在 UI 端选择。
+
+    协议约定：
+    - 工具线程 emit 后阻塞等 QuestionRegistry.submit_answer(question_id, ...)
+    - UI 收到事件 → 渲染 panel → 用户选择 → RPC session.answer_question
+    - cancel_token 被触发或工具超时 → 工具方返回 cancelled 结果
+    """
+    question_id: str
+    question: str
+    options: List[Dict[str, str]]   # [{label, description}, ...]
+    multi_select: bool = False
+    recommended_index: Optional[int] = None
+    allow_other: bool = True        # 允许 "Other" 自定义文本
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="ask_user_question", init=False)
+
+
+@dataclass
+class AskUserQuestionAnswered:
+    """用户已对某条问题作答；UI 收到此事件可关闭 panel。"""
+    question_id: str
+    selected_labels: List[str]      # 多选给多个；单选给一个
+    other_text: Optional[str] = None  # 用户选 "Other" 时填的自定义文本
+    cancelled: bool = False         # True=用户取消（不作答）
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="ask_user_question_answered", init=False)
+
+
 # ========== Union 类型（订阅者用 isinstance 区分）==========
 
 
@@ -181,6 +216,8 @@ Event = Union[
     Error,
     Cancelled,
     BackgroundNotification,
+    AskUserQuestion,
+    AskUserQuestionAnswered,
 ]
 
 
@@ -198,4 +235,6 @@ __all__ = [
     "Error",
     "Cancelled",
     "BackgroundNotification",
+    "AskUserQuestion",
+    "AskUserQuestionAnswered",
 ]

@@ -74,6 +74,7 @@ from tools.tools.bash_task_tool import BashTaskTool
 from tools.tools.bash_permission_tool import BashPermissionTool
 from tools.tools.file_read_tool import FileReadTool
 from tools.tools.file_write_tool import FileWriteTool
+from tools.tools.ask_user_question_tool import AskUserQuestionTool
 
 try:
     from tools.mcp_tools.mcptools_add import load_mcp_tools
@@ -174,6 +175,15 @@ class AgentRunner:
             skill_manager=self._skill_manager,
             ctx_enabled=self.ctx_enabled,
             messages_snapshot_hook=self._on_messages_snapshot,
+        )
+
+        # 5b. 依赖 session 共享态的工具：AskUserQuestionTool 需要 session 的
+        # question_registry + event_bus（跨工具线程同步），在 session 构造完后注册
+        self.registry.register_tool(
+            AskUserQuestionTool(
+                question_registry=self.session.question_registry,
+                event_bus=self.event_bus,
+            )
         )
 
         # 6. CLI 渲染器（订阅事件 → stdout）。gateway 模式下不挂，由 transport 转发事件

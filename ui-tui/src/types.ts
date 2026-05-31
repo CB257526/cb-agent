@@ -22,6 +22,8 @@ export type EventType =
   | "error"
   | "cancelled"
   | "background_notification"
+  | "ask_user_question"
+  | "ask_user_question_answered"
   | "gateway_ready";  // gateway 自定义，不在 events.py 里
 
 export interface BaseEvent {
@@ -102,6 +104,29 @@ export interface GatewayReady extends BaseEvent {
   model: string;
 }
 
+export interface AskQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface AskUserQuestion extends BaseEvent {
+  type: "ask_user_question";
+  question_id: string;
+  question: string;
+  options: AskQuestionOption[];
+  multi_select: boolean;
+  recommended_index?: number | null;
+  allow_other: boolean;
+}
+
+export interface AskUserQuestionAnswered extends BaseEvent {
+  type: "ask_user_question_answered";
+  question_id: string;
+  selected_labels: string[];
+  other_text?: string | null;
+  cancelled: boolean;
+}
+
 export type AgentEvent =
   | TextDelta
   | ReasoningDelta
@@ -114,11 +139,13 @@ export type AgentEvent =
   | ErrorEvent
   | Cancelled
   | GatewayReady
+  | AskUserQuestion
+  | AskUserQuestionAnswered
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========
 
-export type Role = "user" | "assistant" | "tool" | "system";
+export type Role = "user" | "assistant" | "tool" | "system" | "ask_question";
 
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */
 export interface ChatItem {
@@ -132,4 +159,15 @@ export interface ChatItem {
   toolError?: boolean;
   toolDone?: boolean;       // false=运行中，true=已完成
   collapsed?: boolean;      // 工具块默认折叠
+  // 问答（ask_question role 用）
+  questionId?: string;
+  question?: string;
+  options?: AskQuestionOption[];
+  multiSelect?: boolean;
+  recommendedIndex?: number | null;
+  allowOther?: boolean;
+  answered?: boolean;       // 用户已作答；面板转为静态摘要
+  answerLabels?: string[];
+  answerOther?: string;
+  answerCancelled?: boolean;
 }

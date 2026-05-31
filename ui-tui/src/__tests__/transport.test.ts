@@ -123,3 +123,44 @@ describe("Transport stderr line splitter", () => {
     expect(stderrLines).toEqual([]);
   });
 });
+
+describe("Transport answerQuestion RPC", () => {
+  // 用一个抓 stdin 写入的桩 proc
+  function makeWithStdin(): { t: any; written: string[] } {
+    const t = Object.create(Transport.prototype);
+    EventEmitter.call(t);
+    (t as any).rpcCounter = 0;
+    const written: string[] = [];
+    (t as any).proc = { stdin: { write: (s: string) => { written.push(s); } } };
+    return { t, written };
+  }
+
+  it("serializes a single-select answer", () => {
+    const { t, written } = makeWithStdin();
+    const id = t.answerQuestion({ question_id: "q_x", selected_labels: ["A"] });
+    expect(written).toHaveLength(1);
+    const msg = JSON.parse(written[0].trim());
+    expect(msg.method).toBe("session.answer_question");
+    expect(msg.id).toBe(id);
+    expect(msg.params).toEqual({ question_id: "q_x", selected_labels: ["A"] });
+  });
+
+  it("serializes a multi-select answer with other_text", () => {
+    const { t, written } = makeWithStdin();
+    t.answerQuestion({
+      question_id: "q_y",
+      selected_labels: ["Other"],
+      other_text: "Hello",
+    });
+    const msg = JSON.parse(written[0].trim());
+    expect(msg.params.selected_labels).toEqual(["Other"]);
+    expect(msg.params.other_text).toBe("Hello");
+  });
+
+  it("serializes a cancellation", () => {
+    const { t, written } = makeWithStdin();
+    t.answerQuestion({ question_id: "q_z", selected_labels: [], cancelled: true });
+    const msg = JSON.parse(written[0].trim());
+    expect(msg.params.cancelled).toBe(true);
+  });
+});

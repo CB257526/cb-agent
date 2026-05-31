@@ -122,6 +122,8 @@ class Gateway:
             self._handle_clear_history(rpc_id)
         elif method == "session.list_tools":
             self._handle_list_tools(rpc_id)
+        elif method == "session.answer_question":
+            self._handle_answer_question(rpc_id, params)
         else:
             if rpc_id is not None:
                 self.transport.write(make_response(
@@ -246,6 +248,46 @@ class Gateway:
             ))
             return
         self.transport.write(make_response(rpc_id, result={"tools": tools}))
+
+    def _handle_answer_question(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        """UI 端用户在 AskQuestionPanel 选完后回灌答案。
+
+        params 形状:
+          { question_id: str,
+            selected_labels: [str, ...],   # 单选给一个；多选给多个
+            other_text?: str,              # 选了 "Other" 时填的自定义文本
+            cancelled?: bool }             # 用户主动取消 → True
+
+        registry.submit_answer 唤醒工具线程。问题不存在（超时/重复回灌）走 result.delivered=False，
+        不返回错误：UI 收到 ack 即可，业务态由后续 ask_user_question_answered 事件给出。
+        """
+        if rpc_id is None:
+            return
+        qid = params.get("question_id")
+        labels = params.get("selected_labels") or []
+        other_text = params.get("other_text")
+        cancelled = bool(params.get("cancelled", False))
+
+        if not isinstance(qid, str) or not qid:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "question_id required"},
+            ))
+            return
+        if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "selected_labels must be string[]"},
+            ))
+            return
+
+        delivered = self.session.question_registry.submit_answer(
+            qid,
+            selected_labels=labels,
+            other_text=other_text if isinstance(other_text, str) else None,
+            cancelled=cancelled,
+        )
+        self.transport.write(make_response(rpc_id, result={"delivered": delivered}))
 
     # ---------- 启动 ----------
 
