@@ -5,6 +5,7 @@ import { ToolBlock } from "./ToolBlock.js";
 import { Pane } from "./Pane.js";
 import { AskQuestionPanel } from "./AskQuestionPanel.js";
 import { TodoPanel } from "./TodoPanel.js";
+import { Markdown } from "./Markdown.js";
 import { theme } from "../theme.js";
 
 interface Props {
@@ -53,9 +54,7 @@ function renderItem(
         <Box>
           <Text color={theme.agent} bold>cbagent  </Text>
         </Box>
-        <Box>
-          <Text>{item.text}</Text>
-        </Box>
+        <Markdown text={item.text} />
       </Box>
     );
   }
