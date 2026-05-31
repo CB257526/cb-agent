@@ -1,11 +1,27 @@
 import os
+import threading
 from openai import OpenAI
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Any
 import json
 from constant.llm.constant_llm import ConstantLLM
+from agent.event_bus import EventBus
+from agent.events import (
+    Cancelled, ReasoningDelta, TextDelta, TokenUsage, ToolCallPlanned,
+)
 # 加载 .env 文件中的环境变量
 load_dotenv()
+
+
+def _usage_to_dict(usage: Any) -> Optional[Dict[str, int]]:
+    """OpenAI usage 对象 → dict。None 透传 None。"""
+    if usage is None:
+        return None
+    return {
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+    }
 
 class CbAgentsLLM:
     """
@@ -34,7 +50,15 @@ class CbAgentsLLM:
         #实现根据模型提供商判断是否支持函数调用的逻辑
         return ConstantLLM.llm_dict[self.model]["is_tool"]
 
-    def think(self, messages: List[Dict[str, str]], temperature: float = 0, tools: Optional[List[Dict]] = None) -> Any:
+    def think(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0,
+        tools: Optional[List[Dict]] = None,
+        event_bus: Optional[EventBus] = None,
+        cancel_event: Optional[threading.Event] = None,
+        round_idx: int = 0,
+    ) -> Any:
         """
         调用大语言模型进行思考，并返回其响应。
         tools: OpenAI Function Calling 的标准格式 JSON 字符串 比如：
@@ -56,15 +80,29 @@ class CbAgentsLLM:
             }
         }
 
-        return: {'answer': str, 'reason': str, 'tool_calls': List[Dict[str, Any]]}
+        return: {'answer': str, 'reason': str, 'tool_calls': List[Dict[str, Any]],
+                 'usage': Dict | None, 'cancelled': bool}
+
+        event_bus: 可选事件总线。流式 chunk 会经它发出 TextDelta/ReasoningDelta/
+                   TokenUsage/ToolCallPlanned/Cancelled 事件。前端订阅它替代 print。
+                   传 None 时维持旧行为（直接 print 到 stdout）。
+        cancel_event: 可选 threading.Event。每收一个 chunk 检查一次，set 则中止
+                      流式读取并返回已累积内容（带 cancelled=True 标记）。
+        round_idx: 工具循环当前轮次，1-based。仅作为事件元信息透传。
         """
         print(f"🧠 正在调用 {self.model} 模型...")
         try:
             if self.is_Function_Calling:
                 # 支持函数调用的模型调用
-                return self._think_with_Function_Calling(messages, temperature, tools)
+                return self._think_with_Function_Calling(
+                    messages, temperature, tools,
+                    event_bus=event_bus, cancel_event=cancel_event, round_idx=round_idx,
+                )
             else:
-                return self._think_no_Function_Calling(messages, temperature)
+                return self._think_no_Function_Calling(
+                    messages, temperature,
+                    event_bus=event_bus, cancel_event=cancel_event, round_idx=round_idx,
+                )
 
         except Exception as e:
             print(f"❌ 调用LLM API时发生错误: {e}")
@@ -72,30 +110,85 @@ class CbAgentsLLM:
     
     #根据api厂商是否支持Function Calling进行不同的请求
     # 1 不支持Function Calling
-    def _think_no_Function_Calling(self, messages: List[Dict[str, str]], temperature: float = 0) -> str:
+    def _think_no_Function_Calling(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0,
+        event_bus: Optional[EventBus] = None,
+        cancel_event: Optional[threading.Event] = None,
+        round_idx: int = 0,
+    ) -> List[Any]:
         """不支持函数调用的模型调用 直接返回原始响应 让调用者自己解析"""
         response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=temperature,
                 stream=True,
+                stream_options={"include_usage": True},
             )
-            
+
         # 处理流式响应
         print("✅ 大语言模型响应成功:")
-        collected_content = []
+        collected_content: List[str] = []
+        accumulated = ""
+        last_usage = None
+
         for chunk in response:
+            # cancel 检查放最前面，确保下一个 chunk 边界一定能出
+            if cancel_event is not None and cancel_event.is_set():
+                if event_bus is not None:
+                    event_bus.emit(Cancelled(where="llm_stream", round_idx=round_idx))
+                break
+
+            # usage 通常在最后一个 chunk（choices 为空）出现
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                last_usage = usage
+
             if not chunk.choices:
                 continue
             content = chunk.choices[0].delta.content or ""
-            print(content, end="", flush=True)
-            collected_content.append(content)
-        print()  # 在流式输出结束后换行
-        return ["".join(collected_content),None]  # 返回完整响应文本，tool_calls_info为None
+            if content:
+                # 默认（无 bus）维持旧行为打印到 stdout；有 bus 时不直接 print，
+                # 让订阅者自己决定渲染方式
+                if event_bus is None:
+                    print(content, end="", flush=True)
+                accumulated += content
+                collected_content.append(content)
+                if event_bus is not None:
+                    event_bus.emit(TextDelta(
+                        delta=content,
+                        accumulated=accumulated,
+                        round_idx=round_idx,
+                    ))
+        if event_bus is None:
+            print()  # 在流式输出结束后换行（旧行为）
+
+        # 推 token usage 事件
+        if last_usage is not None and event_bus is not None:
+            event_bus.emit(TokenUsage(
+                prompt_tokens=getattr(last_usage, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(last_usage, "completion_tokens", 0) or 0,
+                total_tokens=getattr(last_usage, "total_tokens", 0) or 0,
+                round_idx=round_idx,
+            ))
+
+        full_text = "".join(collected_content)
+        # 兼容旧返回结构：[text, None]；额外字段挂在 list 末尾会破坏调用方解构
+        # → 改成多带回 usage/cancelled 信息但保持位置 0/1 不变
+        return [full_text, None]
 
 
     # 2 支持Function Calling
-    def _think_with_Function_Calling(self, messages: List[Dict[str, str]], temperature: float = 0, tools: Optional[List[Dict]] = None) -> Dict[str, Any]:
+    def _think_with_Function_Calling(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0,
+        tools: Optional[List[Dict]] = None,
+        event_bus: Optional[EventBus] = None,
+        cancel_event: Optional[threading.Event] = None,
+        round_idx: int = 0,
+    ) -> Dict[str, Any]:
         """支持函数调用的模型调用（流式）。
 
         OpenAI 协议在 stream=True 下，tool_calls 会按 index 分块下发：
@@ -106,6 +199,8 @@ class CbAgentsLLM:
             ]
         每个分片可能只带 name 的一部分或 arguments json 的一段，必须按 index 累积。
         content / reasoning_content 同样按 delta 增量拼接。
+
+        event_bus / cancel_event / round_idx 见 think() 文档。
         """
         response = self.client.chat.completions.create(
             model=self.model,
@@ -114,35 +209,65 @@ class CbAgentsLLM:
             tools=tools,
             tool_choice="auto",
             stream=True,
+            stream_options={"include_usage": True},
         )
 
         content_parts: List[str] = []
         reasoning_parts: List[str] = []
+        content_accumulated = ""
+        reasoning_accumulated = ""
         # 按 index 累积 tool_calls 分片
         tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+        last_usage = None
 
         # 控制可见正文的打印：只有真正开始吐 content 时才打 "assistant > " 前缀
         printed_prefix = False
 
         for chunk in response:
+            # cancel 检查放最前面：保证下一 chunk 边界能优雅退出
+            if cancel_event is not None and cancel_event.is_set():
+                if event_bus is not None:
+                    event_bus.emit(Cancelled(where="llm_stream", round_idx=round_idx))
+                break
+
+            # usage 通常在 stream 末尾的"choices 为空"chunk 上
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                last_usage = usage
+
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
 
-            # 1) 普通 content：直接流式打到终端
+            # 1) 普通 content：直接流式打到终端（无 bus 时）或经 bus 派发
             piece = getattr(delta, "content", None) or ""
             if piece:
-                if not printed_prefix:
-                    print("\nassistant > ", end="", flush=True)
-                    printed_prefix = True
-                print(piece, end="", flush=True)
+                if event_bus is None:
+                    if not printed_prefix:
+                        print("\nassistant > ", end="", flush=True)
+                        printed_prefix = True
+                    print(piece, end="", flush=True)
+                content_accumulated += piece
                 content_parts.append(piece)
+                if event_bus is not None:
+                    event_bus.emit(TextDelta(
+                        delta=piece,
+                        accumulated=content_accumulated,
+                        round_idx=round_idx,
+                    ))
 
-            # 2) reasoning_content（DeepSeek thinking 等）：只累计不直接打，
+            # 2) reasoning_content（DeepSeek thinking 等）：旧行为只累计不直接打，
             #    交给上层 run_agent 渲染成 "Thought for Xs" 块
             r_piece = getattr(delta, "reasoning_content", None) or ""
             if r_piece:
                 reasoning_parts.append(r_piece)
+                reasoning_accumulated += r_piece
+                if event_bus is not None:
+                    event_bus.emit(ReasoningDelta(
+                        delta=r_piece,
+                        accumulated=reasoning_accumulated,
+                        round_idx=round_idx,
+                    ))
 
             # 3) tool_calls 分片：按 index 累积
             tc_chunks = getattr(delta, "tool_calls", None) or []
@@ -167,19 +292,39 @@ class CbAgentsLLM:
                     if getattr(fn, "arguments", None):
                         slot["function"]["arguments"] += fn.arguments
 
-        if printed_prefix:
-            print()  # 流式正文末尾补换行
+        if event_bus is None and printed_prefix:
+            print()  # 流式正文末尾补换行（旧行为）
 
         content = "".join(content_parts)
         reasoning_content = "".join(reasoning_parts) or None
         # 按 index 排序，输出形如 [{id, type, function:{name, arguments}}, ...]
         tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
 
+        # tool_calls 累积完成 → 每个发 ToolCallPlanned 事件（执行还没开始）
+        if event_bus is not None:
+            for tc in tool_calls:
+                event_bus.emit(ToolCallPlanned(
+                    call_id=tc.get("id", ""),
+                    name=tc["function"]["name"],
+                    arguments_json=tc["function"]["arguments"],
+                    round_idx=round_idx,
+                ))
+
+        # token usage 事件
+        if last_usage is not None and event_bus is not None:
+            event_bus.emit(TokenUsage(
+                prompt_tokens=getattr(last_usage, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(last_usage, "completion_tokens", 0) or 0,
+                total_tokens=getattr(last_usage, "total_tokens", 0) or 0,
+                round_idx=round_idx,
+            ))
+
         return {
             "answer": content,
             "reason": reasoning_content if reasoning_content else content,
             "tool_calls": tool_calls,
             "reasoning_content": reasoning_content,
+            "usage": _usage_to_dict(last_usage),
         }
     
     def _auto_detect_provider(self, api_key: Optional[str], base_url: Optional[str]) -> str:
