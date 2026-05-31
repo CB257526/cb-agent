@@ -120,6 +120,8 @@ class Gateway:
             self._handle_quit(rpc_id)
         elif method == "session.clear_history":
             self._handle_clear_history(rpc_id)
+        elif method == "session.list_tools":
+            self._handle_list_tools(rpc_id)
         else:
             if rpc_id is not None:
                 self.transport.write(make_response(
@@ -214,6 +216,36 @@ class Gateway:
             return
         if rpc_id is not None:
             self.transport.write(make_response(rpc_id, result={"cleared": True}))
+
+    def _handle_list_tools(self, rpc_id: Any) -> None:
+        """返回当前 registry 注册的工具列表，供 UI 端 / 命令展示。
+
+        结果形状: { tools: [{name, description, schema?}] }
+        - schema 直接透传 OpenAI function-calling 格式（含 parameters），UI 自己决定怎么展示
+        - 失败时仍走 RPC error；不会影响 chat 主流程
+        """
+        if rpc_id is None:
+            return
+        try:
+            registry = self.session.registry
+            schemas = registry.get_tools_description_openai_schema() or []
+            tools = []
+            for entry in schemas:
+                fn = entry.get("function") if isinstance(entry, dict) else None
+                if not fn:
+                    continue
+                tools.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "schema": fn.get("parameters"),
+                })
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result={"tools": tools}))
 
     # ---------- 启动 ----------
 

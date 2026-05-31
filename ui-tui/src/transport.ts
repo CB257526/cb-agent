@@ -138,6 +138,25 @@ export class Transport extends EventEmitter {
     return id;
   }
 
+  /** 发送 RPC 并等响应（5s 超时）。仅用于 list_tools 这种需要数据回来的场景。 */
+  private requestRpc<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    const id = this.sendRpc(method, params);
+    return new Promise<T>((resolve, reject) => {
+      const onResp = (rid: string | number, body: { result?: unknown; error?: { code: number; message: string } }) => {
+        if (rid !== id) return;
+        this.removeListener("response", onResp);
+        clearTimeout(timer);
+        if (body.error) reject(new Error(body.error.message));
+        else resolve(body.result as T);
+      };
+      const timer = setTimeout(() => {
+        this.removeListener("response", onResp);
+        reject(new Error(`RPC ${method} timeout`));
+      }, 5000);
+      this.on("response", onResp);
+    });
+  }
+
   sendPrompt(text: string): string {
     return this.sendRpc("prompt.submit", { text });
   }
@@ -148,6 +167,11 @@ export class Transport extends EventEmitter {
 
   clearHistory(): string {
     return this.sendRpc("session.clear_history");
+  }
+
+  /** 拉取后端工具列表。 */
+  listTools(): Promise<{ tools: Array<{ name: string; description: string; schema?: unknown }> }> {
+    return this.requestRpc("session.list_tools");
   }
 
   quit(): string {

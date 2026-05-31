@@ -26,7 +26,9 @@ import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
 import { ActivityPanel } from "./components/ActivityPanel.js";
 import { Banner } from "./components/Banner.js";
+import { SlashCommandPicker } from "./components/SlashCommandPicker.js";
 import { HistoryStore } from "./historyStore.js";
+import { findCommand, SlashCommand, CommandCtx } from "./commands.js";
 
 const STDERR_RING_MAX = 200;  // 内存里最多留 200 行，超出从头丢
 
@@ -51,6 +53,9 @@ export function App({ transport }: { transport: Transport }) {
   const [protocolErrors, setProtocolErrors] = useState(0);
   const [stderrLines, setStderrLines] = useState<string[]>([]);
   const [showActivity, setShowActivity] = useState(false);
+
+  // / 命令面板：input 以 '/' 开头时自动显示，picker 自己读 input.slice(1) 作 query
+  const slashActive = input.startsWith("/") && !busy;
 
   // useRef 给事件 handler 用，否则闭包里拿到的是旧 setItems
   const itemsRef = useRef(items);
@@ -196,15 +201,40 @@ export function App({ transport }: { transport: Transport }) {
 
   const handleSubmit = useCallback((text: string) => {
     if (!text.trim() || busy) return;
-    // 斜杠命令不入历史；命令系统在 C3 接管时会先于这里拦截，这里再做一道兜底
-    if (!text.startsWith("/")) {
-      historyStore.push(text);
+
+    // 斜杠命令：拦截，不走 prompt.submit，也不入历史
+    if (text.startsWith("/")) {
+      const cmd = findCommand(text);
+      if (cmd) {
+        runCommand(cmd);
+      } else {
+        appendSystem(`未知命令：${text.split(/\s+/)[0]}（输入 / 查看可用命令）`);
+      }
+      setInput("");
+      return;
     }
+
+    historyStore.push(text);
     setItems((prev) => [...prev, { id: nextId(), role: "user", text }]);
     setInput("");
     setBusy(true);
     transport.sendPrompt(text);
-  }, [busy, transport]);
+  }, [busy, transport, appendSystem]);
+
+  /** 命令面板里选中或输入框里完整输入命令时调用 */
+  const runCommand = useCallback((cmd: SlashCommand) => {
+    const ctx: CommandCtx = {
+      transport,
+      appendSystem: (t) => appendSystem(t),
+      setItems,
+      toggleActivity: () => setShowActivity((v) => !v),
+    };
+    const ret = cmd.handler(ctx);
+    if (ret instanceof Promise) {
+      ret.catch((e) => appendSystem(`✗ 命令 ${cmd.name} 抛错：${(e as Error).message}`));
+    }
+    setInput("");
+  }, [transport, appendSystem]);
 
   /** ↑/↓ 翻历史的回调：idx 0 = 最新一条，递增 = 更老。null 表示越界 */
   const getHistoryAt = useCallback((idx: number): string | null => {
@@ -228,12 +258,20 @@ export function App({ transport }: { transport: Transport }) {
       </Box>
 
       <Box marginTop={1} flexDirection="column">
+        {slashActive && (
+          <SlashCommandPicker
+            query={input.slice(1)}
+            onSelect={(cmd) => runCommand(cmd)}
+            onCancel={() => setInput("")}
+          />
+        )}
         <PromptInput
           value={input}
           onChange={setInput}
           onSubmit={handleSubmit}
           disabled={busy}
           getHistoryAt={getHistoryAt}
+          delegateNavKeys={slashActive}
         />
         <Box marginTop={1}>
           <StatusBar

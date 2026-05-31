@@ -350,6 +350,27 @@ class TestGatewayDispatch(unittest.TestCase):
         self.assertEqual(len(replies), 1)
         self.assertEqual(replies[0]["result"]["cleared"], True)
 
+    def test_gateway_list_tools(self):
+        """session.list_tools 应返回 registry 里的工具名/描述/schema 列表。"""
+        llm = FakeLLM([])
+        msgs = self._run_gateway_with_msgs(
+            llm,
+            [json.dumps({"jsonrpc": "2.0", "id": "lt1", "method": "session.list_tools"})],
+            wait_for=2,
+        )
+        replies = [m for m in msgs if m.get("id") == "lt1"]
+        self.assertEqual(len(replies), 1)
+        result = replies[0]["result"]
+        self.assertIn("tools", result)
+        self.assertIsInstance(result["tools"], list)
+        # 真 registry 至少注册了若干工具，断言形状即可
+        if result["tools"]:
+            t = result["tools"][0]
+            self.assertIn("name", t)
+            self.assertIn("description", t)
+            # schema 可为 None（无参函数工具时）但 key 应存在
+            self.assertIn("schema", t)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

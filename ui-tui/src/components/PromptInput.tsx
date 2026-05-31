@@ -24,9 +24,12 @@ export interface PromptInputProps {
   disabled: boolean;
   /** 历史读取器：null 表示无更多 / 边界。idx 0=最新一条，递增=更老 */
   getHistoryAt?: (idx: number) => string | null;
+  /** 浮层（如 SlashCommandPicker）激活时设 true：拦截 ↑/↓/Enter/Esc 给浮层处理，
+   *  本输入框只处理字符编辑（继续打字 / Backspace / 光标移动） */
+  delegateNavKeys?: boolean;
 }
 
-export function PromptInput({ value, onChange, onSubmit, disabled, getHistoryAt }: PromptInputProps) {
+export function PromptInput({ value, onChange, onSubmit, disabled, getHistoryAt, delegateNavKeys }: PromptInputProps) {
   const [cursor, setCursor] = useState(value.length);
   const [historyIdx, setHistoryIdx] = useState<number | null>(null);
 
@@ -41,6 +44,11 @@ export function PromptInput({ value, onChange, onSubmit, disabled, getHistoryAt 
 
   useInput((input, key) => {
     if (disabled) return;
+
+    // 浮层激活时：上/下/回车/Esc 让给浮层；字符编辑继续在这里处理
+    if (delegateNavKeys && (key.upArrow || key.downArrow || key.return || key.escape)) {
+      return;
+    }
 
     // ── 历史翻页 ──
     if (key.upArrow) {
