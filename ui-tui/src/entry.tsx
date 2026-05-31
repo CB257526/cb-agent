@@ -57,11 +57,16 @@ function main() {
     cwd: projectRoot,
   });
 
-  const { waitUntilExit } = render(<App transport={transport} />, {
+  // 把 ink instance 的 clear() 透传给 App，给 Ctrl+L 用
+  // 用 closure 解决"render 时 instance 还没生成"的鸡蛋问题
+  let inkInstance: ReturnType<typeof render> | null = null;
+  const clearScreen = () => inkInstance?.clear();
+
+  inkInstance = render(<App transport={transport} clearScreen={clearScreen} />, {
     exitOnCtrlC: false,  // App 自己处理 Ctrl-C
   });
 
-  waitUntilExit().finally(() => {
+  inkInstance.waitUntilExit().finally(() => {
     transport.close();
   });
 }

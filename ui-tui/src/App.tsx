@@ -39,7 +39,7 @@ historyStore.load();
 let _idCounter = 0;
 const nextId = () => `i${++_idCounter}`;
 
-export function App({ transport }: { transport: Transport }) {
+export function App({ transport, clearScreen }: { transport: Transport; clearScreen?: () => void }) {
   const { exit } = useApp();
 
   const [items, setItems] = useState<ChatItem[]>([]);
@@ -196,6 +196,12 @@ export function App({ transport }: { transport: Transport }) {
       }
     } else if (key.ctrl && inputChar === "o") {
       setShowActivity((v) => !v);
+    } else if (key.ctrl && inputChar === "l") {
+      // 仿 bash：清当前屏幕显示，但保留 React items 和后端 history
+      // 不清 items 的话，scrollback 会重新长出来；这里直接清 items 拿到"干净屏"
+      // 想保留前端可视历史的话以后可以拆成 Ctrl+L=只清屏 / /clear=连后端一起清
+      setItems([]);
+      clearScreen?.();
     }
   });
 

@@ -37,6 +37,7 @@ export function StatusBar({ model, promptTokens, completionTokens, round, maxRou
             <KeyboardShortcutHint shortcut="↑/↓" action="history" />
             <KeyboardShortcutHint shortcut="/" action="commands" />
             <KeyboardShortcutHint shortcut="Ctrl-O" action="log" />
+            <KeyboardShortcutHint shortcut="Ctrl-L" action="clear" />
             <KeyboardShortcutHint shortcut="Ctrl-C" action={busy ? "cancel" : "exit"} />
           </Byline>
         </Text>
