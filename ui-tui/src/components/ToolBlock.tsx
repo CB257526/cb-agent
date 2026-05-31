@@ -45,7 +45,9 @@ export function ToolBlock({ item }: { item: ChatItem }) {
   // 展开态：标题 + IN/OUT 框
   const argsFull = formatArgsFull(item.toolArgs);
   const result = item.toolResult ?? "";
-  const hasResult = result.length > 0;
+  const display = extractDisplay(result);
+  const renderResult = display ?? result;
+  const hasResult = renderResult.length > 0;
 
   return (
     <Box flexDirection="column" marginY={0}>
@@ -70,7 +72,7 @@ export function ToolBlock({ item }: { item: ChatItem }) {
           <Box flexDirection="row" marginTop={argsFull ? 1 : 0}>
             <Box width={5}><Text dimColor>OUT</Text></Box>
             <Box flexDirection="column" flexGrow={1}>
-              {truncate(result, RESULT_MAX).split("\n").map((line, i) => (
+              {truncate(renderResult, RESULT_MAX).split("\n").map((line, i) => (
                 <Text key={i} color={item.toolError ? theme.error : undefined}>{line}</Text>
               ))}
             </Box>
@@ -121,4 +123,23 @@ function formatArgsFull(args?: Record<string, unknown>): string {
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, max) + `\n... [+${s.length - max} chars truncated, see ~/.cb-agent/logs]`;
+}
+
+/**
+ * 工具结果若是 JSON 且包含 __display__ 字段，提取作为 UI 预览。
+ * 当前 BashTool 用此约定避免把整段结构化 JSON 直接刷到屏幕上。
+ * 不是 JSON 或字段缺失时返回 null，由上层 fallback 到原文渲染。
+ */
+function extractDisplay(s: string): string | null {
+  const t = s.trimStart();
+  if (!t.startsWith("{")) return null;
+  try {
+    const obj = JSON.parse(s);
+    if (obj && typeof obj === "object" && typeof obj.__display__ === "string") {
+      return obj.__display__;
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }

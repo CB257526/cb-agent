@@ -36,6 +36,74 @@ from tools.tools.bash_permission import (
 logger = logging.getLogger(__name__)
 
 
+# UI 预览相关常量。仅影响 __display__ 字段，不影响给 LLM 的 stdout/stderr。
+_DISPLAY_STDOUT_PREVIEW = 800
+_DISPLAY_STDERR_PREVIEW = 400
+
+
+def _clip(s: str, n: int) -> str:
+    """字符级截断，超长追加提示。"""
+    if len(s) <= n:
+        return s
+    return s[:n] + f"\n... [+{len(s) - n} chars]"
+
+
+def _build_bash_display(
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    exit_code: int = 0,
+    is_error: bool = False,
+    interrupted: bool = False,
+    timeout: bool = False,
+    background: bool = False,
+    background_task_id: Optional[str] = None,
+    error_override: Optional[str] = None,
+) -> str:
+    """生成 bash 工具的 UI 预览文本（无 ANSI 颜色，前端自行着色）。
+
+    规则：
+    - error_override（参数验证失败 / fatal 拒绝 / 权限拒绝）：直接输出 "✗ <reason>"
+    - background：单行 "⟳ 后台运行中 (task <id>)"
+    - timeout / interrupted：单行标记
+    - is_error：首行 "✗ exit N"，下面 stderr → stdout（各 ≤ 800 字）
+    - 正常：stdout（≤ 800 字），如有 stderr 追加 ≤ 400 字
+    - 全空：返回 "Done."
+    """
+    if error_override:
+        return f"✗ {error_override}"
+
+    if background:
+        return f"⟳ 后台运行中 (task {background_task_id or '?'})"
+
+    if timeout:
+        return "⏱ 命令超时"
+
+    if interrupted:
+        return "✗ 命令被中断"
+
+    stdout = (stdout or "").rstrip()
+    stderr = (stderr or "").rstrip()
+    parts: list[str] = []
+
+    if is_error:
+        parts.append(f"✗ exit {exit_code}")
+        if stderr:
+            parts.append(_clip(stderr, _DISPLAY_STDOUT_PREVIEW))
+        if stdout:
+            parts.append(_clip(stdout, _DISPLAY_STDOUT_PREVIEW))
+    else:
+        if stdout:
+            parts.append(_clip(stdout, _DISPLAY_STDOUT_PREVIEW))
+        if stderr:
+            parts.append(_clip(stderr, _DISPLAY_STDERR_PREVIEW))
+
+    if not parts:
+        return "Done."
+
+    return "\n".join(parts)
+
+
 def _gate_result_to_dict(gate_res) -> Optional[Dict[str, Any]]:
     """把 GateResult 拍平成 JSON 可读字段，给模型用。
 
@@ -176,6 +244,7 @@ class BashTool(Tool):
         if not self.validate_parameters(parameters):
             return json.dumps({
                 "error": "参数验证失败", "stdout": "", "stderr": "",
+                "__display__": _build_bash_display(error_override="参数验证失败"),
             }, ensure_ascii=False)
 
         command = parameters["command"].strip()
@@ -199,6 +268,7 @@ class BashTool(Tool):
                 "background": False,
                 "classification": classify_command(command),
                 "permission": None,
+                "__display__": _build_bash_display(error_override=fatal),
             }, ensure_ascii=False)
 
         warnings = check_warnings(command)
@@ -239,6 +309,9 @@ class BashTool(Tool):
                     "permission_unavailable": gate_res.permission_unavailable,
                     "warnings": warnings,
                     "permission": _gate_result_to_dict(gate_res),
+                    "__display__": _build_bash_display(
+                        error_override=f"[权限拒绝] {gate_res.reason}",
+                    ),
                 }, ensure_ascii=False)
 
         self._last_command = command
@@ -340,6 +413,14 @@ class BashTool(Tool):
             "output_truncated": processed.output_truncated,
             "output_file": processed.output_file,
             "permission": _gate_result_to_dict(gate_res),
+            "__display__": _build_bash_display(
+                stdout=processed.stdout,
+                stderr=processed.stderr,
+                exit_code=exit_code,
+                is_error=is_error,
+                interrupted=interrupted,
+                timeout=timed_out,
+            ),
         }, ensure_ascii=False)
 
     # ========== 后台执行（走 BackgroundRegistry） ==========
@@ -363,6 +444,7 @@ class BashTool(Tool):
                 "classification": classify_command(command),
                 "warnings": warnings,
                 "permission": _gate_result_to_dict(gate_res),
+                "__display__": _build_bash_display(error_override=f"后台启动失败: {e}"),
             }, ensure_ascii=False)
         return json.dumps({
             "stdout": (
@@ -382,6 +464,9 @@ class BashTool(Tool):
             "classification": classify_command(command),
             "warnings": warnings,
             "permission": _gate_result_to_dict(gate_res),
+            "__display__": _build_bash_display(
+                background=True, background_task_id=task.id,
+            ),
         }, ensure_ascii=False)
 
 

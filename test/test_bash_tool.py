@@ -829,5 +829,65 @@ class TestReadStateRegistry(unittest.TestCase):
         self.assertIsNone(reg.get_read_mtime(ghost))
 
 
+class TestBashDisplay(unittest.TestCase):
+    """_build_bash_display + run() 注入 __display__ 字段。"""
+
+    def test_normal_stdout_only(self):
+        from tools.tools.bash_tool import _build_bash_display
+        out = _build_bash_display(stdout="hello\nworld")
+        self.assertEqual(out, "hello\nworld")
+
+    def test_empty_returns_done(self):
+        from tools.tools.bash_tool import _build_bash_display
+        self.assertEqual(_build_bash_display(), "Done.")
+
+    def test_error_prefixes_exit_code(self):
+        from tools.tools.bash_tool import _build_bash_display
+        out = _build_bash_display(stderr="boom", exit_code=1, is_error=True)
+        self.assertTrue(out.startswith("✗ exit 1"))
+        self.assertIn("boom", out)
+
+    def test_error_override_short_circuits(self):
+        from tools.tools.bash_tool import _build_bash_display
+        out = _build_bash_display(error_override="参数验证失败")
+        self.assertEqual(out, "✗ 参数验证失败")
+
+    def test_background_uses_task_id(self):
+        from tools.tools.bash_tool import _build_bash_display
+        out = _build_bash_display(background=True, background_task_id="abc123")
+        self.assertIn("abc123", out)
+        self.assertIn("后台运行中", out)
+
+    def test_timeout_priority(self):
+        from tools.tools.bash_tool import _build_bash_display
+        # timeout 优先于 stdout 输出
+        out = _build_bash_display(stdout="x", timeout=True)
+        self.assertEqual(out, "⏱ 命令超时")
+
+    def test_stdout_clipped_at_800(self):
+        from tools.tools.bash_tool import _build_bash_display
+        big = "a" * 2000
+        out = _build_bash_display(stdout=big)
+        # 截到 800 + 提示，肯定 < 原始 2000
+        self.assertLess(len(out), 1000)
+        self.assertIn("[+1200 chars]", out)
+
+    def test_run_success_includes_display(self):
+        """走真实 run() 路径，确认 __display__ 注入。"""
+        from tools.tools.bash_tool import BashTool
+        from tools.tools.bash_permission import PermissionGate, PermissionStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PermissionStore(Path(tmp) / "perm.json")
+            gate = PermissionGate(store, strict=False)
+            tool = BashTool(permission=gate)
+            res = tool.run({"command": "echo hello"})
+            data = json.loads(res)
+            self.assertIn("__display__", data)
+            self.assertIn("hello", data["__display__"])
+            # __display__ 不应是结构化 JSON，而是裸文本
+            self.assertNotIn("\"stdout\"", data["__display__"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
