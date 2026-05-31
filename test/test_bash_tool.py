@@ -350,6 +350,106 @@ class TestPermission(unittest.TestCase):
             self.assertIsNotNone(s2.is_allowed("git push", "/anywhere"))
 
 
+class TestPermissionPromptChannel(unittest.TestCase):
+    """prompt_user 优先走 question_channel，没 channel 也没 TTY 才返回 permission_unavailable。"""
+
+    def _gate(self, channel=None):
+        from tools.tools.bash_permission import PermissionGate, PermissionStore
+        d = tempfile.mkdtemp()
+        return PermissionGate(
+            store=PermissionStore(store_path=Path(d) / "p.json"),
+            strict=True,
+            question_channel=channel,
+        )
+
+    def test_no_channel_no_tty_returns_unavailable(self):
+        """无 channel + 非 TTY → DENY + permission_unavailable=True（旧行为兜底）。"""
+        from unittest.mock import patch
+        gate = self._gate(channel=None)
+        # 强制 stdin 视为非 TTY，避免 unittest 模式下意外进入 input() 阻塞
+        with patch("sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = False
+            res = gate.prompt_user("python build.py", "python", "非只读", "/x")
+        self.assertEqual(res.decision, Decision.DENY)
+        self.assertTrue(res.permission_unavailable)
+
+    def test_channel_allow_once(self):
+        """channel 返回'允许这一次' → ALLOW，不写 store。"""
+        class FakeChannel:
+            def __init__(self):
+                self.calls = []
+            def ask(self, question, options, **_):
+                self.calls.append({"q": question, "opts": [o["label"] for o in options]})
+                return {"answer": "允许这一次", "cancelled": False}
+
+        ch = FakeChannel()
+        gate = self._gate(channel=ch)
+        res = gate.prompt_user("python build.py", "python", "非只读", "/x")
+        self.assertEqual(res.decision, Decision.ALLOW)
+        self.assertIsNone(res.matched_rule)
+        self.assertEqual(len(ch.calls), 1)
+        # 4 个选项要带上去
+        self.assertEqual(len(ch.calls[0]["opts"]), 4)
+
+    def test_channel_grant_cwd_writes_rule(self):
+        """选'总是允许 ... 在此目录' → 写 store + matched_rule 非空。"""
+        class FakeChannel:
+            def ask(self, question, options, **_):
+                # 模拟用户选了第二项（cwd 范围）
+                _ = question
+                return {"answer": options[1]["label"], "cancelled": False}
+
+        gate = self._gate(channel=FakeChannel())
+        with tempfile.TemporaryDirectory() as proj:
+            res = gate.prompt_user("python build.py", "python", "非只读", proj)
+            self.assertEqual(res.decision, Decision.ALLOW)
+            self.assertIsNotNone(res.matched_rule)
+            self.assertEqual(res.matched_rule.scope, "cwd")
+            # 下次 evaluate 同 cwd 应直接 ALLOW
+            # extract_prefix 在多动词命令(python)上会取前两 token；
+            # 但首个非 dash 子命令以 - 开头时退回单 token "python"，匹配规则
+            r2 = gate.evaluate("python -c x", [["python", "-c", "x"]], [], proj)
+            self.assertEqual(r2.decision, Decision.ALLOW)
+
+    def test_channel_deny_returns_deny(self):
+        """选'拒绝' → DENY，不写 store。"""
+        class FakeChannel:
+            def ask(self, *_a, **_kw):
+                return {"answer": "拒绝", "cancelled": False}
+
+        gate = self._gate(channel=FakeChannel())
+        res = gate.prompt_user("python build.py", "python", "非只读", "/x")
+        self.assertEqual(res.decision, Decision.DENY)
+        self.assertFalse(res.permission_unavailable)
+
+    def test_channel_cancelled_returns_deny(self):
+        """用户取消（Ctrl+C / 关闭弹窗）→ DENY。"""
+        class FakeChannel:
+            def ask(self, *_a, **_kw):
+                return {"cancelled": True}
+
+        gate = self._gate(channel=FakeChannel())
+        res = gate.prompt_user("python build.py", "python", "非只读", "/x")
+        self.assertEqual(res.decision, Decision.DENY)
+        self.assertFalse(res.permission_unavailable)
+
+    def test_channel_exception_falls_back(self):
+        """channel.ask 抛异常 → 不应让用户的 bash 直接挂掉，要降级 TTY 或 unavailable。"""
+        from unittest.mock import patch
+
+        class BrokenChannel:
+            def ask(self, *_a, **_kw):
+                raise RuntimeError("boom")
+
+        gate = self._gate(channel=BrokenChannel())
+        with patch("sys.stdin") as fake_stdin:
+            fake_stdin.isatty.return_value = False
+            res = gate.prompt_user("python build.py", "python", "非只读", "/x")
+        # 测试环境无 TTY，最终落到 unavailable
+        self.assertEqual(res.decision, Decision.DENY)
+        self.assertTrue(res.permission_unavailable)
+
+
 class TestFileRead(unittest.TestCase):
 
     def test_head(self):

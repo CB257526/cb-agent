@@ -188,6 +188,14 @@ class AgentRunner:
             )
         )
 
+        # 5c. 给全局 PermissionGate 装上 question_channel，让 bash 权限弹框
+        # 也能走 UI 而不是 stdin（TUI 模式下 stdin 被前端接管）
+        from agent.question_channel import QuestionChannel
+        from tools.tools.bash_permission import get_permission_gate
+        get_permission_gate().question_channel = QuestionChannel(
+            self.session.question_registry, self.event_bus,
+        )
+
         # 6. CLI 渲染器（订阅事件 → stdout）。gateway 模式下不挂，由 transport 转发事件
         if self._attach_cli_renderer:
             self.renderer = CLIRenderer(self.event_bus)

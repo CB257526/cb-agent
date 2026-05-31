@@ -21,9 +21,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from agent.cancel import get_current_cancel_token
 from agent.event_bus import EventBus
-from agent.events import AskUserQuestion, AskUserQuestionAnswered
+from agent.question_channel import QuestionChannel
 from agent.question_registry import QuestionRegistry
 from tools.tool import Tool, ToolParameter
 
@@ -42,6 +41,7 @@ class AskUserQuestionTool(Tool):
         )
         self._registry = question_registry
         self._bus = event_bus
+        self._channel = QuestionChannel(question_registry, event_bus)
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
@@ -114,34 +114,14 @@ class AskUserQuestionTool(Tool):
         rec = parameters.get("recommended_index")
         recommended_index: Optional[int] = rec if isinstance(rec, int) and not isinstance(rec, bool) else None
 
-        qid = self._registry.new_question_id()
-        self._registry.register(qid)
-
-        self._bus.emit(AskUserQuestion(
-            question_id=qid,
+        result = self._channel.ask(
             question=question,
             options=options,
             multi_select=multi_select,
             recommended_index=recommended_index,
-            allow_other=True,
-        ))
+        )
 
-        cancel_token = get_current_cancel_token()
-        cancel_event = cancel_token.event if cancel_token is not None else None
-
-        try:
-            slot = self._registry.wait_for_answer(qid, cancel_event=cancel_event)
-        finally:
-            self._registry.discard(qid)
-
-        self._bus.emit(AskUserQuestionAnswered(
-            question_id=qid,
-            selected_labels=list(slot.selected_labels),
-            other_text=slot.other_text,
-            cancelled=slot.cancelled,
-        ))
-
-        if slot.cancelled:
+        if result.get("cancelled"):
             return json.dumps(
                 {"cancelled": True, "reason": "user cancelled or interrupted"},
                 ensure_ascii=False,
@@ -150,15 +130,13 @@ class AskUserQuestionTool(Tool):
         if multi_select:
             payload: Dict[str, Any] = {
                 "question": question,
-                "answers": list(slot.selected_labels),
+                "answers": result.get("answers", []),
             }
-            if slot.other_text:
-                payload["other_text"] = slot.other_text
+            if result.get("other_text"):
+                payload["other_text"] = result["other_text"]
             return json.dumps(payload, ensure_ascii=False)
 
-        # 单选
-        answer = slot.selected_labels[0] if slot.selected_labels else ""
-        payload = {"question": question, "answer": answer}
-        if slot.other_text:
-            payload["other_text"] = slot.other_text
+        payload = {"question": question, "answer": result.get("answer", "")}
+        if result.get("other_text"):
+            payload["other_text"] = result["other_text"]
         return json.dumps(payload, ensure_ascii=False)

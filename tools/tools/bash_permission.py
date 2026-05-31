@@ -335,9 +335,13 @@ class PermissionGate:
         self,
         store: Optional[PermissionStore] = None,
         strict: bool = True,
+        question_channel: Optional["QuestionChannel"] = None,
     ):
         self.store = store or PermissionStore()
         self.strict = strict
+        # 问询通道：UI 模式下用它通过 AskUserQuestion 事件向前端弹框；
+        # 没注入时降级到 stdin 弹窗，stdin 也不可用时返回 permission_unavailable
+        self.question_channel = question_channel
 
     def evaluate(
         self,
@@ -395,19 +399,85 @@ class PermissionGate:
         reason: str,
         cwd: str,
     ) -> GateResult:
-        """REPL 同步弹窗，阻塞 stdin 读用户选择。
-
-        非 TTY → 直接返回 DENY + permission_unavailable=True，让模型知道
-        是没终端而不是命令本身被拒。
+        """问用户。优先级：
+        1. question_channel（UI 弹框，跨线程同步等待）
+        2. stdin TTY（CLI 模式 input()）
+        3. 都不可用 → permission_unavailable=True，返回 DENY
         """
-        if not (sys.stdin and sys.stdin.isatty()):
-            return GateResult(
-                Decision.DENY,
-                reason="无可用终端确认权限",
-                permission_unavailable=True,
-            )
+        # 1) UI 通道
+        if self.question_channel is not None:
+            try:
+                return self._prompt_via_channel(command, prefix, reason, cwd)
+            except Exception as e:  # 通道异常退回 stdin / 不可用，避免吞掉用户操作
+                import logging
+                logging.getLogger(__name__).warning(
+                    "permission: question_channel 失败，降级到 stdin: %s", e,
+                )
 
-        # 弹窗框
+        # 2) stdin TTY
+        if sys.stdin and sys.stdin.isatty():
+            return self._prompt_via_stdin(command, prefix, reason, cwd)
+
+        # 3) 不可用
+        return GateResult(
+            Decision.DENY,
+            reason="无可用终端确认权限",
+            permission_unavailable=True,
+        )
+
+    def _prompt_via_channel(
+        self,
+        command: str,
+        prefix: str,
+        reason: str,
+        cwd: str,
+    ) -> GateResult:
+        """通过 question_channel 弹框。channel.ask 阻塞等到用户答完返回 dict
+        {"answer": "<label>", "cancelled": bool}。
+        """
+        question = (
+            f"是否执行命令？\n"
+            f"  命令：{command}\n"
+            f"  原因：{reason}\n"
+            f"  目录：{cwd}"
+        )
+        # label 设计上要能回译为 1/2/3/4 这四档
+        opt_once = "允许这一次"
+        opt_cwd = f'总是允许 "{prefix}" 在此目录'
+        opt_global = f'总是允许 "{prefix}" 在所有目录'
+        opt_deny = "拒绝"
+        options = [
+            {"label": opt_once, "description": "只放行这一次调用"},
+            {"label": opt_cwd, "description": f"加入项目 allowlist（cwd={cwd}）"},
+            {"label": opt_global, "description": "加入全局 allowlist，任何目录都允许"},
+            {"label": opt_deny, "description": "拒绝执行"},
+        ]
+        result = self.question_channel.ask(
+            question=question,
+            options=options,
+            recommended_index=0,
+        )
+        if result.get("cancelled"):
+            return GateResult(Decision.DENY, reason="用户取消")
+        answer = result.get("answer", "")
+        if answer == opt_once:
+            return GateResult(Decision.ALLOW, reason="本次允许")
+        if answer == opt_cwd:
+            rule = self.store.add_rule(prefix, "cwd", cwd)
+            return GateResult(Decision.ALLOW, reason="已加入项目级 allowlist", matched_rule=rule)
+        if answer == opt_global:
+            rule = self.store.add_rule(prefix, "global")
+            return GateResult(Decision.ALLOW, reason="已加入全局 allowlist", matched_rule=rule)
+        return GateResult(Decision.DENY, reason="用户拒绝")
+
+    def _prompt_via_stdin(
+        self,
+        command: str,
+        prefix: str,
+        reason: str,
+        cwd: str,
+    ) -> GateResult:
+        """REPL 同步弹窗，阻塞 stdin。"""
         bar = "─" * 12
         print(f"\n{bar} 需要确认执行 {bar}", flush=True)
         print(f"命令：{command}", flush=True)

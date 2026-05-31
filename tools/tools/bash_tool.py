@@ -69,6 +69,7 @@ class BashTool(Tool):
         session: Optional[BashSession] = None,
         permission: Optional[PermissionGate] = None,
         is_subagent: bool = False,
+        question_channel: Optional[Any] = None,
     ):
         super().__init__(
             name="bash",
@@ -90,6 +91,9 @@ class BashTool(Tool):
             self._session = get_session()
 
         self._permission = permission or get_permission_gate()
+        # 注入了 question_channel 就把它绑到 gate 上，让 prompt_user 走 UI 弹框
+        if question_channel is not None and self._permission.question_channel is None:
+            self._permission.question_channel = question_channel
         self._is_subagent = is_subagent
 
         self._last_command = ""
