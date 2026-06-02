@@ -38,6 +38,7 @@ import os
 import signal
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, Dict, List
 
 # 把 cb-agent 目录加到 sys.path，允许从其它目录起 python
@@ -59,6 +60,7 @@ from agent.events import Done
 from agent.executor import ToolExecutor
 from agent.renderers.cli import CLIRenderer
 from agent.session import AgentSession
+from agent.work_context import LocalSessionStore, TraceSummarizer
 from context import ContextBuilder, ContextConfig
 from skills.skill_manager import SkillManager
 from skills.skill_executor import SkillExecutor
@@ -163,9 +165,18 @@ class AgentRunner:
             config=ContextConfig(
                 max_tokens=8000,
                 min_relevance=0.05,
-                history_max_messages=8,
+                # 新增【工作记录】后，一轮带工具的对话通常会产生
+                # user / assistant final / assistant work_record 三条 history。
+                # 窗口从 8 调到 12，可以让最近几轮工具事实不至于太快被挤出。
+                history_max_messages=12,
             ),
         )
+        # 跨轮工作上下文采用项目级持久化：这些状态和当前仓库文件强绑定，
+        # 放在 .cbagent/sessions 比放到用户级 ~/.cb-agent 更容易理解和清理。
+        session_store = LocalSessionStore(Path(_HERE) / ".cbagent" / "sessions")
+        # trace_summarizer 只在工具轨迹超过阈值时静默调用；小 trace 走规则压缩。
+        # 它不会走主回答的 llm.think 流式路径，因此不会向 UI 误发 text_delta。
+        trace_summarizer = TraceSummarizer(self.llm)
 
         # 5. 会话核心（纯逻辑）
         self.session = AgentSession(
@@ -177,6 +188,8 @@ class AgentRunner:
             skill_manager=self._skill_manager,
             ctx_enabled=self.ctx_enabled,
             messages_snapshot_hook=self._on_messages_snapshot,
+            session_store=session_store,
+            trace_summarizer=trace_summarizer,
         )
 
         # 5b. 依赖 session 共享态的工具：AskUserQuestionTool 需要 session 的
@@ -427,8 +440,10 @@ class AgentRunner:
                 print(f"  {i:2d}. [{role}] {preview}")
             print()
         elif cmd == "/clear":
+            # /clear 现在是彻底清理：内存 history + active session 本地文件。
+            # 这样重启后不会因为 index.json 指向旧 session 而自动恢复旧上下文。
             self.session.clear_history()
-            _info("会话历史已清空")
+            _info("会话历史与本地会话记录已删除")
         elif cmd == "/ctx":
             if arg in ("on", "off"):
                 self.session.ctx_enabled = arg == "on"

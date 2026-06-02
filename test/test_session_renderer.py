@@ -8,8 +8,11 @@ from __future__ import annotations
 import io
 import os
 import sys
+import tempfile
 import threading
 import unittest
+import json
+from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
@@ -38,6 +41,7 @@ from agent.renderers.cli import (
     _short_args,
 )
 from agent.session import AgentSession
+from agent.work_context import LocalSessionStore
 
 
 # ========== fakes ==========
@@ -146,6 +150,92 @@ class TestAgentSessionBasic(unittest.TestCase):
         # 第 2 次 think 的 messages 里应有 tool 消息
         round2_msgs = llm.calls[1]["messages"]
         self.assertTrue(any(m.get("role") == "tool" for m in round2_msgs))
+
+    def test_tool_trace_appended_as_work_record_and_seen_next_turn(self):
+        long_content = "abcdef" * 40
+        llm = FakeLLM([
+            {"answer": "", "tool_calls": [_tc("file_read", '{"path":"a.txt"}')]},
+            {"answer": "看到了文件", "tool_calls": []},
+            {"answer": "继续", "tool_calls": []},
+        ])
+        self.registry.execute_tool = MagicMock(return_value=json.dumps({
+            "path": "a.txt",
+            "mode": "head-100",
+            "total_lines": 12,
+            "returned_lines": 12,
+            "truncated": False,
+            "content": long_content,
+        }, ensure_ascii=False))
+        self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s.chat("读 a.txt")
+
+            self.assertEqual(len(s.history), 3)
+            work_content = s.history[-1].content
+            self.assertIsInstance(work_content, str)
+            self.assertIn("【工作记录】", work_content)
+            self.assertIn("a.txt", work_content)
+            self.assertNotIn(long_content, work_content)
+
+            round2_tool_msgs = llm.calls[1]["messages"]
+            self.assertTrue(any(
+                m.get("role") == "tool" and long_content in m.get("content", "")
+                for m in round2_tool_msgs
+            ))
+
+            transcript = store.active_dir / "transcript.jsonl"
+            raw_transcript = transcript.read_text(encoding="utf-8")
+            self.assertIn("【工作记录】", raw_transcript)
+            self.assertNotIn(long_content, raw_transcript)
+
+            s.chat("继续分析")
+            next_turn_messages = llm.calls[2]["messages"]
+            self.assertTrue(any(
+                "【工作记录】" in str(m.get("content", ""))
+                for m in next_turn_messages
+            ))
+
+    def test_session_store_restores_history_and_clear_deletes_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            llm = FakeLLM([
+                {"answer": "", "tool_calls": [_tc("file_read", '{"path":"b.txt"}')]},
+                {"answer": "done", "tool_calls": []},
+            ])
+            self.registry.execute_tool = MagicMock(return_value=json.dumps({
+                "path": "b.txt",
+                "mode": "head-100",
+                "total_lines": 1,
+                "returned_lines": 1,
+                "content": "hello",
+            }, ensure_ascii=False))
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s.chat("读 b.txt")
+            active_dir = store.active_dir
+
+            restored = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+            self.assertEqual(len(restored.history), 3)
+            self.assertIn("【工作记录】", str(restored.history[-1].content))
+
+            restored.clear_history()
+            self.assertEqual(restored.history, [])
+            self.assertFalse(active_dir.exists())
+            self.assertFalse((root / "index.json").exists())
 
     def test_chat_history_appended_correctly(self):
         llm = FakeLLM([{"answer": "好的", "tool_calls": []}])

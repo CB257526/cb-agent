@@ -38,10 +38,17 @@ from agent.events import (
 )
 from agent.executor import ToolExecutor
 from agent.question_registry import QuestionRegistry
-from context import ContextBuilder
+from context import ContextBuilder, ContextPacket, ContextPriority
 from core.message import Message
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
+from agent.work_context import (
+    LocalSessionStore,
+    RuleTraceSummarizer,
+    TraceCollector,
+    TraceSummarizer,
+    make_work_record_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +72,10 @@ class AgentSession:
         skill_manager: Optional[SkillManager] = None,
         bash_prompt_provider=None,
         ctx_enabled: bool = True,
-        history_window: int = 10,
+        history_window: int = 12,
         messages_snapshot_hook=None,
+        session_store: Optional[LocalSessionStore] = None,
+        trace_summarizer: Optional[TraceSummarizer] = None,
     ) -> None:
         """
         Args:
@@ -84,7 +93,22 @@ class AgentSession:
         self.ctx_enabled = ctx_enabled
         self.history_window = history_window
         self.messages_snapshot_hook = messages_snapshot_hook
+        self.session_store = session_store
+        self.trace_summarizer = trace_summarizer
+        self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
+        if self.session_store is not None:
+            try:
+                # 启动自动恢复最近会话：这里只恢复普通 user/assistant 消息和
+                # 【工作记录】assistant 消息，不恢复 role=tool，也不恢复
+                # assistant.tool_calls。tool 协议消息只在同一轮 tool loop 内合法，
+                # 跨进程/跨轮直接回灌会造成 tool_call_id 对不上的协议风险。
+                self.history = self.session_store.load_latest_history(
+                    max_messages=self.history_window,
+                )
+            except Exception:
+                logger.exception("本地会话历史恢复失败，忽略")
+                self.history = []
         # 当前正在跑的 chat 的 cancel token；REPL 收 Ctrl-C 时调它的 .cancel()
         # 没在 chat 中时为 None
         self.current_cancel_token: Optional[CancelToken] = None
@@ -148,6 +172,10 @@ class AgentSession:
         user_query = self._prepend_background_notifications(user_query)
 
         system_instructions = self._build_system_instructions()
+        # 本地 state 是"长期工作态"，比如已读文件、已改文件、最近命令。
+        # 它比普通 history 更像任务状态，所以在 ContextBuilder 开启时作为
+        # P1_STATE 进入 [State]；关闭 ContextBuilder 时则手工拼入 system。
+        state_packet = self._build_state_packet()
 
         # 构 messages
         if self.ctx_enabled and self.builder is not None:
@@ -155,8 +183,15 @@ class AgentSession:
                 user_query=user_query,
                 conversation_history=self.history,
                 system_instructions=system_instructions,
+                additional_packets=[state_packet] if state_packet else None,
             )
         else:
+            if state_packet is not None:
+                system_instructions = (
+                    system_instructions
+                    + "\n\n[State]\n关键进展与未决问题：\n"
+                    + state_packet.content
+                )
             messages = [{"role": "system", "content": system_instructions}]
             for m in self.history[-self.history_window:]:
                 messages.append(m.to_dict())
@@ -168,12 +203,25 @@ class AgentSession:
             else None
         )
 
-        rounds_used, final_answer = self._tool_loop(messages, tools_schema, token)
+        rounds_used, final_answer, trace_collector = self._tool_loop(
+            messages, tools_schema, token,
+        )
 
-        # 历史落盘（用 user_query 不是整段 system，避免膨胀）
+        # 跨轮历史仍然先保存用户输入和最终回答，保持原来的对话语义。
+        # 下面的 work_record 是额外的普通 assistant 文本，不是 tool 消息。
         self.history.append(Message.create_user_message(user_query))
         if final_answer:
             self.history.append(Message.create_assistant_message(final_answer))
+        # trace_collector 来自本轮工具循环，里面只有被压缩过的工具事实。
+        # 如果本轮没有工具调用，就不会生成【工作记录】，避免无意义地撑大 history。
+        work_record = self._make_work_record(
+            user_query=user_query,
+            final_answer=final_answer,
+            trace_collector=trace_collector,
+        )
+        if work_record is not None and work_record.text:
+            self.history.append(make_work_record_message(work_record))
+        self._persist_turn(user_query, final_answer, work_record)
 
         # Done 事件：让前端知道整轮结束
         self.event_bus.emit(Done(
@@ -184,7 +232,15 @@ class AgentSession:
         return final_answer
 
     def clear_history(self) -> None:
+        # /clear 的新语义是"彻底清理当前会话"：内存 history 和项目级
+        # .cbagent/sessions active session 都删掉。下一轮继续聊天时 store 会
+        # 自动创建新 session，不会把旧上下文再恢复回来。
         self.history.clear()
+        if self.session_store is not None:
+            try:
+                self.session_store.clear_active_session()
+            except Exception:
+                logger.exception("清理本地会话失败")
 
     # ---------- 工具循环 ----------
 
@@ -193,8 +249,8 @@ class AgentSession:
         messages: List[Dict[str, Any]],
         tools_schema: Optional[List[Dict[str, Any]]],
         token: CancelToken,
-    ) -> tuple[int, str]:
-        """工具调用主循环。返回 (rounds_used, final_answer)。
+    ) -> tuple[int, str, TraceCollector]:
+        """工具调用主循环。返回 (rounds_used, final_answer, trace_collector)。
 
         每轮：
         1. 检查 token：进新一轮前已被 cancel → 立刻收尾
@@ -207,6 +263,11 @@ class AgentSession:
         6. 超过 MAX_TOOL_ROUNDS 仍未收敛 → emit Error 并兜底
         """
         partial_answer = ""  # 中断时已经流式打了一部分答案，要回传给前端
+        # trace_collector 与 messages 并行存在：
+        # - messages：完整协议上下文，包含完整 tool result，用于本轮继续 think；
+        # - trace_collector：跨轮压缩轨迹，只记录 path/cwd/exit_code/短摘要等。
+        # 这保证了本轮推理能力不受截断影响，同时下一轮不会背上大段工具输出。
+        trace_collector = TraceCollector()
         for round_idx in range(1, self.MAX_TOOL_ROUNDS + 1):
             # 进入新一轮前先看 token
             if token.is_cancelled():
@@ -217,7 +278,11 @@ class AgentSession:
                     round_idx=max(round_idx - 1, 1),
                     has_tool_calls=False, final=True,
                 ))
-                return round_idx - 1 if round_idx > 1 else 1, partial_answer
+                return (
+                    round_idx - 1 if round_idx > 1 else 1,
+                    partial_answer,
+                    trace_collector,
+                )
 
             self.event_bus.emit(RoundStart(
                 round_idx=round_idx,
@@ -243,7 +308,7 @@ class AgentSession:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, final
+                return round_idx, final, trace_collector
 
             if not isinstance(result, dict):
                 self.event_bus.emit(Error(
@@ -254,7 +319,7 @@ class AgentSession:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, ""
+                return round_idx, "", trace_collector
 
             answer = result.get("answer", "") or ""
             tool_calls = result.get("tool_calls") or []
@@ -268,13 +333,13 @@ class AgentSession:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, answer
+                return round_idx, answer, trace_collector
 
             if not tool_calls:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, answer
+                return round_idx, answer, trace_collector
 
             # assistant 的 tool_calls 消息回灌
             assistant_msg: Dict[str, Any] = {
@@ -293,6 +358,8 @@ class AgentSession:
                 tool_calls, round_idx=round_idx, cancel_token=token,
             )
             for call, exec_result in zip(tool_calls, results):
+                # 完整工具结果仍按 OpenAI tool calling 协议回灌给本轮 messages。
+                # 这一点不能改，否则多轮工具调用时模型看不到真实工具输出。
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
@@ -303,6 +370,15 @@ class AgentSession:
                         else str(exec_result.result)
                     ),
                 })
+                # 另一路只记录压缩摘要，供本轮结束后生成【工作记录】。
+                # 这里不把 trace 写入 messages，避免下一轮出现伪造的 tool 消息。
+                trace_collector.add_tool_result(
+                    call=call,
+                    name=exec_result.name,
+                    result=exec_result.result,
+                    is_error=exec_result.is_error,
+                    round_idx=round_idx,
+                )
 
             self.event_bus.emit(RoundEnd(
                 round_idx=round_idx, has_tool_calls=True, final=False,
@@ -314,9 +390,73 @@ class AgentSession:
             message=f"工具调用超过 {self.MAX_TOOL_ROUNDS} 轮，强制终止",
             round_idx=self.MAX_TOOL_ROUNDS,
         ))
-        return self.MAX_TOOL_ROUNDS, "（工具调用次数过多，已终止本轮）"
+        return self.MAX_TOOL_ROUNDS, "（工具调用次数过多，已终止本轮）", trace_collector
 
     # ---------- 辅助 ----------
+
+    def _build_state_packet(self) -> Optional[ContextPacket]:
+        """把本地滚动状态转换成 ContextBuilder 可消费的高优先级 packet。"""
+        if self.session_store is None:
+            return None
+        try:
+            text = self.session_store.state_text()
+        except Exception:
+            logger.exception("本地会话状态读取失败")
+            return None
+        if not text:
+            return None
+        return ContextPacket(
+            content=text,
+            priority=ContextPriority.P1_STATE,
+            metadata={"source": "local_session_state"},
+        )
+
+    def _make_work_record(
+        self,
+        *,
+        user_query: str,
+        final_answer: str,
+        trace_collector: TraceCollector,
+    ):
+        """把本轮压缩工具轨迹转换成一条 WorkRecord。
+
+        小 trace 直接用规则总结；大 trace 优先走静默 LLM 总结。无论哪条路径
+        失败，都回退到规则总结，并且不影响本轮最终回答和 Done 事件。
+        """
+        if not trace_collector.entries:
+            return None
+        try:
+            if trace_collector.needs_summary() and self.trace_summarizer is not None:
+                return self.trace_summarizer.summarize(
+                    user_query=user_query,
+                    final_answer=final_answer,
+                    trace_entries=trace_collector.entries,
+                )
+            return self.rule_trace_summarizer.summarize(
+                user_query=user_query,
+                final_answer=final_answer,
+                trace_entries=trace_collector.entries,
+            )
+        except Exception:
+            logger.exception("工具轨迹总结失败，使用规则压缩兜底")
+            return self.rule_trace_summarizer.summarize(
+                user_query=user_query,
+                final_answer=final_answer,
+                trace_entries=trace_collector.entries,
+            )
+
+    def _persist_turn(self, user_query: str, final_answer: str, work_record) -> None:
+        """把本轮对话和工作记录写入项目级 session store。"""
+        if self.session_store is None:
+            return
+        try:
+            self.session_store.append_turn(
+                user_query=user_query,
+                final_answer=final_answer,
+                work_record=work_record,
+            )
+        except Exception:
+            logger.exception("本地会话落盘失败")
 
     def _prepend_background_notifications(self, user_query: str) -> str:
         """每轮 chat 前 drain 后台任务通知，挂到 user_query 前作为 system reminder。
