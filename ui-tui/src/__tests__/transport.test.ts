@@ -164,16 +164,19 @@ describe("Transport answerQuestion RPC", () => {
     expect(msg.params.cancelled).toBe(true);
   });
 
-  it("serializes session list/create/switch RPCs", () => {
+  it("serializes session list/create/switch/compact RPCs", () => {
     const { t, written } = makeWithStdin();
     t.listSessions();
     t.createSession();
     t.switchSession("session_20260602_120000_abcdef12");
+    t.compactSession();
 
     const messages = written.map((line) => JSON.parse(line.trim()));
     expect(messages[0].method).toBe("session.list_sessions");
     expect(messages[1].method).toBe("session.create");
     expect(messages[2].method).toBe("session.switch");
     expect(messages[2].params).toEqual({ session_id: "session_20260602_120000_abcdef12" });
+    expect(messages[3].method).toBe("session.compact");
+    expect(messages[3].params).toEqual({});
   });
 });

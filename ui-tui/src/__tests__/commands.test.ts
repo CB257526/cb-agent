@@ -20,12 +20,17 @@ describe("commands", () => {
     it("无匹配返回空", () => {
       expect(filterCommands("xyz")).toEqual([]);
     });
+
+    it("/compact 可按 prefix 找到", () => {
+      expect(filterCommands("co").map((c) => c.name)).toEqual(["/compact"]);
+    });
   });
 
   describe("findCommand", () => {
     it("精确匹配命中", () => {
       expect(findCommand("/help")?.name).toBe("/help");
       expect(findCommand("/tools")?.name).toBe("/tools");
+      expect(findCommand("/compact")?.name).toBe("/compact");
     });
     it("含空格也能 trim", () => {
       expect(findCommand("  /clear  ")?.name).toBe("/clear");
@@ -53,6 +58,7 @@ describe("commands", () => {
       toggleActivityMock = vi.fn();
       transportMock = {
         clearHistory: vi.fn(),
+        compactSession: vi.fn(),
         listTools: vi.fn(),
         createSession: vi.fn(),
         switchSession: vi.fn(),
@@ -78,6 +84,7 @@ describe("commands", () => {
       expect(text).toContain("/clear");
       expect(text).toContain("/tools");
       expect(text).toContain("/sessions");
+      expect(text).toContain("/compact");
     });
 
     it("/clear 调 transport.clearHistory + 清 items + 给个提示", () => {
@@ -95,6 +102,43 @@ describe("commands", () => {
       const cmd = findCommand("/sessions")!;
       cmd.handler(ctx);
       expect(openSessionSwitcherMock).toHaveBeenCalledOnce();
+    });
+
+    it("/compact 调后端压缩并只追加系统提示", async () => {
+      transportMock.compactSession.mockResolvedValue({
+        session: { session_id: "session_20260602_120000_abcdef12" },
+        history: [{ role: "assistant", content: "【上下文压缩】摘要", kind: "compact_record" }],
+        summary: "【上下文压缩】摘要",
+        before_messages: 12,
+        after_messages: 3,
+        persisted: true,
+      });
+
+      const cmd = findCommand("/compact")!;
+      await cmd.handler(ctx);
+
+      expect(transportMock.compactSession).toHaveBeenCalledOnce();
+      expect(applySessionPayloadMock).not.toHaveBeenCalled();
+      expect(setItemsMock).not.toHaveBeenCalled();
+      expect(appendSystemMock.mock.calls[0][0]).toContain("history 12 -> 3");
+      expect(appendSystemMock.mock.calls[0][0]).toContain("已落盘");
+    });
+
+    it("/compact 空上下文时给 no-op 提示", async () => {
+      transportMock.compactSession.mockResolvedValue({
+        session: null,
+        history: [],
+        summary: "",
+        before_messages: 0,
+        after_messages: 0,
+        persisted: false,
+        no_op: true,
+      });
+
+      const cmd = findCommand("/compact")!;
+      await cmd.handler(ctx);
+
+      expect(appendSystemMock.mock.calls[0][0]).toContain("没有可压缩");
     });
 
     it("/new 调 session.create 并应用返回的会话 payload", async () => {

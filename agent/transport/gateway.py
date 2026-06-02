@@ -5,6 +5,7 @@
 2. UI → agent：阻塞读 stdin，按 method 分发：
    - prompt.submit  → 在 asyncio loop 上启动 session.chat_async（不阻塞 stdin 读循环）
    - session.cancel → 直接 set 当前 token（threading.Event.set 线程安全）
+   - session.compact → 压缩当前会话上下文，保留 transcript 审计
    - session.quit   → 关 loop，主流程退出
 
 线程关系：
@@ -120,6 +121,8 @@ class Gateway:
             self._handle_quit(rpc_id)
         elif method == "session.clear_history":
             self._handle_clear_history(rpc_id)
+        elif method == "session.compact":
+            self._handle_compact(rpc_id)
         elif method == "session.list_sessions":
             self._handle_list_sessions(rpc_id)
         elif method == "session.create":
@@ -224,6 +227,31 @@ class Gateway:
             return
         if rpc_id is not None:
             self.transport.write(make_response(rpc_id, result={"cleared": True}))
+
+    def _handle_compact(self, rpc_id: Any) -> None:
+        """压缩当前会话上下文。
+
+        compact 会重写内存 history，并写 compact.json 快照。它和 create/switch 一样
+        不能在 chat 忙碌时执行，否则当前 chat 可能一边读取旧 history，一边被另
+        一个 RPC 改写并落盘，造成上下文和 transcript 的对应关系变乱。
+        """
+        if rpc_id is None:
+            return
+        if self._is_busy():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+        try:
+            payload = self.session.compact_context()
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=payload))
 
     def _handle_list_sessions(self, rpc_id: Any) -> None:
         """列出项目级本地会话。

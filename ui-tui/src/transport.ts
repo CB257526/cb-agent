@@ -20,7 +20,7 @@ import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AgentEvent, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, CompactPayload, SessionPayload, SessionSummary } from "./types.js";
 
 export interface TransportOptions {
   /** Python 解释器路径。默认环境变量 CB_AGENT_PYTHON 或 "python"。 */
@@ -167,6 +167,11 @@ export class Transport extends EventEmitter {
 
   clearHistory(): string {
     return this.sendRpc("session.clear_history");
+  }
+
+  /** 压缩当前 active 会话上下文；不重绘 UI，只返回压缩结果供命令提示。 */
+  compactSession(): Promise<CompactPayload> {
+    return this.requestRpc("session.compact");
   }
 
   /** 列出项目级本地会话摘要。只返回短 preview，不返回 transcript 全文。 */

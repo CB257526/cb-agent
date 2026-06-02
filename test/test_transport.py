@@ -354,6 +354,36 @@ class TestGatewayDispatch(unittest.TestCase):
         self.assertEqual(len(replies), 1)
         self.assertEqual(replies[0]["result"]["cleared"], True)
 
+    def test_gateway_compact_context(self):
+        """session.compact 返回压缩 payload，并写入当前 session 的 compact 快照。"""
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            store.append_turn(
+                user_query="旧问题一",
+                final_answer="旧回答一",
+                work_record=None,
+            )
+            store.append_turn(
+                user_query="旧问题二",
+                final_answer="旧回答二",
+                work_record=None,
+            )
+
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [json.dumps({"jsonrpc": "2.0", "id": "cp1", "method": "session.compact"})],
+                wait_for=2,
+                session_store=store,
+            )
+
+            replies = [m for m in msgs if m.get("id") == "cp1"]
+            self.assertEqual(len(replies), 1)
+            result = replies[0]["result"]
+            self.assertIn("【上下文压缩】", result["summary"])
+            self.assertGreater(result["before_messages"], result["after_messages"])
+            self.assertTrue(result["persisted"])
+            self.assertTrue((store.active_dir / "compact.json").exists())
+
     def test_gateway_list_tools(self):
         """session.list_tools 应返回 registry 里的工具名/描述/schema 列表。"""
         llm = FakeLLM([])

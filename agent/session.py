@@ -43,14 +43,32 @@ from core.message import Message
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
 from agent.work_context import (
+    COMPACT_RECORD_LIMIT,
     LocalSessionStore,
     RuleTraceSummarizer,
     TraceCollector,
     TraceSummarizer,
+    make_compact_record_message,
     make_work_record_message,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _clip_compact_text(text: Any, limit: int = COMPACT_RECORD_LIMIT) -> str:
+    """把 compact 相关文本裁到固定长度。
+
+    /compact 的摘要会进入下一轮 prompt，也会落盘到 compact.json。这里不用
+    work_context._clip 这个私有 helper，是为了让 session.py 的公共行为不依赖
+    下划线函数；但语义保持一致：折叠空白、硬截断，避免摘要反过来撑爆上下文。
+    """
+    if text is None:
+        return ""
+    s = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    s = " ".join(s.split())
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 1)].rstrip() + "…"
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -97,6 +115,22 @@ def _history_message_to_payload(message: Message) -> Dict[str, Any]:
         "content": _message_content_to_text(message.content),
         "kind": metadata.get("kind"),
     }
+
+
+def _message_role_name(message: Message) -> str:
+    """返回 Message 的 role 字符串，兼容 Enum 和普通字符串两种形态。"""
+    return message.role.value if hasattr(message.role, "value") else str(message.role)
+
+
+def _message_kind(message: Message) -> str:
+    """读取本地 message kind。
+
+    work_record/compact_record 在 OpenAI 协议里都是普通 assistant message，
+    本地只靠 metadata.kind 区分用途。/compact 保留最近一轮时要排除这类
+    维护性消息，只留下真正的 user/assistant 对话。
+    """
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return str(metadata.get("kind") or "")
 
 
 class AgentSession:
@@ -220,6 +254,63 @@ class AgentSession:
         return {
             "session": summary,
             "history": self.export_history(),
+        }
+
+    def compact_context(self) -> Dict[str, Any]:
+        """压缩当前会话上下文，释放下一轮 prompt 的近轮历史占用。
+
+        /compact 和 /clear 的语义不同：
+        - /clear 是彻底删除当前 session 文件并清空内存；
+        - /compact 保留 transcript 审计，只把“后续会注入模型的 history”
+          压成一条 `【上下文压缩】` 摘要，并保留最近一轮普通对话。
+
+        这里不 emit TextDelta/Done，也不调用 llm.think()。它是一个同步管理 RPC，
+        TUI 只会收到 RPC response，然后追加系统提示。
+        """
+        before_messages = len(self.history)
+        state_text = self._session_state_text()
+        if before_messages == 0 and not state_text:
+            return {
+                "session": self.current_session_payload().get("session"),
+                "history": self.export_history(),
+                "summary": "",
+                "before_messages": 0,
+                "after_messages": 0,
+                "persisted": False,
+                "no_op": True,
+            }
+
+        summary = self._make_compact_summary(state_text=state_text)
+        compact_message = make_compact_record_message(summary)
+        retained_turn = self._latest_plain_turn_messages()
+
+        # 压缩后的内存 history 是唯一会进入下一轮 ContextBuilder 的近轮历史。
+        # compact_message 承担旧上下文摘要职责；retained_turn 保留用户刚刚说过的
+        # 话和助手最终回答，避免 compact 后立刻丢掉最贴近当前任务的语气/细节。
+        self.history = [compact_message] + retained_turn
+        after_messages = len(self.history)
+
+        persisted = False
+        if self.session_store is not None:
+            try:
+                self.session_store.save_compaction(
+                    summary=str(compact_message.content or ""),
+                    history_payload=self.export_history(),
+                    before_messages=before_messages,
+                    after_messages=after_messages,
+                )
+                persisted = True
+            except Exception:
+                logger.exception("本地会话 compact 快照落盘失败")
+
+        return {
+            "session": self.current_session_payload().get("session"),
+            "history": self.export_history(),
+            "summary": str(compact_message.content or ""),
+            "before_messages": before_messages,
+            "after_messages": after_messages,
+            "persisted": persisted,
+            "no_op": False,
         }
 
     def chat(
@@ -497,6 +588,163 @@ class AgentSession:
         return self.MAX_TOOL_ROUNDS, "（工具调用次数过多，已终止本轮）", trace_collector
 
     # ---------- 辅助 ----------
+
+    def _session_state_text(self) -> str:
+        """读取当前本地会话 state 的可注入文本。
+
+        这个方法和 _build_state_packet() 的读取逻辑保持一致，但返回纯字符串，
+        供 /compact 摘要器使用。它吞掉 store 读取异常，是因为 compact 属于管理
+        命令：state 读失败时仍可压缩内存 history，不能让一次磁盘异常阻断用户。
+        """
+        if self.session_store is None:
+            return ""
+        try:
+            return self.session_store.state_text() or ""
+        except Exception:
+            logger.exception("本地会话状态读取失败")
+            return ""
+
+    def _latest_plain_turn_messages(self) -> List[Message]:
+        """取最近一轮普通 user/assistant 对话。
+
+        history 里现在可能混有三类 assistant：
+        - 给用户看的最终回答；
+        - `【工作记录】`，kind=work_record；
+        - `【上下文压缩】`，kind=compact_record。
+
+        /compact 后只保留真正的最近一轮用户/助手对话，工作记录和 compact 锚点
+        已经被折进新的摘要里，继续保留它们会浪费上下文窗口。
+        """
+        retained: List[Message] = []
+        last_plain_role = ""
+        for message in reversed(self.history):
+            if _message_kind(message):
+                continue
+            role = _message_role_name(message)
+            if role not in {"user", "assistant"}:
+                continue
+            if not retained:
+                retained.append(message)
+                last_plain_role = role
+                if role == "user":
+                    break
+                continue
+            if last_plain_role == "assistant" and role == "user":
+                retained.append(message)
+                break
+        return list(reversed(retained))
+
+    def _history_text_for_compact(self) -> str:
+        """把当前内存 history 渲染成 compact summarizer 的输入文本。
+
+        这里读取的是普通跨轮 history，而不是本轮 tool loop 的 messages，因此不会
+        出现 role=tool 的完整工具输出。每条消息仍然做短截断，最后整体再截断，
+        防止用户/助手长文回答让静默 summarizer 的输入过大。
+        """
+        lines: List[str] = []
+        for message in self.history:
+            role = _message_role_name(message)
+            kind = _message_kind(message)
+            content = _clip_compact_text(_message_content_to_text(message.content), 500)
+            if not content:
+                continue
+            label = role if not kind else f"{role}/{kind}"
+            lines.append(f"{label}: {content}")
+        return _clip_compact_text("\n".join(lines), 12000)
+
+    def _state_snapshot_for_compact(self, state_text: str) -> str:
+        """把 state.json 中的关键结构化状态渲染给 compact summarizer。
+
+        LocalSessionStore.state_text() 已经覆盖 rolling_summary、文件、命令和待办；
+        这里再补 active_task/decisions 等字段，让 LLM 和规则兜底都能看到计划要求
+        的“当前任务、关键结论、待办/阻塞”。
+        """
+        if self.session_store is None:
+            return state_text
+        state = self.session_store.state if isinstance(self.session_store.state, dict) else {}
+        parts: List[str] = []
+        active_task = _clip_compact_text(state.get("active_task"), 240)
+        if active_task:
+            parts.append("当前任务：" + active_task)
+        if state_text:
+            parts.append("滚动状态：\n" + _clip_compact_text(state_text, 4000))
+        decisions = state.get("decisions") if isinstance(state.get("decisions"), list) else []
+        if decisions:
+            parts.append("关键结论：" + "；".join(_clip_compact_text(x, 120) for x in decisions[-8:]))
+        pending = state.get("pending") if isinstance(state.get("pending"), list) else []
+        if pending:
+            parts.append("待办/阻塞：" + "；".join(_clip_compact_text(x, 120) for x in pending[-8:]))
+        return _clip_compact_text("\n".join(parts), 6000)
+
+    def _make_compact_summary(self, *, state_text: str) -> str:
+        """生成 /compact 摘要文本。
+
+        优先走 OpenAI-compatible client 的非流式静默调用；它不会经过 llm.think，
+        因此不会向 EventBus 发 TextDelta/ReasoningDelta，也不会在 TUI 中显示成
+        一条助手回答。任何失败都会回退到规则摘要，保证 /compact 是可靠的管理
+        操作，而不是依赖网络/模型可用性的脆弱路径。
+        """
+        fallback = self._rule_compact_summary(state_text=state_text)
+        client = getattr(self.llm, "client", None)
+        model = getattr(self.llm, "model", None)
+        if client is None or not model:
+            return fallback
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=0,
+                stream=False,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是 cb-agent 的上下文压缩器。请把当前会话历史和工作状态压缩成"
+                            "一条中文摘要，保留后续继续任务必须知道的信息：当前任务、用户偏好、"
+                            "关键结论、已读文件、已改文件、最近命令、待办/阻塞。不要编造。"
+                            "输出不超过1200字，并以【上下文压缩】开头。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "[当前会话历史]\n"
+                            f"{self._history_text_for_compact()}\n\n"
+                            "[本地滚动状态]\n"
+                            f"{self._state_snapshot_for_compact(state_text)}"
+                        ),
+                    },
+                ],
+            )
+            content = response.choices[0].message.content or ""
+        except Exception:
+            logger.exception("silent context compaction failed")
+            return fallback
+
+        content = _clip_compact_text(content, COMPACT_RECORD_LIMIT)
+        if not content:
+            return fallback
+        if not content.startswith("【上下文压缩】"):
+            content = "【上下文压缩】" + content
+        return _clip_compact_text(content, COMPACT_RECORD_LIMIT)
+
+    def _rule_compact_summary(self, *, state_text: str) -> str:
+        """无 LLM 或 LLM 失败时的规则 compact 摘要。
+
+        规则摘要不尝试推断新事实，只把已经存在于 history/state 里的内容重新组织
+        成短文本。这样可以最大限度降低“压缩时编造”的风险，同时仍然释放大部分
+        近轮对话窗口。
+        """
+        state_snapshot = self._state_snapshot_for_compact(state_text)
+        history_text = self._history_text_for_compact()
+        parts = ["【上下文压缩】"]
+        if state_snapshot:
+            parts.append("状态摘要：" + _clip_compact_text(state_snapshot, 700))
+        if history_text:
+            parts.append("最近对话：" + _clip_compact_text(history_text, 500))
+        if len(parts) == 1:
+            parts.append("当前没有可压缩的有效上下文。")
+        return _clip_compact_text("\n".join(parts), COMPACT_RECORD_LIMIT)
 
     def _build_state_packet(self) -> Optional[ContextPacket]:
         """把本地滚动状态转换成 ContextBuilder 可消费的高优先级 packet。"""

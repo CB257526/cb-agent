@@ -267,6 +267,45 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertNotIn("第二会话问题", restored)
             self.assertEqual(store.active_session_id, first_id)
 
+    def test_compact_context_reduces_history_and_is_seen_next_turn(self):
+        """AgentSession.compact_context 会压缩内存 history，并让下一轮看到 compact 锚点。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            llm = FakeLLM([
+                {"answer": "旧回答一", "tool_calls": []},
+                {"answer": "旧回答二", "tool_calls": []},
+                {"answer": "后续回答", "tool_calls": []},
+            ])
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s.chat("旧问题一")
+            s.chat("旧问题二")
+            self.assertEqual(len(s.history), 4)
+
+            payload = s.compact_context()
+            self.assertEqual(payload["before_messages"], 4)
+            self.assertEqual(payload["after_messages"], 3)
+            self.assertTrue(payload["persisted"])
+            self.assertIn("【上下文压缩】", payload["summary"])
+            self.assertEqual(s.history[0].metadata, {"kind": "compact_record"})
+            self.assertTrue((store.active_dir / "compact.json").exists())
+            self.assertTrue((store.active_dir / "compactions.jsonl").exists())
+            self.assertTrue((store.active_dir / "transcript.jsonl").exists())
+
+            s.chat("继续")
+            next_turn_messages = llm.calls[2]["messages"]
+            context_text = "\n".join(str(m.get("content", "")) for m in next_turn_messages)
+            self.assertIn("【上下文压缩】", context_text)
+            self.assertIn("旧问题二", context_text)
+            # compact 摘要本身可以保留“旧问题一”这类旧事实；真正要防止的是
+            # 旧 user/assistant 消息继续作为独立 history 条目占用窗口。
+            raw_contents = [m.get("content") for m in next_turn_messages]
+            self.assertNotIn("旧问题一", raw_contents)
+            self.assertNotIn("旧回答一", raw_contents)
+
     def test_chat_history_appended_correctly(self):
         llm = FakeLLM([{"answer": "好的", "tool_calls": []}])
         s = self._make_session(llm)

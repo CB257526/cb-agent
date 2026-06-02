@@ -52,6 +52,26 @@ export const COMMANDS: readonly SlashCommand[] = [
     },
   },
   {
+    name: "/compact",
+    description: "压缩并释放当前会话上下文",
+    handler: async ({ transport, appendSystem }) => {
+      try {
+        const payload = await transport.compactSession();
+        if (payload.no_op) {
+          appendSystem("当前没有可压缩的上下文。");
+          return;
+        }
+        const persisted = payload.persisted ? "已落盘" : "未落盘";
+        appendSystem(
+          `已压缩上下文：history ${payload.before_messages} -> ${payload.after_messages}，` +
+          `下轮将使用摘要继续（${persisted}）。`
+        );
+      } catch (e) {
+        appendSystem(`/compact 失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
     name: "/sessions",
     description: "打开本地会话切换面板",
     handler: ({ openSessionSwitcher }) => {

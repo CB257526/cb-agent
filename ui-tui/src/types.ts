@@ -186,6 +186,15 @@ export interface SessionPayload {
   history: RestoredHistoryMessage[];
 }
 
+/** session.compact 的返回形状。 */
+export interface CompactPayload extends SessionPayload {
+  summary: string;
+  before_messages: number;
+  after_messages: number;
+  persisted: boolean;
+  no_op?: boolean;
+}
+
 export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought";
 
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */

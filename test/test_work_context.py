@@ -17,6 +17,7 @@ if _ROOT not in sys.path:
 from agent.work_context import (
     LocalSessionStore,
     RuleTraceSummarizer,
+    make_compact_record_message,
     trace_entry_from_tool_result,
 )
 
@@ -135,6 +136,57 @@ class TestWorkContext(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 store.switch_session("../outside")
+
+    def test_compaction_snapshot_restores_from_anchor_and_keeps_transcript(self):
+        """compact 后保留 transcript 审计，但恢复 history 时从 compact 锚点继续。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+
+            store.append_turn(
+                user_query="旧问题一",
+                final_answer="旧回答一",
+                work_record=None,
+            )
+            store.append_turn(
+                user_query="旧问题二",
+                final_answer="旧回答二",
+                work_record=None,
+            )
+            transcript = store.active_dir / "transcript.jsonl"
+            raw_before = transcript.read_text(encoding="utf-8")
+
+            compact_msg = make_compact_record_message("【上下文压缩】旧上下文已经压缩")
+            recent_user = {"role": "user", "content": "旧问题二", "kind": None}
+            recent_assistant = {"role": "assistant", "content": "旧回答二", "kind": None}
+            store.save_compaction(
+                summary=str(compact_msg.content),
+                history_payload=[
+                    {"role": "assistant", "content": str(compact_msg.content), "kind": "compact_record"},
+                    recent_user,
+                    recent_assistant,
+                ],
+                before_messages=4,
+                after_messages=3,
+            )
+
+            self.assertTrue((store.active_dir / "compact.json").exists())
+            self.assertTrue((store.active_dir / "compactions.jsonl").exists())
+            self.assertEqual(raw_before, transcript.read_text(encoding="utf-8"))
+
+            store.append_turn(
+                user_query="compact 后的新问题",
+                final_answer="新回答",
+                work_record=None,
+            )
+
+            restored = LocalSessionStore(root)
+            history = restored.load_latest_history(max_messages=12)
+            restored_text = "\n".join(str(m.content) for m in history)
+            self.assertIn("【上下文压缩】", restored_text)
+            self.assertIn("旧问题二", restored_text)
+            self.assertIn("compact 后的新问题", restored_text)
+            self.assertNotIn("旧问题一", restored_text)
 
 
 if __name__ == "__main__":

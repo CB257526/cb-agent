@@ -46,11 +46,24 @@ TRACE_SUMMARIZE_TOKENS = 800
 # 否则工作记录本身会挤占后续对话窗口。
 WORK_RECORD_LIMIT = 600
 
+# ``【上下文压缩】`` 是 /compact 主动生成的跨轮摘要。它比单轮工作记录承载
+# 的信息更多，需要覆盖一段会话的任务目标、已知事实、已读/已改文件和待办；
+# 但它仍然会进入 prompt，所以这里给一个硬上限，避免 compact 本身变成新的
+# 上下文负担。
+COMPACT_RECORD_LIMIT = 1200
+
 # state.json 中滚动摘要和单文件摘要的上限。state 会作为 P1 State 注入，
 # 优先级高于普通历史，所以必须保持紧凑。
 ROLLING_SUMMARY_LIMIT = 2000
 FILE_SUMMARY_LIMIT = 300
 RECENT_COMMANDS_LIMIT = 10
+
+# compact 后 state 里的结构化集合继续保留，但要做边界裁剪。/compact 的目标是
+# 释放上下文，而不是把 state.json 变成无限增长的第二份 transcript。
+FILES_SEEN_LIMIT = 50
+FILES_MODIFIED_LIMIT = 30
+DECISIONS_LIMIT = 20
+PENDING_LIMIT = 20
 
 
 def _now_iso() -> str:
@@ -98,6 +111,110 @@ def _safe_json_dumps(data: Any, limit: int = 180) -> str:
     except Exception:
         text = str(data)
     return _clip(text, limit)
+
+
+def _tail_mapping(data: Any, limit: int) -> Dict[str, Any]:
+    """保留 dict 的尾部若干项。
+
+    Python 3.7+ dict 保持插入顺序；这里利用这个特性保留最近写入/更新的项目。
+    compact 时不重新排序，是为了不引入额外的时间字段假设：有些旧 state 里的
+    文件项可能没有 last_seen_at/last_modified_at，按现有顺序裁剪最稳妥。
+    """
+    if not isinstance(data, dict):
+        return {}
+    items = list(data.items())[-limit:]
+    return {str(k): v for k, v in items}
+
+
+def _tail_list(data: Any, limit: int) -> List[Any]:
+    """保留 list 的尾部若干项；非 list 输入统一降级为空列表。"""
+    if not isinstance(data, list):
+        return []
+    return data[-limit:]
+
+
+def _message_kind(message: Message) -> str:
+    """读取 Message.metadata.kind，缺失时返回空串。
+
+    work_record/compact_record 都是普通 assistant message，真正区分它们的不是
+    OpenAI role，而是本地 metadata。这个 helper 让恢复、裁剪和 UI 导出都能
+    用同一套语义判断。
+    """
+    meta = message.metadata if isinstance(message.metadata, dict) else {}
+    return str(meta.get("kind") or "")
+
+
+def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
+    """把 compact.json 里的轻量 history payload 还原为 Message。
+
+    compact 快照保存的是 TUI/RPC 也能理解的 `{role, content, kind}`，而不是
+    OpenAI 原始 message。这里故意只恢复 user/assistant/system 三类普通文本：
+    tool message、tool_call_id、assistant.tool_calls 都不允许跨轮恢复。
+    """
+    if not isinstance(payload, dict):
+        return None
+    role = str(payload.get("role") or "")
+    content = str(payload.get("content") or "")
+    kind = payload.get("kind")
+    if not content:
+        return None
+    if role == "user":
+        msg = Message.create_user_message(content)
+    elif role == "system":
+        msg = Message.create_system_message(content)
+    else:
+        msg = Message.create_assistant_message(content)
+    if kind:
+        msg.metadata = {"kind": str(kind)}
+    return msg
+
+
+def _messages_from_transcript_item(item: Dict[str, Any]) -> List[Message]:
+    """把 transcript.jsonl 的单轮记录还原成普通 history 消息。
+
+    transcript 仍然是审计源：每行是一轮 user/final/work_record。compact 恢复时
+    只会读取 compact 之后新增的行；未 compact 的旧会话则读取全部行。无论哪种
+    情况，都不还原 trace_entries 里的工具协议细节。
+    """
+    messages: List[Message] = []
+    user_query = item.get("user_query")
+    final_answer = item.get("final_answer")
+    work_record = item.get("work_record")
+    if user_query:
+        messages.append(Message.create_user_message(str(user_query)))
+    if final_answer:
+        messages.append(Message.create_assistant_message(str(final_answer)))
+    if work_record:
+        messages.append(_create_work_record_message(str(work_record)))
+    return messages
+
+
+def _trim_restored_history(messages: List[Message], max_messages: int) -> List[Message]:
+    """按恢复窗口裁剪 history，并尽量保留最近一次 compact 锚点。
+
+    普通恢复直接取尾部 max_messages 即可；但 compact 后的第一条消息是
+    `【上下文压缩】`，它承担旧上下文摘要的职责。如果后续新消息很多，简单尾裁剪
+    会把 compact 锚点挤掉，导致旧任务状态丢失。因此这里优先保留最近一条
+    compact_record，再用剩余窗口装 compact 之后的最新消息。
+    """
+    if max_messages <= 0:
+        return []
+    if len(messages) <= max_messages:
+        return messages
+
+    compact_idx = None
+    for idx, message in enumerate(messages):
+        if _message_kind(message) == "compact_record":
+            compact_idx = idx
+
+    if compact_idx is None:
+        return messages[-max_messages:]
+
+    anchor = messages[compact_idx]
+    tail_capacity = max_messages - 1
+    if tail_capacity <= 0:
+        return [anchor]
+    return [anchor] + messages[compact_idx + 1:][-tail_capacity:]
 
 
 def _extract_tool_call_name(call: Dict[str, Any]) -> str:
@@ -599,6 +716,8 @@ class LocalSessionStore:
     文件结构：
     - index.json：只保存 active_session_id，用于启动时自动恢复最近会话；
     - <session_id>/transcript.jsonl：每轮 user/final/work_record/trace_entries；
+    - <session_id>/compact.json：最近一次 /compact 的恢复锚点；
+    - <session_id>/compactions.jsonl：每次 /compact 的审计记录；
     - <session_id>/state.json：滚动摘要、已读文件、已改文件、最近命令等。
 
     多会话隔离的关键点也在这里：同一时刻只有一个 active session，但每个
@@ -764,38 +883,117 @@ class LocalSessionStore:
     def load_latest_history(self, max_messages: int = 12) -> List[Message]:
         """从 transcript 恢复最近 history。
 
-        transcript 每轮最多恢复三条普通对话消息：
+        未执行过 /compact 的会话，会从 transcript 恢复最近 history。transcript
+        每轮最多恢复三条普通对话消息：
         1. user_query -> user message；
         2. final_answer -> assistant message；
         3. work_record -> assistant message，content 以【工作记录】开头。
+
+        执行过 /compact 的会话，会优先读取 compact.json：
+        1. 先恢复 compact 快照中的 `【上下文压缩】` 锚点和压缩后保留的最近消息；
+        2. 再从 transcript 的 compact_offset 之后补上新轮次；
+        3. 旧 transcript 保留在磁盘用于审计，但不会重新灌进 prompt。
 
         不恢复 role=tool，也不恢复 assistant.tool_calls。跨轮恢复的是对话和工作
         摘要，而不是上一轮工具协议状态。
         """
         if not self.active_session_id:
             return []
-        path = self.active_dir / "transcript.jsonl"
+
+        transcript_items = self._read_transcript_items(self.active_dir)
+        compact = self._read_json(self.active_dir / "compact.json", {})
+        messages: List[Message] = []
+
+        start_idx = 0
+        if isinstance(compact, dict) and compact:
+            raw_history = compact.get("history")
+            if isinstance(raw_history, list):
+                for payload in raw_history:
+                    msg = _message_payload_to_message(payload)
+                    if msg is not None:
+                        messages.append(msg)
+            start_idx = int(compact.get("transcript_offset") or 0)
+
+        for item in transcript_items[max(0, start_idx):]:
+            messages.extend(_messages_from_transcript_item(item))
+
+        if not messages:
+            return []
+        return _trim_restored_history(messages, max_messages)
+
+    def save_compaction(
+        self,
+        *,
+        summary: str,
+        history_payload: List[Dict[str, Any]],
+        before_messages: int,
+        after_messages: int,
+    ) -> Dict[str, Any]:
+        """保存当前会话的 /compact 快照，并更新滚动 state。
+
+        注意这里不删除、不重写 transcript.jsonl。compact 的核心语义是“以后恢复
+        时从这个快照开始”，不是“销毁旧审计”。因此 compact.json 记录压缩发生时
+        transcript 已有多少行；load_latest_history() 只会补这个 offset 之后的新
+        行，旧行仍留给人工审计和排障。
+        """
+        self.ensure_active()
+        self.active_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = _now_iso()
+        compact = {
+            "ts": ts,
+            "session_id": self.active_session_id,
+            "summary": _clip(summary, COMPACT_RECORD_LIMIT),
+            "transcript_offset": self._count_transcript_turns(self.active_dir),
+            "history": history_payload,
+            "before_messages": before_messages,
+            "after_messages": after_messages,
+        }
+        self._write_json(self.active_dir / "compact.json", compact)
+
+        # compactions.jsonl 是审计流：保留每次 compact 的时间、数量变化和摘要。
+        # 它不像 compact.json 那样只保存最新快照；这样将来排查“什么时候压缩过”
+        # 时，不需要翻 Git 或猜测 state 的 updated_at。
+        with (self.active_dir / "compactions.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(compact, ensure_ascii=False, default=str) + "\n")
+
+        state = self.state if isinstance(self.state, dict) else self._new_state()
+        state["updated_at"] = ts
+        state["rolling_summary"] = _clip(summary, ROLLING_SUMMARY_LIMIT)
+        state["compacted_at"] = ts
+        state["compact_count"] = int(state.get("compact_count") or 0) + 1
+        state["compact_transcript_offset"] = compact["transcript_offset"]
+        state["files_seen"] = _tail_mapping(state.get("files_seen"), FILES_SEEN_LIMIT)
+        state["files_modified"] = _tail_mapping(state.get("files_modified"), FILES_MODIFIED_LIMIT)
+        state["recent_commands"] = _tail_list(state.get("recent_commands"), RECENT_COMMANDS_LIMIT)
+        state["decisions"] = _tail_list(state.get("decisions"), DECISIONS_LIMIT)
+        state["pending"] = _tail_list(state.get("pending"), PENDING_LIMIT)
+        self.save_state(state)
+        self._write_index()
+        return compact
+
+    def _read_transcript_items(self, session_dir: Path) -> List[Dict[str, Any]]:
+        """读取 transcript.jsonl 为结构化行列表。
+
+        这个 helper 只返回 JSON object 行，坏行会触发异常日志并让整次读取失败
+        为空列表。保持保守语义的原因是：如果 transcript 损坏，宁愿少恢复上下文，
+        也不要把半截 JSON 或错误数据伪装成可用 history 注入模型。
+        """
+        path = session_dir / "transcript.jsonl"
         if not path.exists():
             return []
-        messages: List[Message] = []
+        items: List[Dict[str, Any]] = []
         try:
             for line in path.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
                 item = json.loads(line)
-                user_query = item.get("user_query")
-                final_answer = item.get("final_answer")
-                work_record = item.get("work_record")
-                if user_query:
-                    messages.append(Message.create_user_message(str(user_query)))
-                if final_answer:
-                    messages.append(Message.create_assistant_message(str(final_answer)))
-                if work_record:
-                    messages.append(_create_work_record_message(str(work_record)))
+                if isinstance(item, dict):
+                    items.append(item)
         except Exception:
             logger.exception("failed to load transcript from %s", path)
             return []
-        return messages[-max_messages:]
+        return items
 
     def state_text(self) -> str:
         """把 state.json 渲染成可注入 ContextBuilder 的 P1 State 文本。
@@ -1048,16 +1246,37 @@ def _create_work_record_message(text: str) -> Message:
     return msg
 
 
+def _create_compact_record_message(text: str) -> Message:
+    """把 /compact 摘要包装成普通 assistant message。
+
+    compact record 和 work record 一样，都是给下一轮模型看的普通背景文本，
+    不是工具协议消息。它的 metadata.kind 只服务本地恢复和 TUI 渲染；即使某些
+    旧路径丢了 metadata，content 里的 `【上下文压缩】` 前缀也足够让人类识别。
+    """
+    content = _clip(text, COMPACT_RECORD_LIMIT)
+    if not content.startswith("【上下文压缩】"):
+        content = "【上下文压缩】" + content
+    msg = Message.create_assistant_message(content)
+    msg.metadata = {"kind": "compact_record"}
+    return msg
+
+
 def make_work_record_message(record: WorkRecord) -> Message:
     return _create_work_record_message(record.text)
 
 
+def make_compact_record_message(text: str) -> Message:
+    return _create_compact_record_message(text)
+
+
 __all__ = [
+    "COMPACT_RECORD_LIMIT",
     "LocalSessionStore",
     "RuleTraceSummarizer",
     "TraceCollector",
     "TraceEntry",
     "TraceSummarizer",
     "WorkRecord",
+    "make_compact_record_message",
     "make_work_record_message",
 ]
