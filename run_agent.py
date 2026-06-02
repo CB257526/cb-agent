@@ -66,11 +66,10 @@ from agent.session import AgentSession
 from agent.work_context import LocalSessionStore, TraceSummarizer
 from constant.llm.constant_llm import ConstantLLM
 from context import ContextBuilder, ContextConfig
+from context.markdown_memory import MarkdownMemoryProvider
 from skills.skill_manager import SkillManager
 from skills.skill_executor import SkillExecutor
 from tools.toolRegistry import ToolRegistry
-from tools.tools.memory_tool import MemoryTool
-from tools.tools.rag_tool import RAGTool
 from tools.tools.search import SearchTool
 from tools.tools.skill_tool import SkillTool
 from tools.tools.run_skill_script_tool import RunSkillScriptTool
@@ -132,11 +131,14 @@ class AgentRunner:
         use_mcp: bool = True,  # 是否开启 MCP 工具
         ctx_enabled: bool = True,  # 是否开启 ContextBuilder
         attach_cli_renderer: bool = True, # 是否 attach CLIRenderer 到 EventBus
+        memory_system: str = "light",  # light=Markdown 记忆，full=旧 RAG/向量记忆，off=关闭记忆
     ) -> None:
         self.use_mcp = use_mcp and _HAS_MCP
         self.ctx_enabled = ctx_enabled
+        self.memory_system = memory_system
         self.dump_messages = True
         self._attach_cli_renderer = attach_cli_renderer
+        self._md_memory_provider = self._create_markdown_memory_provider()
         # dump 增量游标：每次 chat() 开始重置，让本轮第一次能打全量
         self._dump_seen_count = 0
 
@@ -152,8 +154,8 @@ class AgentRunner:
 
         # 3. 工具注册表
         self.registry = ToolRegistry()
-        self._memory_tool: MemoryTool = None  # type: ignore[assignment]
-        self._rag_tool: RAGTool = None        # type: ignore[assignment]
+        self._memory_tool = None
+        self._rag_tool = None
         self._skill_manager: SkillManager = None  # type: ignore[assignment]
         self._register_native_tools()
         if self.use_mcp:
@@ -174,6 +176,7 @@ class AgentRunner:
         builder = ContextBuilder(
             memory_tool=self._memory_tool,
             rag_tool=self._rag_tool,
+            md_memory_provider=self._md_memory_provider,
             config=ContextConfig(
                 max_tokens=context_max_tokens,
                 min_relevance=0.05,
@@ -198,6 +201,7 @@ class AgentRunner:
             event_bus=self.event_bus,
             builder=builder,
             skill_manager=self._skill_manager,
+            bash_prompt_provider=self._memory_prompt_provider,
             ctx_enabled=self.ctx_enabled,
             messages_snapshot_hook=self._on_messages_snapshot,
             session_store=session_store,
@@ -236,22 +240,55 @@ class AgentRunner:
         _info(f"已注册工具 {len(self.registry.list_tools())} 个: {', '.join(self.registry.list_tools())}")
         _info(f"Skill 数量 {len(self._skill_manager.list_skills())}")
         _info(f"上下文构建器: {'开启' if self.ctx_enabled else '关闭'}")
+        _info(f"记忆系统: {self.memory_system}")
         _info(f"messages dump: {'开启' if self.dump_messages else '关闭'} (用 /msg off 关闭)")
         print()
 
     # ---------- 启动期工具注册 ----------
 
+    def _create_markdown_memory_provider(self):
+        """按需创建轻量 Markdown 记忆 provider。
+
+        轻量模式的承诺是“零 RAG 依赖、但有可落盘的 Markdown 记忆位置”。因此启动
+        阶段就创建两级目录和默认 MEMORY.md：用户打开 TUI 后，即使还没开始第一轮
+        对话，也能在这些路径里看到可编辑的记忆索引。初始化失败只降级为无模板，
+        不阻塞 agent 启动，后续检索也会由 provider 自身兜底。
+        """
+        if self.memory_system != "light":
+            return None
+        provider = MarkdownMemoryProvider(project_dir=Path(_HERE))
+        try:
+            provider.ensure_initialized()
+        except Exception as e:
+            _err(f"轻量 Markdown 记忆目录初始化失败（继续启动）: {e}")
+        return provider
+
     def _register_native_tools(self) -> None:
         """注册项目内置工具。"""
         _info("注册原生工具")
-        self._memory_tool = MemoryTool()
-        self._rag_tool = RAGTool()
         self._skill_manager = SkillManager()
         skill_executor = SkillExecutor()
 
-        for tool in [
-            self._memory_tool,
-            self._rag_tool,
+        tools = []
+        if self.memory_system == "full":
+            # 旧 RAG/向量记忆只在 full 模式懒加载。这样 light/off 的默认启动路径
+            # 不会 import memory_tool/rag_tool，也就不需要 embedding、Qdrant 等依赖。
+            try:
+                from tools.tools.memory_tool import MemoryTool
+                from tools.tools.rag_tool import RAGTool
+                self._memory_tool = MemoryTool()
+                self._rag_tool = RAGTool()
+                tools.extend([self._memory_tool, self._rag_tool])
+            except Exception as e:
+                _err(f"full 记忆工具加载失败（跳过 memory/rag）: {e}")
+                self._memory_tool = None
+                self._rag_tool = None
+        elif self.memory_system == "light":
+            _info("使用轻量 Markdown 记忆：不注册 memory/rag 工具")
+        else:
+            _info("记忆系统关闭：不注册 memory/rag 工具")
+
+        tools.extend([
             TodoTool(event_bus=self.event_bus),
             SearchTool(),
             SkillTool(self._skill_manager),
@@ -261,11 +298,24 @@ class AgentRunner:
             BashPermissionTool(),
             FileReadTool(),
             FileWriteTool(),
-        ]:
+        ])
+
+        for tool in tools:
             try:
                 self.registry.register_tool(tool)
             except Exception as e:
                 _err(f"工具 {tool.name} 注册失败: {e}")
+
+    def _memory_prompt_provider(self) -> str:
+        """返回轻量 Markdown 记忆的系统提示片段。
+
+        轻量模式不注册专门的 memory tool，因此必须在系统提示里告诉模型两级记忆
+        文件的位置和修改约束。模型若要保存记忆，会使用现有 file_read/file_write，
+        仍然受文件写入工具的 read-before-write 保护。
+        """
+        if self._md_memory_provider is None:
+            return ""
+        return self._md_memory_provider.memory_instructions()
 
     def _register_mcp_tools(self) -> None:
         """读取 mcp.json，把每个 MCP 服务器的子工具展开注册。"""
@@ -536,12 +586,22 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-ctx", action="store_true",
-        help="禁用 ContextBuilder（裸跑，记忆/RAG 不参与拼 system）",
+        help="禁用 ContextBuilder（裸跑，记忆不参与拼 system）",
+    )
+    parser.add_argument(
+        "--memory-system",
+        choices=["light", "full", "off"],
+        default="light",
+        help=(
+            "记忆系统选择：light=Markdown 文件记忆（默认，无 RAG 依赖）；"
+            "full=旧 MemoryTool/RAGTool；off=关闭记忆"
+        ),
     )
     args = parser.parse_args()
 
     use_mcp = not args.no_mcp
     ctx_enabled = not args.no_ctx
+    memory_system = args.memory_system
 
     if args.transport == "jsonrpc":
         # gateway 模式：先把 stdout 切到 stderr，AgentRunner 启动期 print 不会污染协议
@@ -552,6 +612,7 @@ def main() -> None:
             use_mcp=use_mcp,
             ctx_enabled=ctx_enabled,
             attach_cli_renderer=False,
+            memory_system=memory_system,
         )
         from agent.transport import Gateway, StdioTransport
         gw = Gateway(
@@ -563,7 +624,7 @@ def main() -> None:
         gw.serve_forever()
         return
 
-    runner = AgentRunner(use_mcp=use_mcp, ctx_enabled=ctx_enabled)
+    runner = AgentRunner(use_mcp=use_mcp, ctx_enabled=ctx_enabled, memory_system=memory_system)
     runner.run()
 
 

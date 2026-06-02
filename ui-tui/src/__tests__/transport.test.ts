@@ -10,9 +10,21 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { Transport } from "../transport.js";
+import { RUN_AGENT_ARGS, Transport } from "../transport.js";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+
+describe("Transport launch args", () => {
+  it("starts the backend in lightweight markdown memory mode by default", () => {
+    expect(RUN_AGENT_ARGS).toEqual([
+      "run_agent.py",
+      "--transport",
+      "jsonrpc",
+      "--memory-system",
+      "light",
+    ]);
+  });
+});
 
 // 用反射改造 Transport：跳过 spawn，直接喂数据到 handleStdout
 function makeFakeTransport(): { t: Transport; feed: (s: string) => void; feedErr: (s: string) => void; events: any[]; responses: any[]; errors: any[]; stderrLines: string[] } {

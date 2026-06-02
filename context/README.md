@@ -24,7 +24,7 @@ Gather（收集）→ Select（筛选）→ Structure（组织）→ Compress（
 LLM 调用之前需要把多源信息拼装成一段提示词。简单 `messages=[...]` 拼接在小场景能跑，
 但一旦同时存在以下任一需求，就需要专门的上下文工程层：
 
-- 长对话历史 + 工具记忆 + 知识库（RAG）+ 系统指令同时存在，需要按预算裁剪
+- 长对话历史 + 本地会话状态 + Markdown 记忆 + 可选 full 记忆/RAG + 系统指令同时存在，需要按预算裁剪
 - 不同信息有**不同优先级**（系统指令 > 任务态 > 证据 > 历史）
 - 候选片段需要**相关性筛选**，避免把无关 RAG/记忆塞进 prompt
 - 多条相似证据需要**去冗余**（MMR），节省 token
@@ -44,8 +44,8 @@ LLM 调用之前需要把多源信息拼装成一段提示词。简单 `messages
 user_query        ┌─────────────┐ packets ┌─────────────┐ packets ┌─────────────┐  text  ┌─────────────┐
 system_instr ───▶ │   Gather    │────────▶│   Select    │────────▶│  Structure  │───────▶│  Compress   │───▶ ctx
 history           │             │         │             │         │             │        │             │
-additional        │ memory/rag/ │         │ relevance + │         │ 按优先级    │        │ 整段丢弃    │
-                  │ history/sys │         │ recency +   │         │ 拼接成节    │        │ 保结构      │
+additional        │ state/md    │         │ relevance + │         │ 按优先级    │        │ 整段丢弃    │
+                  │ memory/rag  │         │ recency +   │         │ 拼接成节    │        │ 保结构      │
                   │ → packets   │         │ MMR + 预算  │         │             │        │             │
                   └─────────────┘         └─────────────┘         └─────────────┘        └─────────────┘
 ```
@@ -90,9 +90,9 @@ additional        │ memory/rag/ │         │ relevance + │         │ �
 
 ### 2.3 同步 / 异步双入口
 
-- `build()` / `build_detailed()`：同步串行调用 memory、RAG
+- `build()` / `build_detailed()`：同步串行扫描 Markdown 记忆，并在 full 模式下调用旧 memory、RAG
 - `abuild()` / `abuild_detailed()`：内部用 `asyncio.gather + asyncio.to_thread`
-  把三路检索（任务态记忆、相关记忆、RAG）**并发**触发
+  把 Markdown 记忆、任务态记忆、相关记忆、RAG **并发**触发
 
 工具本身是同步代码，但通过 `to_thread` 让 IO 重叠，
 通常能把端到端检索延迟从 `t1+t2+t3` 降到 `max(t1,t2,t3)`。
@@ -121,14 +121,51 @@ print(ctx)
 # 直接拿来作为 LLM 的单条 system/user prompt
 ```
 
-### 3.2 接入 memory 与 RAG
+### 3.2 接入轻量 Markdown 记忆（默认模式）
+
+轻量模式不需要 embedding、向量库或任何 RAG env，只扫描全局/项目两级 Markdown 文件：
+
+```python
+from context import ContextBuilder, ContextConfig, MarkdownMemoryProvider
+
+provider = MarkdownMemoryProvider(project_dir=".")
+provider.ensure_initialized()  # 创建 ~/.cbagent/memory 和 ./.cbagent/memory 的 MEMORY.md 模板
+
+builder = ContextBuilder(
+    md_memory_provider=provider,
+    config=ContextConfig(max_tokens=4000),
+)
+ctx = builder.build(user_query="按我的项目约定继续处理")
+```
+
+目录约定：
+
+| 级别 | 默认路径 | 说明 |
+|---|---|---|
+| global | `~/.cbagent/memory/` | 用户长期偏好、跨项目事实 |
+| project | `<project_root>/.cbagent/memory/` | 当前仓库的项目事实、约定、进展 |
+
+每个目录都有一个 `MEMORY.md` 索引，具体记忆文件是同目录下其它 `.md` 文件。记忆文件建议带最小 frontmatter：
+
+```markdown
+---
+name: 用户偏好
+description: 用户希望回答保持中文并附验证命令
+type: user
+scope: global
+---
+
+用户偏好：回答使用中文，必要时列出验证命令。
+```
+
+### 3.3 接入 full memory 与 RAG（可选完整模式）
 
 ```python
 from tools.tools.memory_tool import MemoryTool
 from tools.tools.rag_tool import RAGTool
 from context import ContextBuilder, ContextConfig
 
-# MemoryTool / RAGTool 都自带合理默认值，按需传参即可
+# MemoryTool / RAGTool 只应在 --memory-system full 下启用。
 builder = ContextBuilder(
     memory_tool=MemoryTool(),
     rag_tool=RAGTool(),
@@ -140,7 +177,7 @@ ctx = builder.build(user_query="...", conversation_history=[...])
 记忆与 RAG 的检索查询、top_k、重要度阈值都通过 `ContextConfig` 暴露，
 不需要继承或改动 `ContextBuilder`。
 
-### 3.3 异步并发触发
+### 3.4 异步并发触发
 
 ```python
 ctx = await builder.abuild(
@@ -151,7 +188,7 @@ ctx = await builder.abuild(
 
 接口签名与 `build()` 完全一致，仅内部并发策略不同。
 
-### 3.4 注入额外证据（`additional_packets`）
+### 3.5 注入额外证据（`additional_packets`）
 
 ```python
 from context import ContextPacket, ContextPriority
@@ -164,10 +201,14 @@ extra = ContextPacket(
 ctx = builder.build(user_query="...", additional_packets=[extra])
 ```
 
-`additional_packets` 在 Gather 阶段末尾追加，与其它来源的 packet 一视同仁
+`additional_packets` 默认在 Gather 阶段末尾追加，与其它来源的 packet 一视同仁
 （同样要过 min_relevance、MMR、预算）。
 
-### 3.5 直接拿到 OpenAI messages：`to_messages` / `ato_messages`
+一个特例是 `metadata={"source": "local_session_state"}` 的 packet：它来自
+`LocalSessionStore.state.json`，代表当前 active 会话的滚动工作状态，会被提前到
+system 指令之后、Markdown/full 记忆之前，避免当前任务状态被长期记忆淹没。
+
+### 3.6 直接拿到 OpenAI messages：`to_messages` / `ato_messages`
 
 `build()` 返回的是一段拼好的 prompt 字符串。OpenAI 协议要的是
 `messages=[{"role": ..., "content": ...}, ...]` 列表，
@@ -176,7 +217,7 @@ ctx = builder.build(user_query="...", additional_packets=[extra])
 ```python
 from agent.cb_agents import CbAgentsLLM
 
-builder = ContextBuilder(memory_tool=MemoryTool(), rag_tool=RAGTool())
+builder = ContextBuilder(config=ContextConfig(max_tokens=4000))
 
 messages = builder.to_messages(
     user_query="数据库连接超时怎么办",
@@ -205,7 +246,7 @@ print(result["answer"])
 > 的格式表现更稳。如果你只想要一条 message，直接用 `build()` 拿字符串塞进
 > `[{"role": "user", "content": ctx}]` 即可。
 
-### 3.6 调试：`build_detailed` / `abuild_detailed`
+### 3.7 调试：`build_detailed` / `abuild_detailed`
 
 需要看是哪些片段被丢弃、是否触发了截断时使用：
 
@@ -274,7 +315,7 @@ class ContextResult:
 #### `abuild(...) -> str`
 
 异步版本。`_gather_async` 用 `asyncio.gather + asyncio.to_thread`
-让 memory_state / memory_related / rag 三路检索并发触发。
+让 Markdown 记忆 / memory_state / memory_related / rag 四路检索并发触发。
 
 #### `build_detailed(...) -> ContextResult` / `abuild_detailed(...) -> ContextResult`
 
@@ -291,25 +332,35 @@ OpenAI messages 协议适配。返回 `[{role: system, content: <ctx>}, {role: u
 
 按固定顺序拼装 packet：
 1. system_instructions → P0
-2. memory_state（任务态）→ P1
-3. memory_related（与查询相关）→ P2
-4. rag（知识库）→ P2
-5. conversation_history → P3
-6. additional_packets → 按 packet 自身 priority
+2. `additional_packets` 中的 `local_session_state` → P1（当前会话滚动状态）
+3. Markdown memory state（轻量记忆状态）→ P1
+4. Markdown memory related（轻量相关记忆）→ P2
+5. full memory_state（任务态）→ P1
+6. full memory_related（与查询相关）→ P2
+7. full rag（知识库）→ P2
+8. conversation_history → P3
+9. 其它 additional_packets → 按 packet 自身 priority
 
 #### `_gather_async(...) -> List[ContextPacket]`
 
-同上，但 2/3/4 三路用 `asyncio.gather` 并发。
+同上，但 Markdown memory / full memory / full rag 检索用 `asyncio.gather` 并发。
 
 #### `_make_system_packet(instructions)` / `_make_history_packet(history)`
 
 把字符串 / Message 列表转成 packet。`_make_history_packet` 内部用
 `messages_to_text` 处理 `Message`，自动处理多模态 content 与 `MessageRole` 枚举。
 
+#### `_search_markdown_memory(user_query) -> Tuple[Optional[ContextPacket], Optional[ContextPacket]]`
+
+扫描 `MarkdownMemoryProvider` 提供的项目级/全局 Markdown 文件。状态类记忆进入
+`[State]`，与当前 query 相关的片段进入 `[Evidence]`。这个路径不 import 旧
+`tools.tools.memory_tool` / `tools.tools.rag_tool`，因此轻量安装不会触碰向量/RAG 依赖。
+
 #### `_search_memory_state() -> Optional[ContextPacket]`
 
 遍历 `config.memory_state_types`（默认 `("working", "episodic", "semantic")`），
-分别搜索任务态记忆并合并。注意：原版本只搜 `working`，会漏掉 episodic/semantic 的关键进展。
+分别搜索任务态记忆并合并。只在调用方传入旧 `memory_tool` 时生效，通常对应
+`--memory-system full`。
 
 #### `_search_memory_related(user_query) -> Optional[ContextPacket]`
 
@@ -317,7 +368,8 @@ OpenAI messages 协议适配。返回 `[{role: system, content: <ctx>}, {role: u
 
 #### `_search_rag(user_query) -> Optional[ContextPacket]`
 
-调用 `rag_tool.run({"action": "search", "query": ..., "top_k": ...})`。
+调用 `rag_tool.run({"action": "search", "query": ..., "top_k": ...})`。只在调用方传入
+旧 `rag_tool` 时生效，通常对应 `--memory-system full`。
 
 #### `_normalize_tool_output(raw) -> str`（静态方法）
 
@@ -436,6 +488,7 @@ score(c) = λ * rel(c, query) - (1-λ) * max_{s ∈ selected} sim(c, s)
 | **压缩** | | |
 | `enable_compression` | True | 是否启用 _compress 阶段 |
 | **记忆** | | |
+| `md_memory_provider` | 构造参数 | 轻量 Markdown 记忆 provider，不在 `ContextConfig` 内 |
 | `memory_state_query` | `"任务状态 子目标 结论 阻塞"` | 任务态记忆查询。**用空格分隔**，对向量检索友好（原版本 `"A OR B OR C"` 对向量检索无意义） |
 | `memory_state_min_importance` | 0.7 | 任务态记忆最小重要度 |
 | `memory_state_limit` | 5 | 单类型任务态记忆 top_k |

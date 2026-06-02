@@ -22,6 +22,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { AgentEvent, CompactPayload, SessionPayload, SessionSummary } from "./types.js";
 
+export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
+
 export interface TransportOptions {
   /** Python 解释器路径。默认环境变量 CB_AGENT_PYTHON 或 "python"。 */
   python?: string;
@@ -65,7 +67,7 @@ export class Transport extends EventEmitter {
     mkdirSync(logsDir, { recursive: true });
     this.stderrLogPath = opts.stderrLog ?? join(logsDir, `gateway-${Date.now()}.log`);
 
-    this.proc = spawn(python, ["run_agent.py", "--transport", "jsonrpc"], {
+    this.proc = spawn(python, RUN_AGENT_ARGS, {
       cwd,
       env: { ...process.env, ...opts.env, PYTHONIOENCODING: "utf-8" },
       stdio: ["pipe", "pipe", "pipe"],

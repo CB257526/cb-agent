@@ -16,6 +16,9 @@ import os
 import sys
 import asyncio
 import time
+import subprocess
+import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 # 添加项目根目录到 path
@@ -33,6 +36,7 @@ from context.builder import (
     tokenize_for_relevance,
     _get_encoding,
 )
+from context.markdown_memory import MarkdownMemoryProvider
 from core.message import Message, MessageRole
 
 
@@ -364,9 +368,101 @@ def test_memory_tool_failure_isolated():
     _check("[Task]" in ctx, "异常未中断流水线")
 
 
+def test_markdown_memory_provider_in_context():
+    print("=" * 60)
+    print("测试 10: Markdown 轻量记忆进入 ContextBuilder")
+    print("=" * 60)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        project_root = root / "project"
+        global_memory = root / "global_memory"
+        project_root.mkdir()
+
+        provider = MarkdownMemoryProvider(
+            project_dir=project_root,
+            global_dir=global_memory,
+            max_related=5,
+            max_state=5,
+        )
+        provider.ensure_initialized()
+
+        project_memory = project_root / ".cbagent" / "memory"
+        (project_memory / "project_conventions.md").write_text(
+            """---
+name: 审批流程约定
+description: 当前项目的审批与上下文管理约定
+type: project
+scope: project
+---
+项目事实：审批流程需要保留 transcript 审计，并优先使用 Markdown 记忆。
+""",
+            encoding="utf-8",
+        )
+        (project_memory / "MEMORY.md").write_text(
+            "# Memory Index\n- [审批流程约定](project_conventions.md) — 审批与上下文管理\n",
+            encoding="utf-8",
+        )
+
+        (global_memory / "user_preferences.md").write_text(
+            """---
+name: 用户偏好
+description: 用户长期回答偏好
+type: user
+scope: global
+---
+用户偏好：回答保持中文、简洁，并在必要时说明验证命令。
+""",
+            encoding="utf-8",
+        )
+        (global_memory / "MEMORY.md").write_text(
+            "# Memory Index\n- [用户偏好](user_preferences.md) — 中文简洁回答偏好\n",
+            encoding="utf-8",
+        )
+
+        builder = ContextBuilder(
+            md_memory_provider=provider,
+            config=ContextConfig(max_tokens=4000, min_relevance=0.0),
+        )
+        ctx = builder.build(user_query="请按审批流程处理，并保持中文简洁回答")
+
+        _check("Markdown 记忆状态" in ctx, "包含 Markdown 记忆状态段")
+        _check("审批流程需要保留 transcript 审计" in ctx, "项目级 Markdown 记忆被注入")
+        _check("回答保持中文、简洁" in ctx, "全局 Markdown 记忆被注入")
+        _check("project_conventions.md" in ctx, "上下文标注项目记忆文件名")
+        _check("user_preferences.md" in ctx, "上下文标注全局记忆文件名")
+        _check((project_memory / "MEMORY.md").exists(), "项目级 MEMORY.md 存在")
+        _check((global_memory / "MEMORY.md").exists(), "全局 MEMORY.md 存在")
+
+
+def test_context_builder_import_is_lightweight():
+    print("=" * 60)
+    print("测试 11: context.builder 导入不触碰 full 记忆工具")
+    print("=" * 60)
+
+    code = (
+        "import sys;"
+        "import context.builder;"
+        "bad = [m for m in ('tools.tools.memory_tool','tools.tools.rag_tool') if m in sys.modules];"
+        "print(','.join(bad))"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=env["PYTHONPATH"],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    _check(result.returncode == 0, f"子进程导入 context.builder 成功 ({result.stderr.strip()[:120]})")
+    _check(result.stdout.strip() == "", "未运行时导入 memory_tool/rag_tool")
+
+
 def test_perf_count_tokens():
     print("=" * 60)
-    print("测试 10: count_tokens 性能（编码器复用）")
+    print("测试 12: count_tokens 性能（编码器复用）")
     print("=" * 60)
 
     # 预热
@@ -385,7 +481,7 @@ def test_perf_count_tokens():
 
 def test_to_messages():
     print("=" * 60)
-    print("测试 11: to_messages / ato_messages 适配 OpenAI 协议")
+    print("测试 13: to_messages / ato_messages 适配 OpenAI 协议")
     print("=" * 60)
 
     memory = _MockMemoryTool(search_results={"__default__": "记忆: x"})
@@ -432,6 +528,10 @@ def main():
     test_async_build()
     print()
     test_memory_tool_failure_isolated()
+    print()
+    test_markdown_memory_provider_in_context()
+    print()
+    test_context_builder_import_is_lightweight()
     print()
     test_perf_count_tokens()
     print()

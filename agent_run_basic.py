@@ -4,7 +4,7 @@
 
 复用的组件：
   - CbAgentsLLM          agent/cb_agents.py          LLM 调用（event_bus=None → print 模式）
-  - ContextBuilder       context/builder.py          GSSC 上下文构建（memory + RAG + 历史）
+  - ContextBuilder       context/builder.py          GSSC 上下文构建（Markdown 记忆 / full 记忆 + 历史）
   - ToolRegistry         tools/toolRegistry.py        工具注册/查找/执行
   - MemoryTool           tools/tools/memory_tool.py   记忆增删搜
   - RAGTool              tools/tools/rag_tool.py      知识库文档问答
@@ -40,6 +40,8 @@ import os
 import sys
 import textwrap
 import traceback
+import argparse
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # 确保能 import 项目模块
@@ -66,10 +68,9 @@ for noisy in ("memory", "memory.types", "memory.storage", "memory.manager"):
 from agent.cb_agents import CbAgentsLLM
 from constant.llm.constant_llm import ConstantLLM
 from context.builder import ContextBuilder, ContextConfig
+from context.markdown_memory import MarkdownMemoryProvider
 from core.message import Message
 from tools.toolRegistry import ToolRegistry
-from tools.tools.memory_tool import MemoryTool
-from tools.tools.rag_tool import RAGTool
 from tools.tools.search import SearchTool
 from tools.tools.todo_tool import TodoTool
 from tools.tools.skill_tool import SkillTool
@@ -92,7 +93,9 @@ class BasicAgent:
 
     MAX_TOOL_ROUNDS = 8
 
-    def __init__(self):
+    def __init__(self, memory_system: str = "light"):
+        self.memory_system = memory_system
+        self._md_memory_provider = self._create_markdown_memory_provider()
         print("=" * 50)
         print("Basic Agent — 初始化中…")
         print("=" * 50)
@@ -115,6 +118,7 @@ class BasicAgent:
         self.builder = ContextBuilder(
             memory_tool=self._memory_tool,
             rag_tool=self._rag_tool,
+            md_memory_provider=self._md_memory_provider,
             config=ContextConfig(
                 max_tokens=context_max_tokens,
                 min_relevance=0.05,
@@ -122,6 +126,7 @@ class BasicAgent:
             ),
         )
         print(f"[上下文] ContextBuilder (GSSC) max_tokens={context_max_tokens}")
+        print(f"[记忆] memory_system={self.memory_system}")
 
         # ── 对话历史 ──
         self.history: List[Message] = []
@@ -130,21 +135,51 @@ class BasicAgent:
 
     # ========== 工具注册 ==========
 
+    def _create_markdown_memory_provider(self):
+        """按需创建并初始化轻量 Markdown 记忆目录。
+
+        basic CLI 和主入口保持同一语义：light 模式启动后就能看到全局/项目两级
+        MEMORY.md 模板，而不是等到第一轮 ContextBuilder 扫描时才被动创建。
+        初始化失败只打印诊断，不影响继续跑 off/full 之外的核心功能。
+        """
+        if self.memory_system != "light":
+            return None
+        provider = MarkdownMemoryProvider(project_dir=Path(_HERE))
+        try:
+            provider.ensure_initialized()
+        except Exception as e:
+            print(f"  [!] 轻量 Markdown 记忆目录初始化失败（继续启动）: {e}")
+        return provider
+
     def _register_tools(self) -> None:
         """注册所有项目内置工具。
 
         跳过的工具：
           - AskUserQuestionTool：依赖 EventBus + QuestionRegistry，CLI 模式下无 UI 弹窗
         """
-        # 记忆和 RAG 需要保留引用（交给 ContextBuilder）
-        self._memory_tool = MemoryTool()
-        self._rag_tool = RAGTool()
+        self._memory_tool = None
+        self._rag_tool = None
 
         skill_executor = SkillExecutor()
 
-        tools = [
-            self._memory_tool,
-            self._rag_tool,
+        tools = []
+        if self.memory_system == "full":
+            # full 模式才懒加载旧 MemoryTool/RAGTool，避免 basic 入口在轻量安装下
+            # 因为顶层 import 拉起 embedding/向量库依赖。
+            try:
+                from tools.tools.memory_tool import MemoryTool
+                from tools.tools.rag_tool import RAGTool
+                self._memory_tool = MemoryTool()
+                self._rag_tool = RAGTool()
+                tools.extend([self._memory_tool, self._rag_tool])
+            except Exception as e:
+                print(f"  [!] full 记忆工具加载失败（跳过 memory/rag）: {e}")
+        elif self.memory_system == "light":
+            print("  [*] 使用轻量 Markdown 记忆：不注册 memory/rag 工具")
+        else:
+            print("  [*] 记忆系统关闭：不注册 memory/rag 工具")
+
+        tools.extend([
             SearchTool(),
             TodoTool(),                                  # event_bus=None，不发事件，功能正常
             SkillTool(self._skill_manager),
@@ -154,7 +189,7 @@ class BasicAgent:
             BashTool(),                                  # 无 question_channel，交互式权限会退化
             BashTaskTool(),
             BashPermissionTool(),
-        ]
+        ])
 
         for tool in tools:
             try:
@@ -174,6 +209,10 @@ class BasicAgent:
             "调用工具时选最直接的那个，避免连续多轮无意义调用。",
             "回答用中文，简明扼要。",
         ]
+
+        if self._md_memory_provider is not None:
+            parts.append("")
+            parts.append(self._md_memory_provider.memory_instructions())
 
         # Skill 概览
         try:
@@ -286,11 +325,12 @@ class BasicAgent:
         if final_answer:
             self.history.append(Message.create_assistant_message(final_answer))
 
-        # 5. 自动记录到记忆
-        try:
-            self._memory_tool.auto_record_conversation(user_query, final_answer or "")
-        except Exception:
-            pass
+        # 5. full 模式保留旧的自动记录逻辑；light/off 不注册旧 memory tool。
+        if self._memory_tool is not None:
+            try:
+                self._memory_tool.auto_record_conversation(user_query, final_answer or "")
+            except Exception:
+                pass
 
     # ========== 工具循环 ==========
 
@@ -402,7 +442,15 @@ def _short_args(args: Dict[str, Any], limit: int = 60) -> str:
 # ============================================================
 
 def main() -> None:
-    agent = BasicAgent()
+    parser = argparse.ArgumentParser(description="cb-agent basic CLI")
+    parser.add_argument(
+        "--memory-system",
+        choices=["light", "full", "off"],
+        default="light",
+        help="light=Markdown 记忆（默认）；full=旧 MemoryTool/RAGTool；off=关闭记忆",
+    )
+    args = parser.parse_args()
+    agent = BasicAgent(memory_system=args.memory_system)
     agent.run()
 
 

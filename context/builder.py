@@ -1,12 +1,12 @@
 """上下文构建器 - GSSC 流水线
 
 实现 Gather-Select-Structure-Compress 上下文构建流程：
-1. Gather: 从多源（系统指令、记忆、RAG、对话历史、外部包）收集候选信息
+1. Gather: 从多源（系统指令、Markdown 记忆、旧记忆、RAG、对话历史、外部包）收集候选信息
 2. Select: 基于相关性、新近性、MMR 多样性、token 预算筛选
 3. Structure: 按优先级组织成结构化上下文模板
 4. Compress: 在预算内压缩与规范化（保结构整段丢弃）
 
-提供同步 build() 与异步 abuild() 两套入口，异步版本对 memory/rag 检索做并发触发。
+提供同步 build() 与异步 abuild() 两套入口，异步版本对 Markdown memory / memory / rag 检索做并发触发。
 """
 
 from __future__ import annotations
@@ -18,17 +18,20 @@ import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import IntEnum
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from core.message import Message, MessageRole
-from tools.tools.memory_tool import MemoryTool
-from tools.tools.rag_tool import RAGTool
+from context.markdown_memory import MarkdownMemoryProvider
 from utils.common import (
     _get_encoding,
     count_tokens,
     jaccard,
     tokenize_for_relevance,
 )
+
+if TYPE_CHECKING:
+    from tools.tools.memory_tool import MemoryTool
+    from tools.tools.rag_tool import RAGTool
 
 
 logger = logging.getLogger(__name__)
@@ -204,12 +207,21 @@ class ContextBuilder:
 
     def __init__(
         self,
-        memory_tool: Optional[MemoryTool] = None,
-        rag_tool: Optional[RAGTool] = None,
+        memory_tool: Optional["MemoryTool"] = None,
+        rag_tool: Optional["RAGTool"] = None,
+        md_memory_provider: Optional[MarkdownMemoryProvider] = None,
         config: Optional[ContextConfig] = None,
     ):
+        # 兼容旧构造方式：新增 md_memory_provider 参数前，第三个位置参数就是
+        # ContextConfig。若调用方仍写 ContextBuilder(memory, rag, ContextConfig(...))，
+        # 这里主动把第三参挪回 config，避免后续把配置对象当 Markdown provider 调用。
+        if isinstance(md_memory_provider, ContextConfig) and config is None:
+            config = md_memory_provider
+            md_memory_provider = None
+
         self.memory_tool = memory_tool
         self.rag_tool = rag_tool
+        self.md_memory_provider = md_memory_provider
         self.config = config or ContextConfig()
 
     # ---------- 公开入口 ----------
@@ -348,16 +360,31 @@ class ContextBuilder:
     ) -> List[ContextPacket]:
         """同步收集候选 packet。"""
         packets: List[ContextPacket] = []
+        state_packets, extra_packets = self._split_local_state_packets(additional_packets)
 
         if system_instructions:
             packets.append(self._make_system_packet(system_instructions))
 
-        # 记忆：任务状态
+        # 本地 session state 是跨轮工作上下文的滚动摘要，优先级高于所有记忆来源。
+        # AgentSession 通过 additional_packets 传入它；这里识别 metadata.source 后
+        # 提前插入，剩余 additional_packets 仍按调用方原意在 Gather 末尾追加。
+        packets.extend(state_packets)
+
+        # Markdown 记忆：轻量模式使用，不依赖 embedding/RAG。先注入状态类记忆，
+        # 再注入与当前 query 相关的片段；full 模式如果同时传入旧 memory_tool，
+        # 后面的旧记忆/RAG 路径仍照常工作。
+        md_state, md_related = self._search_markdown_memory(user_query)
+        if md_state:
+            packets.append(md_state)
+        if md_related:
+            packets.append(md_related)
+
+        # 旧记忆：任务状态
         state = self._search_memory_state()
         if state:
             packets.append(state)
 
-        # 记忆：与查询相关
+        # 旧记忆：与查询相关
         related = self._search_memory_related(user_query)
         if related:
             packets.append(related)
@@ -372,7 +399,7 @@ class ContextBuilder:
             packets.append(self._make_history_packet(conversation_history))
 
         # 外部传入
-        packets.extend(additional_packets)
+        packets.extend(extra_packets)
 
         return packets
 
@@ -385,19 +412,29 @@ class ContextBuilder:
     ) -> List[ContextPacket]:
         """异步收集候选 packet：memory/rag 用 to_thread 并发触发。"""
         packets: List[ContextPacket] = []
+        state_packets, extra_packets = self._split_local_state_packets(additional_packets)
 
         if system_instructions:
             packets.append(self._make_system_packet(system_instructions))
 
-        # 三路并发触发同步工具调用
+        # 同步版本同理：本地 session state 先进入 [State]，再拼 Markdown/full 记忆。
+        packets.extend(state_packets)
+
+        # 四路并发触发同步检索。Markdown provider 是纯文件扫描，旧 memory/rag
+        # 是 full 模式才会传入的工具；各自 helper 内部会在未配置时快速返回 None。
+        md_task = asyncio.to_thread(self._search_markdown_memory, user_query)
         state_task = asyncio.to_thread(self._search_memory_state)
         related_task = asyncio.to_thread(self._search_memory_related, user_query)
         rag_task = asyncio.to_thread(self._search_rag, user_query)
 
-        state, related, rag = await asyncio.gather(
-            state_task, related_task, rag_task, return_exceptions=False
+        md_result, state, related, rag = await asyncio.gather(
+            md_task, state_task, related_task, rag_task, return_exceptions=False
         )
 
+        md_state, md_related = md_result
+        for p in (md_state, md_related):
+            if p is not None:
+                packets.append(p)
         for p in (state, related, rag):
             if p is not None:
                 packets.append(p)
@@ -405,11 +442,32 @@ class ContextBuilder:
         if conversation_history:
             packets.append(self._make_history_packet(conversation_history))
 
-        packets.extend(additional_packets)
+        packets.extend(extra_packets)
 
         return packets
 
     # ---------- 工具调用（已抽出，便于 mock 单测） ----------
+
+    @staticmethod
+    def _split_local_state_packets(
+        packets: List[ContextPacket],
+    ) -> Tuple[List[ContextPacket], List[ContextPacket]]:
+        """把 AgentSession 注入的本地滚动状态从 additional_packets 中提前。
+
+        这个 helper 专门服务轻量/持久化上下文的组合：LocalSessionStore 的
+        state.json 代表“当前会话已经确认的任务状态”，应该排在 Markdown 记忆、
+        full MemoryTool 与 RAG 之前。其它 additional packet 仍保留原顺序，并在
+        Gather 末尾追加，避免破坏调用方手动传入证据的旧语义。
+        """
+        state_packets: List[ContextPacket] = []
+        extra_packets: List[ContextPacket] = []
+        for packet in packets:
+            source = packet.metadata.get("source") if isinstance(packet.metadata, dict) else None
+            if source == "local_session_state":
+                state_packets.append(packet)
+            else:
+                extra_packets.append(packet)
+        return state_packets, extra_packets
 
     def _make_system_packet(self, instructions: str) -> ContextPacket:
         return ContextPacket(
@@ -425,6 +483,37 @@ class ContextBuilder:
             priority=ContextPriority.P3_HISTORY,
             metadata={"source": "history", "count": min(len(history), self.config.history_max_messages)},
         )
+
+    def _search_markdown_memory(self, user_query: str) -> Tuple[Optional[ContextPacket], Optional[ContextPacket]]:
+        """检索轻量 Markdown 记忆。
+
+        这个入口只依赖 ``MarkdownMemoryProvider``，不会 import 旧 memory/RAG 包。
+        返回两个 packet：任务态记忆进 [State]，相关记忆进 [Evidence]。任一为空时
+        返回 None，保持 ContextBuilder 对未配置轻量记忆的兼容。
+        """
+        if not self.md_memory_provider:
+            return None, None
+        try:
+            result = self.md_memory_provider.recall(user_query)
+        except Exception:
+            logger.exception("Markdown 记忆检索失败")
+            return None, None
+
+        state_packet = None
+        related_packet = None
+        if result.state_text:
+            state_packet = ContextPacket(
+                content=result.state_text,
+                priority=ContextPriority.P1_STATE,
+                metadata={"source": "markdown_memory.state"},
+            )
+        if result.related_text:
+            related_packet = ContextPacket(
+                content=result.related_text,
+                priority=ContextPriority.P2_EVIDENCE,
+                metadata={"source": "markdown_memory.related"},
+            )
+        return state_packet, related_packet
 
     def _search_memory_state(self) -> Optional[ContextPacket]:
         """搜索任务态：覆盖 working/episodic/semantic 三种类型，结果合并。"""
