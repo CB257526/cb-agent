@@ -7,11 +7,10 @@
         "AMAP_MAPS_API_KEY": "${AMAP_MAPS_API_KEY}"
       }
     },
-    "12306-mcp": {
+    "playwright": {
       "command": "npx",
       "args": [
-        "-y",
-        "12306-mcp"
+        "@playwright/mcp@latest"
       ]
     }
   }
