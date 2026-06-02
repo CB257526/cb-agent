@@ -8,13 +8,21 @@
  */
 
 import type { Transport } from "./transport.js";
-import type { ChatItem } from "./types.js";
+import type { ChatItem, SessionPayload } from "./types.js";
 
 export interface CommandCtx {
   transport: Transport;
+  /** 用户输入的完整命令行，例如 "/switch session_xxx"。 */
+  input: string;
+  /** 去掉命令名后的参数文本。 */
+  args: string;
   appendSystem: (text: string) => void;
   /** 替换整个对话流（/clear 用） */
   setItems: (updater: (prev: ChatItem[]) => ChatItem[]) => void;
+  /** 用后端恢复的 history 重绘当前会话。 */
+  applySessionPayload: (payload: SessionPayload, notice?: string) => void;
+  /** 打开可见的会话切换面板。 */
+  openSessionSwitcher: () => void;
   /** 切换后端日志面板 */
   toggleActivity: () => void;
 }
@@ -41,6 +49,42 @@ export const COMMANDS: readonly SlashCommand[] = [
       transport.clearHistory();
       setItems(() => []);
       appendSystem("对话已清空。");
+    },
+  },
+  {
+    name: "/sessions",
+    description: "打开本地会话切换面板",
+    handler: ({ openSessionSwitcher }) => {
+      openSessionSwitcher();
+    },
+  },
+  {
+    name: "/new",
+    description: "新建并切换到空白会话",
+    handler: async ({ transport, applySessionPayload, appendSystem }) => {
+      try {
+        const payload = await transport.createSession();
+        applySessionPayload(payload, `已新建并切换到会话 ${payload.session?.session_id ?? "unknown"}`);
+      } catch (e) {
+        appendSystem(`/new 失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
+    name: "/switch",
+    description: "切换到指定会话：/switch <id>",
+    handler: async ({ transport, args, applySessionPayload, appendSystem }) => {
+      const sessionId = args.trim();
+      if (!sessionId) {
+        appendSystem("用法：/switch <session_id>");
+        return;
+      }
+      try {
+        const payload = await transport.switchSession(sessionId);
+        applySessionPayload(payload, `已切换到会话 ${payload.session?.session_id ?? sessionId}`);
+      } catch (e) {
+        appendSystem(`/switch 失败：${(e as Error).message}`);
+      }
     },
   },
   {
@@ -78,5 +122,6 @@ export function filterCommands(query: string): SlashCommand[] {
 /** 找精确匹配（用于回车直接执行 '/help' 这种完整输入）。 */
 export function findCommand(input: string): SlashCommand | undefined {
   const trimmed = input.trim();
-  return COMMANDS.find((c) => c.name === trimmed);
+  const name = trimmed.split(/\s+/, 1)[0];
+  return COMMANDS.find((c) => c.name === name);
 }

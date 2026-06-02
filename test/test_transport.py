@@ -14,9 +14,11 @@ import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
@@ -37,6 +39,7 @@ from agent.events import Cancelled, Done, TextDelta, ToolComplete, ToolStart
 from agent.executor import ToolExecutor
 from agent.session import AgentSession
 from agent.transport import Gateway, StdioTransport, make_event_message, make_response
+from agent.work_context import LocalSessionStore
 
 
 # ========== JSON-RPC 序列化 ==========
@@ -162,7 +165,7 @@ class FakeLLM:
         return out
 
 
-def _make_session_for_gateway(llm: FakeLLM):
+def _make_session_for_gateway(llm: FakeLLM, session_store=None):
     bus = EventBus()
     reg = MagicMock()
     reg.execute_tool = MagicMock(return_value="{}")
@@ -173,6 +176,7 @@ def _make_session_for_gateway(llm: FakeLLM):
     s = AgentSession(
         llm=llm, registry=reg, executor=ex, event_bus=bus,
         builder=None, skill_manager=None, ctx_enabled=False,
+        session_store=session_store,
     )
     return s, bus
 
@@ -210,12 +214,12 @@ class _PipeStdin:
 class TestGatewayDispatch(unittest.TestCase):
 
     def _run_gateway_with_msgs(self, llm: FakeLLM, msgs: List[str], wait_for: int = 0,
-                                wait_done: bool = False) -> List[Dict[str, Any]]:
+                                wait_done: bool = False, session_store=None) -> List[Dict[str, Any]]:
         """起 gateway，把 msgs 一行行喂进 stdin，等收到至少 wait_for 条 stdout 行
         （或看到 done 事件，wait_done=True 时），然后关 stdin、join 主线程。
         返回 stdout 解析出的所有 JSON 消息（顺序）。
         """
-        session, bus = _make_session_for_gateway(llm)
+        session, bus = _make_session_for_gateway(llm, session_store=session_store)
         stdin = _PipeStdin()
         out = io.StringIO()
         out_lock = threading.Lock()
@@ -370,6 +374,55 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertIn("description", t)
             # schema 可为 None（无参函数工具时）但 key 应存在
             self.assertIn("schema", t)
+
+    def test_gateway_session_create_list_and_switch(self):
+        """session.* 会话 RPC 返回摘要和普通 history，且能切回旧会话。"""
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            first_id = store.active_session_id
+            store.append_turn(
+                user_query="第一会话问题",
+                final_answer="第一轮回答",
+                work_record=None,
+            )
+            second = store.create_session()
+            second_id = second["session_id"]
+            store.append_turn(
+                user_query="第二会话问题",
+                final_answer="第二轮回答",
+                work_record=None,
+            )
+
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [
+                    json.dumps({"jsonrpc": "2.0", "id": "ls1", "method": "session.list_sessions"}),
+                    json.dumps({"jsonrpc": "2.0", "id": "new1", "method": "session.create"}),
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": "sw1",
+                        "method": "session.switch",
+                        "params": {"session_id": first_id},
+                    }),
+                ],
+                wait_for=4,
+                session_store=store,
+            )
+
+            list_reply = [m for m in msgs if m.get("id") == "ls1"][0]
+            sessions = list_reply["result"]["sessions"]
+            self.assertGreaterEqual(len(sessions), 2)
+            self.assertEqual({first_id, second_id}.issubset({s["session_id"] for s in sessions}), True)
+
+            create_reply = [m for m in msgs if m.get("id") == "new1"][0]
+            self.assertEqual(create_reply["result"]["history"], [])
+            self.assertNotEqual(create_reply["result"]["session"]["session_id"], second_id)
+
+            switch_reply = [m for m in msgs if m.get("id") == "sw1"][0]
+            history_text = "\n".join(item["content"] for item in switch_reply["result"]["history"])
+            self.assertIn("第一会话问题", history_text)
+            self.assertIn("第一轮回答", history_text)
+            self.assertNotIn("第二会话问题", history_text)
 
 
 if __name__ == "__main__":

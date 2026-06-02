@@ -7,6 +7,7 @@ import { theme } from "../theme.js";
 
 export interface StatusBarProps {
   model: string;
+  sessionId?: string | null;
   promptTokens: number;
   completionTokens: number;
   round: number;
@@ -15,7 +16,7 @@ export interface StatusBarProps {
 }
 
 /** 底部状态栏：左边 spinner + 模型/token/round；右边快捷键 byline。 */
-export function StatusBar({ model, promptTokens, completionTokens, round, maxRounds, busy }: StatusBarProps) {
+export function StatusBar({ model, sessionId, promptTokens, completionTokens, round, maxRounds, busy }: StatusBarProps) {
   const totalK = ((promptTokens + completionTokens) / 1000).toFixed(1);
   return (
     <Box flexDirection="row" justifyContent="space-between">
@@ -24,6 +25,7 @@ export function StatusBar({ model, promptTokens, completionTokens, round, maxRou
         <Text dimColor>
           <Byline>
             <Text>{model}</Text>
+            {sessionId ? <Text>session {shortSessionId(sessionId)}</Text> : null}
             <Text>tokens {totalK}k</Text>
             {round > 0 ? <Text>round {round}/{maxRounds}</Text> : null}
             {busy ? <Text color={theme.warning}>working…</Text> : null}
@@ -36,6 +38,7 @@ export function StatusBar({ model, promptTokens, completionTokens, round, maxRou
             <KeyboardShortcutHint shortcut="Enter" action="send" />
             <KeyboardShortcutHint shortcut="↑/↓" action="history" />
             <KeyboardShortcutHint shortcut="/" action="commands" />
+            <KeyboardShortcutHint shortcut="/sessions" action="switch" />
             <KeyboardShortcutHint shortcut="Ctrl-O" action="log" />
             <KeyboardShortcutHint shortcut="Ctrl-L" action="clear" />
             <KeyboardShortcutHint shortcut="Ctrl-C" action={busy ? "cancel" : "exit"} />
@@ -44,4 +47,10 @@ export function StatusBar({ model, promptTokens, completionTokens, round, maxRou
       </Box>
     </Box>
   );
+}
+
+function shortSessionId(sessionId: string): string {
+  const parts = sessionId.split("_");
+  if (parts.length >= 4) return `${parts[1]}_${parts[2]}_${parts[3]}`;
+  return sessionId;
 }

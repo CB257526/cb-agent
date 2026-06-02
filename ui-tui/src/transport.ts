@@ -20,7 +20,7 @@ import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AgentEvent } from "./types.js";
+import { AgentEvent, SessionPayload, SessionSummary } from "./types.js";
 
 export interface TransportOptions {
   /** Python 解释器路径。默认环境变量 CB_AGENT_PYTHON 或 "python"。 */
@@ -167,6 +167,21 @@ export class Transport extends EventEmitter {
 
   clearHistory(): string {
     return this.sendRpc("session.clear_history");
+  }
+
+  /** 列出项目级本地会话摘要。只返回短 preview，不返回 transcript 全文。 */
+  listSessions(): Promise<{ sessions: SessionSummary[]; current?: SessionSummary | null }> {
+    return this.requestRpc("session.list_sessions");
+  }
+
+  /** 新建空白会话并切换过去；后端会返回空 history 供 UI 重绘。 */
+  createSession(): Promise<SessionPayload> {
+    return this.requestRpc("session.create");
+  }
+
+  /** 切换到已有会话；后端返回该会话恢复后的普通 history。 */
+  switchSession(session_id: string): Promise<SessionPayload> {
+    return this.requestRpc("session.switch", { session_id });
   }
 
   /** 拉取后端工具列表。 */

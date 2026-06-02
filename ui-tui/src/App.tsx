@@ -20,13 +20,14 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
-import { AgentEvent, ChatItem } from "./types.js";
+import { AgentEvent, ChatItem, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
 import { ActivityPanel } from "./components/ActivityPanel.js";
 import { Banner } from "./components/Banner.js";
 import { SlashCommandPicker } from "./components/SlashCommandPicker.js";
+import { SessionSwitcher } from "./components/SessionSwitcher.js";
 import { HistoryStore } from "./historyStore.js";
 import { findCommand, SlashCommand, CommandCtx } from "./commands.js";
 
@@ -38,6 +39,25 @@ historyStore.load();
 
 let _idCounter = 0;
 const nextId = () => `i${++_idCounter}`;
+
+function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
+  return history
+    .filter((m) => m.content)
+    .map((m) => {
+      // 工作记录虽然在后端 history 里是普通 assistant message，但在 UI 上用
+      // system 行展示更不容易和模型给用户的最终回答混淆。
+      if (m.kind === "work_record" || m.content.startsWith("【工作记录】")) {
+        return { id: nextId(), role: "system", text: m.content } as ChatItem;
+      }
+      if (m.role === "user") {
+        return { id: nextId(), role: "user", text: m.content } as ChatItem;
+      }
+      if (m.role === "assistant") {
+        return { id: nextId(), role: "assistant", text: m.content } as ChatItem;
+      }
+      return { id: nextId(), role: "system", text: m.content } as ChatItem;
+    });
+}
 
 export function App({ transport, clearScreen }: { transport: Transport; clearScreen?: () => void }) {
   const { exit } = useApp();
@@ -53,16 +73,19 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [protocolErrors, setProtocolErrors] = useState(0);
   const [stderrLines, setStderrLines] = useState<string[]>([]);
   const [showActivity, setShowActivity] = useState(false);
+  const [currentSession, setCurrentSession] = useState<SessionSummary | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [showSessionSwitcher, setShowSessionSwitcher] = useState(false);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
   // 当前等待用户作答的问题 id：决定 EventStream 把输入路由给哪个 panel；
   // 同时 PromptInput 在问答期 disabled，避免误打字提交 prompt
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
 
-  // / 命令面板：input 以 '/' 开头时自动显示，picker 自己读 input.slice(1) 作 query
-  const slashActive = input.startsWith("/") && !busy;
-
-  // useRef 给事件 handler 用，否则闭包里拿到的是旧 setItems
-  const itemsRef = useRef(items);
-  itemsRef.current = items;
+  // / 命令面板：只在输入"纯命令名前缀"时显示。带参数的命令（如
+  // /switch <session_id>）需要让 Enter 直接提交给 handleSubmit，否则 picker
+  // 会抢走回车，用户永远发不出带参数命令。
+  const slashActive = input.startsWith("/") && !input.trim().includes(" ") && !busy && !showSessionSwitcher;
 
   // 流式增量节流：DeepSeek thinking/text 一秒能发几十条 chunk，每条都 setItems
   // 会导致 ink 整树重渲 + stdout ANSI 全屏重画 → 事件循环压不过来 → stdin pipe
@@ -112,9 +135,76 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     flushDelta();
   }, [flushDelta]);
 
-  const appendSystem = useCallback((text: string, color: "red" | "yellow" | "gray" = "gray") => {
+  const appendSystem = useCallback((text: string) => {
     setItems((prev) => [...prev, { id: nextId(), role: "system", text }]);
   }, []);
+
+  const applySessionPayload = useCallback((payload: SessionPayload, notice?: string) => {
+    flushNow();
+    setCurrentSession(payload.session ?? null);
+    setItems(() => {
+      const restored = restoredHistoryToItems(payload.history ?? []);
+      if (notice) restored.push({ id: nextId(), role: "system", text: notice });
+      return restored;
+    });
+    setRound(0);
+    setBusy(false);
+    setActiveQuestionId(null);
+  }, [flushNow]);
+
+  const refreshSessions = useCallback(async () => {
+    setSessionsLoading(true);
+    setSessionsError(null);
+    try {
+      const result = await transport.listSessions();
+      setSessions(result.sessions ?? []);
+      if (result.current !== undefined) setCurrentSession(result.current ?? null);
+    } catch (e) {
+      setSessionsError((e as Error).message);
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, [transport]);
+
+  const openSessionSwitcher = useCallback(() => {
+    if (busy) {
+      appendSystem("agent 正在工作，等本轮结束后再切换会话。");
+      return;
+    }
+    setInput("");
+    setShowSessionSwitcher(true);
+    void refreshSessions();
+  }, [busy, appendSystem, refreshSessions]);
+
+  const handleSwitchSession = useCallback(async (sessionId: string) => {
+    setSessionsLoading(true);
+    setSessionsError(null);
+    try {
+      const payload = await transport.switchSession(sessionId);
+      applySessionPayload(payload, `已切换到会话 ${payload.session?.session_id ?? sessionId}`);
+      setShowSessionSwitcher(false);
+      void refreshSessions();
+    } catch (e) {
+      setSessionsError((e as Error).message);
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, [transport, applySessionPayload, refreshSessions]);
+
+  const handleCreateSession = useCallback(async () => {
+    setSessionsLoading(true);
+    setSessionsError(null);
+    try {
+      const payload = await transport.createSession();
+      applySessionPayload(payload, `已新建并切换到会话 ${payload.session?.session_id ?? "unknown"}`);
+      setShowSessionSwitcher(false);
+      void refreshSessions();
+    } catch (e) {
+      setSessionsError((e as Error).message);
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, [transport, applySessionPayload, refreshSessions]);
 
   // 事件订阅
   useEffect(() => {
@@ -122,6 +212,10 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       switch (ev.type) {
         case "gateway_ready":
           setModel((ev as any).model ?? "unknown");
+          setCurrentSession((ev as any).session ?? null);
+          if (Array.isArray((ev as any).history) && (ev as any).history.length > 0) {
+            setItems(restoredHistoryToItems((ev as any).history));
+          }
           break;
 
         case "round_start":
@@ -301,7 +395,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         _flushTimer.current = null;
       }
     };
-  }, [transport, exit, appendSystem]);
+  }, [transport, exit, appendSystem, flushNow, scheduleFlush]);
 
   // 键盘事件：Ctrl-C 在 busy 时中断/空闲时退出；Ctrl-O 切换后端日志面板
   useInput((inputChar, key) => {
@@ -323,6 +417,26 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     }
   });
 
+  /** 命令面板里选中或输入框里完整输入命令时调用 */
+  const runCommand = useCallback((cmd: SlashCommand, commandLine = input) => {
+    const normalized = commandLine.trim() || cmd.name;
+    const ctx: CommandCtx = {
+      transport,
+      input: normalized,
+      args: normalized.slice(cmd.name.length).trim(),
+      appendSystem: (t) => appendSystem(t),
+      setItems,
+      applySessionPayload,
+      openSessionSwitcher,
+      toggleActivity: () => setShowActivity((v) => !v),
+    };
+    const ret = cmd.handler(ctx);
+    if (ret instanceof Promise) {
+      ret.catch((e) => appendSystem(`✗ 命令 ${cmd.name} 抛错：${(e as Error).message}`));
+    }
+    setInput("");
+  }, [transport, input, appendSystem, applySessionPayload, openSessionSwitcher]);
+
   const handleSubmit = useCallback((text: string) => {
     if (!text.trim() || busy) return;
 
@@ -330,7 +444,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     if (text.startsWith("/")) {
       const cmd = findCommand(text);
       if (cmd) {
-        runCommand(cmd);
+        runCommand(cmd, text);
       } else {
         appendSystem(`未知命令：${text.split(/\s+/)[0]}（输入 / 查看可用命令）`);
       }
@@ -343,22 +457,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     setInput("");
     setBusy(true);
     transport.sendPrompt(text);
-  }, [busy, transport, appendSystem]);
-
-  /** 命令面板里选中或输入框里完整输入命令时调用 */
-  const runCommand = useCallback((cmd: SlashCommand) => {
-    const ctx: CommandCtx = {
-      transport,
-      appendSystem: (t) => appendSystem(t),
-      setItems,
-      toggleActivity: () => setShowActivity((v) => !v),
-    };
-    const ret = cmd.handler(ctx);
-    if (ret instanceof Promise) {
-      ret.catch((e) => appendSystem(`✗ 命令 ${cmd.name} 抛错：${(e as Error).message}`));
-    }
-    setInput("");
-  }, [transport, appendSystem]);
+  }, [busy, transport, appendSystem, runCommand]);
 
   /** ↑/↓ 翻历史的回调：idx 0 = 最新一条，递增 = 更老。null 表示越界 */
   const getHistoryAt = useCallback((idx: number): string | null => {
@@ -395,10 +494,22 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       </Box>
 
       <Box marginTop={1} flexDirection="column">
+        {showSessionSwitcher && (
+          <SessionSwitcher
+            sessions={sessions}
+            currentSessionId={currentSession?.session_id}
+            loading={sessionsLoading}
+            error={sessionsError}
+            onSwitch={handleSwitchSession}
+            onNew={handleCreateSession}
+            onRefresh={refreshSessions}
+            onCancel={() => setShowSessionSwitcher(false)}
+          />
+        )}
         {slashActive && (
           <SlashCommandPicker
             query={input.slice(1)}
-            onSelect={(cmd) => runCommand(cmd)}
+            onSelect={(cmd) => runCommand(cmd, cmd.name)}
             onCancel={() => setInput("")}
           />
         )}
@@ -406,13 +517,14 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           value={input}
           onChange={setInput}
           onSubmit={handleSubmit}
-          disabled={busy || activeQuestionId !== null}
+          disabled={busy || activeQuestionId !== null || showSessionSwitcher}
           getHistoryAt={getHistoryAt}
-          delegateNavKeys={slashActive || activeQuestionId !== null}
+          delegateNavKeys={slashActive || activeQuestionId !== null || showSessionSwitcher}
         />
         <Box marginTop={1}>
           <StatusBar
             model={model}
+            sessionId={currentSession?.session_id}
             promptTokens={promptTokens}
             completionTokens={completionTokens}
             round={round}

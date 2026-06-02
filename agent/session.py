@@ -53,6 +53,52 @@ from agent.work_context import (
 logger = logging.getLogger(__name__)
 
 
+def _message_content_to_text(content: Any) -> str:
+    """把 Message.content 转成 TUI/RPC 可直接展示的短文本。
+
+    ``core.message.Message`` 的 user content 可能是多模态数组，而 assistant content
+    通常是字符串。这里不返回 OpenAI 原始 message dict，是为了避免把 tool_calls、
+    tool_call_id 等本轮协议字段暴露给跨会话恢复流程；前端只需要普通可视文本。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                parts.append(str(item))
+                continue
+            item_type = item.get("type")
+            if item_type == "text":
+                parts.append(str(item.get("text") or ""))
+            elif item_type == "image_url":
+                url = (item.get("image_url") or {}).get("url", "")
+                parts.append(f"[image: {url}]" if url else "[image]")
+            elif item_type == "audio_url":
+                url = (item.get("audio_url") or {}).get("url", "")
+                parts.append(f"[audio: {url}]" if url else "[audio]")
+        return " ".join(p for p in parts if p).strip()
+    return str(content)
+
+
+def _history_message_to_payload(message: Message) -> Dict[str, Any]:
+    """把内存 history 消息转成 JSON-RPC/TUI 恢复用的轻量结构。
+
+    这里故意只输出 role/content/kind 三个字段。跨会话切换恢复的是"用户看到的
+    对话记录 + 工作记录文本"，不是工具调用协议，因此不带 tool role，也不带
+    assistant.tool_calls。
+    """
+    role = message.role.value if hasattr(message.role, "value") else str(message.role)
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return {
+        "role": role,
+        "content": _message_content_to_text(message.content),
+        "kind": metadata.get("kind"),
+    }
+
+
 class AgentSession:
     """单个 agent 会话。一个进程里通常只有一个，但多会话场景也支持。
 
@@ -117,6 +163,64 @@ class AgentSession:
         self.question_registry: QuestionRegistry = QuestionRegistry()
 
     # ---------- 公共入口 ----------
+
+    def export_history(self) -> List[Dict[str, Any]]:
+        """导出当前内存 history，供 RPC/TUI 在切换会话后重绘屏幕。
+
+        这不是给 LLM 的上下文构造函数；LLM 仍然走 ``self.history`` +
+        ContextBuilder。导出层只服务 UI，因此会丢弃协议字段并保留普通文本。
+        """
+        return [_history_message_to_payload(m) for m in self.history]
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """列出本地会话摘要；未启用 session_store 时返回空列表。"""
+        if self.session_store is None:
+            return []
+        return self.session_store.list_sessions()
+
+    def current_session_payload(self) -> Dict[str, Any]:
+        """返回当前会话摘要和可渲染 history。
+
+        Gateway 的 ready/切换响应、TUI 的会话面板都可以复用这个形状，避免前端
+        自己猜测 active session 和 history 的对应关系。
+        """
+        summary = None
+        if self.session_store is not None:
+            summary = self.session_store.current_session_summary()
+        return {
+            "session": summary,
+            "history": self.export_history(),
+        }
+
+    def create_session(self) -> Dict[str, Any]:
+        """创建并切换到一个全新的空会话。
+
+        新会话的隔离语义是：磁盘 active 指针切到新目录，同时内存 history 清空。
+        后续 chat 会写入新目录，不会继续追加旧 transcript。
+        """
+        self.history.clear()
+        if self.session_store is None:
+            return {"session": None, "history": []}
+        summary = self.session_store.create_session()
+        return {"session": summary, "history": []}
+
+    def switch_session(self, session_id: str) -> Dict[str, Any]:
+        """切换到已有会话并恢复它最近的普通 history。
+
+        这一步只读该 session 目录下的 transcript/state；不会把当前会话内容保存到
+        目标会话，也不会生成新的 transcript 行。会话隔离边界完全由
+        LocalSessionStore.switch_session 的目录校验保证。
+        """
+        if self.session_store is None:
+            raise RuntimeError("local session store is not enabled")
+        summary = self.session_store.switch_session(session_id)
+        self.history = self.session_store.load_latest_history(
+            max_messages=self.history_window,
+        )
+        return {
+            "session": summary,
+            "history": self.export_history(),
+        }
 
     def chat(
         self,

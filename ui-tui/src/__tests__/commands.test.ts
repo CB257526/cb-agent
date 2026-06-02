@@ -40,21 +40,31 @@ describe("commands", () => {
     let ctx: CommandCtx;
     let appendSystemMock: ReturnType<typeof vi.fn>;
     let setItemsMock: ReturnType<typeof vi.fn>;
+    let applySessionPayloadMock: ReturnType<typeof vi.fn>;
+    let openSessionSwitcherMock: ReturnType<typeof vi.fn>;
     let toggleActivityMock: ReturnType<typeof vi.fn>;
     let transportMock: any;
 
     beforeEach(() => {
       appendSystemMock = vi.fn();
       setItemsMock = vi.fn();
+      applySessionPayloadMock = vi.fn();
+      openSessionSwitcherMock = vi.fn();
       toggleActivityMock = vi.fn();
       transportMock = {
         clearHistory: vi.fn(),
         listTools: vi.fn(),
+        createSession: vi.fn(),
+        switchSession: vi.fn(),
       };
       ctx = {
         transport: transportMock,
+        input: "",
+        args: "",
         appendSystem: appendSystemMock,
         setItems: setItemsMock,
+        applySessionPayload: applySessionPayloadMock,
+        openSessionSwitcher: openSessionSwitcherMock,
         toggleActivity: toggleActivityMock,
       };
     });
@@ -67,6 +77,7 @@ describe("commands", () => {
       expect(text).toContain("/help");
       expect(text).toContain("/clear");
       expect(text).toContain("/tools");
+      expect(text).toContain("/sessions");
     });
 
     it("/clear 调 transport.clearHistory + 清 items + 给个提示", () => {
@@ -78,6 +89,49 @@ describe("commands", () => {
       const updater = setItemsMock.mock.calls[0][0];
       expect(updater([{ id: "x", role: "user", text: "old" }])).toEqual([]);
       expect(appendSystemMock).toHaveBeenCalled();
+    });
+
+    it("/sessions 打开可见会话切换面板", () => {
+      const cmd = findCommand("/sessions")!;
+      cmd.handler(ctx);
+      expect(openSessionSwitcherMock).toHaveBeenCalledOnce();
+    });
+
+    it("/new 调 session.create 并应用返回的会话 payload", async () => {
+      const payload = {
+        session: { session_id: "session_20260602_120000_abcdef12" },
+        history: [],
+      };
+      transportMock.createSession.mockResolvedValue(payload);
+      const cmd = findCommand("/new")!;
+      await cmd.handler(ctx);
+      expect(transportMock.createSession).toHaveBeenCalledOnce();
+      expect(applySessionPayloadMock).toHaveBeenCalledWith(
+        payload,
+        expect.stringContaining("session_20260602_120000_abcdef12"),
+      );
+    });
+
+    it("/switch 带参数时调用后端切换并应用恢复 history", async () => {
+      const payload = {
+        session: { session_id: "session_20260602_120000_abcdef12" },
+        history: [{ role: "user", content: "old", kind: null }],
+      };
+      transportMock.switchSession.mockResolvedValue(payload);
+      const cmd = findCommand("/switch session_20260602_120000_abcdef12")!;
+      await cmd.handler({ ...ctx, args: "session_20260602_120000_abcdef12" });
+      expect(transportMock.switchSession).toHaveBeenCalledWith("session_20260602_120000_abcdef12");
+      expect(applySessionPayloadMock).toHaveBeenCalledWith(
+        payload,
+        expect.stringContaining("session_20260602_120000_abcdef12"),
+      );
+    });
+
+    it("/switch 缺参数时给出用法", async () => {
+      const cmd = findCommand("/switch")!;
+      await cmd.handler({ ...ctx, args: "" });
+      expect(transportMock.switchSession).not.toHaveBeenCalled();
+      expect(appendSystemMock.mock.calls[0][0]).toContain("/switch");
     });
 
     it("/tools 成功时格式化输出", async () => {

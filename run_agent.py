@@ -22,6 +22,9 @@
     /tools      列出所有已注册工具
     /skills     列出所有 Skill
     /history    查看当前会话历史
+    /sessions   列出本项目的本地会话
+    /new        新建并切换到空白会话
+    /switch ID  切换到指定会话
     /clear      清空会话历史
     /ctx on|off 开关 ContextBuilder（默认 on）
     /msg on|off 开关每轮 messages dump（默认 on）
@@ -98,18 +101,22 @@ for noisy in ("memory", "memory.types", "memory.storage", "memory.manager"):
 
 
 def _hr(char: str = "─", width: int = 60) -> str:
+    """打印分隔线，用于分隔不同阶段的输出"""
     return char * width
 
 
 def _section(title: str) -> None:
+    """打印标题，用于分隔不同阶段的输出"""
     print(f"\n{_hr()}\n{title}\n{_hr()}")
 
 
 def _info(msg: str) -> None:
+    """打印信息，用于启动期的输出"""
     print(f"[*] {msg}")
 
 
 def _err(msg: str) -> None:
+    """打印错误信息，用于启动期的输出"""
     print(f"[!] {msg}", file=sys.stderr)
 
 
@@ -121,9 +128,9 @@ class AgentRunner:
 
     def __init__(
         self,
-        use_mcp: bool = True,
-        ctx_enabled: bool = True,
-        attach_cli_renderer: bool = True,
+        use_mcp: bool = True,  # 是否开启 MCP 工具
+        ctx_enabled: bool = True,  # 是否开启 ContextBuilder
+        attach_cli_renderer: bool = True, # 是否 attach CLIRenderer 到 EventBus
     ) -> None:
         self.use_mcp = use_mcp and _HAS_MCP
         self.ctx_enabled = ctx_enabled
@@ -392,7 +399,10 @@ class AgentRunner:
         """斜杠命令分派。返回 True 继续 REPL，False 退出。"""
         parts = line.split(maxsplit=1)
         cmd = parts[0].lower()
-        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        # raw_arg 保留原文，供 /switch 这类需要完整 id 的命令使用；
+        # arg_lower 只用于 on/off 这种固定关键字，避免把未来参数意外改写。
+        raw_arg = parts[1].strip() if len(parts) > 1 else ""
+        arg_lower = raw_arg.lower()
 
         if cmd in ("/quit", "/exit"):
             _info("再见")
@@ -405,6 +415,9 @@ class AgentRunner:
                 "  /tools       列出所有已注册工具\n"
                 "  /skills      列出所有 Skill\n"
                 "  /history     查看当前会话历史\n"
+                "  /sessions    列出本项目的本地会话\n"
+                "  /new         新建并切换到空白会话\n"
+                "  /switch ID   切换到指定会话\n"
                 "  /clear       清空会话历史\n"
                 "  /ctx on|off  开关 ContextBuilder (当前: "
                 + ("on" if self.session.ctx_enabled else "off")
@@ -439,21 +452,58 @@ class AgentRunner:
                 preview = (content or "")[:120]
                 print(f"  {i:2d}. [{role}] {preview}")
             print()
+        elif cmd == "/sessions":
+            # 多会话列表只展示 LocalSessionStore 提供的摘要，不读取 transcript 全文。
+            # 这样 CLI 查看列表不会把旧对话的大段工作记录重新塞进当前上下文。
+            sessions = self.session.list_sessions()
+            if not sessions:
+                _info("当前项目还没有本地会话")
+                return True
+            print(f"\n本地会话 ({len(sessions)} 个)：")
+            for item in sessions:
+                mark = "*" if item.get("is_active") else " "
+                sid = item.get("session_id", "")
+                turns = item.get("turn_count", 0)
+                updated = str(item.get("updated_at") or "")[:19]
+                preview = item.get("active_task") or item.get("rolling_summary") or "（空会话）"
+                print(f" {mark} {sid}  turns={turns}  updated={updated}")
+                print(f"     {str(preview)[:100]}")
+            print("\n用 /switch <session_id> 切换；用 /new 新建空白会话。")
+        elif cmd == "/new":
+            # 新建会话会立即清空内存 history，并把 store active 指向新的独立目录。
+            # 旧会话仍留在 .cbagent/sessions 下，可用 /sessions 找回。
+            payload = self.session.create_session()
+            session_info = payload.get("session") if isinstance(payload, dict) else None
+            sid = session_info.get("session_id") if isinstance(session_info, dict) else "（未启用本地存储）"
+            _info(f"已新建并切换到会话 {sid}")
+        elif cmd == "/switch":
+            if not raw_arg:
+                _info("用法: /switch <session_id>")
+                return True
+            try:
+                payload = self.session.switch_session(raw_arg)
+            except Exception as e:
+                _err(f"切换会话失败: {e}")
+                return True
+            session_info = payload.get("session") if isinstance(payload, dict) else None
+            sid = session_info.get("session_id") if isinstance(session_info, dict) else raw_arg
+            restored = payload.get("history") if isinstance(payload, dict) else []
+            _info(f"已切换到会话 {sid}，恢复 history {len(restored)} 条")
         elif cmd == "/clear":
             # /clear 现在是彻底清理：内存 history + active session 本地文件。
             # 这样重启后不会因为 index.json 指向旧 session 而自动恢复旧上下文。
             self.session.clear_history()
             _info("会话历史与本地会话记录已删除")
         elif cmd == "/ctx":
-            if arg in ("on", "off"):
-                self.session.ctx_enabled = arg == "on"
-                _info(f"ContextBuilder = {arg}")
+            if arg_lower in ("on", "off"):
+                self.session.ctx_enabled = arg_lower == "on"
+                _info(f"ContextBuilder = {arg_lower}")
             else:
                 _info(f"用法: /ctx on|off  (当前: {'on' if self.session.ctx_enabled else 'off'})")
         elif cmd == "/msg":
-            if arg in ("on", "off"):
-                self.dump_messages = arg == "on"
-                _info(f"messages dump = {arg}")
+            if arg_lower in ("on", "off"):
+                self.dump_messages = arg_lower == "on"
+                _info(f"messages dump = {arg_lower}")
             else:
                 _info(f"用法: /msg on|off  (当前: {'on' if self.dump_messages else 'off'})")
         else:

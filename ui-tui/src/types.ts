@@ -103,6 +103,10 @@ export interface Cancelled extends BaseEvent {
 export interface GatewayReady extends BaseEvent {
   type: "gateway_ready";
   model: string;
+  /** 后端当前 active 的本地会话摘要；未启用本地存储时可能为空。 */
+  session?: SessionSummary | null;
+  /** 后端启动时从 active session 恢复出的普通 history。 */
+  history?: RestoredHistoryMessage[];
 }
 
 export interface AskQuestionOption {
@@ -157,6 +161,30 @@ export type AgentEvent =
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========
+
+/** 后端 LocalSessionStore 暴露给 UI 的轻量会话摘要。 */
+export interface SessionSummary {
+  session_id: string;
+  created_at?: string;
+  updated_at?: string;
+  turn_count?: number;
+  active_task?: string;
+  rolling_summary?: string;
+  is_active?: boolean;
+}
+
+/** 切换/恢复会话时返回的普通历史消息。 */
+export interface RestoredHistoryMessage {
+  role: "user" | "assistant" | "system" | string;
+  content: string;
+  kind?: string | null;
+}
+
+/** session.create / session.switch 的统一返回形状。 */
+export interface SessionPayload {
+  session: SessionSummary | null;
+  history: RestoredHistoryMessage[];
+}
 
 export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought";
 

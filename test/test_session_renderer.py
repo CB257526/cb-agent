@@ -237,6 +237,36 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertFalse(active_dir.exists())
             self.assertFalse((root / "index.json").exists())
 
+    def test_agent_session_create_and_switch_keeps_histories_isolated(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            first_id = store.active_session_id
+            llm = FakeLLM([
+                {"answer": "第一会话回答", "tool_calls": []},
+                {"answer": "第二会话回答", "tool_calls": []},
+            ])
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s.chat("第一会话问题")
+            self.assertEqual(len(s.history), 2)
+
+            created = s.create_session()
+            second_id = created["session"]["session_id"]
+            self.assertNotEqual(first_id, second_id)
+            self.assertEqual(s.history, [])
+            s.chat("第二会话问题")
+
+            payload = s.switch_session(first_id)  # type: ignore[arg-type]
+            self.assertEqual(payload["session"]["session_id"], first_id)
+            restored = "\n".join(item["content"] for item in payload["history"])
+            self.assertIn("第一会话问题", restored)
+            self.assertIn("第一会话回答", restored)
+            self.assertNotIn("第二会话问题", restored)
+            self.assertEqual(store.active_session_id, first_id)
+
     def test_chat_history_appended_correctly(self):
         llm = FakeLLM([{"answer": "好的", "tool_calls": []}])
         s = self._make_session(llm)

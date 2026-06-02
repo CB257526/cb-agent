@@ -120,6 +120,12 @@ class Gateway:
             self._handle_quit(rpc_id)
         elif method == "session.clear_history":
             self._handle_clear_history(rpc_id)
+        elif method == "session.list_sessions":
+            self._handle_list_sessions(rpc_id)
+        elif method == "session.create":
+            self._handle_create_session(rpc_id)
+        elif method == "session.switch":
+            self._handle_switch_session(rpc_id, params)
         elif method == "session.list_tools":
             self._handle_list_tools(rpc_id)
         elif method == "session.answer_question":
@@ -219,6 +225,85 @@ class Gateway:
         if rpc_id is not None:
             self.transport.write(make_response(rpc_id, result={"cleared": True}))
 
+    def _handle_list_sessions(self, rpc_id: Any) -> None:
+        """列出项目级本地会话。
+
+        返回值只包含轻量摘要，不包含 transcript 全文。TUI 用它渲染会话切换面板；
+        真正切换时再通过 ``session.switch`` 拿对应会话的最近 history。
+        """
+        if rpc_id is None:
+            return
+        try:
+            sessions = self.session.list_sessions()
+            current = self.session.current_session_payload().get("session")
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(
+            rpc_id,
+            result={"sessions": sessions, "current": current},
+        ))
+
+    def _handle_create_session(self, rpc_id: Any) -> None:
+        """新建空白会话并切换过去。
+
+        为避免上下文串线，busy 时不允许新建/切换；否则一个正在执行的 chat 可能在
+        旧会话开始，却在新会话目录落盘。
+        """
+        if rpc_id is None:
+            return
+        if self._is_busy():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+        try:
+            payload = self.session.create_session()
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=payload))
+
+    def _handle_switch_session(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        """切换到指定 session_id，并返回该会话恢复后的普通 history。"""
+        if rpc_id is None:
+            return
+        if self._is_busy():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "params.session_id required"},
+            ))
+            return
+        try:
+            payload = self.session.switch_session(session_id.strip())
+        except ValueError as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": str(e)},
+            ))
+            return
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=payload))
+
     def _handle_list_tools(self, rpc_id: Any) -> None:
         """返回当前 registry 注册的工具列表，供 UI 端 / 命令展示。
 
@@ -289,6 +374,11 @@ class Gateway:
         )
         self.transport.write(make_response(rpc_id, result={"delivered": delivered}))
 
+    def _is_busy(self) -> bool:
+        """线程安全读取 busy 状态，供会话切换/新建等同步 RPC 使用。"""
+        with self._busy_lock:
+            return self._busy
+
     # ---------- 启动 ----------
 
     def serve_forever(self) -> None:
@@ -317,12 +407,15 @@ class Gateway:
         reader_thread.start()
 
         # 发一条 ready 事件，告诉 UI 可以开始交互了
+        session_payload = self.session.current_session_payload()
         self.transport.write({
             "jsonrpc": "2.0",
             "method": "event",
             "params": {
                 "type": "gateway_ready",
                 "model": getattr(self.session.llm, "model", "unknown"),
+                "session": session_payload.get("session"),
+                "history": session_payload.get("history", []),
             },
         })
 

@@ -601,6 +601,10 @@ class LocalSessionStore:
     - <session_id>/transcript.jsonl：每轮 user/final/work_record/trace_entries；
     - <session_id>/state.json：滚动摘要、已读文件、已改文件、最近命令等。
 
+    多会话隔离的关键点也在这里：同一时刻只有一个 active session，但每个
+    session 都拥有独立目录。切换会话只会改 index 指针并重载该目录的 state；
+    不会把 A 会话的 transcript/state 合并进 B 会话。
+
     Store 被 AgentSession 以依赖注入方式使用；单测不传 store 时完全不落盘。
     """
 
@@ -622,6 +626,20 @@ class LocalSessionStore:
             raise RuntimeError("active_session_id is not set")
         return self.root / self.active_session_id
 
+    def current_session_summary(self) -> Optional[Dict[str, Any]]:
+        """返回当前 active session 的摘要；没有 active 时返回 None。
+
+        摘要是给 CLI/TUI/RPC 展示用的轻量对象，不包含 transcript 正文，
+        也不包含完整工具输出。这样前端可以安全列出会话，而不会把历史文件内容
+        一股脑重新读进 UI 或网络协议。
+        """
+        if not self.active_session_id or not self._is_valid_session_id(self.active_session_id):
+            return None
+        target = self.root / self.active_session_id
+        if not target.exists():
+            return None
+        return self._session_summary_from_dir(target)
+
     def ensure_active(self) -> None:
         """确保有可写的 active session。
 
@@ -629,28 +647,93 @@ class LocalSessionStore:
         下一轮 append_turn/save_state 需要自动创建一个新 session，否则会因为
         active_session_id=None 写不进去。
         """
-        if self.active_session_id and (self.root / self.active_session_id).exists():
+        if (
+            self.active_session_id
+            and self._is_valid_session_id(self.active_session_id)
+            and (self.root / self.active_session_id).exists()
+        ):
             return
         self._load_or_create()
 
     def _load_or_create(self) -> None:
         """加载最近 session；不存在或损坏时创建新 session。
 
-        这里没有做复杂的 session 选择器，符合当前需求："启动自动恢复最近会话"。
-        将来如果要加 /sessions list /resume，可以基于 index.json 扩展。
+        这里遵循 index.json 的 active 指针。没有 active 指针时创建空白新会话，
+        而不是自动挑一个旧目录恢复；这样 /clear 删除 active 后，重启不会偷偷
+        回到其它旧会话。旧会话仍可通过 list/switch 显式找回。
         """
         self.root.mkdir(parents=True, exist_ok=True)
         index = self._read_json(self.index_path, {})
         active = index.get("active_session_id") if isinstance(index, dict) else None
-        if isinstance(active, str) and (self.root / active).exists():
+        if (
+            isinstance(active, str)
+            and self._is_valid_session_id(active)
+            and (self.root / active).exists()
+        ):
             self.active_session_id = active
             self.state = self._read_json(self.active_dir / "state.json", {})
             return
+        self.create_session()
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """列出当前项目下的所有本地会话摘要。
+
+        只扫描 ``root/session_*`` 子目录，并且只读取每个目录里的 ``state.json``
+        与 transcript 行数。这里不读取 transcript 的正文，是为了避免 TUI 打开
+        会话列表时把大量历史内容加载进内存，也避免把旧工具摘要误注入当前上下文。
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        sessions: List[Dict[str, Any]] = []
+        for child in self.root.iterdir():
+            if not child.is_dir() or not self._is_valid_session_id(child.name):
+                continue
+            sessions.append(self._session_summary_from_dir(child))
+        sessions.sort(
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            reverse=True,
+        )
+        return sessions
+
+    def create_session(self) -> Dict[str, Any]:
+        """创建一个新的空白会话并立即设为 active。
+
+        新会话不会继承旧会话的 history/state。AgentSession 调用本方法后会同步
+        清空内存 history，从而保证下一轮 prompt 只看到这个新会话自己的上下文。
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
         self.active_session_id = self._new_session_id()
         self.state = self._new_state()
         self.active_dir.mkdir(parents=True, exist_ok=True)
-        self._write_json(self.index_path, {"active_session_id": self.active_session_id})
-        self.save_state(self.state)
+        self._write_json(self.active_dir / "state.json", self.state)
+        self._write_index()
+        return self._session_summary_from_dir(self.active_dir)
+
+    def switch_session(self, session_id: str) -> Dict[str, Any]:
+        """切换 active session，并返回切换后的摘要。
+
+        ``session_id`` 只能是本 store 自己创建的目录名形式，不能包含路径分隔符
+        或 ``..``。这一步很重要：会话切换接口会读写 state/transcript，如果不做
+        白名单校验，就可能被误用成任意路径访问。
+        """
+        if not self._is_valid_session_id(session_id):
+            raise ValueError(f"invalid session_id: {session_id!r}")
+        target = self.root / session_id
+        if not target.exists() or not target.is_dir():
+            raise ValueError(f"session not found: {session_id}")
+
+        self.active_session_id = session_id
+        state = self._read_json(target / "state.json", {})
+        if not isinstance(state, dict) or not state:
+            # 兼容极少数只有 transcript、没有 state 的旧/损坏目录：补一份空 state，
+            # 但不合并其它会话内容，仍然保持这个目录自己的隔离边界。
+            state = self._new_state()
+        state["session_id"] = session_id
+        state.setdefault("created_at", self._mtime_iso(target))
+        state["updated_at"] = state.get("updated_at") or self._mtime_iso(target)
+        self.state = state
+        self._write_json(target / "state.json", self.state)
+        self._write_index()
+        return self._session_summary_from_dir(target)
 
     def _new_session_id(self) -> str:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -689,6 +772,8 @@ class LocalSessionStore:
         不恢复 role=tool，也不恢复 assistant.tool_calls。跨轮恢复的是对话和工作
         摘要，而不是上一轮工具协议状态。
         """
+        if not self.active_session_id:
+            return []
         path = self.active_dir / "transcript.jsonl"
         if not path.exists():
             return []
@@ -784,7 +869,7 @@ class LocalSessionStore:
         else:
             self._bump_turn(user_query=user_query)
         self.save_state(self.state)
-        self._write_json(self.index_path, {"active_session_id": self.active_session_id})
+        self._write_index()
 
     def merge_work_record(self, record: WorkRecord, *, user_query: str = "") -> None:
         """把本轮 WorkRecord 合并进滚动 state。
@@ -850,11 +935,86 @@ class LocalSessionStore:
         if self.active_session_id:
             target = self.root / self.active_session_id
             if target.exists():
+                self._assert_safe_session_dir(target)
                 shutil.rmtree(target)
         if self.index_path.exists():
             self.index_path.unlink()
         self.active_session_id = None
         self.state = {}
+
+    def _write_index(self) -> None:
+        """写入 active 指针。
+
+        index 只放当前激活会话 id，不保存会话内容。多会话列表通过扫描目录获得，
+        这样删除某个 session 目录后不会出现 index 里残留一大份旧元数据的问题。
+        """
+        self._write_json(
+            self.index_path,
+            {
+                "active_session_id": self.active_session_id,
+                "updated_at": _now_iso(),
+            },
+        )
+
+    def _session_summary_from_dir(self, session_dir: Path) -> Dict[str, Any]:
+        """从单个 session 目录提取列表页需要的摘要。
+
+        这个方法故意只返回短 preview 和计数，不返回 transcript 全文。TUI 切换到
+        该会话时才会通过 AgentSession.load_latest_history 恢复最近 history。
+        """
+        session_id = session_dir.name
+        state = self._read_json(session_dir / "state.json", {})
+        if not isinstance(state, dict):
+            state = {}
+        created_at = str(state.get("created_at") or self._mtime_iso(session_dir))
+        updated_at = str(state.get("updated_at") or self._newest_mtime_iso(session_dir))
+        return {
+            "session_id": session_id,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "turn_count": int(state.get("turn_count") or self._count_transcript_turns(session_dir)),
+            "active_task": _clip(state.get("active_task"), 120),
+            "rolling_summary": _clip(state.get("rolling_summary"), 180),
+            "is_active": session_id == self.active_session_id,
+        }
+
+    def _count_transcript_turns(self, session_dir: Path) -> int:
+        """粗略统计 transcript 轮数，用于 state 缺 turn_count 时兜底。"""
+        path = session_dir / "transcript.jsonl"
+        try:
+            if not path.exists():
+                return 0
+            return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        except Exception:
+            logger.exception("failed to count transcript turns from %s", path)
+            return 0
+
+    def _newest_mtime_iso(self, session_dir: Path) -> str:
+        """取 session 目录内关键文件的最新 mtime，作为 updated_at 兜底。"""
+        paths = [session_dir, session_dir / "state.json", session_dir / "transcript.jsonl"]
+        newest = max((p.stat().st_mtime for p in paths if p.exists()), default=session_dir.stat().st_mtime)
+        return datetime.fromtimestamp(newest, timezone.utc).isoformat()
+
+    @staticmethod
+    def _mtime_iso(path: Path) -> str:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+
+    @staticmethod
+    def _is_valid_session_id(session_id: str) -> bool:
+        """校验会话目录名，防止 switch/delete 走出 sessions 根目录。"""
+        return bool(re.fullmatch(r"session_\d{8}_\d{6}_[0-9a-f]{8}", session_id or ""))
+
+    def _assert_safe_session_dir(self, target: Path) -> None:
+        """删除前确认目标目录确实位于 sessions 根目录下。
+
+        这是对 ``shutil.rmtree`` 的最后一道保险。即使 index.json 被手工写坏，
+        也不能让 active_session_id 通过 ``..`` 之类的路径片段影响 sessions
+        目录之外的文件。
+        """
+        root = self.root.resolve()
+        resolved = target.resolve()
+        if resolved == root or root not in resolved.parents:
+            raise RuntimeError(f"refuse to remove unsafe session dir: {resolved}")
 
     @staticmethod
     def _read_json(path: Path, default: Any) -> Any:
