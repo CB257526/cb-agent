@@ -6,6 +6,7 @@
    - prompt.submit  → 在 asyncio loop 上启动 session.chat_async（不阻塞 stdin 读循环）
    - session.cancel → 直接 set 当前 token（threading.Event.set 线程安全）
    - session.compact → 压缩当前会话上下文，保留 transcript 审计
+   - session.mcp_status → 查询 MCP 后台连接进度
    - session.quit   → 关 loop，主流程退出
 
 线程关系：
@@ -123,6 +124,8 @@ class Gateway:
             self._handle_clear_history(rpc_id)
         elif method == "session.compact":
             self._handle_compact(rpc_id)
+        elif method == "session.mcp_status":
+            self._handle_mcp_status(rpc_id)
         elif method == "session.list_sessions":
             self._handle_list_sessions(rpc_id)
         elif method == "session.create":
@@ -266,6 +269,40 @@ class Gateway:
             ))
             return
         self.transport.write(make_response(rpc_id, result=payload))
+
+    def _handle_mcp_status(self, rpc_id: Any) -> None:
+        """返回 MCP 后台连接状态。
+
+        MCP 状态和 chat history 无关，是纯运行时状态：UI 可以在 agent 忙碌时
+        查询它，用来展示“哪些 server 还在连接”。如果 run_agent.py 没有给
+        session 挂载 provider（例如单测或旧装配方式），这里返回 disabled，
+        保持 JSON-RPC 接口稳定。
+        """
+        if rpc_id is None:
+            return
+        try:
+            # 查询时顺手触发一次后台加载：正常 TUI 启动路径会在 gateway_ready 后
+            # 已经触发；这个兜底主要服务 CLI/测试或未来自定义 Gateway 装配。
+            starter = getattr(self.session, "mcp_background_loader", None)
+            if callable(starter):
+                status = starter()
+            else:
+                provider = getattr(self.session, "mcp_status_provider", None)
+                status = provider() if callable(provider) else {
+                    "status": "disabled",
+                    "servers": [],
+                    "total": 0,
+                    "connected": 0,
+                    "failed": 0,
+                    "error": "MCP status provider unavailable",
+                }
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=status))
 
     def _handle_list_sessions(self, rpc_id: Any) -> None:
         """列出项目级本地会话。
@@ -461,6 +498,15 @@ class Gateway:
                 "context_window": session_payload.get("context_window"),
             },
         })
+
+        # ready 事件发出后再启动 MCP 后台连接。这样 TUI 可以先渲染首屏和输入框，
+        # 后续 mcp_status 事件会自然追加/更新状态；配置再多也不会卡住用户第一句。
+        starter = getattr(self.session, "mcp_background_loader", None)
+        if callable(starter):
+            try:
+                starter()
+            except Exception:
+                logger.exception("failed to start MCP background loading")
 
         await self._stop_event.wait()
 

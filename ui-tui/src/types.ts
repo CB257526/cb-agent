@@ -25,6 +25,7 @@ export type EventType =
   | "ask_user_question"
   | "ask_user_question_answered"
   | "todo_list_updated"
+  | "mcp_status"
   | "gateway_ready";  // gateway 自定义，不在 events.py 里
 
 export interface BaseEvent {
@@ -149,6 +150,27 @@ export interface TodoListUpdated extends BaseEvent {
   items: TodoItem[];
 }
 
+export interface MCPServerStatus {
+  name: string;
+  status: "pending" | "connecting" | "connected" | "error" | "disabled" | string;
+  tools_count?: number;
+  elapsed_seconds?: number;
+  error?: string | null;
+}
+
+export interface MCPStatusPayload {
+  status: "pending" | "loading" | "ready" | "error" | "disabled" | string;
+  servers: MCPServerStatus[];
+  total: number;
+  connected: number;
+  failed: number;
+  error?: string | null;
+}
+
+export interface MCPStatusEvent extends BaseEvent, MCPStatusPayload {
+  type: "mcp_status";
+}
+
 export type AgentEvent =
   | TextDelta
   | ReasoningDelta
@@ -164,6 +186,7 @@ export type AgentEvent =
   | AskUserQuestion
   | AskUserQuestionAnswered
   | TodoListUpdated
+  | MCPStatusEvent
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========

@@ -40,6 +40,8 @@ import logging
 import os
 import signal
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List
@@ -59,7 +61,7 @@ if sys.platform == "win32":
 
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
-from agent.events import Done
+from agent.events import Done, MCPStatus
 from agent.executor import ToolExecutor
 from agent.renderers.cli import CLIRenderer
 from agent.session import AgentSession
@@ -82,7 +84,7 @@ from tools.tools.file_write_tool import FileWriteTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
 
 try:
-    from tools.mcp_tools.mcptools_add import load_mcp_tools
+    from tools.mcp_tools.mcptools_add import load_mcp_server_configs
     _HAS_MCP = True
 except Exception:
     _HAS_MCP = False
@@ -143,6 +145,10 @@ class AgentRunner:
         self.dump_messages = bool(attach_cli_renderer)
         self._attach_cli_renderer = attach_cli_renderer
         self._md_memory_provider = self._create_markdown_memory_provider()
+        self._mcp_lock = threading.RLock()
+        self._mcp_thread: threading.Thread | None = None
+        self._mcp_started = False
+        self._mcp_status: Dict[str, Any] = self._initial_mcp_status()
         # dump 增量游标：每次 chat() 开始重置，让本轮第一次能打全量
         self._dump_seen_count = 0
 
@@ -162,8 +168,7 @@ class AgentRunner:
         self._rag_tool = None
         self._skill_manager: SkillManager = None  # type: ignore[assignment]
         self._register_native_tools()
-        if self.use_mcp:
-            self._register_mcp_tools()
+        self._prepare_mcp_loading()
 
         # 4. 工具调度器（依赖 event_bus）
         self.executor = ToolExecutor(
@@ -211,6 +216,12 @@ class AgentRunner:
             session_store=session_store,
             trace_summarizer=trace_summarizer,
         )
+        # Gateway 只持有 AgentSession，不直接知道 AgentRunner。这里把 MCP 运行态
+        # 以“可选回调”的形式挂到 session 上：旧代码不需要感知这些属性；JSON-RPC
+        # 模式则可以在 gateway_ready 后启动后台连接，并通过 session.mcp_status
+        # 查询当前进度。MCP 状态是运行时信息，不写入 history。
+        self.session.mcp_status_provider = self.mcp_status
+        self.session.mcp_background_loader = self.start_mcp_background_loading
 
         # 5b. 依赖 session 共享态的工具：AskUserQuestionTool 需要 session 的
         # question_registry + event_bus（跨工具线程同步），在 session 构造完后注册
@@ -245,6 +256,7 @@ class AgentRunner:
         _info(f"Skill 数量 {len(self._skill_manager.list_skills())}")
         _info(f"上下文构建器: {'开启' if self.ctx_enabled else '关闭'}")
         _info(f"记忆系统: {self.memory_system}")
+        _info(f"MCP: {self._format_mcp_status_line(self.mcp_status())}")
         _info(f"messages dump: {'开启' if self.dump_messages else '关闭'} (用 /msg off 关闭)")
         print()
 
@@ -321,25 +333,233 @@ class AgentRunner:
             return ""
         return self._md_memory_provider.memory_instructions()
 
-    def _register_mcp_tools(self) -> None:
-        """读取 mcp.json，把每个 MCP 服务器的子工具展开注册。"""
-        _info("加载 MCP 配置")
+    def _initial_mcp_status(self) -> Dict[str, Any]:
+        """创建 MCP 状态快照的初始值。
+
+        这里不能做任何慢操作，只记录当前启动参数是否允许 MCP。真正读取 mcp.json
+        和连接 server 都在后续步骤完成，保证 AgentRunner 构造尽量轻。
+        """
+        if not self.use_mcp:
+            reason = "未安装 MCP 依赖" if not _HAS_MCP else "启动参数 --no-mcp 已关闭"
+            return {
+                "status": "disabled",
+                "servers": [],
+                "total": 0,
+                "connected": 0,
+                "failed": 0,
+                "error": reason,
+            }
+        return {
+            "status": "pending",
+            "servers": [],
+            "total": 0,
+            "connected": 0,
+            "failed": 0,
+        }
+
+    def _prepare_mcp_loading(self) -> None:
+        """快速读取 MCP server 列表，但不连接任何 server。
+
+        旧实现会在启动期同步调用 MCPTool(...)._discover_tools()，这会启动外部
+        MCP 进程并等待 list_tools，配置多时 TUI 会迟迟收不到 gateway_ready。
+        新实现只在这里读取 mcp.json 中的 server 名称和命令，把慢连接延后到
+        start_mcp_background_loading()，由 Gateway 发出 ready 后触发。
+        """
+        if not self.use_mcp:
+            return
+        _info("读取 MCP 配置（后台连接）")
         try:
-            mcp_tools = load_mcp_tools()
+            server_configs = load_mcp_server_configs()
+        except FileNotFoundError:
+            with self._mcp_lock:
+                self._mcp_status = {
+                    "status": "disabled",
+                    "servers": [],
+                    "total": 0,
+                    "connected": 0,
+                    "failed": 0,
+                    "error": "未找到 mcp.json",
+                }
+            return
         except Exception as e:
-            _err(f"MCP 加载失败（跳过）: {e}")
+            with self._mcp_lock:
+                self._mcp_status = {
+                    "status": "error",
+                    "servers": [],
+                    "total": 0,
+                    "connected": 0,
+                    "failed": 1,
+                    "error": str(e),
+                }
+            _err(f"MCP 配置读取失败（跳过）: {e}")
             return
 
-        for mcp_tool in mcp_tools:
+        servers = []
+        for item in server_configs:
+            servers.append({
+                "name": item.get("name", ""),
+                "status": "pending",
+                "tools_count": 0,
+                "elapsed_seconds": 0.0,
+                "error": None,
+                "_config": item,
+            })
+        with self._mcp_lock:
+            self._mcp_status = {
+                "status": "pending" if servers else "ready",
+                "servers": servers,
+                "total": len(servers),
+                "connected": 0,
+                "failed": 0,
+            }
+
+    def mcp_status(self) -> Dict[str, Any]:
+        """返回 MCP 状态快照，供 Gateway RPC/TUI 展示。
+
+        返回值会剥掉内部使用的 ``_config``，避免把 command/env 这类实现细节或
+        潜在敏感配置透给前端。前端只需要 name/status/tools_count/error。
+        """
+        with self._mcp_lock:
+            snapshot = dict(self._mcp_status)
+            servers = []
+            for server in self._mcp_status.get("servers", []):
+                public = {k: v for k, v in server.items() if not k.startswith("_")}
+                servers.append(public)
+            snapshot["servers"] = servers
+        return snapshot
+
+    def _emit_mcp_status(self) -> None:
+        """把当前 MCP 快照作为事件发出；失败只记日志，不影响后台加载。"""
+        snapshot = self.mcp_status()
+        try:
+            self.event_bus.emit(MCPStatus(
+                status=str(snapshot.get("status") or "unknown"),
+                servers=list(snapshot.get("servers") or []),
+                total=int(snapshot.get("total") or 0),
+                connected=int(snapshot.get("connected") or 0),
+                failed=int(snapshot.get("failed") or 0),
+            ))
+        except Exception:
+            logging.getLogger(__name__).exception("emit MCP status failed")
+
+    def start_mcp_background_loading(self) -> Dict[str, Any]:
+        """启动 MCP 后台连接线程，并立即返回当前状态。
+
+        Gateway 在发出 gateway_ready 之后调用它，TUI 因此能先进入可输入状态；
+        MCP 工具准备好后会动态注册到 ToolRegistry，下一轮 prompt 就会自然出现在
+        tool schema 中。重复调用是幂等的，/mcp 查询不会重复启动连接。
+        """
+        with self._mcp_lock:
+            status = self._mcp_status.get("status")
+            servers = self._mcp_status.get("servers") or []
+            if status in {"disabled", "ready", "error"} or not servers:
+                return self.mcp_status()
+            if self._mcp_started:
+                return self.mcp_status()
+            self._mcp_started = True
+            self._mcp_status["status"] = "loading"
+
+        self._emit_mcp_status()
+        thread = threading.Thread(
+            target=self._load_mcp_tools_background,
+            name="cb-agent-mcp-loader",
+            daemon=True,
+        )
+        with self._mcp_lock:
+            self._mcp_thread = thread
+        thread.start()
+        return self.mcp_status()
+
+    def _load_mcp_tools_background(self) -> None:
+        """后台逐个连接 MCP server，并把展开后的工具注册进 registry。"""
+        try:
+            # MCPTool 的构造会导入 fastmcp 并同步发现工具；必须放在后台线程里。
+            # 这样 TUI 首屏和第一句 prompt 不会因为 MCP 依赖导入或 server 握手而卡住。
+            from tools.mcp_tools.mcptool import MCPTool
+        except Exception as e:
+            with self._mcp_lock:
+                for item in self._mcp_status.get("servers", []):
+                    if item.get("status") not in {"connected", "error"}:
+                        item["status"] = "error"
+                        item["error"] = f"MCP 依赖加载失败: {e}"
+                self._mcp_status["failed"] = len(self._mcp_status.get("servers") or [])
+                self._mcp_status["connected"] = 0
+                self._mcp_status["status"] = "error"
+                self._mcp_status["error"] = str(e)
+            _err(f"MCP 依赖加载失败: {e}")
+            self._emit_mcp_status()
+            return
+
+        with self._mcp_lock:
+            servers = list(self._mcp_status.get("servers") or [])
+
+        for index, server in enumerate(servers):
+            started_at = time.monotonic()
+            name = str(server.get("name") or f"mcp_{index + 1}")
+            config = server.get("_config") if isinstance(server.get("_config"), dict) else {}
+            with self._mcp_lock:
+                current = self._mcp_status["servers"][index]
+                current["status"] = "connecting"
+                current["error"] = None
+            self._emit_mcp_status()
+
             try:
+                mcp_tool = MCPTool(
+                    name=name,
+                    server_command=config.get("server_command"),
+                    env=config.get("env"),
+                )
                 expanded = mcp_tool.get_expanded_tools()
+                registered_count = 0
                 if not expanded:
                     self.registry.register_tool(mcp_tool)
-                    continue
-                for sub in expanded:
-                    self.registry.register_tool(sub)
+                    registered_count = 1
+                else:
+                    for sub in expanded:
+                        self.registry.register_tool(sub)
+                        registered_count += 1
+                elapsed = round(time.monotonic() - started_at, 2)
+                with self._mcp_lock:
+                    current = self._mcp_status["servers"][index]
+                    current["status"] = "connected"
+                    current["tools_count"] = registered_count
+                    current["elapsed_seconds"] = elapsed
+                    current["error"] = None
+                    self._mcp_status["connected"] = sum(
+                        1 for item in self._mcp_status["servers"]
+                        if item.get("status") == "connected"
+                    )
             except Exception as e:
-                _err(f"MCP 工具 {getattr(mcp_tool, 'name', '?')} 展开失败: {e}")
+                elapsed = round(time.monotonic() - started_at, 2)
+                with self._mcp_lock:
+                    current = self._mcp_status["servers"][index]
+                    current["status"] = "error"
+                    current["elapsed_seconds"] = elapsed
+                    current["error"] = str(e)
+                    self._mcp_status["failed"] = sum(
+                        1 for item in self._mcp_status["servers"]
+                        if item.get("status") == "error"
+                    )
+                _err(f"MCP 服务器 {name} 连接失败: {e}")
+            self._emit_mcp_status()
+
+        with self._mcp_lock:
+            failed = sum(1 for item in self._mcp_status["servers"] if item.get("status") == "error")
+            connected = sum(1 for item in self._mcp_status["servers"] if item.get("status") == "connected")
+            self._mcp_status["failed"] = failed
+            self._mcp_status["connected"] = connected
+            self._mcp_status["status"] = "error" if failed and not connected else "ready"
+        self._emit_mcp_status()
+
+    def _format_mcp_status_line(self, status: Dict[str, Any]) -> str:
+        """CLI 启动摘要里用的一行 MCP 状态。"""
+        state = status.get("status", "unknown")
+        total = int(status.get("total") or 0)
+        connected = int(status.get("connected") or 0)
+        failed = int(status.get("failed") or 0)
+        if total:
+            return f"{state} ({connected}/{total} connected, {failed} failed)"
+        return str(status.get("error") or state)
 
     # ---------- 钩子 ----------
 
@@ -397,6 +617,10 @@ class AgentRunner:
             "输入问题与我对话，输入 /help 看命令，/quit 退出。\n"
             "对话进行中按 Ctrl-C 中断当前回答（不退出进程）；空闲时按 Ctrl-C 或 /quit 退出。\n"
         )
+        # CLI 没有 gateway_ready 这个协议层事件，因此在进入输入循环前主动启动
+        # 后台 MCP 连接。连接仍在 daemon 线程里跑，用户可以立刻输入，也可以用
+        # /mcp 查看进度。
+        self.start_mcp_background_loading()
 
         while True:
             try:
@@ -479,6 +703,7 @@ class AgentRunner:
                 "\n可用命令：\n"
                 "  /help        打印帮助\n"
                 "  /tools       列出所有已注册工具\n"
+                "  /mcp         查看 MCP 后台连接状态\n"
                 "  /skills      列出所有 Skill\n"
                 "  /history     查看当前会话历史\n"
                 "  /sessions    列出本项目的本地会话\n"
@@ -500,6 +725,30 @@ class AgentRunner:
                 tool = self.registry.get_tool(n)
                 desc = tool.description if tool else ""
                 print(f"  - {n}: {desc[:80]}")
+            print()
+        elif cmd == "/mcp":
+            # /mcp 只读运行态，不参与当前对话，也不会写入本地 session。
+            # start_mcp_background_loading 是幂等的：如果还没启动就启动，如果已经
+            # 在连或已完成，就只是返回当前快照。
+            status = self.start_mcp_background_loading()
+            print(f"\nMCP 状态: {self._format_mcp_status_line(status)}")
+            servers = status.get("servers") or []
+            if not servers:
+                reason = status.get("error")
+                if reason:
+                    print(f"  - {reason}")
+            for item in servers:
+                name = item.get("name", "unknown")
+                state = item.get("status", "unknown")
+                tools_count = item.get("tools_count", 0)
+                elapsed = item.get("elapsed_seconds", 0)
+                error = item.get("error")
+                tail = f", tools={tools_count}" if tools_count else ""
+                if elapsed:
+                    tail += f", {elapsed}s"
+                if error:
+                    tail += f", error={error}"
+                print(f"  - {name}: {state}{tail}")
             print()
         elif cmd == "/skills":
             skills = self._skill_manager.list_skills()

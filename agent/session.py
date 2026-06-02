@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.cancel import (
     CancelToken,
@@ -217,6 +217,13 @@ class AgentSession:
         # AskUserQuestionTool 用：工具线程 register+wait，gateway 在 RPC 里
         # submit_answer。整个进程一份，session 持有给 gateway/tool 共享。
         self.question_registry: QuestionRegistry = QuestionRegistry()
+        # MCP 后台加载由 AgentRunner 装配，但 Gateway 只持有 AgentSession。
+        # 因此这里暴露两个可选回调槽位：
+        # - mcp_status_provider：只读当前连接快照；
+        # - mcp_background_loader：幂等启动后台连接并返回快照。
+        # 这两个状态只服务 UI/CLI 展示，不写入 history，也不参与 ContextBuilder。
+        self.mcp_status_provider: Optional[Callable[[], Dict[str, Any]]] = None
+        self.mcp_background_loader: Optional[Callable[[], Dict[str, Any]]] = None
 
     # ---------- 公共入口 ----------
 

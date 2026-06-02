@@ -224,6 +224,23 @@ class TodoListUpdated:
     type: str = field(default="todo_list_updated", init=False)
 
 
+@dataclass
+class MCPStatus:
+    """MCP 后台加载状态快照。
+
+    MCP 服务器可能需要启动外部进程、下载 npm 包或连接远端服务，不能再阻塞 agent
+    启动关键路径。这个事件只用于 UI/CLI 展示“正在连接/已连接/失败”，不进入
+    会话 history，也不参与下一轮 prompt，避免把运行时状态污染成长期上下文。
+    """
+    status: str                         # disabled / loading / ready / error
+    servers: List[Dict[str, Any]]       # [{name, status, tools_count, error?, elapsed_seconds?}]
+    total: int = 0
+    connected: int = 0
+    failed: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="mcp_status", init=False)
+
+
 # ========== Union 类型（订阅者用 isinstance 区分）==========
 
 
@@ -243,6 +260,7 @@ Event = Union[
     AskUserQuestion,
     AskUserQuestionAnswered,
     TodoListUpdated,
+    MCPStatus,
 ]
 
 
@@ -262,4 +280,5 @@ __all__ = [
     "BackgroundNotification",
     "AskUserQuestion",
     "AskUserQuestionAnswered",
+    "MCPStatus",
 ]

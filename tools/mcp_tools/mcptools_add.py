@@ -3,9 +3,10 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
-from .mcptool import MCPTool
+if TYPE_CHECKING:
+    from .mcptool import MCPTool
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,34 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
-def load_mcp_tools(mcp_json_path: str | None = None) -> List[MCPTool]:
+def load_mcp_server_configs(mcp_json_path: str | None = None) -> List[Dict[str, Any]]:
+    """从 mcp.json 读取 MCP 服务器配置，但不连接服务器。
+
+    MCPTool 构造函数会同步发现远端工具，可能启动外部进程或等待网络连接。
+    TUI 启动时只需要先知道“有哪些服务器要连”，所以把轻量配置读取单独拆出来，
+    供后台加载器先渲染 pending/connecting 状态，再逐个真正实例化 MCPTool。
+    """
+    if mcp_json_path is None:
+        mcp_json_path = Path(__file__).parent.parent.parent / "mcp.json"
+
+    with open(mcp_json_path, "r", encoding="utf-8") as f:
+        config: Dict[str, Any] = json.load(f)
+
+    config = _expand_env(config)
+    servers: List[Dict[str, Any]] = []
+    for server_name, server_config in config.get("mcpServers", {}).items():
+        command = server_config.get("command", "")
+        args = server_config.get("args", [])
+        env = server_config.get("env")
+        servers.append({
+            "name": server_name,
+            "server_command": [command] + args,
+            "env": env,
+        })
+    return servers
+
+
+def load_mcp_tools(mcp_json_path: str | None = None) -> List["MCPTool"]:
     """从 mcp.json 读取 MCP 服务器配置，返回 MCPTool 列表。
 
     支持在配置中使用 ${VAR} / ${VAR:-default} 占位符，运行时从环境变量读取。
@@ -50,25 +78,19 @@ def load_mcp_tools(mcp_json_path: str | None = None) -> List[MCPTool]:
     Returns:
         MCPTool 实例列表
     """
-    if mcp_json_path is None:
-        mcp_json_path = Path(__file__).parent.parent.parent / "mcp.json"
-
-    with open(mcp_json_path, "r", encoding="utf-8") as f:
-        config: Dict[str, Any] = json.load(f)
-
-    config = _expand_env(config)
+    # 这里保持旧同步 API 的行为，但把 MCPTool 的 import 放到函数内部。
+    # 新的后台加载路径只需要读取 mcp.json，如果顶层 import MCPTool，就会在
+    # 轻量启动阶段提前触碰 fastmcp 等依赖；虽然不会连接 server，但仍会拖慢
+    # 或破坏“只读配置、不启动 MCP”的承诺。
+    from .mcptool import MCPTool
 
     tools: List[MCPTool] = []
 
-    for server_name, server_config in config.get("mcpServers", {}).items():
-        command = server_config.get("command", "")
-        args = server_config.get("args", [])
-        env = server_config.get("env")
-
+    for server in load_mcp_server_configs(mcp_json_path):
         tool = MCPTool(
-            name=server_name,
-            server_command=[command] + args,
-            env=env,
+            name=server["name"],
+            server_command=server["server_command"],
+            env=server.get("env"),
         )
         tools.append(tool)
 

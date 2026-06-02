@@ -20,7 +20,7 @@ import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AgentEvent, CompactPayload, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, CompactPayload, MCPStatusPayload, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
@@ -204,6 +204,11 @@ export class Transport extends EventEmitter {
   /** 拉取后端工具列表。 */
   listTools(): Promise<{ tools: Array<{ name: string; description: string; schema?: unknown }> }> {
     return this.requestRpc("session.list_tools");
+  }
+
+  /** 查询 MCP 后台连接状态。MCP 工具可能仍在连接中，返回的是当前快照。 */
+  mcpStatus(): Promise<MCPStatusPayload> {
+    return this.requestRpc("session.mcp_status");
   }
 
   /** 用户回答 AskUserQuestionTool 的提问。selected_labels 单选给一个，多选给多个。

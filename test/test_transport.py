@@ -165,7 +165,7 @@ class FakeLLM:
         return out
 
 
-def _make_session_for_gateway(llm: FakeLLM, session_store=None):
+def _make_session_for_gateway(llm: FakeLLM, session_store=None, mcp_status_provider=None, mcp_background_loader=None):
     bus = EventBus()
     reg = MagicMock()
     reg.execute_tool = MagicMock(return_value="{}")
@@ -178,6 +178,10 @@ def _make_session_for_gateway(llm: FakeLLM, session_store=None):
         builder=None, skill_manager=None, ctx_enabled=False,
         session_store=session_store,
     )
+    if mcp_status_provider is not None:
+        s.mcp_status_provider = mcp_status_provider
+    if mcp_background_loader is not None:
+        s.mcp_background_loader = mcp_background_loader
     return s, bus
 
 
@@ -214,12 +218,19 @@ class _PipeStdin:
 class TestGatewayDispatch(unittest.TestCase):
 
     def _run_gateway_with_msgs(self, llm: FakeLLM, msgs: List[str], wait_for: int = 0,
-                                wait_done: bool = False, session_store=None) -> List[Dict[str, Any]]:
+                                wait_done: bool = False, session_store=None,
+                                mcp_status_provider=None,
+                                mcp_background_loader=None) -> List[Dict[str, Any]]:
         """起 gateway，把 msgs 一行行喂进 stdin，等收到至少 wait_for 条 stdout 行
         （或看到 done 事件，wait_done=True 时），然后关 stdin、join 主线程。
         返回 stdout 解析出的所有 JSON 消息（顺序）。
         """
-        session, bus = _make_session_for_gateway(llm, session_store=session_store)
+        session, bus = _make_session_for_gateway(
+            llm,
+            session_store=session_store,
+            mcp_status_provider=mcp_status_provider,
+            mcp_background_loader=mcp_background_loader,
+        )
         stdin = _PipeStdin()
         out = io.StringIO()
         out_lock = threading.Lock()
@@ -412,6 +423,34 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertIn("description", t)
             # schema 可为 None（无参函数工具时）但 key 应存在
             self.assertIn("schema", t)
+
+    def test_gateway_mcp_status_rpc_and_ready_starts_background_loader(self):
+        """gateway_ready 后触发 MCP 后台加载，session.mcp_status 返回当前快照。"""
+        calls: List[str] = []
+
+        def starter():
+            calls.append("start")
+            return {
+                "status": "loading",
+                "servers": [{"name": "filesystem", "status": "connecting", "tools_count": 0}],
+                "total": 1,
+                "connected": 0,
+                "failed": 0,
+            }
+
+        msgs = self._run_gateway_with_msgs(
+            FakeLLM([]),
+            [json.dumps({"jsonrpc": "2.0", "id": "mcp1", "method": "session.mcp_status"})],
+            wait_for=2,
+            mcp_background_loader=starter,
+        )
+
+        self.assertGreaterEqual(len(calls), 1)
+        replies = [m for m in msgs if m.get("id") == "mcp1"]
+        self.assertEqual(len(replies), 1)
+        result = replies[0]["result"]
+        self.assertEqual(result["status"], "loading")
+        self.assertEqual(result["servers"][0]["name"], "filesystem")
 
     def test_gateway_session_create_list_and_switch(self):
         """session.* 会话 RPC 返回摘要和普通 history，且能切回旧会话。"""

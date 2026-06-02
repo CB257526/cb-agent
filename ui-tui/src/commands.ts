@@ -8,7 +8,7 @@
  */
 
 import type { Transport } from "./transport.js";
-import type { ChatItem, ContextWindow, SessionPayload } from "./types.js";
+import type { ChatItem, ContextWindow, MCPStatusPayload, SessionPayload } from "./types.js";
 
 export interface CommandCtx {
   transport: Transport;
@@ -35,6 +35,32 @@ export interface SlashCommand {
   name: string;          // 含开头的 '/'
   description: string;
   handler: (ctx: CommandCtx) => void | Promise<void>;
+}
+
+export function formatMCPStatus(status: MCPStatusPayload): string {
+  const total = Number(status.total ?? status.servers?.length ?? 0);
+  const connected = Number(status.connected ?? 0);
+  const failed = Number(status.failed ?? 0);
+  const state = status.status || "unknown";
+  const lines = [`MCP 状态：${state}（${connected}/${total} connected，${failed} failed）`];
+
+  const servers = Array.isArray(status.servers) ? status.servers : [];
+  if (!servers.length) {
+    if (status.error) lines.push(`  • ${status.error}`);
+    return lines.join("\n");
+  }
+
+  for (const server of servers) {
+    const name = server.name || "unknown";
+    const serverState = server.status || "unknown";
+    const parts: string[] = [];
+    if (server.tools_count) parts.push(`tools=${server.tools_count}`);
+    if (server.elapsed_seconds) parts.push(`${server.elapsed_seconds}s`);
+    if (server.error) parts.push(`error=${server.error}`);
+    const suffix = parts.length ? ` (${parts.join(", ")})` : "";
+    lines.push(`  • ${name}: ${serverState}${suffix}`);
+  }
+  return lines.join("\n");
 }
 
 export const COMMANDS: readonly SlashCommand[] = [
@@ -129,6 +155,18 @@ export const COMMANDS: readonly SlashCommand[] = [
         appendSystem(`已注册 ${result.tools.length} 个工具：\n` + lines.join("\n"));
       } catch (e) {
         appendSystem(`✗ /tools 失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
+    name: "/mcp",
+    description: "查看 MCP 后台连接状态",
+    handler: async ({ transport, appendSystem }) => {
+      try {
+        const status = await transport.mcpStatus();
+        appendSystem(formatMCPStatus(status));
+      } catch (e) {
+        appendSystem(`✗ /mcp 失败：${(e as Error).message}`);
       }
     },
   },

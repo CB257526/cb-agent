@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { COMMANDS, filterCommands, findCommand } from "../commands.js";
+import { COMMANDS, filterCommands, findCommand, formatMCPStatus } from "../commands.js";
 import type { CommandCtx } from "../commands.js";
 
 describe("commands", () => {
@@ -31,6 +31,7 @@ describe("commands", () => {
       expect(findCommand("/help")?.name).toBe("/help");
       expect(findCommand("/tools")?.name).toBe("/tools");
       expect(findCommand("/compact")?.name).toBe("/compact");
+      expect(findCommand("/mcp")?.name).toBe("/mcp");
     });
     it("含空格也能 trim", () => {
       expect(findCommand("  /clear  ")?.name).toBe("/clear");
@@ -63,6 +64,7 @@ describe("commands", () => {
       transportMock = {
         clearHistory: vi.fn(),
         compactSession: vi.fn(),
+        mcpStatus: vi.fn(),
         listTools: vi.fn(),
         createSession: vi.fn(),
         switchSession: vi.fn(),
@@ -91,6 +93,7 @@ describe("commands", () => {
       expect(text).toContain("/tools");
       expect(text).toContain("/sessions");
       expect(text).toContain("/compact");
+      expect(text).toContain("/mcp");
     });
 
     it("/clear 调 transport.clearHistory + 清 items + 给个提示", () => {
@@ -219,10 +222,54 @@ describe("commands", () => {
       expect(text).toContain("timeout");
     });
 
+    it("/mcp 成功时格式化后台连接状态", async () => {
+      transportMock.mcpStatus.mockResolvedValue({
+        status: "loading",
+        total: 2,
+        connected: 1,
+        failed: 0,
+        servers: [
+          { name: "filesystem", status: "connected", tools_count: 4, elapsed_seconds: 0.3 },
+          { name: "playwright", status: "connecting" },
+        ],
+      });
+      const cmd = findCommand("/mcp")!;
+      await cmd.handler(ctx);
+      expect(transportMock.mcpStatus).toHaveBeenCalledOnce();
+      const text = appendSystemMock.mock.calls[0][0];
+      expect(text).toContain("MCP 状态：loading");
+      expect(text).toContain("filesystem: connected");
+      expect(text).toContain("playwright: connecting");
+    });
+
+    it("/mcp RPC 报错时输出错误信息", async () => {
+      transportMock.mcpStatus.mockRejectedValue(new Error("mcp timeout"));
+      const cmd = findCommand("/mcp")!;
+      await cmd.handler(ctx);
+      const text = appendSystemMock.mock.calls[0][0];
+      expect(text).toContain("✗");
+      expect(text).toContain("mcp timeout");
+    });
+
     it("/log 触发 toggleActivity", () => {
       const cmd = findCommand("/log")!;
       cmd.handler(ctx);
       expect(toggleActivityMock).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("formatMCPStatus", () => {
+    it("能格式化空 server 且保留 error", () => {
+      const text = formatMCPStatus({
+        status: "disabled",
+        total: 0,
+        connected: 0,
+        failed: 0,
+        error: "未找到 mcp.json",
+        servers: [],
+      });
+      expect(text).toContain("disabled");
+      expect(text).toContain("未找到 mcp.json");
     });
   });
 });

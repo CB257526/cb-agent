@@ -29,7 +29,7 @@ import { Banner } from "./components/Banner.js";
 import { SlashCommandPicker } from "./components/SlashCommandPicker.js";
 import { SessionSwitcher } from "./components/SessionSwitcher.js";
 import { HistoryStore } from "./historyStore.js";
-import { findCommand, SlashCommand, CommandCtx } from "./commands.js";
+import { findCommand, SlashCommand, CommandCtx, formatMCPStatus } from "./commands.js";
 
 const STDERR_RING_MAX = 200;  // 内存里最多留 200 行，超出从头丢
 
@@ -132,6 +132,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   // 反压回 Python，整条链路就卡住。把高频 delta 累积到 ref，每 ~60ms flush 一次。
   const _pendingDelta = useRef<{ reasoning: string; text: string }>({ reasoning: "", text: "" });
   const _flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // MCP 后台加载会按 server 状态变化发事件。这里只记录上一次展示文本，
+  // 防止同一快照重复追加 system 行，保持对话流安静。
+  const _lastMcpStatusText = useRef("");
 
   const flushDelta = useCallback(() => {
     _flushTimer.current = null;
@@ -274,6 +277,15 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             setItems(restoredHistoryToItems((ev as any).history));
           }
           break;
+
+        case "mcp_status": {
+          const text = formatMCPStatus(ev as any);
+          if (text && text !== _lastMcpStatusText.current) {
+            _lastMcpStatusText.current = text;
+            appendSystem(text);
+          }
+          break;
+        }
 
         case "round_start":
           setRound((ev as any).round_idx);
