@@ -86,6 +86,8 @@ export interface Done extends BaseEvent {
   final_answer: string;
   rounds_used: number;
   cancelled: boolean;
+  /** 当前 active 会话的动态上下文窗口估算。 */
+  context_window?: ContextWindow | null;
 }
 
 export interface ErrorEvent extends BaseEvent {
@@ -107,6 +109,8 @@ export interface GatewayReady extends BaseEvent {
   session?: SessionSummary | null;
   /** 后端启动时从 active session 恢复出的普通 history。 */
   history?: RestoredHistoryMessage[];
+  /** 启动恢复后当前会话的上下文窗口估算。 */
+  context_window?: ContextWindow | null;
 }
 
 export interface AskQuestionOption {
@@ -180,10 +184,21 @@ export interface RestoredHistoryMessage {
   kind?: string | null;
 }
 
+/** 后端估算的当前 active 会话上下文窗口占用。 */
+export interface ContextWindow {
+  used_tokens: number;
+  max_tokens: number;
+  remaining_tokens?: number;
+  percent: number;
+  source?: string;
+  scope?: string;
+}
+
 /** session.create / session.switch 的统一返回形状。 */
 export interface SessionPayload {
   session: SessionSummary | null;
   history: RestoredHistoryMessage[];
+  context_window?: ContextWindow | null;
 }
 
 /** session.compact 的返回形状。 */

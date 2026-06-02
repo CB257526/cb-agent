@@ -46,6 +46,8 @@ describe("commands", () => {
     let appendSystemMock: ReturnType<typeof vi.fn>;
     let setItemsMock: ReturnType<typeof vi.fn>;
     let applySessionPayloadMock: ReturnType<typeof vi.fn>;
+    let setContextWindowMock: ReturnType<typeof vi.fn>;
+    let resetContextWindowMock: ReturnType<typeof vi.fn>;
     let openSessionSwitcherMock: ReturnType<typeof vi.fn>;
     let toggleActivityMock: ReturnType<typeof vi.fn>;
     let transportMock: any;
@@ -54,6 +56,8 @@ describe("commands", () => {
       appendSystemMock = vi.fn();
       setItemsMock = vi.fn();
       applySessionPayloadMock = vi.fn();
+      setContextWindowMock = vi.fn();
+      resetContextWindowMock = vi.fn();
       openSessionSwitcherMock = vi.fn();
       toggleActivityMock = vi.fn();
       transportMock = {
@@ -70,6 +74,8 @@ describe("commands", () => {
         appendSystem: appendSystemMock,
         setItems: setItemsMock,
         applySessionPayload: applySessionPayloadMock,
+        setContextWindow: setContextWindowMock,
+        resetContextWindow: resetContextWindowMock,
         openSessionSwitcher: openSessionSwitcherMock,
         toggleActivity: toggleActivityMock,
       };
@@ -95,6 +101,7 @@ describe("commands", () => {
       // setItems 收到的 updater 应当返回空数组
       const updater = setItemsMock.mock.calls[0][0];
       expect(updater([{ id: "x", role: "user", text: "old" }])).toEqual([]);
+      expect(resetContextWindowMock).toHaveBeenCalledOnce();
       expect(appendSystemMock).toHaveBeenCalled();
     });
 
@@ -112,6 +119,7 @@ describe("commands", () => {
         before_messages: 12,
         after_messages: 3,
         persisted: true,
+        context_window: { used_tokens: 120, max_tokens: 8000, percent: 1.5 },
       });
 
       const cmd = findCommand("/compact")!;
@@ -120,6 +128,7 @@ describe("commands", () => {
       expect(transportMock.compactSession).toHaveBeenCalledOnce();
       expect(applySessionPayloadMock).not.toHaveBeenCalled();
       expect(setItemsMock).not.toHaveBeenCalled();
+      expect(setContextWindowMock).toHaveBeenCalledWith({ used_tokens: 120, max_tokens: 8000, percent: 1.5 });
       expect(appendSystemMock.mock.calls[0][0]).toContain("history 12 -> 3");
       expect(appendSystemMock.mock.calls[0][0]).toContain("已落盘");
     });

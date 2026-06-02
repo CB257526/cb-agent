@@ -444,6 +444,7 @@ class Gateway:
                 "model": getattr(self.session.llm, "model", "unknown"),
                 "session": session_payload.get("session"),
                 "history": session_payload.get("history", []),
+                "context_window": session_payload.get("context_window"),
             },
         })
 

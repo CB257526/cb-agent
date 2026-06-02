@@ -8,7 +8,7 @@
  */
 
 import type { Transport } from "./transport.js";
-import type { ChatItem, SessionPayload } from "./types.js";
+import type { ChatItem, ContextWindow, SessionPayload } from "./types.js";
 
 export interface CommandCtx {
   transport: Transport;
@@ -21,6 +21,10 @@ export interface CommandCtx {
   setItems: (updater: (prev: ChatItem[]) => ChatItem[]) => void;
   /** 用后端恢复的 history 重绘当前会话。 */
   applySessionPayload: (payload: SessionPayload, notice?: string) => void;
+  /** 更新底部 Context 上下文窗口指标。 */
+  setContextWindow: (contextWindow: ContextWindow | null) => void;
+  /** 将底部 Context 指标重置为 0，同时保留当前窗口上限。 */
+  resetContextWindow: () => void;
   /** 打开可见的会话切换面板。 */
   openSessionSwitcher: () => void;
   /** 切换后端日志面板 */
@@ -45,18 +49,22 @@ export const COMMANDS: readonly SlashCommand[] = [
   {
     name: "/clear",
     description: "清空对话历史（前后端都清）",
-    handler: ({ transport, setItems, appendSystem }) => {
+    handler: ({ transport, setItems, appendSystem, resetContextWindow }) => {
       transport.clearHistory();
       setItems(() => []);
+      resetContextWindow();
       appendSystem("对话已清空。");
     },
   },
   {
     name: "/compact",
     description: "压缩并释放当前会话上下文",
-    handler: async ({ transport, appendSystem }) => {
+    handler: async ({ transport, appendSystem, setContextWindow }) => {
       try {
         const payload = await transport.compactSession();
+        if (payload.context_window !== undefined) {
+          setContextWindow(payload.context_window ?? null);
+        }
         if (payload.no_op) {
           appendSystem("当前没有可压缩的上下文。");
           return;

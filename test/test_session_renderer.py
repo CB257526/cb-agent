@@ -131,6 +131,9 @@ class TestAgentSessionBasic(unittest.TestCase):
         self.assertEqual(len(dones), 1)
         self.assertEqual(dones[0].final_answer, "ok")
         self.assertEqual(dones[0].rounds_used, 1)
+        self.assertIsInstance(dones[0].context_window, dict)
+        self.assertGreater(dones[0].context_window["used_tokens"], 0)
+        self.assertEqual(dones[0].context_window["scope"], "state+history")
 
     def test_chat_with_tool_call_runs_two_rounds(self):
         # 第 1 轮：模型让调 file_read；第 2 轮：模型给最终答案
@@ -289,6 +292,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(payload["before_messages"], 4)
             self.assertEqual(payload["after_messages"], 3)
             self.assertTrue(payload["persisted"])
+            self.assertIn("context_window", payload)
+            self.assertGreater(payload["context_window"]["used_tokens"], 0)
             self.assertIn("【上下文压缩】", payload["summary"])
             self.assertEqual(s.history[0].metadata, {"kind": "compact_record"})
             self.assertTrue((store.active_dir / "compact.json").exists())

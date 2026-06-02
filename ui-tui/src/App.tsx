@@ -20,7 +20,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
-import { AgentEvent, ChatItem, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, ChatItem, ContextWindow, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
@@ -75,6 +75,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [maxRounds, setMaxRounds] = useState(0);
   const [promptTokens, setPromptTokens] = useState(0);
   const [completionTokens, setCompletionTokens] = useState(0);
+  const [contextWindow, setContextWindow] = useState<ContextWindow | null>(null);
   const [protocolErrors, setProtocolErrors] = useState(0);
   const [stderrLines, setStderrLines] = useState<string[]>([]);
   const [showActivity, setShowActivity] = useState(false);
@@ -144,9 +145,23 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     setItems((prev) => [...prev, { id: nextId(), role: "system", text }]);
   }, []);
 
+  const resetContextWindow = useCallback(() => {
+    setContextWindow((prev) => ({
+      used_tokens: 0,
+      max_tokens: prev?.max_tokens ?? 8000,
+      remaining_tokens: prev?.max_tokens ?? 8000,
+      percent: 0,
+      source: "estimate",
+      scope: prev?.scope ?? "state+history",
+    }));
+  }, []);
+
   const applySessionPayload = useCallback((payload: SessionPayload, notice?: string) => {
     flushNow();
     setCurrentSession(payload.session ?? null);
+    if (payload.context_window !== undefined) {
+      setContextWindow(payload.context_window ?? null);
+    }
     setItems(() => {
       const restored = restoredHistoryToItems(payload.history ?? []);
       if (notice) restored.push({ id: nextId(), role: "system", text: notice });
@@ -218,6 +233,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         case "gateway_ready":
           setModel((ev as any).model ?? "unknown");
           setCurrentSession((ev as any).session ?? null);
+          if ((ev as any).context_window !== undefined) {
+            setContextWindow((ev as any).context_window ?? null);
+          }
           if (Array.isArray((ev as any).history) && (ev as any).history.length > 0) {
             setItems(restoredHistoryToItems((ev as any).history));
           }
@@ -305,6 +323,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
         case "done":
           flushNow();
+          if ((ev as any).context_window !== undefined) {
+            setContextWindow((ev as any).context_window ?? null);
+          }
           setBusy(false);
           setRound(0);
           break;
@@ -432,6 +453,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       appendSystem: (t) => appendSystem(t),
       setItems,
       applySessionPayload,
+      setContextWindow,
+      resetContextWindow,
       openSessionSwitcher,
       toggleActivity: () => setShowActivity((v) => !v),
     };
@@ -440,7 +463,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       ret.catch((e) => appendSystem(`✗ 命令 ${cmd.name} 抛错：${(e as Error).message}`));
     }
     setInput("");
-  }, [transport, input, appendSystem, applySessionPayload, openSessionSwitcher]);
+  }, [transport, input, appendSystem, applySessionPayload, setContextWindow, resetContextWindow, openSessionSwitcher]);
 
   const handleSubmit = useCallback((text: string) => {
     if (!text.trim() || busy) return;
@@ -532,6 +555,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             sessionId={currentSession?.session_id}
             promptTokens={promptTokens}
             completionTokens={completionTokens}
+            contextWindow={contextWindow}
             round={round}
             maxRounds={maxRounds}
             busy={busy}

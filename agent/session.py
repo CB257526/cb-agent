@@ -42,6 +42,7 @@ from context import ContextBuilder, ContextPacket, ContextPriority
 from core.message import Message
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
+from utils.common import count_tokens
 from agent.work_context import (
     COMPACT_RECORD_LIMIT,
     LocalSessionStore,
@@ -131,6 +132,20 @@ def _message_kind(message: Message) -> str:
     """
     metadata = message.metadata if isinstance(message.metadata, dict) else {}
     return str(metadata.get("kind") or "")
+
+
+def _context_message_line(message: Message) -> str:
+    """把一条跨轮 history 渲染成上下文估算用的单行文本。
+
+    这里不是给 UI 展示，也不是还原 OpenAI 原始 message；它只服务 token 估算。
+    因此保留 role/kind/content 三类会影响 prompt 体积的信息即可，继续排除
+    tool_call_id、tool_calls 等只属于单轮工具协议的字段。
+    """
+    role = _message_role_name(message)
+    kind = _message_kind(message)
+    content = _message_content_to_text(message.content)
+    label = role if not kind else f"{role}/{kind}"
+    return f"{label}: {content}".strip()
 
 
 class AgentSession:
@@ -224,6 +239,7 @@ class AgentSession:
         return {
             "session": summary,
             "history": self.export_history(),
+            "context_window": self.context_window_usage(),
         }
 
     def create_session(self) -> Dict[str, Any]:
@@ -234,9 +250,9 @@ class AgentSession:
         """
         self.history.clear()
         if self.session_store is None:
-            return {"session": None, "history": []}
+            return {"session": None, "history": [], "context_window": self.context_window_usage()}
         summary = self.session_store.create_session()
-        return {"session": summary, "history": []}
+        return {"session": summary, "history": [], "context_window": self.context_window_usage()}
 
     def switch_session(self, session_id: str) -> Dict[str, Any]:
         """切换到已有会话并恢复它最近的普通 history。
@@ -254,6 +270,7 @@ class AgentSession:
         return {
             "session": summary,
             "history": self.export_history(),
+            "context_window": self.context_window_usage(),
         }
 
     def compact_context(self) -> Dict[str, Any]:
@@ -273,6 +290,7 @@ class AgentSession:
             return {
                 "session": self.current_session_payload().get("session"),
                 "history": self.export_history(),
+                "context_window": self.context_window_usage(),
                 "summary": "",
                 "before_messages": 0,
                 "after_messages": 0,
@@ -306,6 +324,7 @@ class AgentSession:
         return {
             "session": self.current_session_payload().get("session"),
             "history": self.export_history(),
+            "context_window": self.context_window_usage(),
             "summary": str(compact_message.content or ""),
             "before_messages": before_messages,
             "after_messages": after_messages,
@@ -423,6 +442,7 @@ class AgentSession:
             final_answer=final_answer,
             rounds_used=rounds_used,
             cancelled=token.is_cancelled(),
+            context_window=self.context_window_usage(),
         ))
         return final_answer
 
@@ -436,6 +456,53 @@ class AgentSession:
                 self.session_store.clear_active_session()
             except Exception:
                 logger.exception("清理本地会话失败")
+
+    def context_window_usage(self) -> Dict[str, Any]:
+        """估算当前会话动态上下文占用，用于 TUI 的 Context 指标。
+
+        这个指标回答的是“当前 active 会话已有多少内容会继续挤占后续上下文窗口”，
+        不是 OpenAI usage 里的“已经消耗了多少 token”。因此它只统计动态部分：
+
+        - 本地滚动 state，也就是已读/已改文件、最近命令、compact 摘要等；
+        - 当前恢复进内存的 history，包括普通 user/assistant、工作记录和 compact 记录。
+
+        固定系统提示、工具 schema、Skill 列表以及下一条尚未提交的用户输入不计入。
+        这样空会话会接近 0%，切换会话和 /compact 后的变化也更直观。分母使用
+        ContextBuilder 的 `max_tokens`；未挂 builder 时退回 8000，保持 UI 有可用窗口。
+        """
+        max_tokens = 8000
+        cfg = getattr(getattr(self, "builder", None), "config", None)
+        if cfg is not None:
+            try:
+                max_tokens = int(getattr(cfg, "max_tokens", max_tokens) or max_tokens)
+            except Exception:
+                max_tokens = 8000
+        max_tokens = max(max_tokens, 1)
+
+        parts: List[str] = []
+        state_text = self._session_state_text()
+        if state_text:
+            parts.append("[State]\n" + state_text)
+
+        history_lines = [
+            _context_message_line(message)
+            for message in self.history[-self.history_window:]
+            if _message_content_to_text(message.content)
+        ]
+        if history_lines:
+            parts.append("[Context]\n" + "\n".join(history_lines))
+
+        text = "\n\n".join(parts)
+        used_tokens = count_tokens(text) if text else 0
+        percent = min(100.0, (used_tokens / max_tokens) * 100.0)
+        return {
+            "used_tokens": used_tokens,
+            "max_tokens": max_tokens,
+            "remaining_tokens": max(0, max_tokens - used_tokens),
+            "percent": round(percent, 1),
+            "source": "estimate",
+            "scope": "state+history",
+        }
 
     # ---------- 工具循环 ----------
 

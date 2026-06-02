@@ -124,6 +124,9 @@ class Done:
     final_answer: str
     rounds_used: int
     cancelled: bool = False
+    # 当前 active 会话的动态上下文窗口估算。它不是 API usage，而是“下一轮会话
+    # state/history 大约占用多少上下文窗口”。TUI 用它刷新底部 Context 指标。
+    context_window: Optional[Dict[str, Any]] = None
     timestamp: float = field(default_factory=_now)
     type: str = field(default="done", init=False)
 

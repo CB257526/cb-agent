@@ -303,6 +303,12 @@ class TestGatewayDispatch(unittest.TestCase):
         self.assertIn("gateway_ready", types)
         self.assertIn("text_delta", types)
         self.assertIn("done", types)
+        ready = [m for m in msgs if m.get("params", {}).get("type") == "gateway_ready"][0]
+        self.assertIn("context_window", ready["params"])
+        self.assertEqual(ready["params"]["context_window"]["scope"], "state+history")
+        done = [m for m in msgs if m.get("params", {}).get("type") == "done"][0]
+        self.assertIn("context_window", done["params"])
+        self.assertGreater(done["params"]["context_window"]["used_tokens"], 0)
         # accept 响应：id=p1, result.status=accepted
         accepts = [m for m in msgs if m.get("id") == "p1"]
         self.assertEqual(len(accepts), 1)
@@ -381,6 +387,8 @@ class TestGatewayDispatch(unittest.TestCase):
             result = replies[0]["result"]
             self.assertIn("【上下文压缩】", result["summary"])
             self.assertGreater(result["before_messages"], result["after_messages"])
+            self.assertIn("context_window", result)
+            self.assertGreater(result["context_window"]["used_tokens"], 0)
             self.assertTrue(result["persisted"])
             self.assertTrue((store.active_dir / "compact.json").exists())
 
