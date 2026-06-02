@@ -23,6 +23,13 @@ import { join } from "node:path";
 import { AgentEvent, CompactPayload, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
+export const STDERR_UI_LINE_MAX = 4000;
+
+function clipStderrForUi(line: string): string {
+  if (line.length <= STDERR_UI_LINE_MAX) return line;
+  const omitted = line.length - STDERR_UI_LINE_MAX;
+  return `${line.slice(0, STDERR_UI_LINE_MAX)}…（实时日志已截断 ${omitted} 字符，完整内容见日志文件）`;
+}
 
 export interface TransportOptions {
   /** Python 解释器路径。默认环境变量 CB_AGENT_PYTHON 或 "python"。 */
@@ -112,7 +119,10 @@ export class Transport extends EventEmitter {
       let line = this.stderrBuf.slice(0, nl);
       this.stderrBuf = this.stderrBuf.slice(nl + 1);
       if (line.endsWith("\r")) line = line.slice(0, -1);
-      this.emit("stderr", line);
+      // stderr 原文已经在调用 handleStderr 前写入日志文件；这里 emit 给 TUI 的只是
+      // 实时面板预览。超长 messages dump / JSON 行如果完整进入 React state，会让
+      // Ink 反复重绘大字符串，表现为终端卡死和 VS Code 内存飙升，所以只截断 UI 副本。
+      this.emit("stderr", clipStderrForUi(line));
     }
   }
 

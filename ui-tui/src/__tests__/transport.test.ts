@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { RUN_AGENT_ARGS, Transport } from "../transport.js";
+import { RUN_AGENT_ARGS, STDERR_UI_LINE_MAX, Transport } from "../transport.js";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -133,6 +133,14 @@ describe("Transport stderr line splitter", () => {
     const { feedErr, stderrLines } = makeFakeTransport();
     feedErr("no newline yet");
     expect(stderrLines).toEqual([]);
+  });
+
+  it("clips very long stderr lines for the live UI preview", () => {
+    const { feedErr, stderrLines } = makeFakeTransport();
+    feedErr(`${"x".repeat(STDERR_UI_LINE_MAX + 25)}\n`);
+    expect(stderrLines).toHaveLength(1);
+    expect(stderrLines[0].length).toBeLessThan(STDERR_UI_LINE_MAX + 80);
+    expect(stderrLines[0]).toContain("实时日志已截断");
   });
 });
 

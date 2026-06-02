@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from typing import List
@@ -72,7 +73,31 @@ def _make_llm() -> CbAgentsLLM:
     llm.model = "test-model"
     llm.is_Function_Calling = True  # 子类用例可覆盖
     llm.client = SimpleNamespace()  # 不会被实际调用
+    # _iter_chat_stream 依赖这些运行时字段；真实实例由 __init__ 设置，测试里
+    # 绕过 __init__ 是为了不读 env / 不创建真实 OpenAI client，所以这里手动补齐。
+    llm._stream_lock = threading.Lock()
+    llm._stream_seq = 0
+    llm._active_streams = {}
+    llm._stream_poll_seconds = 0.02
+    llm._stream_idle_log_seconds = 60.0
+    llm._stream_join_seconds = 0.5
     return llm
+
+
+class _BlockingStream:
+    """模拟 provider 已经返回 stream，但后续 chunk 永远不来的场景。"""
+
+    def __init__(self) -> None:
+        self.iter_started = threading.Event()
+        self.closed = threading.Event()
+
+    def __iter__(self):
+        self.iter_started.set()
+        self.closed.wait(timeout=5.0)
+        return iter(())
+
+    def close(self) -> None:
+        self.closed.set()
 
 
 # ========== usage 工具 ==========
@@ -242,6 +267,41 @@ class TestThinkWithFunctionCallingEvents(unittest.TestCase):
         self.assertEqual(cancelled[0].where, "llm_stream")
         # 累积的 answer 只有 part1
         self.assertEqual(result["answer"], "part1")
+
+    def test_cancel_while_waiting_for_next_chunk_closes_stream(self):
+        """取消不依赖“下一个 chunk”到来，能直接关闭正在等待的 stream。"""
+        cancel_event = threading.Event()
+        blocking_stream = _BlockingStream()
+        self.llm.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kw: blocking_stream),
+            ),
+        )
+        result_box = {}
+
+        def run_think():
+            result_box["result"] = self.llm._think_with_Function_Calling(
+                messages=[],
+                event_bus=self.bus,
+                cancel_event=cancel_event,
+                round_idx=4,
+            )
+
+        thread = threading.Thread(target=run_think, daemon=True)
+        thread.start()
+        self.assertTrue(blocking_stream.iter_started.wait(timeout=1.0))
+
+        cancel_event.set()
+        deadline = time.time() + 1.5
+        while thread.is_alive() and time.time() < deadline:
+            time.sleep(0.01)
+
+        self.assertFalse(thread.is_alive(), "think should return after cancel without a new chunk")
+        self.assertTrue(blocking_stream.closed.is_set(), "active stream should be closed on cancel")
+        cancelled = [e for e in self.events if isinstance(e, Cancelled)]
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(cancelled[0].where, "llm_stream")
+        self.assertEqual(result_box["result"]["answer"], "")
 
 
 # ========== 默认行为（无 bus）回归 ==========

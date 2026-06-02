@@ -136,7 +136,11 @@ class AgentRunner:
         self.use_mcp = use_mcp and _HAS_MCP
         self.ctx_enabled = ctx_enabled
         self.memory_system = memory_system
-        self.dump_messages = True
+        # CLI 直接交互时保留 messages dump，方便开发者用 /msg on|off 看原始上下文；
+        # TUI/jsonrpc 模式 attach_cli_renderer=False，此时 stderr 会被前端实时收集，
+        # 如果默认 dump 完整 system prompt + 工具 schema，集成终端和 React 渲染都会承压。
+        # 因此 TUI 默认关闭 dump，仍可在 CLI 模式下手动 /msg on 调试。
+        self.dump_messages = bool(attach_cli_renderer)
         self._attach_cli_renderer = attach_cli_renderer
         self._md_memory_provider = self._create_markdown_memory_provider()
         # dump 增量游标：每次 chat() 开始重置，让本轮第一次能打全量
@@ -427,9 +431,16 @@ class AgentRunner:
 
         def _on_sigint(_signum, _frame):
             # signal handler 在主线程执行；调 token.cancel() 不阻塞
-            # cb_agents 流式循环每个 chunk 看 token.is_set()，下一个 chunk 边界停
-            # 这里不直接 print；让 CLIRenderer 在收到 Cancelled 事件时打 ✗
+            # 过去只设置 token，若 SDK 正阻塞等待下一个 stream chunk，就必须等到
+            # provider 再吐数据才会真正停下。现在同步 close 活跃 stream，让 Ctrl-C
+            # 能打断底层流式连接；界面输出仍交给 CLIRenderer 处理。
             token.cancel()
+            cancel_streams = getattr(self.llm, "cancel_active_streams", None)
+            if callable(cancel_streams):
+                try:
+                    cancel_streams("cli_sigint")
+                except Exception:
+                    logging.getLogger(__name__).exception("failed to close stream on Ctrl-C")
 
         try:
             signal.signal(signal.SIGINT, _on_sigint)

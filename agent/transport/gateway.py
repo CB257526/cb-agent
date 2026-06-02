@@ -204,8 +204,22 @@ class Gateway:
                 self.transport.write(make_response(rpc_id, result={"cancelled": False}))
             return
         token.cancel()
+        closed_streams = 0
+        llm = getattr(self.session, "llm", None)
+        cancel_streams = getattr(llm, "cancel_active_streams", None)
+        if callable(cancel_streams):
+            # cancel token 只能让正在执行的 Python 逻辑“下一次检查时”退出；
+            # 如果当前卡在 OpenAI SDK 的 stream 网络读上，就可能一直等不到下一次检查。
+            # 主动 close 活跃 stream 可以从 RPC 线程直接打断底层响应，避免 TUI 长时间 busy。
+            try:
+                closed_streams = int(cancel_streams("gateway_session_cancel") or 0)
+            except Exception:
+                logger.exception("failed to close active LLM streams on cancel")
         if rpc_id is not None:
-            self.transport.write(make_response(rpc_id, result={"cancelled": True}))
+            self.transport.write(make_response(
+                rpc_id,
+                result={"cancelled": True, "closed_streams": closed_streams},
+            ))
 
     def _handle_quit(self, rpc_id: Any) -> None:
         if rpc_id is not None:
