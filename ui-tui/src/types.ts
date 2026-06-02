@@ -88,6 +88,8 @@ export interface Done extends BaseEvent {
   cancelled: boolean;
   /** 当前 active 会话的动态上下文窗口估算。 */
   context_window?: ContextWindow | null;
+  /** 本轮是否因为上下文接近阈值而自动 compact 或压缩 tool result。 */
+  auto_compact?: AutoCompactPayload | null;
 }
 
 export interface ErrorEvent extends BaseEvent {
@@ -187,11 +189,36 @@ export interface RestoredHistoryMessage {
 /** 后端估算的当前 active 会话上下文窗口占用。 */
 export interface ContextWindow {
   used_tokens: number;
+  /** agent 实际使用的安全窗口，默认是模型 max_tokens 的 80%。 */
   max_tokens: number;
   remaining_tokens?: number;
   percent: number;
+  /** 模型声明的完整上下文窗口，来自 constant/llm/constant_llm.py。 */
+  model_max_tokens?: number;
+  /** max_tokens 相对 model_max_tokens 的比例，默认 0.8。 */
+  threshold_ratio?: number;
   source?: string;
   scope?: string;
+}
+
+/** 自动 compact 的单次审计事件。字段保持宽松，便于后端演进。 */
+export interface AutoCompactEvent {
+  reason: string;
+  round_idx?: number;
+  before_messages?: number;
+  after_messages?: number;
+  before_tokens?: number;
+  after_tokens?: number;
+  budget_tokens?: number;
+  request_tokens?: number | null;
+  compressed_tool_messages?: number;
+  persisted?: boolean;
+  history_compaction?: AutoCompactEvent | null;
+}
+
+export interface AutoCompactPayload {
+  compacted: boolean;
+  events: AutoCompactEvent[];
 }
 
 /** session.create / session.switch 的统一返回形状。 */

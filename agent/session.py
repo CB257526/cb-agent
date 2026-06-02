@@ -23,6 +23,7 @@ ContextBuilder / ToolRegistry / Executor / LLM 都从外部传入，便于测试
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,7 @@ from agent.events import (
 )
 from agent.executor import ToolExecutor
 from agent.question_registry import QuestionRegistry
+from constant.llm.constant_llm import ConstantLLM
 from context import ContextBuilder, ContextPacket, ContextPriority
 from core.message import Message
 from skills.skill_manager import SkillManager
@@ -156,6 +158,11 @@ class AgentSession:
 
     # 工具调用循环最大轮数，防死循环
     MAX_TOOL_ROUNDS = 20
+    # 当前工具循环的完整 tool result 被压缩进 messages 时，每条 tool message
+    # 最多保留的字符数。它比跨轮 TraceCollector 的 100 字符略宽，是因为本轮
+    # 模型还需要靠这条摘要继续推理；但仍然要有硬边界，防止 file_read/stdout
+    # 这类结果把下一次 think 请求撑爆。
+    AUTO_TOOL_MESSAGE_LIMIT = 700
 
     def __init__(
         self,
@@ -381,35 +388,50 @@ class AgentSession:
         """
         return await asyncio.to_thread(self.chat, user_query, cancel_token)
 
-    def _chat_impl(self, user_query: str, token: CancelToken) -> str:
-        # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
-        user_query = self._prepend_background_notifications(user_query)
+    def _build_chat_messages(
+        self,
+        *,
+        user_query: str,
+        system_instructions: str,
+    ) -> List[Dict[str, Any]]:
+        """按当前 history/state 构造本轮初始 LLM messages。
 
-        system_instructions = self._build_system_instructions()
-        # 本地 state 是"长期工作态"，比如已读文件、已改文件、最近命令。
-        # 它比普通 history 更像任务状态，所以在 ContextBuilder 开启时作为
-        # P1_STATE 进入 [State]；关闭 ContextBuilder 时则手工拼入 system。
+        这个 helper 把 _chat_impl 里原本内联的构造逻辑抽出来，是为了自动
+        compact 后可以立刻重建 messages：先压缩 self.history/state，再重新
+        让 ContextBuilder 选择上下文，当前轮就能真正吃到压缩效果。
+        """
         state_packet = self._build_state_packet()
-
-        # 构 messages
         if self.ctx_enabled and self.builder is not None:
-            messages = self.builder.to_messages(
+            return self.builder.to_messages(
                 user_query=user_query,
                 conversation_history=self.history,
                 system_instructions=system_instructions,
                 additional_packets=[state_packet] if state_packet else None,
             )
-        else:
-            if state_packet is not None:
-                system_instructions = (
-                    system_instructions
-                    + "\n\n[State]\n关键进展与未决问题：\n"
-                    + state_packet.content
-                )
-            messages = [{"role": "system", "content": system_instructions}]
-            for m in self.history[-self.history_window:]:
-                messages.append(m.to_dict())
-            messages.append({"role": "user", "content": user_query})
+
+        effective_system = system_instructions
+        if state_packet is not None:
+            effective_system = (
+                effective_system
+                + "\n\n[State]\n关键进展与未决问题：\n"
+                + state_packet.content
+            )
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": effective_system}]
+        for m in self.history[-self.history_window:]:
+            messages.append(m.to_dict())
+        messages.append({"role": "user", "content": user_query})
+        return messages
+
+    def _chat_impl(self, user_query: str, token: CancelToken) -> str:
+        # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
+        user_query = self._prepend_background_notifications(user_query)
+
+        system_instructions = self._build_system_instructions()
+        auto_compactions: List[Dict[str, Any]] = []
+        messages = self._build_chat_messages(
+            user_query=user_query,
+            system_instructions=system_instructions,
+        )
 
         tools_schema = (
             self.registry.get_tools_description_openai_schema()
@@ -417,9 +439,27 @@ class AgentSession:
             else None
         )
 
-        rounds_used, final_answer, trace_collector = self._tool_loop(
+        # 预检完整请求体，而不只看 state/history。原因是工具 schema、系统提示、
+        # Skill 列表和当前用户输入也会占用真实模型窗口；如果这里达到或超过 80%
+        # 安全窗口，就先 compact 当前跨轮 history/state，再重建 messages，让
+        # 本轮第一次 think 就使用压缩后的上下文。
+        preflight = self._maybe_auto_compact_preflight(
+            user_query=user_query,
+            system_instructions=system_instructions,
+            messages=messages,
+            tools_schema=tools_schema,
+        )
+        if preflight is not None:
+            auto_compactions.append(preflight)
+            messages = self._build_chat_messages(
+                user_query=user_query,
+                system_instructions=system_instructions,
+            )
+
+        rounds_used, final_answer, trace_collector, loop_compactions = self._tool_loop(
             messages, tools_schema, token,
         )
+        auto_compactions.extend(loop_compactions)
 
         # 跨轮历史仍然先保存用户输入和最终回答，保持原来的对话语义。
         # 下面的 work_record 是额外的普通 assistant 文本，不是 tool 消息。
@@ -437,12 +477,26 @@ class AgentSession:
             self.history.append(make_work_record_message(work_record))
         self._persist_turn(user_query, final_answer, work_record)
 
+        # 本轮结束后再看一次跨轮 state/history。工具轨迹落盘和 state 合并可能让
+        # 下一轮动态上下文达到或超过安全窗口；此时自动执行与 /compact 同语义的压缩，
+        # transcript 仍保留审计，下一轮 prompt 则从 compact 快照继续。
+        post_turn_compaction = self._maybe_auto_compact_history(
+            reason="post_turn",
+            round_idx=rounds_used,
+        )
+        if post_turn_compaction is not None:
+            auto_compactions.append(post_turn_compaction)
+
         # Done 事件：让前端知道整轮结束
         self.event_bus.emit(Done(
             final_answer=final_answer,
             rounds_used=rounds_used,
             cancelled=token.is_cancelled(),
             context_window=self.context_window_usage(),
+            auto_compact={
+                "compacted": bool(auto_compactions),
+                "events": auto_compactions,
+            } if auto_compactions else None,
         ))
         return final_answer
 
@@ -457,28 +511,36 @@ class AgentSession:
             except Exception:
                 logger.exception("清理本地会话失败")
 
-    def context_window_usage(self) -> Dict[str, Any]:
-        """估算当前会话动态上下文占用，用于 TUI 的 Context 指标。
+    def _model_max_tokens(self) -> int:
+        """返回当前模型声明的完整上下文窗口。
 
-        这个指标回答的是“当前 active 会话已有多少内容会继续挤占后续上下文窗口”，
-        不是 OpenAI usage 里的“已经消耗了多少 token”。因此它只统计动态部分：
-
-        - 本地滚动 state，也就是已读/已改文件、最近命令、compact 摘要等；
-        - 当前恢复进内存的 history，包括普通 user/assistant、工作记录和 compact 记录。
-
-        固定系统提示、工具 schema、Skill 列表以及下一条尚未提交的用户输入不计入。
-        这样空会话会接近 0%，切换会话和 /compact 后的变化也更直观。分母使用
-        ContextBuilder 的 `max_tokens`；未挂 builder 时退回 8000，保持 UI 有可用窗口。
+        这里不再读 ContextBuilder.config.max_tokens 作为主来源，因为用户已经把
+        各模型真实窗口统一维护在 ``constant/llm/constant_llm.py``。ContextBuilder
+        只是“如何组织上下文”的组件，模型窗口是 LLM 配置的一部分，两者拆开后，
+        切换模型时状态栏和自动 compact 不会被旧的 8000 默认值误导。
         """
-        max_tokens = 8000
-        cfg = getattr(getattr(self, "builder", None), "config", None)
-        if cfg is not None:
-            try:
-                max_tokens = int(getattr(cfg, "max_tokens", max_tokens) or max_tokens)
-            except Exception:
-                max_tokens = 8000
-        max_tokens = max(max_tokens, 1)
+        return ConstantLLM.model_max_tokens(getattr(self.llm, "model", None))
 
+    def _context_budget_tokens(self) -> int:
+        """返回 agent 实际可使用的上下文窗口，默认是模型窗口的 80%。
+
+        这个值同时服务三个地方：
+        - TUI 底部 Context 指标的分母；
+        - 自动 compact 的触发阈值；
+        - 估算当前工具循环 messages 是否需要压缩。
+
+        保留 20% 不使用，是为了给模型输出、provider 额外包装和 token 估算误差
+        留缓冲，避免显示“刚好没满”但真实 API 请求已经超窗。
+        """
+        return ConstantLLM.context_window_tokens(getattr(self.llm, "model", None))
+
+    def _dynamic_context_text(self) -> str:
+        """渲染会被跨轮注入的动态上下文文本，用于估算和自动 compact。
+
+        它只统计 state/history，不统计固定 system prompt、工具 schema 和当前用户
+        输入。因此这个结果适合回答“这段会话记忆本身占了多少窗口”；完整请求是否
+        超阈值则由 _estimate_request_tokens() 另外计算。
+        """
         parts: List[str] = []
         state_text = self._session_state_text()
         if state_text:
@@ -491,8 +553,24 @@ class AgentSession:
         ]
         if history_lines:
             parts.append("[Context]\n" + "\n".join(history_lines))
+        return "\n\n".join(parts)
 
-        text = "\n\n".join(parts)
+    def context_window_usage(self) -> Dict[str, Any]:
+        """估算当前会话动态上下文占用，用于 TUI 的 Context 指标。
+
+        这个指标回答的是“当前 active 会话已有多少内容会继续挤占后续上下文窗口”，
+        不是 OpenAI usage 里的“已经消耗了多少 token”。因此它只统计动态部分：
+
+        - 本地滚动 state，也就是已读/已改文件、最近命令、compact 摘要等；
+        - 当前恢复进内存的 history，包括普通 user/assistant、工作记录和 compact 记录。
+
+        固定系统提示、工具 schema、Skill 列表以及下一条尚未提交的用户输入不计入。
+        这样空会话会接近 0%，切换会话和 /compact 后的变化也更直观。分母使用
+        ``constant_llm.py`` 中当前模型 max_tokens 的 80%，与自动 compact 阈值一致。
+        """
+        model_max_tokens = self._model_max_tokens()
+        max_tokens = self._context_budget_tokens()
+        text = self._dynamic_context_text()
         used_tokens = count_tokens(text) if text else 0
         percent = min(100.0, (used_tokens / max_tokens) * 100.0)
         return {
@@ -502,6 +580,184 @@ class AgentSession:
             "percent": round(percent, 1),
             "source": "estimate",
             "scope": "state+history",
+            "model_max_tokens": model_max_tokens,
+            "threshold_ratio": ConstantLLM.CONTEXT_USAGE_RATIO,
+        }
+
+    def _estimate_request_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """粗略估算一次 LLM 请求的 token 数。
+
+        自动 compact 不能只看 history，因为真实请求还包含 system prompt、当前
+        user query、工具 schema，以及本轮 tool loop 累积的 assistant/tool 消息。
+        这里把 messages/tools_schema 序列化为 JSON 后统一计数，结果不是 provider
+        的精确 token accounting，但足以做“是否接近窗口”的保守触发判断。
+        """
+        payload = {
+            "messages": messages,
+            "tools": tools_schema or [],
+        }
+        try:
+            text = json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(payload)
+        return count_tokens(text)
+
+    def _auto_compact_history(
+        self,
+        *,
+        reason: str,
+        round_idx: int = 0,
+        force: bool = False,
+        request_tokens: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """执行一次自动跨轮 compact，并返回审计用轻量事件。
+
+        与手动 /compact 一样，它只重写 ``self.history`` 和当前 session 的
+        compact.json/state.json；不会删除 transcript，也不会向 history 里写 role=tool。
+        ``force=True`` 用于 preflight：即使 state/history 自身没有达到 80% 窗口，
+        只要完整请求体超阈值，也尝试压缩可压缩的跨轮历史。
+        """
+        before_usage = self.context_window_usage()
+        budget = int(before_usage["max_tokens"])
+        if not force and int(before_usage["used_tokens"]) < budget:
+            return None
+        before_messages = len(self.history)
+        state_text = self._session_state_text()
+        if before_messages == 0 and not state_text:
+            return None
+
+        try:
+            payload = self.compact_context()
+        except Exception:
+            logger.exception("自动上下文 compact 失败")
+            return None
+        if payload.get("no_op"):
+            return None
+
+        after_usage = payload.get("context_window") or self.context_window_usage()
+        return {
+            "reason": reason,
+            "round_idx": round_idx,
+            "before_messages": before_messages,
+            "after_messages": int(payload.get("after_messages") or len(self.history)),
+            "before_tokens": int(before_usage.get("used_tokens") or 0),
+            "after_tokens": int(after_usage.get("used_tokens") or 0),
+            "budget_tokens": budget,
+            "request_tokens": request_tokens,
+            "persisted": bool(payload.get("persisted")),
+        }
+
+    def _maybe_auto_compact_history(
+        self,
+        *,
+        reason: str,
+        round_idx: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """当跨轮 state/history 达到或超过 80% 安全窗口时自动 compact。"""
+        return self._auto_compact_history(reason=reason, round_idx=round_idx, force=False)
+
+    def _maybe_auto_compact_preflight(
+        self,
+        *,
+        user_query: str,
+        system_instructions: str,
+        messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]],
+    ) -> Optional[Dict[str, Any]]:
+        """本轮第一次 think 前，按完整请求体判断是否先压缩跨轮历史。
+
+        如果请求体已经达到或超过模型窗口 80%，即便动态 history 单独看还没达到，也说明
+        system prompt/工具 schema/当前输入叠加后空间紧张。此时优先压缩 history，
+        然后由 _chat_impl 重建 messages，让本轮第一次请求就变小。
+        """
+        del user_query, system_instructions  # 仅用于调用点自解释，估算直接读 messages。
+        request_tokens = self._estimate_request_tokens(messages, tools_schema)
+        budget = self._context_budget_tokens()
+        if request_tokens < budget:
+            return None
+        return self._auto_compact_history(
+            reason="preflight",
+            round_idx=0,
+            force=True,
+            request_tokens=request_tokens,
+        )
+
+    def _tool_result_message_summary(
+        self,
+        *,
+        name: str,
+        trace_line: str,
+    ) -> str:
+        """生成替换当前轮 tool message content 的安全摘要。
+
+        这一步只发生在当前工具循环请求体达到或超过 80% 窗口时。它不会影响
+        TraceCollector 里的跨轮事实，也不会写完整文件正文/stdout 到磁盘；只是把
+        下一次 ``llm.think(messages=...)`` 里的 tool content 从“完整输出”换成
+        “已压缩摘要”，以保住 tool_call_id 配对同时释放上下文。
+        """
+        summary = (
+            "【自动工具结果压缩】当前工具循环已接近上下文窗口，"
+            f"工具 {name} 的完整输出已替换为摘要：{trace_line}"
+        )
+        return _clip_compact_text(summary, self.AUTO_TOOL_MESSAGE_LIMIT)
+
+    def _maybe_compress_tool_loop_messages(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]],
+        tool_message_summaries: Dict[int, str],
+        compressed_indices: set[int],
+        round_idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        """当前轮 messages 达到或超过 80% 窗口时，压缩已完成的 tool result。
+
+        这里故意不删除 assistant/tool 消息，也不把 tool role 改成 assistant。
+        OpenAI tool calling 协议要求 assistant.tool_calls 后必须有匹配的 tool
+        message；直接删改 role 会导致下一次请求 400。替换 content 则能同时满足
+        协议和上下文压缩需求。
+        """
+        budget = self._context_budget_tokens()
+        before_tokens = self._estimate_request_tokens(messages, tools_schema)
+        if before_tokens < budget:
+            return None
+
+        compressed_count = 0
+        for idx, summary in tool_message_summaries.items():
+            if idx in compressed_indices:
+                continue
+            if idx < 0 or idx >= len(messages):
+                continue
+            if messages[idx].get("role") != "tool":
+                continue
+            messages[idx]["content"] = summary
+            compressed_indices.add(idx)
+            compressed_count += 1
+
+        # 当前轮压缩 tool content 只影响正在跑的局部 messages；为了让下一轮也轻，
+        # 同时尝试 compact 跨轮 history/state。它不会改变当前 messages，但会更新
+        # Done 之后 TUI 看到的 context_window 和本地 compact 快照。
+        history_event = self._auto_compact_history(
+            reason="tool_loop_history",
+            round_idx=round_idx,
+            force=True,
+            request_tokens=before_tokens,
+        )
+        after_tokens = self._estimate_request_tokens(messages, tools_schema)
+        if compressed_count == 0 and history_event is None:
+            return None
+        return {
+            "reason": "tool_loop",
+            "round_idx": round_idx,
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "budget_tokens": budget,
+            "compressed_tool_messages": compressed_count,
+            "history_compaction": history_event,
         }
 
     # ---------- 工具循环 ----------
@@ -511,8 +767,8 @@ class AgentSession:
         messages: List[Dict[str, Any]],
         tools_schema: Optional[List[Dict[str, Any]]],
         token: CancelToken,
-    ) -> tuple[int, str, TraceCollector]:
-        """工具调用主循环。返回 (rounds_used, final_answer, trace_collector)。
+    ) -> tuple[int, str, TraceCollector, List[Dict[str, Any]]]:
+        """工具调用主循环。返回 (rounds_used, final_answer, trace_collector, auto_compactions)。
 
         每轮：
         1. 检查 token：进新一轮前已被 cancel → 立刻收尾
@@ -530,6 +786,13 @@ class AgentSession:
         # - trace_collector：跨轮压缩轨迹，只记录 path/cwd/exit_code/短摘要等。
         # 这保证了本轮推理能力不受截断影响，同时下一轮不会背上大段工具输出。
         trace_collector = TraceCollector()
+        # 当前轮 messages 的自动压缩事件会在 chat 结束时放进 Done.auto_compact，
+        # 方便 TUI 或日志侧知道“这轮为了保护上下文窗口做过压缩”。
+        loop_compactions: List[Dict[str, Any]] = []
+        # tool message content 只有在当前请求体达到或超过 80% 安全窗口时才会被替换。
+        # key 是 messages 里的下标，value 是预先从 TraceEntry 生成的安全摘要。
+        tool_message_summaries: Dict[int, str] = {}
+        compressed_tool_message_indices: set[int] = set()
         for round_idx in range(1, self.MAX_TOOL_ROUNDS + 1):
             # 进入新一轮前先看 token
             if token.is_cancelled():
@@ -544,6 +807,7 @@ class AgentSession:
                     round_idx - 1 if round_idx > 1 else 1,
                     partial_answer,
                     trace_collector,
+                    loop_compactions,
                 )
 
             self.event_bus.emit(RoundStart(
@@ -570,7 +834,7 @@ class AgentSession:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, final, trace_collector
+                return round_idx, final, trace_collector, loop_compactions
 
             if not isinstance(result, dict):
                 self.event_bus.emit(Error(
@@ -581,7 +845,7 @@ class AgentSession:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, "", trace_collector
+                return round_idx, "", trace_collector, loop_compactions
 
             answer = result.get("answer", "") or ""
             tool_calls = result.get("tool_calls") or []
@@ -595,13 +859,13 @@ class AgentSession:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, answer, trace_collector
+                return round_idx, answer, trace_collector, loop_compactions
 
             if not tool_calls:
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, answer, trace_collector
+                return round_idx, answer, trace_collector, loop_compactions
 
             # assistant 的 tool_calls 消息回灌
             assistant_msg: Dict[str, Any] = {
@@ -622,6 +886,7 @@ class AgentSession:
             for call, exec_result in zip(tool_calls, results):
                 # 完整工具结果仍按 OpenAI tool calling 协议回灌给本轮 messages。
                 # 这一点不能改，否则多轮工具调用时模型看不到真实工具输出。
+                tool_message_idx = len(messages)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
@@ -634,13 +899,27 @@ class AgentSession:
                 })
                 # 另一路只记录压缩摘要，供本轮结束后生成【工作记录】。
                 # 这里不把 trace 写入 messages，避免下一轮出现伪造的 tool 消息。
-                trace_collector.add_tool_result(
+                trace_entry = trace_collector.add_tool_result(
                     call=call,
                     name=exec_result.name,
                     result=exec_result.result,
                     is_error=exec_result.is_error,
                     round_idx=round_idx,
                 )
+                tool_message_summaries[tool_message_idx] = self._tool_result_message_summary(
+                    name=exec_result.name,
+                    trace_line=trace_entry.to_line(),
+                )
+
+            compact_event = self._maybe_compress_tool_loop_messages(
+                messages=messages,
+                tools_schema=tools_schema,
+                tool_message_summaries=tool_message_summaries,
+                compressed_indices=compressed_tool_message_indices,
+                round_idx=round_idx,
+            )
+            if compact_event is not None:
+                loop_compactions.append(compact_event)
 
             self.event_bus.emit(RoundEnd(
                 round_idx=round_idx, has_tool_calls=True, final=False,
@@ -652,7 +931,12 @@ class AgentSession:
             message=f"工具调用超过 {self.MAX_TOOL_ROUNDS} 轮，强制终止",
             round_idx=self.MAX_TOOL_ROUNDS,
         ))
-        return self.MAX_TOOL_ROUNDS, "（工具调用次数过多，已终止本轮）", trace_collector
+        return (
+            self.MAX_TOOL_ROUNDS,
+            "（工具调用次数过多，已终止本轮）",
+            trace_collector,
+            loop_compactions,
+        )
 
     # ---------- 辅助 ----------
 

@@ -64,6 +64,7 @@ for noisy in ("memory", "memory.types", "memory.storage", "memory.manager"):
     logging.getLogger(noisy).setLevel(logging.ERROR)
 
 from agent.cb_agents import CbAgentsLLM
+from constant.llm.constant_llm import ConstantLLM
 from context.builder import ContextBuilder, ContextConfig
 from core.message import Message
 from tools.toolRegistry import ToolRegistry
@@ -110,16 +111,17 @@ class BasicAgent:
         print(f"\n[工具] 已注册 {len(names)} 个: {', '.join(names)}")
 
         # ── 上下文构建器（复用 GSSC 流水线） ──
+        context_max_tokens = ConstantLLM.context_window_tokens(self.llm.model)
         self.builder = ContextBuilder(
             memory_tool=self._memory_tool,
             rag_tool=self._rag_tool,
             config=ContextConfig(
-                max_tokens=8000,
+                max_tokens=context_max_tokens,
                 min_relevance=0.05,
                 history_max_messages=8,
             ),
         )
-        print(f"[上下文] ContextBuilder (GSSC) max_tokens=8000")
+        print(f"[上下文] ContextBuilder (GSSC) max_tokens={context_max_tokens}")
 
         # ── 对话历史 ──
         self.history: List[Message] = []

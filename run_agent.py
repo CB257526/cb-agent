@@ -64,6 +64,7 @@ from agent.executor import ToolExecutor
 from agent.renderers.cli import CLIRenderer
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore, TraceSummarizer
+from constant.llm.constant_llm import ConstantLLM
 from context import ContextBuilder, ContextConfig
 from skills.skill_manager import SkillManager
 from skills.skill_executor import SkillExecutor
@@ -166,11 +167,15 @@ class AgentRunner:
         )
 
         # 4. 上下文构建器
+        # ContextBuilder 的预算也跟随模型配置走。用户在 constant_llm.py 里维护
+        # 各模型 max_tokens，这里只取 80% 作为 agent 可用窗口，剩余部分留给模型
+        # 输出和 provider 侧额外开销；自动 compact 与 TUI Context 指标也使用同一值。
+        context_max_tokens = ConstantLLM.context_window_tokens(self.llm.model)
         builder = ContextBuilder(
             memory_tool=self._memory_tool,
             rag_tool=self._rag_tool,
             config=ContextConfig(
-                max_tokens=8000,
+                max_tokens=context_max_tokens,
                 min_relevance=0.05,
                 # 新增【工作记录】后，一轮带工具的对话通常会产生
                 # user / assistant final / assistant work_record 三条 history。

@@ -40,6 +40,40 @@ historyStore.load();
 let _idCounter = 0;
 const nextId = () => `i${++_idCounter}`;
 
+function formatCompactTokens(tokens: unknown): string {
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) return "0";
+  if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
+  return `${Math.round(tokens)}`;
+}
+
+function describeAutoCompact(ev: AgentEvent): string | null {
+  const payload = (ev as any).auto_compact;
+  if (!payload?.compacted || !Array.isArray(payload.events) || payload.events.length === 0) {
+    return null;
+  }
+
+  // 自动 compact 是后端为了保护下一轮 prompt 做的维护动作，不应该像手动
+  // /compact 一样重绘整段 history。这里仅把审计信息压成一行 system 提示：
+  // 用户能知道“发生过压缩”，当前屏幕上的工具卡片和助手回答则保持原样。
+  const compressedToolMessages = payload.events.reduce((sum: number, item: any) => {
+    return sum + Number(item?.compressed_tool_messages || 0);
+  }, 0);
+  const historyEvents = payload.events.filter((item: any) => {
+    if (!item) return false;
+    if (item.reason && item.reason !== "tool_loop") return true;
+    return !!item.history_compaction;
+  });
+  const context = (ev as any).context_window;
+  const contextText = context
+    ? `Context ${formatCompactTokens(context.used_tokens)}/${formatCompactTokens(context.max_tokens)} ${context.percent ?? 0}%`
+    : "Context 已刷新";
+  const parts: string[] = [];
+  if (compressedToolMessages > 0) parts.push(`压缩 tool 结果 ${compressedToolMessages} 条`);
+  if (historyEvents.length > 0) parts.push(`压缩会话记忆 ${historyEvents.length} 次`);
+  if (parts.length === 0) parts.push("已执行上下文保护");
+  return `已自动压缩上下文：${parts.join("，")}，${contextText}。`;
+}
+
 function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
   return history
     .filter((m) => m.content)
@@ -325,6 +359,10 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           flushNow();
           if ((ev as any).context_window !== undefined) {
             setContextWindow((ev as any).context_window ?? null);
+          }
+          {
+            const notice = describeAutoCompact(ev);
+            if (notice) appendSystem(notice);
           }
           setBusy(false);
           setRound(0);

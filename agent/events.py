@@ -127,6 +127,9 @@ class Done:
     # 当前 active 会话的动态上下文窗口估算。它不是 API usage，而是“下一轮会话
     # state/history 大约占用多少上下文窗口”。TUI 用它刷新底部 Context 指标。
     context_window: Optional[Dict[str, Any]] = None
+    # 自动上下文压缩审计信息。它只描述本轮是否为了保护上下文窗口做过 compact
+    # 或 tool result 摘要替换；不包含完整工具输出，也不会被当成助手回答渲染。
+    auto_compact: Optional[Dict[str, Any]] = None
     timestamp: float = field(default_factory=_now)
     type: str = field(default="done", init=False)
 

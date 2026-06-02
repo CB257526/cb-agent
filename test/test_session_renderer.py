@@ -42,6 +42,7 @@ from agent.renderers.cli import (
 )
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore
+from constant.llm.constant_llm import ConstantLLM
 
 
 # ========== fakes ==========
@@ -135,6 +136,30 @@ class TestAgentSessionBasic(unittest.TestCase):
         self.assertGreater(dones[0].context_window["used_tokens"], 0)
         self.assertEqual(dones[0].context_window["scope"], "state+history")
 
+    def test_context_window_uses_model_config_at_eighty_percent(self):
+        """Context 指标使用 constant_llm.py 里的模型窗口，并取 80% 作为安全预算。"""
+        original = ConstantLLM.llm_dict.get("fake")
+        ConstantLLM.llm_dict["fake"] = {
+            "is_tool": True,
+            "is_reasoning": False,
+            "json_output": True,
+            "max_tokens": 1000,
+            "image_ability": False,
+        }
+        try:
+            llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+            s = self._make_session(llm)
+            s.chat("q")
+            usage = s.context_window_usage()
+            self.assertEqual(usage["model_max_tokens"], 1000)
+            self.assertEqual(usage["max_tokens"], 800)
+            self.assertEqual(usage["threshold_ratio"], 0.8)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
     def test_chat_with_tool_call_runs_two_rounds(self):
         # 第 1 轮：模型让调 file_read；第 2 轮：模型给最终答案
         llm = FakeLLM([
@@ -153,6 +178,64 @@ class TestAgentSessionBasic(unittest.TestCase):
         # 第 2 次 think 的 messages 里应有 tool 消息
         round2_msgs = llm.calls[1]["messages"]
         self.assertTrue(any(m.get("role") == "tool" for m in round2_msgs))
+
+    def test_tool_loop_auto_compresses_large_tool_result_without_breaking_protocol(self):
+        """工具循环接近窗口时只压缩 tool.content，不破坏 role/tool_call_id 协议配对。"""
+        original = ConstantLLM.llm_dict.get("fake")
+        ConstantLLM.llm_dict["fake"] = {
+            "is_tool": True,
+            "is_reasoning": False,
+            "json_output": True,
+            "max_tokens": 700,
+            "image_ability": False,
+        }
+        huge_content = "large-tool-output-" * 300
+        call_id = "call_big_read"
+        try:
+            llm = FakeLLM([
+                {"answer": "", "tool_calls": [_tc("file_read", '{"path":"big.txt"}', call_id=call_id)]},
+                {"answer": "已基于压缩结果继续", "tool_calls": []},
+            ])
+            self.registry.execute_tool = MagicMock(return_value=json.dumps({
+                "path": "big.txt",
+                "mode": "all",
+                "total_lines": 200,
+                "returned_lines": 200,
+                "truncated": False,
+                "content": huge_content,
+            }, ensure_ascii=False))
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+
+            answer = s.chat("读 big.txt")
+
+            self.assertEqual(answer, "已基于压缩结果继续")
+            self.assertEqual(len(llm.calls), 2)
+            round2_msgs = llm.calls[1]["messages"]
+            tool_msgs = [m for m in round2_msgs if m.get("role") == "tool"]
+            self.assertEqual(len(tool_msgs), 1)
+            self.assertEqual(tool_msgs[0].get("tool_call_id"), call_id)
+            self.assertIn("【自动工具结果压缩】", tool_msgs[0].get("content", ""))
+            self.assertNotIn(huge_content, tool_msgs[0].get("content", ""))
+
+            dones = [e for e in self.events if isinstance(e, Done)]
+            self.assertTrue(dones)
+            auto_compact = dones[-1].auto_compact
+            self.assertIsInstance(auto_compact, dict)
+            self.assertTrue(auto_compact["compacted"])
+            self.assertTrue(any(
+                event.get("reason") == "tool_loop"
+                and event.get("compressed_tool_messages", 0) >= 1
+                for event in auto_compact["events"]
+            ))
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
 
     def test_tool_trace_appended_as_work_record_and_seen_next_turn(self):
         long_content = "abcdef" * 40
