@@ -1,7 +1,7 @@
 """消息日志：将每次 LLM 调用的完整 messages 列表写入结构化日志文件。
 
 格式：可读文本，每条消息带时间戳、序号、角色、内容。
-内容超过 4000 字符自动截断，末尾标注原始长度。
+日志文件保留完整内容不截断；截断是未来前端展示层的职责。
 
 使用方式：
     logger = MessageLogger("/path/to/messages.log")
@@ -16,17 +16,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-
-# 每条消息内容最多显示的字符数
-CONTENT_MAX_CHARS = 4000
-
-
-def _truncate(text: str, max_chars: int = CONTENT_MAX_CHARS) -> str:
-    """截断文本，末尾标注原始长度。"""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + f"\n…[截断，共 {len(text)} 字符]"
 
 
 def _flat_content(content: Any) -> str:
@@ -78,7 +67,6 @@ def _tool_calls_text(tool_calls: List[Dict[str, Any]]) -> str:
                 args_str = args_raw
         else:
             args_str = str(args_raw)
-        args_str = _truncate(args_str, 1500)
         lines.append(f"  ── tool_call id={fid} ──\n  {name}({args_str})")
     return "\n".join(lines)
 
@@ -151,10 +139,10 @@ class MessageLogger:
             lines.append("")
             lines.append(tag)
 
-            # 输出文本内容
+            # 输出文本内容（完整保留，不截断）
             text = _flat_content(content)
             if text:
-                lines.append(_truncate(text))
+                lines.append(text)
 
             # assistant 的 tool_calls 详情
             if role == "assistant":
