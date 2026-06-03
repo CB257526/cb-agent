@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import tempfile
@@ -33,6 +34,8 @@ from tools.tools.file_state import get_read_state_registry
 
 # 写入大小硬上限：避免模型一次塞 100MB 文本进 tool_result
 MAX_WRITE_BYTES = 10 * 1024 * 1024  # 10MB
+# diff 最大行数：超出截断，防止 tool_result JSON 膨胀
+MAX_DIFF_LINES = 80
 
 
 class FileWriteTool(Tool):
@@ -185,21 +188,31 @@ class FileWriteTool(Tool):
         # diff 摘要：增/删行数（粗粒度，纯计数不做 patch）
         added, removed = _line_delta(old_content, content)
 
-        return json.dumps(
-            {
-                "ok": True,
-                "type": file_type,
-                "path": str(p),
-                "bytes_written": size,
-                "lines_added": added,
-                "lines_removed": removed,
-                "message": (
-                    f"已创建 {p}" if file_type == "create"
-                    else f"已更新 {p}（+{added}/-{removed} 行）"
-                ),
-            },
-            ensure_ascii=False,
+        # 生成 unified diff，供 TUI 展示变更详情
+        diff_text, diff_truncated, diff_total, diff_shown = _generate_unified_diff(
+            old_content, content, str(p),
         )
+
+        result: Dict[str, Any] = {
+            "ok": True,
+            "type": file_type,
+            "path": str(p),
+            "bytes_written": size,
+            "lines_added": added,
+            "lines_removed": removed,
+            "message": (
+                f"已创建 {p}" if file_type == "create"
+                else f"已更新 {p}（+{added}/-{removed} 行）"
+            ),
+        }
+        # 仅在 diff 非空时附加（无变更时 unified_diff 返回空列表）
+        if diff_text:
+            result["diff"] = diff_text
+            result["diff_truncated"] = diff_truncated
+            result["diff_lines_total"] = diff_total
+            result["diff_lines_shown"] = diff_shown
+
+        return json.dumps(result, ensure_ascii=False)
 
     @staticmethod
     def _safe_read(p: Path) -> Optional[str]:
@@ -249,3 +262,56 @@ def _line_delta(old: Optional[str], new: str) -> tuple[int, int]:
         )
         return (diff_count, diff_count)
     return (added, removed)
+
+
+def _generate_unified_diff(
+    old: Optional[str],
+    new: str,
+    file_path: str,
+    max_lines: int = MAX_DIFF_LINES,
+) -> tuple[str, bool, int, int]:
+    """生成 unified diff，供 TUI 展示文件变更。
+
+    Args:
+        old: 旧文件内容，None 表示新建文件。
+        new: 新文件内容。
+        file_path: 文件路径（用于 diff 头部）。
+        max_lines: 最大行数，超出截断。
+
+    Returns:
+        (diff_text, truncated, total_lines, shown_lines)
+        - diff_text: unified diff 文本
+        - truncated: 是否被截断
+        - total_lines: diff 总行数
+        - shown_lines: 实际显示行数
+    """
+    old_lines: list[str]
+    from_file: str
+    if old is None:
+        # 新建文件：所有行都是新增
+        old_lines = []
+        from_file = "/dev/null"
+    else:
+        old_lines = old.splitlines(keepends=True)
+        from_file = file_path
+
+    new_lines = new.splitlines(keepends=True)
+    to_file = file_path
+
+    diff_gen = difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=from_file,
+        tofile=to_file,
+        lineterm="\n",
+    )
+
+    # 收成单个字符串交给 JSON 传输，前端按 \n split 即可还原逐行结构
+    all_lines = list(diff_gen)
+    total_lines = len(all_lines)
+
+    if total_lines <= max_lines:
+        return "".join(all_lines), False, total_lines, total_lines
+
+    shown = all_lines[:max_lines]
+    return "".join(shown), True, total_lines, max_lines

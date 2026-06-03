@@ -56,6 +56,14 @@ export const ToolBlock = React.memo(function ToolBlock({ item }: { item: ChatIte
   );
   const hasResult = renderResult.length > 0;
 
+  // diff 数据提取与可视化块构建
+  const diffData = useMemo(() => extractDiff(result), [result]);
+  const hasDiff = diffData !== null;
+  const diffBlocks = useMemo(
+    () => (diffData ? buildDiffBlocks(diffData.text).slice(0, DIFF_MAX_BLOCKS) : []),
+    [diffData],
+  );
+
   return (
     <Box flexDirection="column" marginY={0}>
       <Box>
@@ -82,6 +90,73 @@ export const ToolBlock = React.memo(function ToolBlock({ item }: { item: ChatIte
               {resultLines.map((line, i) => (
                 <Text key={i} color={item.toolError ? theme.error : undefined}>{line}</Text>
               ))}
+            </Box>
+          </Box>
+        )}
+        {hasDiff && (
+          <Box flexDirection="row" marginTop={1}>
+            <Box width={5}><Text dimColor>DIFF</Text></Box>
+            <Box flexDirection="column" flexGrow={1}>
+              {diffBlocks.map((block, bi) => (
+                <Box key={bi} flexDirection="column">
+                  {block.kind === "context" && (
+                    block.lines.map((line, li) => (
+                      <Text key={li} dimColor>{line}</Text>
+                    ))
+                  )}
+                  {block.kind === "removal" && (
+                    block.lines.map((line, li) => (
+                      <Text key={li} color={theme.error} backgroundColor="#3d1f28">{line}</Text>
+                    ))
+                  )}
+                  {block.kind === "addition" && (
+                    block.lines.map((line, li) => (
+                      <Text key={li} color={theme.success} backgroundColor="#1a3a2a">{line}</Text>
+                    ))
+                  )}
+                  {block.kind === "modify" && (
+                    block.pairs.map((pair, pi) => (
+                      <Box key={pi} flexDirection="column">
+                        {/* 删除行（红底） */}
+                        {pair.old && (
+                          <Text backgroundColor="#3d1f28">
+                            <Text color={theme.error}>- </Text>
+                            {pair.wordDiff ? (
+                              <>
+                                <Text dimColor>{pair.wordDiff.oldPrefix}</Text>
+                                <Text color={theme.error} bold backgroundColor="#5a2030">{pair.wordDiff.oldChanged}</Text>
+                                <Text dimColor>{pair.wordDiff.oldSuffix}</Text>
+                              </>
+                            ) : (
+                              <Text color={theme.error}>{pair.old.slice(1)}</Text>
+                            )}
+                          </Text>
+                        )}
+                        {/* 新增行（绿底） */}
+                        {pair.new && (
+                          <Text backgroundColor="#1a3a2a">
+                            <Text color={theme.success}>+ </Text>
+                            {pair.wordDiff ? (
+                              <>
+                                <Text dimColor>{pair.wordDiff.newPrefix}</Text>
+                                <Text color={theme.success} bold backgroundColor="#1d4a30">{pair.wordDiff.newChanged}</Text>
+                                <Text dimColor>{pair.wordDiff.newSuffix}</Text>
+                              </>
+                            ) : (
+                              <Text color={theme.success}>{pair.new.slice(1)}</Text>
+                            )}
+                          </Text>
+                        )}
+                      </Box>
+                    ))
+                  )}
+                </Box>
+              ))}
+              {diffData?.truncated && (
+                <Text dimColor>
+                  ... [diff 已截断，显示 {diffData.linesShown}/{diffData.linesTotal} 行]
+                </Text>
+              )}
             </Box>
           </Box>
         )}
@@ -142,11 +217,210 @@ function extractDisplay(s: string): string | null {
   if (!t.startsWith("{")) return null;
   try {
     const obj = JSON.parse(s);
-    if (obj && typeof obj === "object" && typeof obj.__display__ === "string") {
-      return obj.__display__;
+    if (obj && typeof obj === "object") {
+      // BashTool 约定：显式 __display__ 字段
+      if (typeof obj.__display__ === "string") return obj.__display__;
+      // 通用回退：任何工具包含 message 字段时，用作文本预览
+      if (typeof obj.message === "string") return obj.message;
     }
   } catch {
     return null;
   }
   return null;
 }
+
+// ── Diff 解析与可视化渲染 ──
+
+interface DiffData {
+  text: string;
+  truncated: boolean;
+  linesTotal: number;
+  linesShown: number;
+}
+
+/** 从 toolResult JSON 中提取 diff 数据。不是 JSON 或没有 diff 字段时返回 null。 */
+function extractDiff(result: string): DiffData | null {
+  const t = result.trimStart();
+  if (!t.startsWith("{")) return null;
+  try {
+    const obj = JSON.parse(result);
+    if (obj && typeof obj === "object" && typeof obj.diff === "string" && obj.diff.length > 0) {
+      return {
+        text: obj.diff,
+        truncated: !!obj.diff_truncated,
+        linesTotal: typeof obj.diff_lines_total === "number" ? obj.diff_lines_total : 0,
+        linesShown: typeof obj.diff_lines_shown === "number" ? obj.diff_lines_shown : 0,
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+// ── 行级标记 ──
+
+type RawLineType = "header" | "hunk" | "add" | "remove" | "context";
+
+function classifyLine(line: string): RawLineType {
+  if (line.startsWith("--- ") || line.startsWith("+++ ")) return "header";
+  if (line.startsWith("@@")) return "hunk";
+  if (line.startsWith("+")) return "add";
+  if (line.startsWith("-")) return "remove";
+  return "context";
+}
+
+// ── 词级 diff ──
+
+interface LineDiff {
+  oldPrefix: string;
+  oldChanged: string;
+  oldSuffix: string;
+  newPrefix: string;
+  newChanged: string;
+  newSuffix: string;
+}
+
+/** 对一对 "删除/新增" 行做简单的词级差异定位。
+ *
+ *  算法：找最长公共前缀 + 最长公共后缀，中间部分即为变更区域。
+ *  适合大多数单行修改场景（重命名变量、改字符串等）。
+ *  当变更比例超过 60% 时返回 null，由上层按整行替换渲染。 */
+function computeLineDiff(oldLine: string, newLine: string): LineDiff | null {
+  const minLen = Math.min(oldLine.length, newLine.length);
+
+  // 公共前缀
+  let prefixLen = 0;
+  while (prefixLen < minLen && oldLine[prefixLen] === newLine[prefixLen]) {
+    prefixLen++;
+  }
+
+  // 公共后缀（不越入前缀区域）
+  let suffixLen = 0;
+  while (
+    suffixLen < minLen - prefixLen &&
+    oldLine[oldLine.length - 1 - suffixLen] === newLine[newLine.length - 1 - suffixLen]
+  ) {
+    suffixLen++;
+  }
+
+  const oldChanged = oldLine.slice(prefixLen, oldLine.length - suffixLen);
+  const newChanged = newLine.slice(prefixLen, newLine.length - suffixLen);
+
+  // 变更比例 > 60% → 放弃词级高亮，按整行替换渲染
+  const changeRatio = Math.max(oldChanged.length / Math.max(oldLine.length, 1),
+                               newChanged.length / Math.max(newLine.length, 1));
+  if (changeRatio > 0.6) return null;
+
+  return {
+    oldPrefix: oldLine.slice(0, prefixLen),
+    oldChanged,
+    oldSuffix: oldLine.slice(oldLine.length - suffixLen),
+    newPrefix: newLine.slice(0, prefixLen),
+    newChanged,
+    newSuffix: newLine.slice(newLine.length - suffixLen),
+  };
+}
+
+// ── 可视化块（一个块 = 一段上下文 / 一组增删改） ──
+
+type DiffBlock =
+  | { kind: "context"; lines: string[] }
+  | { kind: "removal"; lines: string[] }
+  | { kind: "addition"; lines: string[] }
+  | { kind: "modify"; pairs: { old: string; new: string; wordDiff: LineDiff | null }[] };
+
+/** 把原始 diff 文本转为可视化块列表。
+ *
+ *  处理步骤：
+ *  1. 按行解析 → 去掉 header / hunk 行
+ *  2. 将相邻的 -/+ 行配对为 modify 块
+ *  3. 剩余的 - 行 → removal 块，+ 行 → addition 块
+ *  4. 上下文行合并为一个 context 块
+ */
+function buildDiffBlocks(rawDiff: string): DiffBlock[] {
+  const rawLines = rawDiff.split("\n");
+  const blocks: DiffBlock[] = [];
+
+  // 阶段 1：收集有效行（丢掉 header/hunk），标记类型
+  interface TaggedLine { type: RawLineType; text: string; content: string }
+  const tagged: TaggedLine[] = [];
+  for (const line of rawLines) {
+    const type = classifyLine(line);
+    if (type === "header" || type === "hunk") continue;
+    // 去掉 +/- 前缀，保留原文字用于词级 diff
+    const content = (type === "add" || type === "remove") ? line.slice(1) : line;
+    tagged.push({ type, text: line, content });
+  }
+
+  // 阶段 2：配对 -/+ 行，生成 modify / removal / addition / context 块
+  let i = 0;
+  let ctxBuf: string[] = [];
+
+  function flushCtx() {
+    if (ctxBuf.length > 0) {
+      blocks.push({ kind: "context", lines: ctxBuf.slice() });
+      ctxBuf = [];
+    }
+  }
+
+  while (i < tagged.length) {
+    const cur = tagged[i];
+
+    if (cur.type === "context") {
+      ctxBuf.push(cur.text);
+      i++;
+      continue;
+    }
+
+    // 尝试配对连续的 - 行和 + 行 → modify 块
+    if (cur.type === "remove") {
+      const removals: TaggedLine[] = [];
+      while (i < tagged.length && tagged[i].type === "remove") {
+        removals.push(tagged[i]);
+        i++;
+      }
+      const additions: TaggedLine[] = [];
+      while (i < tagged.length && tagged[i].type === "add") {
+        additions.push(tagged[i]);
+        i++;
+      }
+
+      flushCtx();
+
+      const maxPairs = Math.max(removals.length, additions.length);
+      const pairs: { old: string; new: string; wordDiff: LineDiff | null }[] = [];
+      for (let j = 0; j < maxPairs; j++) {
+        const oldContent = j < removals.length ? removals[j].content : "";
+        const newContent = j < additions.length ? additions[j].content : "";
+        pairs.push({
+          old: j < removals.length ? removals[j].text : "",
+          new: j < additions.length ? additions[j].text : "",
+          wordDiff: (oldContent && newContent) ? computeLineDiff(oldContent, newContent) : null,
+        });
+      }
+      blocks.push({ kind: "modify", pairs });
+      continue;
+    }
+
+    // 孤立的 + 行 → addition 块
+    if (cur.type === "add") {
+      flushCtx();
+      const lines: string[] = [];
+      while (i < tagged.length && tagged[i].type === "add") {
+        lines.push(tagged[i].text);
+        i++;
+      }
+      blocks.push({ kind: "addition", lines });
+      continue;
+    }
+
+    i++;
+  }
+
+  flushCtx();
+  return blocks;
+}
+
+/** 前端 diff 渲染安全截断行数（后端已做截断，此处为兜底）。 */
+const DIFF_MAX_BLOCKS = 40;
