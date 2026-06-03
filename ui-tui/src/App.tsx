@@ -127,17 +127,36 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   // 会抢走回车，用户永远发不出带参数命令。
   const slashActive = input.startsWith("/") && !input.trim().includes(" ") && !busy && !showSessionSwitcher;
 
-  // 流式增量节流：DeepSeek thinking/text 一秒能发几十条 chunk。
+  // ===== 流式增量节流 =====
   //
-  // 核心性能策略（思考文本）：
-  //   之前 → 拼接到同一个 thought item，每次渲染都把全部累积文本重写为 ANSI 序列，
-  //          文本越长 O(n^2) 越重 → 终端 I/O 阻塞事件循环 → CPU 100% → 卡死。
-  //   现在 → 每次 flush 创建新的不可变 thought chunk。旧 chunk 的 text 永不变，
-  //          React.memo 让 Ink 跳过所有旧块的调和/布局/ANSI 输出，只追加新行。
+  // 问题背景：DeepSeek 等模型一秒能发几十条 chunk，每次 setItems → React
+  // 全树重渲 → Ink 写 ANSI 到终端。长时间 streaming 时（如 15s+ 输出），高频
+  // 终端写入造成两个问题：
   //
-  // 节流：累积够 200 字立刻 flush（块不会太碎），否则等 60ms；最长 500ms 强制 flush。
+  //   1. 界面抖动：assistant 文本增长导致下面所有元素（工具卡片、状态栏）持续
+  //      向下位移，Ink 每秒移动 16 次光标 → 画面不稳定。
+  //   2. 滚轮失灵：鼠标向上滚动浏览历史时，Ink 的 ANSI 输出干扰终端 scrollback
+  //      buffer → 终端跳回顶部。
+  //
+  // 策略：自适应节流。同一个 busy 周期内 flush 次数越多 → 间隔越长。
+  //   前 5 次：60ms（首次响应快）
+  //   5-30 次：60→200ms 线性递增
+  //   30 次后：200ms 稳定（约 6s 后达到，此时输出趋于稳定，抖动/滚轮问题消失）
+  //
+  // 边界事件（tool_start/done/error/cancelled）走 flushNow，不受限。
+
   const FLUSH_CHAR_THRESHOLD = 200;
   const FLUSH_MAX_MS = 500;
+
+  /** 自适应 flush 间隔：flush 次数越多 → 间隔越长（60→200ms） */
+  function adaptiveDelay(): number {
+    const n = _flushCount.current;
+    if (n <= 5) return 60;
+    if (n <= 30) return 60 + Math.round(((n - 5) / 25) * 140);  // 60→200 线性
+    return 200;
+  }
+
+  const _flushCount = useRef(0);
   const _pendingDelta = useRef<{ reasoning: string; text: string; firstAt: number }>({ reasoning: "", text: "", firstAt: 0 });
   const _flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // MCP 后台加载会按 server 状态变化发事件。这里只记录上一次展示文本，
@@ -150,6 +169,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     const t = _pendingDelta.current.text;
     _pendingDelta.current = { reasoning: "", text: "", firstAt: 0 };
     if (!r && !t) return;
+    _flushCount.current += 1;
     setItems((prev) => {
       let next = prev;
       if (r) {
@@ -158,7 +178,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         next = [...next, { id: nextId(), role: "thought", text: r }];
       }
       if (t) {
-        // 助手文本：保持追加行为（文本较短，不会有 O(n^2) 问题）
+        // 助手文本：保持追加行为。流式阶段跳过 Markdown 解析，
+        // 只做纯文本追加，render 开销已大幅降低。
         const last = next[next.length - 1];
         if (last && last.role === "assistant") {
           next = [...next.slice(0, -1), { ...last, text: last.text + t }];
@@ -178,14 +199,14 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     const len = pending.reasoning.length + pending.text.length;
     const elapsed = Date.now() - pending.firstAt;
 
-    // 内容够多 → 立即 flush；超时 → 强制 flush；否则等到 60ms
+    // 内容够多 → 立即 flush；超时 → 强制 flush；否则按自适应延迟
     let delay: number;
     if (len >= FLUSH_CHAR_THRESHOLD) {
       delay = 0;
     } else if (elapsed >= FLUSH_MAX_MS) {
       delay = 0;
     } else {
-      delay = 60;
+      delay = adaptiveDelay();
     }
 
     if (delay === 0) {
@@ -204,6 +225,11 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     flushDelta();
   }, [flushDelta]);
 
+  /** 重置节流计数器：每个新 busy 周期从 60ms 开始 */
+  const resetFlushRhythm = useCallback(() => {
+    _flushCount.current = 0;
+  }, []);
+
   const appendSystem = useCallback((text: string) => {
     setItems((prev) => [...prev, { id: nextId(), role: "system", text }]);
   }, []);
@@ -221,6 +247,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
   const applySessionPayload = useCallback((payload: SessionPayload, notice?: string) => {
     flushNow();
+    resetFlushRhythm();
     setCurrentSession(payload.session ?? null);
     if (payload.context_window !== undefined) {
       setContextWindow(payload.context_window ?? null);
@@ -233,7 +260,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     setRound(0);
     setBusy(false);
     setActiveQuestionId(null);
-  }, [flushNow]);
+  }, [flushNow, resetFlushRhythm]);
 
   const refreshSessions = useCallback(async () => {
     setSessionsLoading(true);
@@ -294,6 +321,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     const onEvent = (ev: AgentEvent) => {
       switch (ev.type) {
         case "gateway_ready":
+          resetFlushRhythm();
           setModel((ev as any).model ?? "unknown");
           setCurrentSession((ev as any).session ?? null);
           if ((ev as any).context_window !== undefined) {
@@ -394,6 +422,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
         case "done":
           flushNow();
+          resetFlushRhythm();
           if ((ev as any).context_window !== undefined) {
             setContextWindow((ev as any).context_window ?? null);
           }
@@ -407,12 +436,14 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
         case "error":
           flushNow();
+          resetFlushRhythm();
           appendSystem(`✗ ${(ev as any).where}: ${(ev as any).message}`);
           setBusy(false);
           break;
 
         case "cancelled":
           flushNow();
+          resetFlushRhythm();
           appendSystem(`⏸ 已中断 (${(ev as any).where})`);
           setBusy(false);
           break;
@@ -496,7 +527,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         _flushTimer.current = null;
       }
     };
-  }, [transport, exit, appendSystem, flushNow, scheduleFlush]);
+  }, [transport, exit, appendSystem, flushNow, scheduleFlush, resetFlushRhythm]);
 
   // 键盘事件：Ctrl-C 在 busy 时中断/空闲时退出；Ctrl-O 切换后端日志面板
   useInput((inputChar, key) => {
