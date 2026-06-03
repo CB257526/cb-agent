@@ -10,6 +10,9 @@ import { theme } from "../theme.js";
 
 interface Props {
   items: ChatItem[];
+  /** agent 是否正在工作中。为 true 时，当前 assistant 文本仍在流式接收，
+   *  跳过 Markdown 解析直接用纯文本渲染，避免 O(n^2) 解析开销。 */
+  busy?: boolean;
   /** 当一个 ask_question item 处于 pending（未作答）时调用。已作答时 App 不传 onAnswer。 */
   onAnswerQuestion?: (
     questionId: string,
@@ -24,8 +27,17 @@ interface Props {
  *  性能要点：连续 thought item 合并为一个视觉块 —— 只有第一个显示
  *  "💭 thinking" 头部，后续的只显示纯文本。每个 thought chunk 是不可变的
  *  （App.tsx 每次 flush 创建新 chunk，从不修改旧 chunk），所以 React.memo
- *  让 Ink 跳过所有旧块的调和/布局/ANSI 输出，只追加新行到终端。 */
-export function EventStream({ items, onAnswerQuestion, activeQuestionId }: Props) {
+ *  让 Ink 跳过所有旧块的调和/布局/ANSI 输出，只追加新行到终端。
+ *
+ *  流式输出阶段：当前 assistant 文本还在不断增长时，跳过 Markdown 解析，
+ *  直接用纯 Text 渲染 —— 否则每次 flush 都要 parseBlocks 解析全文，O(n^2)。
+ *  done 事件后 busy 变 false，自动切回 Markdown 渲染。 */
+export function EventStream({ items, busy, onAnswerQuestion, activeQuestionId }: Props) {
+  // 找到当前正在流式增长的 assistant item 索引（done 后 busy=false，所有项都用 Markdown）
+  const streamingIdx = busy
+    ? (() => { for (let i = items.length - 1; i >= 0; i--) { if (items[i].role === "assistant") return i; } return -1; })()
+    : -1;
+
   return (
     <Box flexDirection="column">
       {items.map((it, i) => {
@@ -41,7 +53,7 @@ export function EventStream({ items, onAnswerQuestion, activeQuestionId }: Props
         }
         return (
           <Box key={it.id} marginBottom={1}>
-            {renderItem(it, onAnswerQuestion, activeQuestionId)}
+            {renderItem(it, onAnswerQuestion, activeQuestionId, i === streamingIdx)}
           </Box>
         );
       })}
@@ -72,6 +84,7 @@ function renderItem(
   item: ChatItem,
   onAnswerQuestion?: Props["onAnswerQuestion"],
   activeQuestionId?: string | null,
+  streaming?: boolean,
 ): React.ReactElement {
   if (item.role === "user") {
     // 用 Pane 给 user 消息加一条蓝色顶 Divider
@@ -85,12 +98,18 @@ function renderItem(
     );
   }
   if (item.role === "assistant") {
+    // 流式接收中：纯文本渲染，跳过 Markdown 解析（O(n^2) → O(1)）
+    // done 后 busy=false → streaming=false → 切回 Markdown
     return (
       <Box flexDirection="column" paddingLeft={2}>
         <Box>
           <Text color={theme.agent} bold>cbagent  </Text>
         </Box>
-        <Markdown text={item.text} />
+        {streaming ? (
+          <Text>{item.text}</Text>
+        ) : (
+          <Markdown text={item.text} />
+        )}
       </Box>
     );
   }

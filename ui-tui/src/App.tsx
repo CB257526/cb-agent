@@ -584,6 +584,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
       <EventStream
         items={items}
+        busy={busy}
         onAnswerQuestion={handleAnswerQuestion}
         activeQuestionId={activeQuestionId}
       />
