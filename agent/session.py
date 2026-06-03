@@ -1227,27 +1227,19 @@ class AgentSession:
         return "\n".join(lines) + "\n\n" + user_query
 
     def _build_system_instructions(self) -> str:
-        """组装 system prompt：角色 + 工具清单 + Bash prompt + Skill 概览。
+        """组装 system prompt：角色 + 工具发现指引 + Bash prompt + Skill 概览。
 
-        从 ToolRegistry 动态拉工具描述，避免和实际注册脱节。
+        不在 system prompt 里内联全部工具描述了（工具多时占用大量 token）。
+        模型应通过调用 list_tools 工具来动态获取可用能力列表。
         """
+        total = len(self.registry.list_tools())
         parts = [
-            "你是 cb-agent 的智能助手。下面列出当前可用的能力，按需调用：",
-            "遇到复杂的问题是请务必调用todo工具",
-            "",
-        ]
-
-        tools_desc = self.registry.get_tools_description()
-        if tools_desc and tools_desc != "暂无可用工具":
-            parts.append(tools_desc)
-        else:
-            parts.append("（当前没有已注册的工具）")
-
-        parts.extend([
+            "你是 cb-agent 的智能助手。",
+            "遇到复杂问题时请务必调用 todo 工具分解任务。",
             "",
             "调用工具时选最直接的那个，避免连续多轮无意义调用。",
             "回答用中文，简明扼要。",
-        ])
+        ]
 
         if self.bash_prompt_provider is not None:
             try:

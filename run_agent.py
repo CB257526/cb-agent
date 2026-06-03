@@ -83,6 +83,7 @@ from tools.tools.bash_permission_tool import BashPermissionTool
 from tools.tools.file_read_tool import FileReadTool
 from tools.tools.file_write_tool import FileWriteTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
+from tools.tools.list_tools_tool import ListToolsTool
 
 try:
     from tools.mcp_tools.mcptools_add import load_mcp_server_configs
@@ -314,6 +315,7 @@ class AgentRunner:
 
         tools.extend([
             TodoTool(event_bus=self.event_bus),
+            ListToolsTool(),
             SearchTool(),
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),
