@@ -64,6 +64,7 @@ from agent.event_bus import EventBus
 from agent.events import Done, MCPStatus
 from agent.executor import ToolExecutor
 from agent.renderers.cli import CLIRenderer
+from agent.message_logger import MessageLogger
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore, TraceSummarizer
 from constant.llm.constant_llm import ConstantLLM
@@ -202,6 +203,12 @@ class AgentRunner:
         # 它不会走主回答的 llm.think 流式路径，因此不会向 UI 误发 text_delta。
         trace_summarizer = TraceSummarizer(self.llm)
 
+        # 消息日志：将所有发送给 LLM 的消息全文记录到独立文件，
+        # 包含 system/user/assistant/tool 全部角色的消息内容
+        message_logger = MessageLogger(
+            Path(_HERE) / ".cbagent" / "logs" / f"messages-{int(time.time())}.log"
+        )
+
         # 5. 会话核心（纯逻辑）
         self.session = AgentSession(
             llm=self.llm,
@@ -215,6 +222,7 @@ class AgentRunner:
             messages_snapshot_hook=self._on_messages_snapshot,
             session_store=session_store,
             trace_summarizer=trace_summarizer,
+            message_logger=message_logger,
         )
         # Gateway 只持有 AgentSession，不直接知道 AgentRunner。这里把 MCP 运行态
         # 以“可选回调”的形式挂到 session 上：旧代码不需要感知这些属性；JSON-RPC

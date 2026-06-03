@@ -38,6 +38,7 @@ from agent.events import (
     BackgroundNotification, Cancelled, Done, Error, RoundEnd, RoundStart,
 )
 from agent.executor import ToolExecutor
+from agent.message_logger import MessageLogger
 from agent.question_registry import QuestionRegistry
 from constant.llm.constant_llm import ConstantLLM
 from context import ContextBuilder, ContextPacket, ContextPriority
@@ -178,12 +179,15 @@ class AgentSession:
         messages_snapshot_hook=None,
         session_store: Optional[LocalSessionStore] = None,
         trace_summarizer: Optional[TraceSummarizer] = None,
+        message_logger: Optional[MessageLogger] = None,
     ) -> None:
         """
         Args:
             messages_snapshot_hook: 可选回调 (messages, round_idx) -> None，
                 每轮 think 前调用一次。给 CLI dump 调试用，不属于事件流（事件
                 是结构化的；dump 是面向开发者的"看原始上下文"调试通道）。
+            message_logger: 可选消息日志记录器。非 None 时，在每次 LLM 调用前后
+                将完整 messages 列表写入独立日志文件，包含所有 role 的消息全文。
         """
         self.llm = llm
         self.registry = registry
@@ -197,6 +201,7 @@ class AgentSession:
         self.messages_snapshot_hook = messages_snapshot_hook
         self.session_store = session_store
         self.trace_summarizer = trace_summarizer
+        self.message_logger = message_logger
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
         if self.session_store is not None:
@@ -462,6 +467,16 @@ class AgentSession:
                 user_query=user_query,
                 system_instructions=system_instructions,
             )
+
+        # 记录本轮初始消息（含 system/user/history）
+        if self.message_logger is not None:
+            try:
+                self.message_logger.log(
+                    messages,
+                    label=f"会话开始 | query=\"{user_query[:100]}\"",
+                )
+            except Exception:
+                logger.exception("message_logger 写入失败")
 
         rounds_used, final_answer, trace_collector, loop_compactions = self._tool_loop(
             messages, tools_schema, token,
@@ -826,6 +841,15 @@ class AgentSession:
                     self.messages_snapshot_hook(messages, round_idx)
                 except Exception:
                     logger.exception("messages_snapshot_hook 抛异常，已吞")
+
+            if self.message_logger is not None:
+                try:
+                    self.message_logger.log(
+                        messages,
+                        label=f"第 {round_idx} 轮 think 前",
+                    )
+                except Exception:
+                    logger.exception("message_logger 写入失败")
 
             result = self.llm.think(
                 messages,
