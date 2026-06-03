@@ -121,6 +121,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   // 当前等待用户作答的问题 id：决定 EventStream 把输入路由给哪个 panel；
   // 同时 PromptInput 在问答期 disabled，避免误打字提交 prompt
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
+  // 是否展开全部历史消息（Ctrl+E 切换）。默认折叠（只显示最近 50 条）防抖动。
+  const [showAllMessages, setShowAllMessages] = useState(false);
 
   // / 命令面板：只在输入"纯命令名前缀"时显示。带参数的命令（如
   // /switch <session_id>）需要让 Enter 直接提交给 handleSubmit，否则 picker
@@ -540,6 +542,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       }
     } else if (key.ctrl && inputChar === "o") {
       setShowActivity((v) => !v);
+    } else if (key.ctrl && inputChar === "e") {
+      // Ctrl+E：展开/折叠历史消息。busy 期间强制折叠防抖动。
+      setShowAllMessages((v) => !v);
     } else if (key.ctrl && inputChar === "l") {
       // 仿 bash：清当前屏幕显示，但保留 React items 和后端 history
       // 不清 items 的话，scrollback 会重新长出来；这里直接清 items 拿到"干净屏"
@@ -616,6 +621,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       <EventStream
         items={items}
         busy={busy}
+        showAll={showAllMessages}
         onAnswerQuestion={handleAnswerQuestion}
         activeQuestionId={activeQuestionId}
       />

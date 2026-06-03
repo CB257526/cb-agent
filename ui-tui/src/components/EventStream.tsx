@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useMemo } from "react";
 import { Box, Text } from "ink";
 import { ChatItem } from "../types.js";
 import { ToolBlock } from "./ToolBlock.js";
@@ -8,11 +8,17 @@ import { TodoPanel } from "./TodoPanel.js";
 import { Markdown } from "./Markdown.js";
 import { theme } from "../theme.js";
 
+/** 最多渲染的消息条数。超出时旧消息折叠，避免 React 全量调和导致终端抖动。 */
+const MAX_VISIBLE = 50;
+
 interface Props {
   items: ChatItem[];
   /** agent 是否正在工作中。为 true 时，当前 assistant 文本仍在流式接收，
-   *  跳过 Markdown 解析直接用纯文本渲染，避免 O(n^2) 解析开销。 */
+   *  跳过 Markdown 解析直接用纯文本渲染，避免 O(n^2) 解析开销。
+   *  同时强制折叠历史消息（无视 showAll），防止抖动。 */
   busy?: boolean;
+  /** 用户是否主动展开全部历史消息（Ctrl+E 切换）。busy 期间被忽略。 */
+  showAll?: boolean;
   /** 当一个 ask_question item 处于 pending（未作答）时调用。已作答时 App 不传 onAnswer。 */
   onAnswerQuestion?: (
     questionId: string,
@@ -24,27 +30,51 @@ interface Props {
 
 /** 主对话流：把 ChatItem 列表按角色渲染。
  *
- *  性能要点：连续 thought item 合并为一个视觉块 —— 只有第一个显示
- *  "💭 thinking" 头部，后续的只显示纯文本。每个 thought chunk 是不可变的
- *  （App.tsx 每次 flush 创建新 chunk，从不修改旧 chunk），所以 React.memo
- *  让 Ink 跳过所有旧块的调和/布局/ANSI 输出，只追加新行到终端。
- *
- *  流式输出阶段：当前 assistant 文本还在不断增长时，跳过 Markdown 解析，
- *  直接用纯 Text 渲染 —— 否则每次 flush 都要 parseBlocks 解析全文，O(n^2)。
- *  done 事件后 busy 变 false，自动切回 Markdown 渲染。 */
-export function EventStream({ items, busy, onAnswerQuestion, activeQuestionId }: Props) {
-  // 找到当前正在流式增长的 assistant item 索引（done 后 busy=false，所有项都用 Markdown）
+ *  性能要点：
+ *  1. 窗口渲染：只显示最近 MAX_VISIBLE 条，旧消息折叠为一行动态提示。
+ *     避免 items 积累后每次 setItems 触发全量 React 调和 → Ink ANSI 重写 → 终端抖动。
+ *  2. 连续 thought item 合并为一个视觉块 —— 只有第一个显示 "💭 thinking" 头部。
+ *  3. 流式输出阶段：当前 assistant 文本还在不断增长时，跳过 Markdown 解析，
+ *     直接用纯 Text 渲染 —— 否则每次 flush 都要 parseBlocks 解析全文，O(n^2)。
+ *     done 事件后 busy 变 false，自动切回 Markdown 渲染。 */
+export function EventStream({ items, busy, showAll, onAnswerQuestion, activeQuestionId }: Props) {
+  // busy 期间强制折叠防抖动；空闲时尊重用户 Ctrl+E 选择
+  const effectiveShowAll = !busy && showAll;
+
+  // 窗口：只渲染尾部最多 MAX_VISIBLE 条
+  const { visibleItems, hiddenCount } = useMemo(() => {
+    if (effectiveShowAll || items.length <= MAX_VISIBLE) {
+      return { visibleItems: items, hiddenCount: 0 };
+    }
+    return {
+      visibleItems: items.slice(items.length - MAX_VISIBLE),
+      hiddenCount: items.length - MAX_VISIBLE,
+    };
+  }, [items, effectiveShowAll]);
+
+  // 找到当前正在流式增长的 assistant item 在 visibleItems 中的索引
   const streamingIdx = busy
-    ? (() => { for (let i = items.length - 1; i >= 0; i--) { if (items[i].role === "assistant") return i; } return -1; })()
+    ? (() => {
+        for (let i = visibleItems.length - 1; i >= 0; i--) {
+          if (visibleItems[i].role === "assistant") return i;
+        }
+        return -1;
+      })()
     : -1;
 
   return (
     <Box flexDirection="column">
-      {items.map((it, i) => {
+      {hiddenCount > 0 && (
+        <Box marginBottom={1}>
+          <Text dimColor>
+            ... 以上 {hiddenCount} 条消息已折叠（Ctrl+E 展开 / 再按折叠）
+          </Text>
+        </Box>
+      )}
+      {visibleItems.map((it, i) => {
         if (it.role === "thought") {
-          const prevWasThought = i > 0 && items[i - 1].role === "thought";
-          const nextIsThought = i + 1 < items.length && items[i + 1].role === "thought";
-          // 连续的 thought chunk：头部只在第一块显示，间距只在最后一块加
+          const prevWasThought = i > 0 && visibleItems[i - 1].role === "thought";
+          const nextIsThought = i + 1 < visibleItems.length && visibleItems[i + 1].role === "thought";
           return (
             <Box key={it.id} marginBottom={nextIsThought ? 0 : 1}>
               <ThoughtChunk text={it.text} showHeader={!prevWasThought} />
