@@ -19,18 +19,54 @@ interface Props {
   activeQuestionId?: string | null;
 }
 
-/** 主对话流：把 ChatItem 列表按角色渲染。 */
+/** 主对话流：把 ChatItem 列表按角色渲染。
+ *
+ *  性能要点：连续 thought item 合并为一个视觉块 —— 只有第一个显示
+ *  "💭 thinking" 头部，后续的只显示纯文本。每个 thought chunk 是不可变的
+ *  （App.tsx 每次 flush 创建新 chunk，从不修改旧 chunk），所以 React.memo
+ *  让 Ink 跳过所有旧块的调和/布局/ANSI 输出，只追加新行到终端。 */
 export function EventStream({ items, onAnswerQuestion, activeQuestionId }: Props) {
   return (
     <Box flexDirection="column">
-      {items.map((it) => (
-        <Box key={it.id} marginBottom={1}>
-          {renderItem(it, onAnswerQuestion, activeQuestionId)}
-        </Box>
-      ))}
+      {items.map((it, i) => {
+        if (it.role === "thought") {
+          const prevWasThought = i > 0 && items[i - 1].role === "thought";
+          const nextIsThought = i + 1 < items.length && items[i + 1].role === "thought";
+          // 连续的 thought chunk：头部只在第一块显示，间距只在最后一块加
+          return (
+            <Box key={it.id} marginBottom={nextIsThought ? 0 : 1}>
+              <ThoughtChunk text={it.text} showHeader={!prevWasThought} />
+            </Box>
+          );
+        }
+        return (
+          <Box key={it.id} marginBottom={1}>
+            {renderItem(it, onAnswerQuestion, activeQuestionId)}
+          </Box>
+        );
+      })}
     </Box>
   );
 }
+
+/**
+ * 单个思考文本块。text 在创建后永不修改（App.tsx 每次 flush 创建新 chunk），
+ * React.memo 保证旧块永远不重渲染 —— Ink 只需往终端追加新行，零擦写开销。
+ */
+const ThoughtChunk = React.memo(function ThoughtChunk({ text, showHeader }: { text: string; showHeader: boolean }) {
+  return (
+    <Box flexDirection="column" paddingLeft={2}>
+      {showHeader && (
+        <Box>
+          <Text dimColor italic>💭 thinking</Text>
+        </Box>
+      )}
+      <Box>
+        <Text dimColor>{text}</Text>
+      </Box>
+    </Box>
+  );
+});
 
 function renderItem(
   item: ChatItem,
@@ -63,19 +99,6 @@ function renderItem(
   }
   if (item.role === "todo") {
     return <TodoPanel items={item.todoItems ?? []} />;
-  }
-  if (item.role === "thought") {
-    // dim 灰显的"思考流"块；折叠机制简单——长度过长会自然换行，前端不主动截
-    return (
-      <Box flexDirection="column" paddingLeft={2}>
-        <Box>
-          <Text dimColor italic>💭 thinking</Text>
-        </Box>
-        <Box>
-          <Text dimColor>{item.text}</Text>
-        </Box>
-      </Box>
-    );
   }
   if (item.role === "ask_question") {
     // 仅给当前 active 的问题接 onAnswer；其他（已答 / 旧的）传 undefined → 转纯展示

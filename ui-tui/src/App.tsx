@@ -54,7 +54,7 @@ function describeAutoCompact(ev: AgentEvent): string | null {
 
   // 自动 compact 是后端为了保护下一轮 prompt 做的维护动作，不应该像手动
   // /compact 一样重绘整段 history。这里仅把审计信息压成一行 system 提示：
-  // 用户能知道“发生过压缩”，当前屏幕上的工具卡片和助手回答则保持原样。
+  // 用户能知道"发生过压缩"，当前屏幕上的工具卡片和助手回答则保持原样。
   const compressedToolMessages = payload.events.reduce((sum: number, item: any) => {
     return sum + Number(item?.compressed_tool_messages || 0);
   }, 0);
@@ -127,10 +127,18 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   // 会抢走回车，用户永远发不出带参数命令。
   const slashActive = input.startsWith("/") && !input.trim().includes(" ") && !busy && !showSessionSwitcher;
 
-  // 流式增量节流：DeepSeek thinking/text 一秒能发几十条 chunk，每条都 setItems
-  // 会导致 ink 整树重渲 + stdout ANSI 全屏重画 → 事件循环压不过来 → stdin pipe
-  // 反压回 Python，整条链路就卡住。把高频 delta 累积到 ref，每 ~60ms flush 一次。
-  const _pendingDelta = useRef<{ reasoning: string; text: string }>({ reasoning: "", text: "" });
+  // 流式增量节流：DeepSeek thinking/text 一秒能发几十条 chunk。
+  //
+  // 核心性能策略（思考文本）：
+  //   之前 → 拼接到同一个 thought item，每次渲染都把全部累积文本重写为 ANSI 序列，
+  //          文本越长 O(n^2) 越重 → 终端 I/O 阻塞事件循环 → CPU 100% → 卡死。
+  //   现在 → 每次 flush 创建新的不可变 thought chunk。旧 chunk 的 text 永不变，
+  //          React.memo 让 Ink 跳过所有旧块的调和/布局/ANSI 输出，只追加新行。
+  //
+  // 节流：累积够 200 字立刻 flush（块不会太碎），否则等 60ms；最长 500ms 强制 flush。
+  const FLUSH_CHAR_THRESHOLD = 200;
+  const FLUSH_MAX_MS = 500;
+  const _pendingDelta = useRef<{ reasoning: string; text: string; firstAt: number }>({ reasoning: "", text: "", firstAt: 0 });
   const _flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // MCP 后台加载会按 server 状态变化发事件。这里只记录上一次展示文本，
   // 防止同一快照重复追加 system 行，保持对话流安静。
@@ -140,19 +148,17 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     _flushTimer.current = null;
     const r = _pendingDelta.current.reasoning;
     const t = _pendingDelta.current.text;
-    _pendingDelta.current = { reasoning: "", text: "" };
+    _pendingDelta.current = { reasoning: "", text: "", firstAt: 0 };
     if (!r && !t) return;
     setItems((prev) => {
       let next = prev;
       if (r) {
-        const last = next[next.length - 1];
-        if (last && last.role === "thought") {
-          next = [...next.slice(0, -1), { ...last, text: last.text + r }];
-        } else {
-          next = [...next, { id: nextId(), role: "thought", text: r }];
-        }
+        // 思考内容：创建新的不可变 chunk，永不修改。
+        // 旧 chunk 保持原样 → React.memo 让 Ink 跳过重绘。
+        next = [...next, { id: nextId(), role: "thought", text: r }];
       }
       if (t) {
+        // 助手文本：保持追加行为（文本较短，不会有 O(n^2) 问题）
         const last = next[next.length - 1];
         if (last && last.role === "assistant") {
           next = [...next.slice(0, -1), { ...last, text: last.text + t }];
@@ -166,7 +172,27 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
   const scheduleFlush = useCallback(() => {
     if (_flushTimer.current !== null) return;
-    _flushTimer.current = setTimeout(flushDelta, 60);
+    const pending = _pendingDelta.current;
+    if (!pending.firstAt) pending.firstAt = Date.now();
+
+    const len = pending.reasoning.length + pending.text.length;
+    const elapsed = Date.now() - pending.firstAt;
+
+    // 内容够多 → 立即 flush；超时 → 强制 flush；否则等到 60ms
+    let delay: number;
+    if (len >= FLUSH_CHAR_THRESHOLD) {
+      delay = 0;
+    } else if (elapsed >= FLUSH_MAX_MS) {
+      delay = 0;
+    } else {
+      delay = 60;
+    }
+
+    if (delay === 0) {
+      flushDelta();
+    } else {
+      _flushTimer.current = setTimeout(flushDelta, delay);
+    }
   }, [flushDelta]);
 
   // 在边界事件（tool_start / done / round_end / ask_user_question 等）前要立即 flush，
@@ -300,8 +326,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
         }
 
         case "reasoning_delta": {
-          // 思考流：增量拼接到最近一个 thought item；遇到非 thought（如 assistant
-          // 文本已经开始 / 工具块插进来）就开新的一块，让 thought 始终独立成段
+          // 思考流：增量累积，flush 时创建独立的不可变 chunk
           const delta = (ev as any).delta as string;
           _pendingDelta.current.reasoning += delta;
           scheduleFlush();
