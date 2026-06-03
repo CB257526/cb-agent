@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 load_dotenv()
 import json
 import os
+import threading
+import asyncio
+import concurrent.futures
 
 # MCP服务器环境变量映射表
 # 用于自动检测常见MCP服务器需要的环境变量
@@ -23,7 +26,7 @@ class MCPTool(Tool):
     """MCP (Model Context Protocol) 工具
 
     连接到 MCP 服务器并调用其提供的工具、资源和提示词。
-    
+
     功能：
     - 列出服务器提供的工具
     - 调用服务器工具
@@ -47,8 +50,13 @@ class MCPTool(Tool):
         >>> tool = MCPTool(server=server)
 
     注意：使用 fastmcp 库，已包含在依赖中
+
+    持久化连接：
+        对于外部 stdio MCP 服务器（如 Playwright），连接在首次 run() 时建立并保持存活，
+        所有后续工具调用复用同一连接/子进程。这保证了有状态服务器（如浏览器会话）
+        在多次工具调用间保持活跃。调用 close() 或进程退出时自动清理。
     """
-    
+
     def __init__(self,
                  name: str = "mcp",
                  description: Optional[str] = None,
@@ -110,6 +118,11 @@ class MCPTool(Tool):
 
         # 环境变量处理（优先级：env > env_keys > 自动检测）
         self.env = self._prepare_env(env, env_keys, server_command)
+
+        # 持久化连接（仅对 stdio 等外部 MCP 服务器生效，内存传输不用）
+        self._persistent_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._persistent_client = None   # MCPClient 实例
+        self._persistent_thread: Optional[threading.Thread] = None
 
         # 如果没有指定任何服务器，创建内置演示服务器
         if not server_command and not server:
@@ -237,10 +250,9 @@ class MCPTool(Tool):
             )
 
     def _discover_tools(self):
-        """发现MCP服务器提供的所有工具"""
+        """发现MCP服务器提供的所有工具（使用临时连接）"""
         try:
             from tools.mcp_tools.client import MCPClient
-            import asyncio
 
             async def discover():
                 client_source = self.server if self.server else self.server_command
@@ -252,7 +264,6 @@ class MCPTool(Tool):
             try:
                 loop = asyncio.get_running_loop()
                 # 如果已有循环，在新线程中运行
-                import concurrent.futures
                 def run_in_thread():
                     new_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(new_loop)
@@ -336,6 +347,255 @@ class MCPTool(Tool):
 
         return expanded_tools
 
+    # ===== 持久化客户端连接 =====
+    #
+    # 问题背景：之前每次 run() 都创建新的 async with MCPClient(...)，
+    # 调用结束后子进程被杀死。对于有状态 MCP 服务器（如 Playwright），
+    # 这意味着浏览器在每次工具调用后被关闭，无法保持会话。
+    #
+    # 解决方案：对外部 stdio MCP 服务器，在独立 daemon 线程中保持持久
+    # 事件循环 + 客户端连接。所有工具调用通过 run_coroutine_threadsafe
+    # 派发到该线程，复用同一子进程/连接。
+
+    def _ensure_client(self):
+        """确保外部 stdio MCP 服务器的持久化客户端已连接。
+
+        内存传输模式（self.server）不走此路径，每次调用仍创建临时客户端。
+        """
+        if self._persistent_client is not None:
+            return
+        # 内存传输模式：不需要持久化
+        if self.server is not None:
+            return
+        # 没有 server_command 也跳过
+        if not self.server_command:
+            return
+
+        from tools.mcp_tools.client import MCPClient
+
+        # 创建独立事件循环并在 daemon 线程中启动
+        self._persistent_loop = asyncio.new_event_loop()
+
+        def run_loop():
+            asyncio.set_event_loop(self._persistent_loop)
+            self._persistent_loop.run_forever()
+
+        self._persistent_thread = threading.Thread(target=run_loop, daemon=True)
+        self._persistent_thread.start()
+
+        # 在持久化循环中连接客户端
+        async def connect():
+            client = MCPClient(self.server_command, self.server_args, env=self.env)
+            await client.__aenter__()
+            return client
+
+        future = asyncio.run_coroutine_threadsafe(connect(), self._persistent_loop)
+        try:
+            self._persistent_client = future.result(timeout=30)
+        except Exception as e:
+            # 连接失败时清理
+            self._persistent_loop.call_soon_threadsafe(self._persistent_loop.stop)
+            self._persistent_thread.join(timeout=5)
+            self._persistent_loop.close()
+            self._persistent_loop = None
+            self._persistent_thread = None
+            raise RuntimeError(f"MCP 持久化连接失败: {e}")
+
+    def close(self):
+        """关闭持久化 MCP 客户端连接和子进程。
+
+        应在 agent session 结束时调用，释放 Playwright 浏览器等资源。
+        幂等：多次调用安全。
+        """
+        if self._persistent_client is None:
+            return
+
+        async def disconnect():
+            try:
+                await self._persistent_client.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(disconnect(), self._persistent_loop)
+            future.result(timeout=10)
+        except Exception:
+            pass
+
+        if self._persistent_loop is not None:
+            self._persistent_loop.call_soon_threadsafe(self._persistent_loop.stop)
+
+        if self._persistent_thread is not None:
+            self._persistent_thread.join(timeout=5)
+
+        if self._persistent_loop is not None:
+            try:
+                self._persistent_loop.close()
+            except Exception:
+                pass
+
+        self._persistent_client = None
+        self._persistent_loop = None
+        self._persistent_thread = None
+
+    def __del__(self):
+        """析构时自动清理持久化连接。"""
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _run_via_persistent_client(self, action: str, parameters: Dict[str, Any]) -> str:
+        """通过持久化客户端执行 MCP 操作。"""
+        async def run_op():
+            if action == "list_tools":
+                tools = await self._persistent_client.list_tools()
+                if not tools:
+                    return "没有找到可用的工具"
+                result = f"找到 {len(tools)} 个工具:\n"
+                for tool in tools:
+                    result += f"- {tool['name']}: {tool['description']}\n"
+                return result
+
+            elif action == "call_tool":
+                tool_name = parameters.get("tool_name")
+                arguments = parameters.get("arguments", {})
+                if not tool_name:
+                    return "错误：必须指定 tool_name 参数"
+                result = await self._persistent_client.call_tool(tool_name, arguments)
+                return f"工具 '{tool_name}' 执行结果:\n{result}"
+
+            elif action == "list_resources":
+                resources = await self._persistent_client.list_resources()
+                if not resources:
+                    return "没有找到可用的资源"
+                result = f"找到 {len(resources)} 个资源:\n"
+                for resource in resources:
+                    result += f"- {resource['uri']}: {resource['name']}\n"
+                return result
+
+            elif action == "read_resource":
+                uri = parameters.get("uri")
+                if not uri:
+                    return "错误：必须指定 uri 参数"
+                content = await self._persistent_client.read_resource(uri)
+                return f"资源 '{uri}' 内容:\n{content}"
+
+            elif action == "list_prompts":
+                prompts = await self._persistent_client.list_prompts()
+                if not prompts:
+                    return "没有找到可用的提示词"
+                result = f"找到 {len(prompts)} 个提示词:\n"
+                for prompt in prompts:
+                    result += f"- {prompt['name']}: {prompt['description']}\n"
+                return result
+
+            elif action == "get_prompt":
+                prompt_name = parameters.get("prompt_name")
+                prompt_arguments = parameters.get("prompt_arguments", {})
+                if not prompt_name:
+                    return "错误：必须指定 prompt_name 参数"
+                messages = await self._persistent_client.get_prompt(prompt_name, prompt_arguments)
+                result = f"提示词 '{prompt_name}':\n"
+                for msg in messages:
+                    result += f"[{msg['role']}] {msg['content']}\n"
+                return result
+
+            else:
+                return f"错误：不支持的操作 '{action}'"
+
+        future = asyncio.run_coroutine_threadsafe(run_op(), self._persistent_loop)
+        return future.result()
+
+    def _run_via_temp_client(self, action: str, parameters: Dict[str, Any]) -> str:
+        """通过临时客户端执行 MCP 操作（内存传输或首次调用的回退路径）。"""
+        from tools.mcp_tools.client import MCPClient
+
+        async def run_mcp_operation():
+            if self.server:
+                client_source = self.server
+            else:
+                client_source = self.server_command
+
+            async with MCPClient(client_source, self.server_args, env=self.env) as client:
+                if action == "list_tools":
+                    tools = await client.list_tools()
+                    if not tools:
+                        return "没有找到可用的工具"
+                    result = f"找到 {len(tools)} 个工具:\n"
+                    for tool in tools:
+                        result += f"- {tool['name']}: {tool['description']}\n"
+                    return result
+
+                elif action == "call_tool":
+                    tool_name = parameters.get("tool_name")
+                    arguments = parameters.get("arguments", {})
+                    if not tool_name:
+                        return "错误：必须指定 tool_name 参数"
+                    result = await client.call_tool(tool_name, arguments)
+                    return f"工具 '{tool_name}' 执行结果:\n{result}"
+
+                elif action == "list_resources":
+                    resources = await client.list_resources()
+                    if not resources:
+                        return "没有找到可用的资源"
+                    result = f"找到 {len(resources)} 个资源:\n"
+                    for resource in resources:
+                        result += f"- {resource['uri']}: {resource['name']}\n"
+                    return result
+
+                elif action == "read_resource":
+                    uri = parameters.get("uri")
+                    if not uri:
+                        return "错误：必须指定 uri 参数"
+                    content = await client.read_resource(uri)
+                    return f"资源 '{uri}' 内容:\n{content}"
+
+                elif action == "list_prompts":
+                    prompts = await client.list_prompts()
+                    if not prompts:
+                        return "没有找到可用的提示词"
+                    result = f"找到 {len(prompts)} 个提示词:\n"
+                    for prompt in prompts:
+                        result += f"- {prompt['name']}: {prompt['description']}\n"
+                    return result
+
+                elif action == "get_prompt":
+                    prompt_name = parameters.get("prompt_name")
+                    prompt_arguments = parameters.get("prompt_arguments", {})
+                    if not prompt_name:
+                        return "错误：必须指定 prompt_name 参数"
+                    messages = await client.get_prompt(prompt_name, prompt_arguments)
+                    result = f"提示词 '{prompt_name}':\n"
+                    for msg in messages:
+                        result += f"[{msg['role']}] {msg['content']}\n"
+                    return result
+
+                else:
+                    return f"错误：不支持的操作 '{action}'"
+
+        # 运行异步操作
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+                # 有运行中的循环 → 在新线程中运行
+                def run_in_thread():
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        return new_loop.run_until_complete(run_mcp_operation())
+                    finally:
+                        new_loop.close()
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(run_in_thread)
+                    return future.result()
+            except RuntimeError:
+                # 没有运行中的循环 → 直接运行
+                return asyncio.run(run_mcp_operation())
+        except Exception as e:
+            return f"异步操作失败: {str(e)}"
+
     def run(self, parameters: Dict[str, Any]) -> str:
         """
         执行 MCP 操作
@@ -353,8 +613,6 @@ class MCPTool(Tool):
         Returns:
             操作结果
         """
-        from tools.mcp_tools.client import MCPClient
-
         # 智能推断action：如果没有action但有tool_name，自动设置为call_tool
         action = parameters.get("action", "").lower()
         if not action and "tool_name" in parameters:
@@ -363,108 +621,20 @@ class MCPTool(Tool):
 
         if not action:
             return "错误：必须指定 action 参数或 tool_name 参数"
-        
+
         try:
-            # 使用增强的异步客户端
-            import asyncio
-            from tools.mcp_tools.client import MCPClient
+            # 外部 MCP 服务器：使用持久化连接（保持子进程/浏览器存活）
+            if self.server_command and not self.server:
+                self._ensure_client()
+                if self._persistent_client is not None:
+                    return self._run_via_persistent_client(action, parameters)
 
-            async def run_mcp_operation():
-                # 根据配置选择客户端创建方式
-                if self.server:
-                    # 使用内置服务器（内存传输）
-                    client_source = self.server
-                else:
-                    # 使用外部服务器命令
-                    client_source = self.server_command
+            # 内存传输模式：每次创建临时客户端
+            return self._run_via_temp_client(action, parameters)
 
-                async with MCPClient(client_source, self.server_args, env=self.env) as client:
-                    if action == "list_tools":
-                        tools = await client.list_tools()
-                        if not tools:
-                            return "没有找到可用的工具"
-                        result = f"找到 {len(tools)} 个工具:\n"
-                        for tool in tools:
-                            result += f"- {tool['name']}: {tool['description']}\n"
-                        return result
-
-                    elif action == "call_tool":
-                        tool_name = parameters.get("tool_name")
-                        arguments = parameters.get("arguments", {})
-                        if not tool_name:
-                            return "错误：必须指定 tool_name 参数"
-                        result = await client.call_tool(tool_name, arguments)
-                        return f"工具 '{tool_name}' 执行结果:\n{result}"
-
-                    elif action == "list_resources":
-                        resources = await client.list_resources()
-                        if not resources:
-                            return "没有找到可用的资源"
-                        result = f"找到 {len(resources)} 个资源:\n"
-                        for resource in resources:
-                            result += f"- {resource['uri']}: {resource['name']}\n"
-                        return result
-
-                    elif action == "read_resource":
-                        uri = parameters.get("uri")
-                        if not uri:
-                            return "错误：必须指定 uri 参数"
-                        content = await client.read_resource(uri)
-                        return f"资源 '{uri}' 内容:\n{content}"
-
-                    elif action == "list_prompts":
-                        prompts = await client.list_prompts()
-                        if not prompts:
-                            return "没有找到可用的提示词"
-                        result = f"找到 {len(prompts)} 个提示词:\n"
-                        for prompt in prompts:
-                            result += f"- {prompt['name']}: {prompt['description']}\n"
-                        return result
-
-                    elif action == "get_prompt":
-                        prompt_name = parameters.get("prompt_name")
-                        prompt_arguments = parameters.get("prompt_arguments", {})
-                        if not prompt_name:
-                            return "错误：必须指定 prompt_name 参数"
-                        messages = await client.get_prompt(prompt_name, prompt_arguments)
-                        result = f"提示词 '{prompt_name}':\n"
-                        for msg in messages:
-                            result += f"[{msg['role']}] {msg['content']}\n"
-                        return result
-
-                    else:
-                        return f"错误：不支持的操作 '{action}'"
-
-            # 运行异步操作
-            try:
-                # 检查是否已有运行中的事件循环
-                try:
-                    loop = asyncio.get_running_loop()
-                    # 如果有运行中的循环，在新线程中运行新的事件循环
-                    import concurrent.futures
-                    import threading
-
-                    def run_in_thread():
-                        # 在新线程中创建新的事件循环
-                        new_loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(new_loop)
-                        try:
-                            return new_loop.run_until_complete(run_mcp_operation())
-                        finally:
-                            new_loop.close()
-
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(run_in_thread)
-                        return future.result()
-                except RuntimeError:
-                    # 没有运行中的循环，直接运行
-                    return asyncio.run(run_mcp_operation())
-            except Exception as e:
-                return f"异步操作失败: {str(e)}"
-                    
         except Exception as e:
             return f"MCP 操作失败: {str(e)}"
-    
+
     def get_parameters(self) -> List[ToolParameter]:
         """获取工具参数定义"""
         return [
