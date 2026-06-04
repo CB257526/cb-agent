@@ -149,6 +149,9 @@ function renderItem(
   if (item.role === "todo") {
     return <TodoPanel items={item.todoItems ?? []} />;
   }
+  if (item.role === "system") {
+    return <SystemMessage text={item.text} />;
+  }
   if (item.role === "ask_question") {
     // 仅给当前 active 的问题接 onAnswer；其他（已答 / 旧的）传 undefined → 转纯展示
     const isActive = !!activeQuestionId && item.questionId === activeQuestionId && !item.answered;
@@ -161,6 +164,125 @@ function renderItem(
     );
   }
   return <Text dimColor>{item.text}</Text>;
+}
+
+function SystemMessage({ text }: { text: string }) {
+  const mcp = parseMcpStatus(text);
+  if (mcp) return <MCPStatusCard data={mcp} />;
+
+  const skills = parseSkillList(text);
+  if (skills) return <SkillListCard data={skills} />;
+
+  return (
+    <Pane color={theme.info}>
+      <Box flexDirection="column">
+        <Text color={theme.info} bold>system</Text>
+        <Markdown text={text} />
+      </Box>
+    </Pane>
+  );
+}
+
+type ParsedMCPStatus = {
+  state: string;
+  connected: number;
+  total: number;
+  failed: number;
+  servers: Array<{ name: string; status: string; detail?: string }>;
+};
+
+function parseMcpStatus(text: string): ParsedMCPStatus | null {
+  const lines = text.trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const head = /^MCP 状态：(.+?)（(\d+)\/(\d+) connected，(\d+) failed）$/.exec(lines[0] ?? "");
+  if (!head) return null;
+  return {
+    state: head[1],
+    connected: Number(head[2]),
+    total: Number(head[3]),
+    failed: Number(head[4]),
+    servers: lines.slice(1).map((line) => {
+      const match = /^[•\-]\s*([^:]+):\s*([^\s(]+)(?:\s*\((.*)\))?$/.exec(line);
+      if (!match) return { name: line, status: "unknown" };
+      return { name: match[1], status: match[2], detail: match[3] };
+    }),
+  };
+}
+
+function MCPStatusCard({ data }: { data: ParsedMCPStatus }) {
+  const ready = data.state === "ready" || data.connected === data.total;
+  const color = data.failed > 0 ? theme.error : ready ? theme.success : theme.info;
+  return (
+    <Pane color={color}>
+      <Box flexDirection="column">
+        <Box>
+          <Text color={color} bold>MCP </Text>
+          <Text color={color} bold>{data.state}</Text>
+          <Text dimColor>  {data.connected}/{data.total} connected</Text>
+          {data.failed > 0 && <Text color={theme.error}>  {data.failed} failed</Text>}
+        </Box>
+        <Box flexDirection="column" marginTop={1}>
+          {data.servers.map((server) => {
+            const serverColor = server.status === "connected" ? theme.success : server.status === "error" ? theme.error : theme.warning;
+            return (
+              <Box key={server.name}>
+                <Text color={serverColor}>● </Text>
+                <Text bold>{server.name}</Text>
+                <Text dimColor>  </Text>
+                <Text color={serverColor}>{server.status}</Text>
+                {server.detail && <Text dimColor>  {server.detail}</Text>}
+              </Box>
+            );
+          })}
+        </Box>
+      </Box>
+    </Pane>
+  );
+}
+
+type ParsedSkillList = {
+  count: number;
+  skills: Array<{ name: string; description: string }>;
+};
+
+function parseSkillList(text: string): ParsedSkillList | null {
+  const lines = text.trim().split(/\r?\n/);
+  const head = /^已发现\s+(\d+)\s+个\s+Skill：$/.exec((lines[0] ?? "").trim());
+  if (!head) return null;
+  const skills = lines.slice(1).map((line) => {
+    const match = /^\s*[-•]\s+([^:]+):\s*(.*)$/.exec(line);
+    if (!match) return null;
+    return { name: match[1].trim(), description: match[2].trim() };
+  }).filter((item): item is { name: string; description: string } => item !== null);
+  return { count: Number(head[1]), skills };
+}
+
+function SkillListCard({ data }: { data: ParsedSkillList }) {
+  return (
+    <Pane color={theme.primary}>
+      <Box flexDirection="column">
+        <Box>
+          <Text color={theme.primary} bold>Skills </Text>
+          <Text bold>{data.count}</Text>
+          <Text dimColor> available</Text>
+        </Box>
+        <Box flexDirection="column" marginTop={1}>
+          {data.skills.map((skill) => (
+            <Box key={skill.name} flexDirection="column" marginBottom={1}>
+              <Box>
+                <Text color={theme.suggestion}>◆ </Text>
+                <Text color={theme.suggestion} bold>{skill.name}</Text>
+              </Box>
+              {skill.description && (
+                <Box paddingLeft={2}>
+                  <Text dimColor>{skill.description}</Text>
+                </Box>
+              )}
+            </Box>
+          ))}
+        </Box>
+      </Box>
+    </Pane>
+  );
 }
 
 const AskQuestionRow = React.memo(function AskQuestionRow({
