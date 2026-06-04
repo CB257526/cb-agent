@@ -202,4 +202,13 @@ describe("Transport answerQuestion RPC", () => {
     expect(messages[4].method).toBe("session.mcp_status");
     expect(messages[4].params).toEqual({});
   });
+
+  it("serializes load skill RPC", () => {
+    const { t, written } = makeWithStdin();
+    t.loadSkill("pdf", "foo.pdf");
+
+    const msg = JSON.parse(written[0].trim());
+    expect(msg.method).toBe("session.load_skill");
+    expect(msg.params).toEqual({ name: "pdf", args: "foo.pdf" });
+  });
 });

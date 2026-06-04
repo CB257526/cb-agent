@@ -98,7 +98,10 @@ class Skill:
         return result
 
     def get_references(self) -> dict:
-        """扫描 skill_dir 下除 SKILL.md 外的 *.md 文件
+        """扫描 Skill 参考文档
+
+        兼容旧结构下 skill_dir 根目录的 *.md，同时支持文档推荐的
+        references/*.md；SKILL.md 永远不作为参考文档暴露。
 
         Returns:
             {文件名(不含扩展名): 文件内容} 的字典
@@ -107,15 +110,21 @@ class Skill:
         if not self.skill_dir.is_dir():
             return refs
 
-        for md_file in self.skill_dir.glob("*.md"):
-            if md_file.name.upper() == "SKILL.md":
-                continue
-            try:
-                content = md_file.read_text(encoding="utf-8")
-                key = md_file.stem  # 文件名不含扩展名
-                refs[key] = content
-            except (OSError, UnicodeDecodeError):
-                continue
+        def add_md_files(base_dir: Path) -> None:
+            if not base_dir.is_dir():
+                return
+            for md_file in base_dir.glob("*.md"):
+                if md_file.name.lower() == "skill.md":
+                    continue
+                try:
+                    content = md_file.read_text(encoding="utf-8")
+                    key = md_file.stem  # 文件名不含扩展名
+                    refs[key] = content
+                except (OSError, UnicodeDecodeError):
+                    continue
+
+        add_md_files(self.skill_dir)
+        add_md_files(self.skill_dir / "references")
         return refs
 
     def get_scripts(self) -> dict:

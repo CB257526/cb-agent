@@ -66,6 +66,7 @@ describe("commands", () => {
         compactSession: vi.fn(),
         mcpStatus: vi.fn(),
         listTools: vi.fn(),
+        loadSkill: vi.fn(),
         createSession: vi.fn(),
         switchSession: vi.fn(),
       };
@@ -220,6 +221,40 @@ describe("commands", () => {
       const text = appendSystemMock.mock.calls[0][0];
       expect(text).toContain("✗");
       expect(text).toContain("timeout");
+    });
+
+    it("/skill 带参数时加载后端 Skill 内容", async () => {
+      transportMock.loadSkill.mockResolvedValue({
+        name: "pdf",
+        content: "## Skill: pdf\nPDF body",
+      });
+      const cmd = findCommand("/skill pdf foo.pdf")!;
+      await cmd.handler({ ...ctx, args: "pdf foo.pdf" });
+
+      expect(transportMock.loadSkill).toHaveBeenCalledWith("pdf", "foo.pdf");
+      expect(appendSystemMock.mock.calls[0][0]).toContain("## Skill: pdf");
+    });
+
+    it("/skill 缺参数时列出后端 Skill", async () => {
+      transportMock.loadSkill.mockResolvedValue({
+        name: null,
+        content: "已发现 1 个 Skill：\n  - pdf: PDF skill",
+      });
+      const cmd = findCommand("/skill")!;
+      await cmd.handler({ ...ctx, args: "" });
+
+      expect(transportMock.loadSkill).toHaveBeenCalledWith("", "");
+      expect(appendSystemMock.mock.calls[0][0]).toContain("已发现 1 个 Skill");
+    });
+
+    it("/skill RPC 报错时输出错误信息", async () => {
+      transportMock.loadSkill.mockRejectedValue(new Error("missing skill"));
+      const cmd = findCommand("/skill nope")!;
+      await cmd.handler({ ...ctx, args: "nope" });
+
+      const text = appendSystemMock.mock.calls[0][0];
+      expect(text).toContain("✗");
+      expect(text).toContain("missing skill");
     });
 
     it("/mcp 成功时格式化后台连接状态", async () => {

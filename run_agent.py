@@ -716,6 +716,7 @@ class AgentRunner:
                 "  /tools       列出所有已注册工具\n"
                 "  /mcp         查看 MCP 后台连接状态\n"
                 "  /skills      列出所有 Skill\n"
+                "  /skill NAME  手动加载指定 Skill\n"
                 "  /history     查看当前会话历史\n"
                 "  /sessions    列出本项目的本地会话\n"
                 "  /new         新建并切换到空白会话\n"
@@ -767,6 +768,8 @@ class AgentRunner:
             for s in skills:
                 print(f"  - {s.name}: {(s.description or '')[:80]}")
             print()
+        elif cmd == "/skill":
+            self._handle_skill_command(raw_arg)
         elif cmd == "/history":
             history = self.session.history
             print(f"\n会话历史 ({len(history)} 条)：")
@@ -833,8 +836,46 @@ class AgentRunner:
             else:
                 _info(f"用法: /msg on|off  (当前: {'on' if self.dump_messages else 'off'})")
         else:
+            if self._handle_named_skill_command(cmd, raw_arg):
+                return True
             _err(f"未知命令 {cmd}，/help 查看可用命令")
         return True
+
+    def _handle_named_skill_command(self, cmd: str, raw_arg: str) -> bool:
+        """处理 /pdf 这类按 Skill 名称直接触发的命令。"""
+        if not cmd.startswith("/") or len(cmd) <= 1:
+            return False
+        skill_name = cmd[1:]
+        skill = self._skill_manager.get_skill(skill_name)
+        if skill is None:
+            return False
+        self._print_skill_content(skill_name, raw_arg)
+        return True
+
+    def _handle_skill_command(self, raw_arg: str) -> None:
+        """处理 /skill NAME [args]。"""
+        if not raw_arg:
+            print("\n" + self._skill_manager.format_skill_list() + "\n")
+            return
+        parts = raw_arg.split(maxsplit=1)
+        skill_name = parts[0].strip()
+        args = parts[1].strip() if len(parts) > 1 else ""
+        self._print_skill_content(skill_name, args)
+
+    def _print_skill_content(self, skill_name: str, args: str = "") -> None:
+        """用户显式触发 Skill：尊重 user_invocable，但不受模型禁用字段限制。"""
+        self._skill_manager.check_for_changes()
+        skill = self._skill_manager.get_skill(skill_name)
+        if skill is None:
+            available = ", ".join(s.name for s in self._skill_manager.list_skills())
+            _err(f"未找到 Skill '{skill_name}'。可用 Skill: {available}")
+            return
+        if not skill.user_invocable:
+            _err(f"Skill '{skill.name}' 不允许用户通过 slash 命令手动触发")
+            return
+        self._skill_manager.record_usage(skill.name)
+        content = self._skill_manager.load_skill_content(skill.name, args)
+        print(f"\n{content}\n")
 
 
 # ========== 入口 ==========

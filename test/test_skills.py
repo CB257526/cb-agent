@@ -72,6 +72,7 @@ def test_load_skill_content():
     assert "## Skill: pdf" in content, "内容应包含 Skill 标题"
     assert "PDF Processing Guide" in content, "内容应包含正文"
     assert "可用参考文档" in content, "内容应提示可用的参考文档"
+    assert "load_skill_reference" not in content, "不应提示不存在的 load_skill_reference 工具"
 
     # 测试加载指定参考文档
     ref_content = manager.load_skill_reference("pdf", "forms")
@@ -79,6 +80,7 @@ def test_load_skill_content():
     print()
 
     assert len(ref_content) > 100, "参考文档应有内容"
+    assert "SKILL" not in manager.get_skill("pdf").get_references(), "SKILL.md 不应暴露为参考文档"
 
     # 测试加载不存在的参考文档
     err = manager.load_skill_reference("pdf", "nonexistent")
@@ -88,10 +90,112 @@ def test_load_skill_content():
     print("[PASS] L2 Skill 内容加载测试通过\n")
 
 
+def test_references_directory_and_alias_dedupe():
+    """测试 references/ 目录和别名去重。"""
+    print("=" * 60)
+    print("测试 4: 参考文档目录和别名去重")
+    print("=" * 60)
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        skill_dir = root / "demo-skill"
+        refs_dir = skill_dir / "references"
+        refs_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: demo-skill\n"
+            "description: demo skill\n"
+            "aliases:\n"
+            "  - demo\n"
+            "---\n"
+            "body\n",
+            encoding="utf-8",
+        )
+        (skill_dir / "root-ref.md").write_text("root reference", encoding="utf-8")
+        (refs_dir / "nested-ref.md").write_text("nested reference", encoding="utf-8")
+
+        manager = SkillManager(skills_dir=root)
+        skill = manager.get_skill("demo")
+        refs = skill.get_references()
+        skills = manager.list_skills()
+
+        print(f"refs: {list(refs.keys())}")
+        print(f"skills: {[s.name for s in skills]}")
+
+        assert skill is not None
+        assert "root-ref" in refs
+        assert "nested-ref" in refs
+        assert "SKILL" not in refs
+        assert [s.name for s in skills] == ["demo-skill"]
+
+    print("[PASS] 参考文档目录和别名去重测试通过\n")
+
+
+def test_multiple_skill_dirs_project_overrides_user():
+    """测试默认设计中的多目录扫描和后扫描目录覆盖。"""
+    print("=" * 60)
+    print("测试 5: 多目录扫描和项目级覆盖")
+    print("=" * 60)
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        user_dir = root / "user" / "skills"
+        project_dir = root / "project" / "skills"
+        (user_dir / "shared").mkdir(parents=True)
+        (project_dir / "shared").mkdir(parents=True)
+        (user_dir / "user-only").mkdir(parents=True)
+
+        (user_dir / "shared" / "SKILL.md").write_text(
+            "---\n"
+            "name: shared\n"
+            "description: user shared\n"
+            "aliases:\n"
+            "  - shared-alias\n"
+            "---\n"
+            "user body\n",
+            encoding="utf-8",
+        )
+        (project_dir / "shared" / "SKILL.md").write_text(
+            "---\n"
+            "name: shared\n"
+            "description: project shared\n"
+            "aliases:\n"
+            "  - shared-alias\n"
+            "---\n"
+            "project body\n",
+            encoding="utf-8",
+        )
+        (user_dir / "user-only" / "SKILL.md").write_text(
+            "---\nname: user-only\ndescription: user only\n---\nuser only body\n",
+            encoding="utf-8",
+        )
+
+        manager = SkillManager(skills_dir=[user_dir, project_dir])
+        names = [s.name for s in manager.list_skills()]
+        shared = manager.get_skill("shared")
+        alias = manager.get_skill("shared-alias")
+
+        print(f"skills: {names}")
+        print(f"shared desc: {shared.description}")
+
+        assert set(names) == {"shared", "user-only"}
+        assert shared.description == "project shared"
+        assert alias is shared
+        assert "project body" in manager.load_skill_content("shared")
+
+    print("[PASS] 多目录扫描和项目级覆盖测试通过\n")
+
+
 def test_skill_tool():
     """测试 SkillTool"""
     print("=" * 60)
-    print("测试 4: SkillTool")
+    print("测试 6: SkillTool")
     print("=" * 60)
 
     manager = SkillManager()
@@ -128,7 +232,7 @@ def test_skill_tool():
 def test_run_skill_script_tool():
     """测试 RunSkillScriptTool"""
     print("=" * 60)
-    print("测试 5: RunSkillScriptTool")
+    print("测试 7: RunSkillScriptTool")
     print("=" * 60)
 
     manager = SkillManager()
@@ -159,7 +263,7 @@ def test_run_skill_script_tool():
 def test_tool_registry():
     """测试工具注册到 ToolRegistry"""
     print("=" * 60)
-    print("测试 6: 工具注册")
+    print("测试 8: 工具注册")
     print("=" * 60)
 
     manager = SkillManager()
@@ -185,7 +289,7 @@ def test_tool_registry():
 def test_variable_substitution():
     """测试变量替换"""
     print("=" * 60)
-    print("测试 7: 变量替换")
+    print("测试 9: 变量替换")
     print("=" * 60)
 
     # 创建一个测试用的 Skill
@@ -232,7 +336,7 @@ def test_variable_substitution():
 def test_match_skill():
     """测试关键词匹配"""
     print("=" * 60)
-    print("测试 8: 关键词匹配")
+    print("测试 10: 关键词匹配")
     print("=" * 60)
 
     manager = SkillManager()
@@ -251,17 +355,83 @@ def test_match_skill():
     print("[PASS] 关键词匹配测试完成\n")
 
 
+def test_hot_reload():
+    """测试 SkillManager 会在读取时热重载。"""
+    print("=" * 60)
+    print("测试 11: 热重载")
+    print("=" * 60)
+
+    import tempfile
+    import time
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        skill_dir = root / "reload-skill"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: reload-skill\ndescription: old desc\n---\nold body\n",
+            encoding="utf-8",
+        )
+        manager = SkillManager(skills_dir=root)
+        assert manager.get_skill("reload-skill").description == "old desc"
+
+        time.sleep(1.1)
+        skill_md.write_text(
+            "---\nname: reload-skill\ndescription: new desc\n---\nnew body\n",
+            encoding="utf-8",
+        )
+        assert manager.get_skill("reload-skill").description == "new desc"
+        assert "new body" in manager.load_skill_content("reload-skill")
+
+    print("[PASS] 热重载测试通过\n")
+
+
+def test_slash_skill_command():
+    """测试 /skill 手动触发入口。"""
+    print("=" * 60)
+    print("测试 12: /skill 手动触发")
+    print("=" * 60)
+
+    import tempfile
+    from pathlib import Path
+    from run_agent import AgentRunner
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        skill_dir = root / "manual-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: manual-skill\ndescription: manual skill\n---\nmanual body $ARGUMENTS\n",
+            encoding="utf-8",
+        )
+        manager = SkillManager(skills_dir=root)
+        runner = AgentRunner.__new__(AgentRunner)
+        runner._skill_manager = manager
+
+        assert runner._handle_command("/skill") is True
+        assert runner._handle_command("/skill manual-skill hello") is True
+        assert runner._handle_command("/manual-skill hello") is True
+
+    print("[PASS] /skill 手动触发测试通过\n")
+
+
 if __name__ == "__main__":
     print("\n[Skills 系统测试]\n")
 
     test_skill_manager()
     test_skills_overview()
     test_load_skill_content()
+    test_references_directory_and_alias_dedupe()
+    test_multiple_skill_dirs_project_overrides_user()
     test_skill_tool()
     test_run_skill_script_tool()
     test_tool_registry()
     test_variable_substitution()
     test_match_skill()
+    test_hot_reload()
+    test_slash_skill_command()
 
     print("=" * 60)
     print("[所有测试完成]")

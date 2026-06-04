@@ -134,6 +134,8 @@ class Gateway:
             self._handle_switch_session(rpc_id, params)
         elif method == "session.list_tools":
             self._handle_list_tools(rpc_id)
+        elif method == "session.load_skill":
+            self._handle_load_skill(rpc_id, params)
         elif method == "session.answer_question":
             self._handle_answer_question(rpc_id, params)
         else:
@@ -412,6 +414,69 @@ class Gateway:
             ))
             return
         self.transport.write(make_response(rpc_id, result={"tools": tools}))
+
+    def _handle_load_skill(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        """用户显式加载 Skill，供 TUI /skill 命令使用。"""
+        if rpc_id is None:
+            return
+        skill_name = params.get("name")
+        args = params.get("args", "")
+        if not isinstance(args, str):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "params.args must be string"},
+            ))
+            return
+
+        manager = getattr(self.session, "skill_manager", None)
+        if manager is None:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": "skill manager unavailable"},
+            ))
+            return
+
+        try:
+            manager.check_for_changes()
+            if not isinstance(skill_name, str) or not skill_name.strip():
+                self.transport.write(make_response(
+                    rpc_id,
+                    result={"name": None, "content": manager.format_skill_list()},
+                ))
+                return
+            skill = manager.get_skill(skill_name.strip())
+            if skill is None:
+                available = [s.name for s in manager.list_skills()]
+                self.transport.write(make_response(
+                    rpc_id,
+                    error={
+                        "code": _ERR_INVALID_PARAMS,
+                        "message": f"未找到 Skill '{skill_name.strip()}'。可用 Skill: {', '.join(available)}",
+                    },
+                ))
+                return
+            if not skill.user_invocable:
+                self.transport.write(make_response(
+                    rpc_id,
+                    error={
+                        "code": _ERR_INVALID_PARAMS,
+                        "message": f"Skill '{skill.name}' 不允许用户通过 slash 命令手动触发",
+                    },
+                ))
+                return
+            manager.record_usage(skill.name)
+            content = manager.load_skill_content(skill.name, args)
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+
+        self.transport.write(make_response(
+            rpc_id,
+            result={"name": skill.name, "content": content},
+        ))
 
     def _handle_answer_question(self, rpc_id: Any, params: Dict[str, Any]) -> None:
         """UI 端用户在 AskQuestionPanel 选完后回灌答案。

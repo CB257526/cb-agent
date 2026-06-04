@@ -40,6 +40,7 @@ from agent.executor import ToolExecutor
 from agent.session import AgentSession
 from agent.transport import Gateway, StdioTransport, make_event_message, make_response
 from agent.work_context import LocalSessionStore
+from skills.skill_manager import SkillManager
 
 
 # ========== JSON-RPC 序列化 ==========
@@ -165,7 +166,13 @@ class FakeLLM:
         return out
 
 
-def _make_session_for_gateway(llm: FakeLLM, session_store=None, mcp_status_provider=None, mcp_background_loader=None):
+def _make_session_for_gateway(
+    llm: FakeLLM,
+    session_store=None,
+    mcp_status_provider=None,
+    mcp_background_loader=None,
+    skill_manager=None,
+):
     bus = EventBus()
     reg = MagicMock()
     reg.execute_tool = MagicMock(return_value="{}")
@@ -175,7 +182,7 @@ def _make_session_for_gateway(llm: FakeLLM, session_store=None, mcp_status_provi
     ex = ToolExecutor(reg.execute_tool, bus)
     s = AgentSession(
         llm=llm, registry=reg, executor=ex, event_bus=bus,
-        memory_loader=None, skill_manager=None, ctx_enabled=False,
+        memory_loader=None, skill_manager=skill_manager, ctx_enabled=False,
         session_store=session_store,
     )
     if mcp_status_provider is not None:
@@ -220,7 +227,8 @@ class TestGatewayDispatch(unittest.TestCase):
     def _run_gateway_with_msgs(self, llm: FakeLLM, msgs: List[str], wait_for: int = 0,
                                 wait_done: bool = False, session_store=None,
                                 mcp_status_provider=None,
-                                mcp_background_loader=None) -> List[Dict[str, Any]]:
+                                mcp_background_loader=None,
+                                skill_manager=None) -> List[Dict[str, Any]]:
         """起 gateway，把 msgs 一行行喂进 stdin，等收到至少 wait_for 条 stdout 行
         （或看到 done 事件，wait_done=True 时），然后关 stdin、join 主线程。
         返回 stdout 解析出的所有 JSON 消息（顺序）。
@@ -230,6 +238,7 @@ class TestGatewayDispatch(unittest.TestCase):
             session_store=session_store,
             mcp_status_provider=mcp_status_provider,
             mcp_background_loader=mcp_background_loader,
+            skill_manager=skill_manager,
         )
         stdin = _PipeStdin()
         out = io.StringIO()
@@ -423,6 +432,65 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertIn("description", t)
             # schema 可为 None（无参函数工具时）但 key 应存在
             self.assertIn("schema", t)
+
+    def test_gateway_load_skill(self):
+        """session.load_skill 返回用户显式加载的 Skill 内容。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill_dir = root / "manual-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: manual-skill\ndescription: manual skill\n---\nmanual body $ARGUMENTS\n",
+                encoding="utf-8",
+            )
+            manager = SkillManager(skills_dir=root)
+
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "sk1",
+                    "method": "session.load_skill",
+                    "params": {"name": "manual-skill", "args": "hello"},
+                })],
+                wait_for=2,
+                skill_manager=manager,
+            )
+
+            replies = [m for m in msgs if m.get("id") == "sk1"]
+            self.assertEqual(len(replies), 1)
+            self.assertEqual(replies[0]["result"]["name"], "manual-skill")
+            self.assertIn("manual body hello", replies[0]["result"]["content"])
+
+    def test_gateway_load_skill_without_name_lists_skills(self):
+        """session.load_skill 不传 name 时返回 Skill 列表。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill_dir = root / "manual-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: manual-skill\ndescription: manual skill\n---\nmanual body\n",
+                encoding="utf-8",
+            )
+            manager = SkillManager(skills_dir=root)
+
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "sk-list",
+                    "method": "session.load_skill",
+                    "params": {"name": ""},
+                })],
+                wait_for=2,
+                skill_manager=manager,
+            )
+
+            replies = [m for m in msgs if m.get("id") == "sk-list"]
+            self.assertEqual(len(replies), 1)
+            self.assertIsNone(replies[0]["result"]["name"])
+            self.assertIn("已发现 1 个 Skill", replies[0]["result"]["content"])
+            self.assertIn("manual-skill", replies[0]["result"]["content"])
 
     def test_gateway_mcp_status_rpc_and_ready_starts_background_loader(self):
         """gateway_ready 后触发 MCP 后台加载，session.mcp_status 返回当前快照。"""

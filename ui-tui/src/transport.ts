@@ -206,6 +206,11 @@ export class Transport extends EventEmitter {
     return this.requestRpc("session.list_tools");
   }
 
+  /** 手动加载 Skill 内容，供 /skill 命令展示。 */
+  loadSkill(name: string, args = ""): Promise<{ name: string | null; content: string }> {
+    return this.requestRpc("session.load_skill", { name, args });
+  }
+
   /** 查询 MCP 后台连接状态。MCP 工具可能仍在连接中，返回的是当前快照。 */
   mcpStatus(): Promise<MCPStatusPayload> {
     return this.requestRpc("session.mcp_status");

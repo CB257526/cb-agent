@@ -52,6 +52,8 @@ class SkillTool(Tool):
         args = parameters.get("args", "")
         document = parameters.get("document", "").strip()
 
+        self.skill_manager.check_for_changes()
+
         # 查找 Skill
         skill = self.skill_manager.get_skill(skill_name)
         if not skill:

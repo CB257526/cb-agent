@@ -159,6 +159,19 @@ export const COMMANDS: readonly SlashCommand[] = [
     },
   },
   {
+    name: "/skill",
+    description: "列出或手动加载 Skill：/skill [name] [args]",
+    handler: async ({ transport, args, appendSystem }) => {
+      const [name = "", ...rest] = args.trim().split(/\s+/);
+      try {
+        const result = await transport.loadSkill(name, rest.join(" "));
+        appendSystem(result.content);
+      } catch (e) {
+        appendSystem(`✗ /skill 失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
     name: "/mcp",
     description: "查看 MCP 后台连接状态",
     handler: async ({ transport, appendSystem }) => {
