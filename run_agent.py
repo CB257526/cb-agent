@@ -68,8 +68,7 @@ from agent.message_logger import MessageLogger
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore, TraceSummarizer
 from constant.llm.constant_llm import ConstantLLM
-from context import ContextBuilder, ContextConfig
-from context.markdown_memory import MarkdownMemoryProvider
+from context import MemoryLoader, OpenAICompatibleAdapter
 from skills.skill_manager import SkillManager
 from skills.skill_executor import SkillExecutor
 from tools.toolRegistry import ToolRegistry
@@ -179,44 +178,34 @@ class AgentRunner:
             max_workers=4,
         )
 
-        # 4. 上下文构建器
-        # ContextBuilder 的预算也跟随模型配置走。用户在 constant_llm.py 里维护
-        # 各模型 max_tokens，这里只取 80% 作为 agent 可用窗口，剩余部分留给模型
-        # 输出和 provider 侧额外开销；自动 compact 与 TUI Context 指标也使用同一值。
-        context_max_tokens = ConstantLLM.context_window_tokens(self.llm.model)
-        builder = ContextBuilder(
-            memory_tool=self._memory_tool,
-            rag_tool=self._rag_tool,
-            md_memory_provider=self._md_memory_provider,
-            config=ContextConfig(
-                max_tokens=context_max_tokens,
-                min_relevance=0.05,
-                # 新增【工作记录】后，一轮带工具的对话通常会产生
-                # user / assistant final / assistant work_record 三条 history。
-                # 窗口从 8 调到 12，可以让最近几轮工具事实不至于太快被挤出。
-                history_max_messages=12,
-            ),
-        )
-        # 跨轮工作上下文采用项目级持久化：这些状态和当前仓库文件强绑定，
+        # 4. 上下文模块装配(对齐 Claude Code 重构后)
+        # MemoryLoader 替代旧 ContextBuilder + MarkdownMemoryProvider 组合,
+        # 走多级 CLAUDE.md 路径优先级链(Managed > User > Project > Local)。
+        # OpenAICompatibleAdapter 把分段 system prompt join 成单 string,适配
+        # 国内厂商的 OpenAI 兼容 API。
+        memory_loader = MemoryLoader(cwd=Path(_HERE)) if self.ctx_enabled else None
+        provider_adapter = OpenAICompatibleAdapter()
+        # 跨轮工作上下文采用项目级持久化:这些状态和当前仓库文件强绑定,
         # 放在 .cbagent/sessions 比放到用户级 ~/.cb-agent 更容易理解和清理。
         session_store = LocalSessionStore(Path(_HERE) / ".cbagent" / "sessions")
-        # trace_summarizer 只在工具轨迹超过阈值时静默调用；小 trace 走规则压缩。
-        # 它不会走主回答的 llm.think 流式路径，因此不会向 UI 误发 text_delta。
+        # trace_summarizer 只在工具轨迹超过阈值时静默调用;小 trace 走规则压缩。
+        # 它不会走主回答的 llm.think 流式路径,因此不会向 UI 误发 text_delta。
         trace_summarizer = TraceSummarizer(self.llm)
 
-        # 消息日志：将所有发送给 LLM 的消息全文记录到独立文件，
+        # 消息日志:将所有发送给 LLM 的消息全文记录到独立文件,
         # 包含 system/user/assistant/tool 全部角色的消息内容
         message_logger = MessageLogger(
             Path(_HERE) / ".cbagent" / "logs" / f"messages-{int(time.time())}.log"
         )
 
-        # 5. 会话核心（纯逻辑）
+        # 5. 会话核心(纯逻辑)
         self.session = AgentSession(
             llm=self.llm,
             registry=self.registry,
             executor=self.executor,
             event_bus=self.event_bus,
-            builder=builder,
+            memory_loader=memory_loader,
+            provider_adapter=provider_adapter,
             skill_manager=self._skill_manager,
             bash_prompt_provider=self._memory_prompt_provider,
             ctx_enabled=self.ctx_enabled,
@@ -272,21 +261,33 @@ class AgentRunner:
     # ---------- 启动期工具注册 ----------
 
     def _create_markdown_memory_provider(self):
-        """按需创建轻量 Markdown 记忆 provider。
+        """重构后保留为兼容 stub —— Markdown 记忆改由 MemoryLoader 统一加载。
 
-        轻量模式的承诺是“零 RAG 依赖、但有可落盘的 Markdown 记忆位置”。因此启动
-        阶段就创建两级目录和默认 MEMORY.md：用户打开 TUI 后，即使还没开始第一轮
-        对话，也能在这些路径里看到可编辑的记忆索引。初始化失败只降级为无模板，
-        不阻塞 agent 启动，后续检索也会由 provider 自身兜底。
+        旧的 MarkdownMemoryProvider 已删除,记忆加载现在走 context.memory.MemoryLoader
+        的多级 CLAUDE.md 路径优先级链。这里仍然在 light 模式下保证全局/项目级
+        memory 目录存在并写入模板 CLAUDE.md,以便用户首次打开 TUI 就能编辑。
+
+        返回 None: bash_prompt_provider 调用方拿到 None 时会跳过 memory 提示段
+        (memory 内容已经被 MemoryLoader 注入 system prompt 的 dynamic memory section)。
         """
         if self.memory_system != "light":
             return None
-        provider = MarkdownMemoryProvider(project_dir=Path(_HERE))
         try:
-            provider.ensure_initialized()
+            global_dir = Path.home() / ".cbagent"
+            project_dir = Path(_HERE) / ".cbagent" / "memory"
+            for d in (global_dir, project_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            user_memory = global_dir / "CLAUDE.md"
+            if not user_memory.exists():
+                user_memory.write_text(
+                    "# cb-agent 用户全局记忆\n\n"
+                    "这是 cb-agent 跨项目共享的全局指令。把对所有项目都适用的偏好、"
+                    "规则、工具使用约定写在这里。具体项目的指令请放在项目根目录的 CLAUDE.md。\n",
+                    encoding="utf-8",
+                )
         except Exception as e:
-            _err(f"轻量 Markdown 记忆目录初始化失败（继续启动）: {e}")
-        return provider
+            _err(f"轻量记忆目录初始化失败(继续启动): {e}")
+        return None
 
     def _register_native_tools(self) -> None:
         """注册项目内置工具。"""

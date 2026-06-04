@@ -83,7 +83,7 @@ def _make_session(llm: FakeLLM, runner=None) -> tuple[AgentSession, EventBus, Li
     ex = ToolExecutor(reg.execute_tool, bus)
     s = AgentSession(
         llm=llm, registry=reg, executor=ex, event_bus=bus,
-        builder=None, skill_manager=None, ctx_enabled=False,
+        memory_loader=None, skill_manager=None, ctx_enabled=False,
     )
     return s, bus, events
 

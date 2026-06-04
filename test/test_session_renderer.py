@@ -107,7 +107,7 @@ class TestAgentSessionBasic(unittest.TestCase):
     def _make_session(self, llm: FakeLLM, **kwargs) -> AgentSession:
         return AgentSession(
             llm=llm, registry=self.registry, executor=self.executor,
-            event_bus=self.bus, builder=None, skill_manager=None,
+            event_bus=self.bus, memory_loader=None, skill_manager=None,
             ctx_enabled=False, **kwargs,
         )
 

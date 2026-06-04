@@ -175,7 +175,7 @@ def _make_session_for_gateway(llm: FakeLLM, session_store=None, mcp_status_provi
     ex = ToolExecutor(reg.execute_tool, bus)
     s = AgentSession(
         llm=llm, registry=reg, executor=ex, event_bus=bus,
-        builder=None, skill_manager=None, ctx_enabled=False,
+        memory_loader=None, skill_manager=None, ctx_enabled=False,
         session_store=session_store,
     )
     if mcp_status_provider is not None:

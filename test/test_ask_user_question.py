@@ -272,7 +272,7 @@ class TestGatewayAnswerQuestion(unittest.TestCase):
         ex = ToolExecutor(reg.execute_tool, bus)
         session = AgentSession(
             llm=FakeLLM(), registry=reg, executor=ex, event_bus=bus,
-            builder=None, skill_manager=None, ctx_enabled=False,
+            memory_loader=None, skill_manager=None, ctx_enabled=False,
         )
 
         # 预先在 registry 挂一个等待槽
@@ -356,7 +356,7 @@ class TestGatewayAnswerQuestion(unittest.TestCase):
         ex = ToolExecutor(reg.execute_tool, bus)
         session = AgentSession(
             llm=FakeLLM(), registry=reg, executor=ex, event_bus=bus,
-            builder=None, skill_manager=None, ctx_enabled=False,
+            memory_loader=None, skill_manager=None, ctx_enabled=False,
         )
 
         stdin = _PipeStdin()

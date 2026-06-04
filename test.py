@@ -115,28 +115,44 @@ from agent.cb_agents import CbAgentsLLM
 # print(manager.build_skills_overview())
 
 
+import asyncio
+from pathlib import Path
+
 from tools.tools.memory_tool import MemoryTool
 from tools.tools.rag_tool import RAGTool
-from context import ContextBuilder, ContextConfig
+from context import (
+    MemoryLoader,
+    OpenAICompatibleAdapter,
+    build_system_prompt_blocks,
+    get_system_prompt,
+)
 from core.message import Message
 
-builder = ContextBuilder(
-    memory_tool=MemoryTool(),
-    rag_tool=RAGTool(),
-    config=ContextConfig(max_tokens=8000, min_relevance=0.05),
-)
+# 重构后:不再有 ContextBuilder 流水线。直接组装 system prompt + 历史。
+loader = MemoryLoader(cwd=Path.cwd())
+adapter = OpenAICompatibleAdapter()
 
 user_query = "数据库连接超时怎么办"
 
-# 一行拿到 OpenAI 风格 messages
-messages = builder.to_messages(
-    user_query=user_query,
-    system_instructions="你是资深 DBA",
-    conversation_history=[
-        Message.create_user_message("我们项目用的 PostgreSQL"),
-        Message.create_assistant_message("好的，记下了"),
-    ],
-)
+async def _build():
+    parts = await get_system_prompt(
+        enabled_tools=frozenset(["memory", "rag"]),
+        model="deepseek-v4-flash",
+        memory_loader=loader,
+        language="Chinese",
+    )
+    parts.append("你是资深 DBA")
+    blocks = build_system_prompt_blocks(parts, use_global_cache_scope=False)
+    return adapter.emit_system(blocks)
+
+system_payload = asyncio.run(_build())
+
+messages = [
+    {"role": "system", "content": system_payload},
+    Message.create_user_message("我们项目用的 PostgreSQL").to_dict(),
+    Message.create_assistant_message("好的,记下了").to_dict(),
+    {"role": "user", "content": user_query},
+]
 
 # 直接喂给 LLM
 llm = CbAgentsLLM()

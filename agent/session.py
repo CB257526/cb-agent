@@ -12,12 +12,20 @@ AgentRunner 的会话主流程组合起来，但**不直接做任何输出**—�
   组装，跟 print 无关，原样搬过来
 - 历史管理（self.history）也在 session 里（前端无需知道历史结构）
 
-不在这里：
+不在这里:
 - 启动期 _section/_info：装配阶段的输出，仍由 run_agent.py 主入口打
 - /xxx 斜杠命令：CLI 专属功能，REPL 那边处理
 - 渲染逻辑（颜色 / 面板）：CLIRenderer 那边
 
-ContextBuilder / ToolRegistry / Executor / LLM 都从外部传入，便于测试和换前端。
+上下文工程模块对接 (Claude Code 对齐重构):
+- 旧 ContextBuilder/ContextPacket 已删除,改走 context.get_system_prompt
+  组装 list[str] -> build_system_prompt_blocks -> provider_adapter.emit_system
+  -> 单 string 进 messages[0]。
+- memory_loader / provider_adapter 在 run_agent.py 装配,这里只持依赖。
+- _build_chat_messages 不再使用 GSSC 流水线;state/compact/work_record 链路
+  保留(用户决策: work_context.py 完整保留)。
+
+ToolRegistry / Executor / LLM 仍从外部传入,便于测试和换前端。
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.cancel import (
@@ -41,11 +50,19 @@ from agent.executor import ToolExecutor
 from agent.message_logger import MessageLogger
 from agent.question_registry import QuestionRegistry
 from constant.llm.constant_llm import ConstantLLM
-from context import ContextBuilder, ContextPacket, ContextPriority
+from context import (
+    MemoryLoader,
+    OpenAICompatibleAdapter,
+    build_system_prompt_blocks,
+    clear_system_prompt_sections,
+    count_tokens,
+    get_system_prompt,
+    should_use_global_cache_scope,
+)
+from context.cache.provider_adapter import CacheControlAdapter
 from core.message import Message
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
-from utils.common import count_tokens
 from agent.work_context import (
     COMPACT_RECORD_LIMIT,
     LocalSessionStore,
@@ -171,7 +188,8 @@ class AgentSession:
         registry: ToolRegistry,
         executor: ToolExecutor,
         event_bus: EventBus,
-        builder: Optional[ContextBuilder] = None,
+        memory_loader: Optional[MemoryLoader] = None,
+        provider_adapter: Optional[CacheControlAdapter] = None,
         skill_manager: Optional[SkillManager] = None,
         bash_prompt_provider=None,
         ctx_enabled: bool = True,
@@ -180,20 +198,27 @@ class AgentSession:
         session_store: Optional[LocalSessionStore] = None,
         trace_summarizer: Optional[TraceSummarizer] = None,
         message_logger: Optional[MessageLogger] = None,
+        language: Optional[str] = "Chinese",
+        mcp_clients=None,
     ) -> None:
         """
         Args:
-            messages_snapshot_hook: 可选回调 (messages, round_idx) -> None，
-                每轮 think 前调用一次。给 CLI dump 调试用，不属于事件流（事件
-                是结构化的；dump 是面向开发者的"看原始上下文"调试通道）。
-            message_logger: 可选消息日志记录器。非 None 时，在每次 LLM 调用前后
-                将完整 messages 列表写入独立日志文件，包含所有 role 的消息全文。
+            messages_snapshot_hook: 可选回调 (messages, round_idx) -> None,
+                每轮 think 前调用一次。给 CLI dump 调试用,不属于事件流(事件
+                是结构化的;dump 是面向开发者的"看原始上下文"调试通道)。
+            message_logger: 可选消息日志记录器。非 None 时,在每次 LLM 调用前后
+                将完整 messages 列表写入独立日志文件,包含所有 role 的消息全文。
+            memory_loader: 多级 CLAUDE.md 加载器(对齐 Claude Code 的 claudemd.ts)。
+                为 None 时 system prompt 不注入 memory section,适合 --bare 模式。
+            provider_adapter: 把 SystemPromptBlock 列表转成具体 API 字段的适配器。
+                默认 OpenAICompatibleAdapter(国内厂商兼容),join 成单 string。
         """
         self.llm = llm
         self.registry = registry
         self.executor = executor
         self.event_bus = event_bus
-        self.builder = builder
+        self.memory_loader = memory_loader
+        self.provider_adapter = provider_adapter or OpenAICompatibleAdapter()
         self.skill_manager = skill_manager
         self.bash_prompt_provider = bash_prompt_provider
         self.ctx_enabled = ctx_enabled
@@ -202,31 +227,33 @@ class AgentSession:
         self.session_store = session_store
         self.trace_summarizer = trace_summarizer
         self.message_logger = message_logger
+        self.language = language
+        self.mcp_clients = mcp_clients
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
         if self.session_store is not None:
             try:
-                # 启动自动恢复最近会话：这里只恢复普通 user/assistant 消息和
-                # 【工作记录】assistant 消息，不恢复 role=tool，也不恢复
-                # assistant.tool_calls。tool 协议消息只在同一轮 tool loop 内合法，
+                # 启动自动恢复最近会话:这里只恢复普通 user/assistant 消息和
+                # 【工作记录】assistant 消息,不恢复 role=tool,也不恢复
+                # assistant.tool_calls。tool 协议消息只在同一轮 tool loop 内合法,
                 # 跨进程/跨轮直接回灌会造成 tool_call_id 对不上的协议风险。
                 self.history = self.session_store.load_latest_history(
                     max_messages=self.history_window,
                 )
             except Exception:
-                logger.exception("本地会话历史恢复失败，忽略")
+                logger.exception("本地会话历史恢复失败,忽略")
                 self.history = []
-        # 当前正在跑的 chat 的 cancel token；REPL 收 Ctrl-C 时调它的 .cancel()
+        # 当前正在跑的 chat 的 cancel token;REPL 收 Ctrl-C 时调它的 .cancel()
         # 没在 chat 中时为 None
         self.current_cancel_token: Optional[CancelToken] = None
-        # AskUserQuestionTool 用：工具线程 register+wait，gateway 在 RPC 里
-        # submit_answer。整个进程一份，session 持有给 gateway/tool 共享。
+        # AskUserQuestionTool 用:工具线程 register+wait,gateway 在 RPC 里
+        # submit_answer。整个进程一份,session 持有给 gateway/tool 共享。
         self.question_registry: QuestionRegistry = QuestionRegistry()
-        # MCP 后台加载由 AgentRunner 装配，但 Gateway 只持有 AgentSession。
-        # 因此这里暴露两个可选回调槽位：
-        # - mcp_status_provider：只读当前连接快照；
-        # - mcp_background_loader：幂等启动后台连接并返回快照。
-        # 这两个状态只服务 UI/CLI 展示，不写入 history，也不参与 ContextBuilder。
+        # MCP 后台加载由 AgentRunner 装配,但 Gateway 只持有 AgentSession。
+        # 因此这里暴露两个可选回调槽位:
+        # - mcp_status_provider:只读当前连接快照;
+        # - mcp_background_loader:幂等启动后台连接并返回快照。
+        # 这两个状态只服务 UI/CLI 展示,不写入 history,也不参与 system prompt。
         self.mcp_status_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self.mcp_background_loader: Optional[Callable[[], Dict[str, Any]]] = None
 
@@ -408,31 +435,104 @@ class AgentSession:
     ) -> List[Dict[str, Any]]:
         """按当前 history/state 构造本轮初始 LLM messages。
 
-        这个 helper 把 _chat_impl 里原本内联的构造逻辑抽出来，是为了自动
-        compact 后可以立刻重建 messages：先压缩 self.history/state，再重新
-        让 ContextBuilder 选择上下文，当前轮就能真正吃到压缩效果。
+        重构后流程(对齐 Claude Code):
+        1. system_instructions 是 _build_system_instructions 返回的"项目自定义"段
+           (角色、bash prompt、Skill 概览),作为 user-appended 段加在新 system
+           prompt 末尾。
+        2. get_system_prompt 异步组装完整 system prompt list[str](含 CLAUDE.md
+           memory section、env_info、language 等)。
+        3. build_system_prompt_blocks 切成带 cache scope 的 SystemPromptBlock。
+        4. provider_adapter.emit_system 转成具体 API 字段(OpenAI 兼容是单 string)。
+        5. 把本地 SessionState 文本作为单独的 user message 注入(取代旧的
+           [State] packet 概念,语义更直白:"这些是上次会话的工作笔记")。
+        6. 历史消息按 history_window 截尾,user_query 最后追加。
         """
-        state_packet = self._build_state_packet()
-        if self.ctx_enabled and self.builder is not None:
-            return self.builder.to_messages(
-                user_query=user_query,
-                conversation_history=self.history,
-                system_instructions=system_instructions,
-                additional_packets=[state_packet] if state_packet else None,
+        # 同步上下文里调 async,用 asyncio.run 起一个临时 loop。session 自身的
+        # chat() 是 sync(由 cb_agents 的 OpenAI SDK 流式同步迭代器决定),所以
+        # 每轮新建 event loop 是合理的;chat_async 走 to_thread 绕过 loop 冲突。
+        # registry.list_tools() 直接返回 list[str](工具名),frozenset 一下用作
+        # 缓存键的稳定输入。
+        enabled_tools = frozenset(self.registry.list_tools())
+        try:
+            system_parts = asyncio.run(
+                get_system_prompt(
+                    enabled_tools=enabled_tools,
+                    model=getattr(self.llm, "model", "") or "",
+                    cwd=Path.cwd(),
+                    memory_loader=self.memory_loader if self.ctx_enabled else None,
+                    mcp_clients=self.mcp_clients,
+                    skill_commands=self._collect_skill_commands(),
+                    language=self.language,
+                )
             )
+        except RuntimeError:
+            # 已在 event loop 里(罕见,工具内调时):用 nest_asyncio 兼容
+            loop = asyncio.new_event_loop()
+            try:
+                system_parts = loop.run_until_complete(
+                    get_system_prompt(
+                        enabled_tools=enabled_tools,
+                        model=getattr(self.llm, "model", "") or "",
+                        cwd=Path.cwd(),
+                        memory_loader=self.memory_loader if self.ctx_enabled else None,
+                        mcp_clients=self.mcp_clients,
+                        skill_commands=self._collect_skill_commands(),
+                        language=self.language,
+                    )
+                )
+            finally:
+                loop.close()
 
-        effective_system = system_instructions
-        if state_packet is not None:
-            effective_system = (
-                effective_system
-                + "\n\n[State]\n关键进展与未决问题：\n"
-                + state_packet.content
-            )
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": effective_system}]
+        # 把项目自定义指令作为 user-appended 段追加到末尾
+        if system_instructions and system_instructions.strip():
+            system_parts.append(system_instructions.strip())
+
+        # 切分 + 转 provider 格式
+        model_id = getattr(self.llm, "model", "") or ""
+        blocks = build_system_prompt_blocks(
+            system_parts,
+            use_global_cache_scope=should_use_global_cache_scope(model_id),
+        )
+        system_payload = self.provider_adapter.emit_system(blocks)
+
+        # 组装最终 messages
+        messages: List[Dict[str, Any]] = []
+        if isinstance(system_payload, str):
+            if system_payload.strip():
+                messages.append({"role": "system", "content": system_payload})
+        elif isinstance(system_payload, list):
+            # Anthropic adapter 返回 list[dict];OpenAI 兼容路径走不到这里
+            messages.append({"role": "system", "content": system_payload})
+
+        # SessionState 作为独立 user message 注入(取代旧的 [State] packet)
+        state_text = self._session_state_text()
+        if state_text:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[本地工作态 / SessionState]\n"
+                    "(以下是当前会话的滚动工作笔记,用于跨轮恢复;不是用户最新指令)\n\n"
+                    + state_text
+                ),
+            })
+
+        # 截尾历史
         for m in self.history[-self.history_window:]:
             messages.append(m.to_dict())
         messages.append({"role": "user", "content": user_query})
         return messages
+
+    def _collect_skill_commands(self) -> List[Any]:
+        """从 SkillManager 收集 skill 命令,失败返回空列表。"""
+        if self.skill_manager is None:
+            return []
+        try:
+            list_fn = getattr(self.skill_manager, "list_commands", None)
+            if callable(list_fn):
+                return list(list_fn() or [])
+        except Exception:
+            logger.exception("skill_manager.list_commands 调用失败")
+        return []
 
     def _chat_impl(self, user_query: str, token: CancelToken) -> str:
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
@@ -523,15 +623,23 @@ class AgentSession:
         return final_answer
 
     def clear_history(self) -> None:
-        # /clear 的新语义是"彻底清理当前会话"：内存 history 和项目级
+        # /clear 的新语义是"彻底清理当前会话":内存 history 和项目级
         # .cbagent/sessions active session 都删掉。下一轮继续聊天时 store 会
-        # 自动创建新 session，不会把旧上下文再恢复回来。
+        # 自动创建新 session,不会把旧上下文再恢复回来。
+        # 同时清空 SystemPromptSectionCache 与 MemoryLoader memoize,让下一轮
+        # 重读 CLAUDE.md / 重算 env_info(用户编辑了记忆文件后能立刻生效)。
         self.history.clear()
         if self.session_store is not None:
             try:
                 self.session_store.clear_active_session()
             except Exception:
                 logger.exception("清理本地会话失败")
+        clear_system_prompt_sections()
+        if self.memory_loader is not None:
+            try:
+                self.memory_loader.reset_cache(reason="clear_history")
+            except Exception:
+                logger.exception("MemoryLoader 缓存清理失败")
 
     def _model_max_tokens(self) -> int:
         """返回当前模型声明的完整上下文窗口。
@@ -1127,23 +1235,6 @@ class AgentSession:
         if len(parts) == 1:
             parts.append("当前没有可压缩的有效上下文。")
         return _clip_compact_text("\n".join(parts), COMPACT_RECORD_LIMIT)
-
-    def _build_state_packet(self) -> Optional[ContextPacket]:
-        """把本地滚动状态转换成 ContextBuilder 可消费的高优先级 packet。"""
-        if self.session_store is None:
-            return None
-        try:
-            text = self.session_store.state_text()
-        except Exception:
-            logger.exception("本地会话状态读取失败")
-            return None
-        if not text:
-            return None
-        return ContextPacket(
-            content=text,
-            priority=ContextPriority.P1_STATE,
-            metadata={"source": "local_session_state"},
-        )
 
     def _make_work_record(
         self,
