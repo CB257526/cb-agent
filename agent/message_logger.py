@@ -1,13 +1,11 @@
-"""消息日志：将每次 LLM 调用的完整 messages 列表写入结构化日志文件。
+"""Level-aware LLM message logging.
 
-格式：可读文本，每条消息带时间戳、序号、角色、内容。
-日志文件保留完整内容不截断；截断是未来前端展示层的职责。
+The normal runtime log records lifecycle, tool, gateway and error details.
+This logger is only for the exact OpenAI-compatible ``messages`` payload that
+is sent into the model. It supports two modes:
 
-使用方式：
-    logger = MessageLogger("/path/to/messages.log")
-    logger.log(messages, label="初始上下文")
-    logger.log(messages, label="第 2 轮 think 前")
-    logger.close()
+- ``summary``: roles, sizes, previews and tool-call metadata only.
+- ``full``: complete message content and tool-call arguments.
 """
 
 from __future__ import annotations
@@ -15,19 +13,12 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 def _flat_content(content: Any) -> str:
-    """将 OpenAI message content 转为可读字符串。
-
-    处理三种形态：
-    - 纯字符串
-    - 多模态数组（[{type: text, text: ...}, {type: image_url, ...}]）
-    - None（assistant 发出 tool_calls 时 content 可能为空）
-    """
     if content is None:
-        return "(无文本内容)"
+        return "(no text content)"
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -36,23 +27,30 @@ def _flat_content(content: Any) -> str:
             if not isinstance(item, dict):
                 parts.append(str(item))
                 continue
-            t = item.get("type", "")
-            if t == "text":
+            item_type = item.get("type", "")
+            if item_type == "text":
                 parts.append(str(item.get("text", "")))
-            elif t == "image_url":
+            elif item_type == "image_url":
                 url = (item.get("image_url") or {}).get("url", "")[:100]
-                parts.append(f"[图片: {url}]")
-            elif t == "audio_url":
+                parts.append(f"[image: {url}]")
+            elif item_type == "audio_url":
                 url = (item.get("audio_url") or {}).get("url", "")[:100]
-                parts.append(f"[音频: {url}]")
+                parts.append(f"[audio: {url}]")
             else:
-                parts.append(f"[{t}]")
-        return " ".join(p for p in parts if p).strip() or "(空内容)"
+                parts.append(f"[{item_type}]")
+        return " ".join(p for p in parts if p).strip() or "(empty content)"
     return str(content)
 
 
-def _tool_calls_text(tool_calls: List[Dict[str, Any]]) -> str:
-    """渲染 assistant 消息里的 tool_calls 字段。"""
+def _clip(text: str, limit: int = 240) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _tool_calls_text(tool_calls: List[Dict[str, Any]], *, full: bool) -> str:
     lines: List[str] = []
     for tc in tool_calls:
         fid = tc.get("id", "?")
@@ -67,29 +65,32 @@ def _tool_calls_text(tool_calls: List[Dict[str, Any]]) -> str:
                 args_str = args_raw
         else:
             args_str = str(args_raw)
-        lines.append(f"  ── tool_call id={fid} ──\n  {name}({args_str})")
+        if not full:
+            args_str = _clip(args_str)
+        lines.append(f"  -- tool_call id={fid} --\n  {name}({args_str})")
     return "\n".join(lines)
 
 
 class MessageLogger:
-    """将会话消息写入专用日志文件。
-
-    线程安全：write() 依赖 Python 文件对象的内部缓冲，多线程并发调用
-    时可能产生交错行；此项目消息日志只在单线程的 asyncio 主循环中调用，
-    因此不需要加锁。
-    """
-
-    def __init__(self, file_path: Path | str):
+    def __init__(self, file_path: Path | str, *, mode: str = "full"):
+        if mode not in {"summary", "full"}:
+            raise ValueError("MessageLogger mode must be 'summary' or 'full'")
+        self.mode = mode
         self._path = Path(file_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._file = open(str(self._path), "a", encoding="utf-8")
         self._write_header()
 
-    def _write_header(self):
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _write_header(self) -> None:
         self._file.write(
-            f"cb-agent 消息日志\n"
-            f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"{'='*70}\n"
+            "cb-agent message log\n"
+            f"mode: {self.mode}\n"
+            f"started_at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"{'=' * 70}\n"
         )
         self._file.flush()
 
@@ -98,67 +99,50 @@ class MessageLogger:
         messages: List[Dict[str, Any]],
         label: str = "",
     ) -> None:
-        """将消息列表写入日志文件。"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         count = len(messages)
-        total_chars = sum(
-            len(str(_flat_content(m.get("content")))) for m in messages
-        )
+        total_chars = sum(len(_flat_content(m.get("content"))) for m in messages)
+        full = self.mode == "full"
 
-        lines: List[str] = []
-        lines.append("")
-        lines.append("─" * 70)
-        header = f"[{now}] {label}"
-        if label:
-            header += "  "
-        header += f"messages={count}  chars≈{total_chars}"
-        lines.append(header)
-        lines.append("─" * 70)
+        lines: List[str] = [
+            "",
+            "-" * 70,
+            f"[{now}] {label}  messages={count} chars={total_chars}",
+            "-" * 70,
+        ]
 
         for i, msg in enumerate(messages):
             role = msg.get("role", "?")
             content = msg.get("content")
-
-            # 构建消息头
-            tag = f"[{i}] {role.upper()}"
+            text = _flat_content(content)
+            tag = f"[{i}] {str(role).upper()} chars={len(text)}"
             if role == "tool":
-                tag += f" | name={msg.get('name', '?')}"
-                tag += f" | call_id={msg.get('tool_call_id', '?')}"
+                tag += f" name={msg.get('name', '?')} call_id={msg.get('tool_call_id', '?')}"
             elif role == "assistant":
                 tcs = msg.get("tool_calls") or []
                 if tcs:
-                    tc_names = [
-                        tc.get("function", {}).get("name", "?") for tc in tcs
-                    ]
-                    tag += f" | tool_calls={tc_names}"
-            elif role == "system":
-                # 显示系统提示的前 80 字符作为预览
-                preview = _flat_content(content)[:80].replace("\n", " ")
-                tag += f" | preview=\"{preview}...\"" if len(str(content or "")) > 80 else f" | \"{preview}\""
-
+                    tc_names = [tc.get("function", {}).get("name", "?") for tc in tcs]
+                    tag += f" tool_calls={tc_names}"
             lines.append("")
             lines.append(tag)
 
-            # 输出文本内容（完整保留，不截断）
-            text = _flat_content(content)
-            if text:
+            if full:
                 lines.append(text)
+            else:
+                lines.append(f"preview: {_clip(text)}")
 
-            # assistant 的 tool_calls 详情
             if role == "assistant":
-                tcs = msg.get("tool_calls")
+                tcs = msg.get("tool_calls") or []
                 if tcs:
-                    lines.append(_tool_calls_text(tcs))
+                    lines.append(_tool_calls_text(tcs, full=full))
 
-        lines.append("")
         self._file.write("\n".join(lines))
         self._file.flush()
 
     def close(self) -> None:
-        """关闭日志文件。"""
         try:
-            self._file.write(f"\n{'='*70}\n")
-            self._file.write(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self._file.write(f"\n{'=' * 70}\n")
+            self._file.write(f"ended_at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             self._file.flush()
             self._file.close()
         except Exception:

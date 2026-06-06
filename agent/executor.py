@@ -167,9 +167,20 @@ class ToolExecutor:
         """
         if not tool_calls:
             return []
+        tool_names = [
+            tc.get("function", {}).get("name", "")
+            for tc in tool_calls
+        ]
+        logger.info(
+            "executor start: round=%s calls=%s tools=%s",
+            round_idx,
+            len(tool_calls),
+            tool_names,
+        )
 
         # submit 前最后一次窗口：已 cancel 就直接全部占位
         if cancel_token is not None and cancel_token.is_cancelled():
+            logger.info("executor cancelled before submit: round=%s calls=%s", round_idx, len(tool_calls))
             if self._bus is not None:
                 self._bus.emit(Cancelled(where="executor", round_idx=round_idx))
             return [
@@ -177,7 +188,9 @@ class ToolExecutor:
             ]
 
         if should_parallelize(tool_calls):
+            logger.info("executor mode: parallel round=%s calls=%s", round_idx, len(tool_calls))
             return self._execute_parallel(tool_calls, round_idx, cancel_token)
+        logger.info("executor mode: serial round=%s calls=%s", round_idx, len(tool_calls))
         return self._execute_serial(tool_calls, round_idx, cancel_token)
 
     # ---------- 串行 ----------
@@ -195,6 +208,11 @@ class ToolExecutor:
                 if self._bus is not None and not cancel_emitted:
                     self._bus.emit(Cancelled(where="executor", round_idx=round_idx))
                     cancel_emitted = True
+                logger.info(
+                    "executor skipped tool after cancel: round=%s name=%s",
+                    round_idx,
+                    tc.get("function", {}).get("name", ""),
+                )
                 results.append(self._cancelled_placeholder(tc))
                 continue
             results.append(self._run_one(tc, round_idx))
@@ -241,6 +259,13 @@ class ToolExecutor:
         name = tool_call.get("function", {}).get("name", "")
         raw_args = tool_call.get("function", {}).get("arguments", "{}")
         args = _parse_arguments(raw_args)
+        logger.info(
+            "tool start: round=%s name=%s call_id=%s args_keys=%s",
+            round_idx,
+            name,
+            call_id,
+            sorted(args.keys()),
+        )
 
         if self._bus is not None:
             self._bus.emit(ToolStart(
@@ -267,6 +292,15 @@ class ToolExecutor:
                 round_idx=round_idx,
             ))
 
+        logger.info(
+            "tool complete: round=%s name=%s call_id=%s is_error=%s duration=%.2fs result_chars=%s",
+            round_idx,
+            name,
+            call_id,
+            is_error,
+            duration,
+            len(result) if isinstance(result, str) else len(str(result)),
+        )
         return ToolCallResult(
             call_id=call_id, name=name, arguments=args,
             result=result, duration_seconds=duration, is_error=is_error,

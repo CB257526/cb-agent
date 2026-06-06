@@ -75,6 +75,13 @@ class CbAgentsLLM:
             raise ValueError("模型ID、API密钥和服务地址必须被提供或在.env文件中定义。")
 
         self.client = OpenAI(api_key=apiKey, base_url=baseUrl, timeout=timeout)
+        logger.info(
+            "LLM client initialized: model=%s base_url=%s function_calling=%s timeout=%s",
+            self.model,
+            baseUrl,
+            self.is_Function_Calling,
+            timeout,
+        )
 
     def _next_stream_id(self) -> int:
         """生成本进程内递增 stream id，便于日志把一次 LLM 请求串起来。"""
@@ -248,6 +255,13 @@ class CbAgentsLLM:
                     continue
 
                 if kind == "created":
+                    logger.info(
+                        "LLM stream created: stream=%s round=%s elapsed=%.2fs model=%s",
+                        stream_id,
+                        round_idx,
+                        payload,
+                        self.model,
+                    )
                     print(f"✅ 大语言模型响应成功（stream={stream_id}, {payload:.2f}s）:")
                     continue
                 if kind == "chunk":
@@ -270,8 +284,22 @@ class CbAgentsLLM:
                 if kind == "error":
                     if cancel_event is not None and cancel_event.is_set():
                         break
+                    logger.error(
+                        "LLM stream error: stream=%s round=%s model=%s error=%r",
+                        stream_id,
+                        round_idx,
+                        self.model,
+                        payload,
+                    )
                     raise payload
                 if kind == "done":
+                    logger.info(
+                        "LLM stream done: stream=%s round=%s elapsed=%.2fs model=%s",
+                        stream_id,
+                        round_idx,
+                        time.monotonic() - started_at,
+                        self.model,
+                    )
                     break
         finally:
             if stop_event.is_set():
@@ -326,6 +354,14 @@ class CbAgentsLLM:
         round_idx: 工具循环当前轮次，1-based。仅作为事件元信息透传。
         """
         print(f"🧠 正在调用 {self.model} 模型...")
+        logger.info(
+            "LLM think start: round=%s model=%s messages=%s tools=%s function_calling=%s",
+            round_idx,
+            self.model,
+            len(messages or []),
+            len(tools or []),
+            self.is_Function_Calling,
+        )
         try:
             if self.is_Function_Calling:
                 # 支持函数调用的模型调用
@@ -340,6 +376,7 @@ class CbAgentsLLM:
                 )
 
         except Exception as e:
+            logger.exception("LLM think failed: round=%s model=%s", round_idx, self.model)
             print(f"❌ 调用LLM API时发生错误: {e}")
             return None
     
@@ -425,6 +462,13 @@ class CbAgentsLLM:
         full_text = "".join(collected_content)
         # 兼容旧返回结构：[text, None]；额外字段挂在 list 末尾会破坏调用方解构
         # → 改成多带回 usage/cancelled 信息但保持位置 0/1 不变
+        logger.info(
+            "LLM think done: round=%s model=%s answer_chars=%s usage=%s",
+            round_idx,
+            self.model,
+            len(full_text),
+            _usage_to_dict(last_usage),
+        )
         return [full_text, None]
 
 
@@ -583,6 +627,15 @@ class CbAgentsLLM:
                 round_idx=round_idx,
             ))
 
+        logger.info(
+            "LLM think done: round=%s model=%s answer_chars=%s reasoning_chars=%s tool_calls=%s usage=%s",
+            round_idx,
+            self.model,
+            len(content),
+            len(reasoning_content or ""),
+            len(tool_calls),
+            _usage_to_dict(last_usage),
+        )
         return {
             "answer": content,
             "reason": reasoning_content if reasoning_content else content,
@@ -654,5 +707,3 @@ if __name__ == '__main__':
 
     except ValueError as e:
         print(e)
-
-

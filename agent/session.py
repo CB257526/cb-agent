@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -256,6 +257,13 @@ class AgentSession:
         # 这两个状态只服务 UI/CLI 展示,不写入 history,也不参与 system prompt。
         self.mcp_status_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self.mcp_background_loader: Optional[Callable[[], Dict[str, Any]]] = None
+        logger.info(
+            "AgentSession initialized: ctx_enabled=%s history_window=%s restored_history=%s message_logger=%s",
+            self.ctx_enabled,
+            self.history_window,
+            len(self.history),
+            bool(self.message_logger),
+        )
 
     # ---------- 公共入口 ----------
 
@@ -535,6 +543,7 @@ class AgentSession:
         return []
 
     def _chat_impl(self, user_query: str, token: CancelToken) -> str:
+        chat_started = time.perf_counter()
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
         user_query = self._prepend_background_notifications(user_query)
 
@@ -550,6 +559,19 @@ class AgentSession:
             if self.llm.is_Function_Calling
             else None
         )
+        logger.info(
+            "chat start: query_chars=%s history=%s messages=%s tools=%s function_calling=%s",
+            len(user_query),
+            len(self.history),
+            len(messages),
+            len(tools_schema or []),
+            self.llm.is_Function_Calling,
+        )
+        logger.debug(
+            "chat request estimate: tokens=%s context=%s",
+            self._estimate_request_tokens(messages, tools_schema),
+            self.context_window_usage(),
+        )
 
         # 预检完整请求体，而不只看 state/history。原因是工具 schema、系统提示、
         # Skill 列表和当前用户输入也会占用真实模型窗口；如果这里达到或超过 80%
@@ -563,6 +585,7 @@ class AgentSession:
         )
         if preflight is not None:
             auto_compactions.append(preflight)
+            logger.info("auto compact before first think: %s", preflight)
             messages = self._build_chat_messages(
                 user_query=user_query,
                 system_instructions=system_instructions,
@@ -609,8 +632,18 @@ class AgentSession:
         )
         if post_turn_compaction is not None:
             auto_compactions.append(post_turn_compaction)
+            logger.info("auto compact after turn: %s", post_turn_compaction)
 
         # Done 事件：让前端知道整轮结束
+        elapsed = time.perf_counter() - chat_started
+        logger.info(
+            "chat done: rounds=%s cancelled=%s answer_chars=%s auto_compactions=%s elapsed=%.2fs",
+            rounds_used,
+            token.is_cancelled(),
+            len(final_answer or ""),
+            len(auto_compactions),
+            elapsed,
+        )
         self.event_bus.emit(Done(
             final_answer=final_answer,
             rounds_used=rounds_used,
@@ -945,6 +978,12 @@ class AgentSession:
                 round_idx=round_idx,
                 max_rounds=self.MAX_TOOL_ROUNDS,
             ))
+            logger.info(
+                "round start: round=%s messages=%s request_tokens_est=%s",
+                round_idx,
+                len(messages),
+                self._estimate_request_tokens(messages, tools_schema),
+            )
             if self.messages_snapshot_hook is not None:
                 try:
                     self.messages_snapshot_hook(messages, round_idx)
@@ -971,12 +1010,14 @@ class AgentSession:
             # 不支持 FC 的模型返回 [text, None]
             if isinstance(result, list):
                 final = result[0] or ""
+                logger.info("round final without tools: round=%s answer_chars=%s", round_idx, len(final))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
                 return round_idx, final, trace_collector, loop_compactions
 
             if not isinstance(result, dict):
+                logger.error("LLM returned unexpected result: round=%s type=%s", round_idx, type(result).__name__)
                 self.event_bus.emit(Error(
                     where="llm",
                     message=f"模型返回非预期结构: {type(result).__name__}",
@@ -996,12 +1037,14 @@ class AgentSession:
 
             # 流式过程中被 cancel → 不再发起新一轮工具调用，直接收尾
             if token.is_cancelled():
+                logger.info("round cancelled after llm stream: round=%s answer_chars=%s", round_idx, len(answer))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
                 return round_idx, answer, trace_collector, loop_compactions
 
             if not tool_calls:
+                logger.info("round final: round=%s answer_chars=%s", round_idx, len(answer))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
@@ -1017,6 +1060,18 @@ class AgentSession:
                 # thinking 模式要求 reasoning_content 回传，否则下一轮 400
                 assistant_msg["reasoning_content"] = reasoning
             messages.append(assistant_msg)
+            tool_names = [
+                call.get("function", {}).get("name", "?")
+                for call in tool_calls
+            ]
+            logger.info(
+                "round planned tool calls: round=%s count=%s tools=%s answer_chars=%s reasoning_chars=%s",
+                round_idx,
+                len(tool_calls),
+                tool_names,
+                len(answer),
+                len(reasoning or ""),
+            )
 
             # 调度执行（事件由 ToolExecutor 自己 emit ToolStart/ToolComplete）
             # token 透传给 executor：串行/并发模式下都在工具间做 cancel 检查
@@ -1060,10 +1115,12 @@ class AgentSession:
             )
             if compact_event is not None:
                 loop_compactions.append(compact_event)
+                logger.info("tool loop compacted messages: %s", compact_event)
 
             self.event_bus.emit(RoundEnd(
                 round_idx=round_idx, has_tool_calls=True, final=False,
             ))
+            logger.info("round end with tools: round=%s tool_results=%s", round_idx, len(results))
 
         # 超出最大轮数
         self.event_bus.emit(Error(

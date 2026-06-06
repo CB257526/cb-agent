@@ -59,6 +59,11 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+from agent.logging_config import configure_logging
+
+_LOG_SETTINGS = configure_logging(Path(_HERE))
+logger = logging.getLogger(__name__)
+
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import Done, MCPStatus
@@ -93,13 +98,6 @@ except Exception:
 
 
 # 日志：默认只显示 WARNING 以上，避免被各模块的 INFO 刷屏
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-for noisy in ("memory", "memory.types", "memory.storage", "memory.manager"):
-    logging.getLogger(noisy).setLevel(logging.ERROR)
-
 
 # ========== 启动期纯字符输出 ==========
 
@@ -111,16 +109,19 @@ def _hr(char: str = "─", width: int = 60) -> str:
 
 def _section(title: str) -> None:
     """打印标题，用于分隔不同阶段的输出"""
+    logger.info("section: %s", title)
     print(f"\n{_hr()}\n{title}\n{_hr()}")
 
 
 def _info(msg: str) -> None:
     """打印信息，用于启动期的输出"""
+    logger.info(msg)
     print(f"[*] {msg}")
 
 
 def _err(msg: str) -> None:
     """打印错误信息，用于启动期的输出"""
+    logger.error(msg)
     print(f"[!] {msg}", file=sys.stderr)
 
 
@@ -137,9 +138,19 @@ class AgentRunner:
         attach_cli_renderer: bool = True, # 是否 attach CLIRenderer 到 EventBus
         memory_system: str = "light",  # light=Markdown 记忆，full=旧 RAG/向量记忆，off=关闭记忆
     ) -> None:
+        self.logging_settings = _LOG_SETTINGS
         self.use_mcp = use_mcp and _HAS_MCP
         self.ctx_enabled = ctx_enabled
         self.memory_system = memory_system
+        logger.info(
+            "AgentRunner init: use_mcp=%s has_mcp=%s ctx_enabled=%s attach_cli_renderer=%s memory_system=%s log_level=%s",
+            use_mcp,
+            _HAS_MCP,
+            ctx_enabled,
+            attach_cli_renderer,
+            memory_system,
+            self.logging_settings.verbosity,
+        )
         # CLI 直接交互时保留 messages dump，方便开发者用 /msg on|off 看原始上下文；
         # TUI/jsonrpc 模式 attach_cli_renderer=False，此时 stderr 会被前端实时收集，
         # 如果默认 dump 完整 system prompt + 工具 schema，集成终端和 React 渲染都会承压。
@@ -195,9 +206,19 @@ class AgentRunner:
 
         # 消息日志:将所有发送给 LLM 的消息全文记录到独立文件,
         # 包含 system/user/assistant/tool 全部角色的消息内容
-        message_logger = MessageLogger(
-            Path(_HERE) / ".cbagent" / "logs" / f"messages-{int(time.time())}.log"
-        )
+        message_logger = None
+        if self.logging_settings.message_log_mode != "off":
+            message_logger = MessageLogger(
+                self.logging_settings.log_dir / f"messages-{int(time.time())}.log",
+                mode=self.logging_settings.message_log_mode,
+            )
+            logger.info(
+                "message logger enabled: mode=%s path=%s",
+                self.logging_settings.message_log_mode,
+                message_logger.path,
+            )
+        else:
+            logger.info("message logger disabled at log level=%s", self.logging_settings.verbosity)
 
         # 5. 会话核心(纯逻辑)
         self.session = AgentSession(

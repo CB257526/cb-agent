@@ -140,6 +140,20 @@ LLM_BASE_URL=https://your-provider.example/v1
 LLM_TIMEOUT=60
 ```
 
+日志等级也可以在 `.env` 里控制：
+
+```env
+# basic | detail | full
+CBAGENT_LOG_LEVEL=basic
+CBAGENT_LOG_DIR=.cbagent/logs
+```
+
+- `basic`: 记录启动、会话、工具、网关、错误等关键生命周期日志。
+- `detail`: 增加每轮 think、工具调度、RPC 分发和 messages 摘要日志。
+- `full`: 开启 DEBUG，并把发送给 LLM 的完整 messages 写入 `messages-*.log`。
+
+运行日志默认写到 `.cbagent/logs/cb-agent-<timestamp>.log`；TUI 仍会把 Python stderr 镜像到 `~/.cb-agent/logs/gateway-<timestamp>.log`。
+
 注意：`LLM_MODEL_ID` 必须在 [constant/llm/constant_llm.py](constant/llm/constant_llm.py) 的 `ConstantLLM.llm_dict` 里登记。新增模型时要补：
 
 - `is_tool`

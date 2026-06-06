@@ -113,6 +113,7 @@ class Gateway:
         method = msg.get("method")
         rpc_id = msg.get("id")
         params = msg.get("params") or {}
+        logger.info("rpc dispatch: method=%s id=%s params_keys=%s", method, rpc_id, sorted(params.keys()) if isinstance(params, dict) else [])
 
         if method == "prompt.submit":
             self._handle_prompt_submit(rpc_id, params)
@@ -139,6 +140,7 @@ class Gateway:
         elif method == "session.answer_question":
             self._handle_answer_question(rpc_id, params)
         else:
+            logger.warning("rpc unknown method: method=%r id=%s", method, rpc_id)
             if rpc_id is not None:
                 self.transport.write(make_response(
                     rpc_id,
@@ -149,6 +151,7 @@ class Gateway:
     def _handle_prompt_submit(self, rpc_id: Any, params: Dict[str, Any]) -> None:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
+            logger.warning("prompt rejected: invalid text id=%s", rpc_id)
             if rpc_id is not None:
                 self.transport.write(make_response(
                     rpc_id,
@@ -160,6 +163,7 @@ class Gateway:
         # 单 session：拒绝并发 chat。UI 应该等上一个 done 事件再发下一个 prompt
         with self._busy_lock:
             if self._busy:
+                logger.info("prompt rejected: busy id=%s text_chars=%s", rpc_id, len(text))
                 if rpc_id is not None:
                     self.transport.write(make_response(
                         rpc_id,
@@ -171,17 +175,20 @@ class Gateway:
         # 立刻 ack——chat 是异步任务，结果通过事件流送
         if rpc_id is not None:
             self.transport.write(make_response(rpc_id, result={"status": "accepted"}))
+        logger.info("prompt accepted: id=%s text_chars=%s", rpc_id, len(text))
 
         # 投递到 asyncio loop
         loop = self._loop
         if loop is None:
             with self._busy_lock:
                 self._busy = False
+            logger.error("prompt accepted but event loop unavailable: id=%s", rpc_id)
             return
         asyncio.run_coroutine_threadsafe(self._run_chat(text), loop)
 
     async def _run_chat(self, text: str) -> None:
         token = CancelToken()
+        logger.info("chat task start: text_chars=%s", len(text))
         try:
             await self.session.chat_async(text, cancel_token=token)
         except Exception as e:
@@ -201,14 +208,17 @@ class Gateway:
         finally:
             with self._busy_lock:
                 self._busy = False
+            logger.info("chat task finished")
 
     def _handle_cancel(self, rpc_id: Any, params: Dict[str, Any]) -> None:
         token = self.session.current_cancel_token
         if token is None:
+            logger.info("cancel requested but no active token: id=%s", rpc_id)
             if rpc_id is not None:
                 self.transport.write(make_response(rpc_id, result={"cancelled": False}))
             return
         token.cancel()
+        logger.info("cancel requested: id=%s", rpc_id)
         closed_streams = 0
         llm = getattr(self.session, "llm", None)
         cancel_streams = getattr(llm, "cancel_active_streams", None)
@@ -225,8 +235,10 @@ class Gateway:
                 rpc_id,
                 result={"cancelled": True, "closed_streams": closed_streams},
             ))
+        logger.info("cancel completed: id=%s closed_streams=%s", rpc_id, closed_streams)
 
     def _handle_quit(self, rpc_id: Any) -> None:
+        logger.info("quit requested: id=%s", rpc_id)
         if rpc_id is not None:
             self.transport.write(make_response(rpc_id, result={"bye": True}))
         loop = self._loop
@@ -540,6 +552,7 @@ class Gateway:
     async def _serve_async(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
+        logger.info("gateway serve start")
 
         # stdin 读线程：每读到一行 dispatch 一次。线程内不持有 loop 引用做 await，
         # 所有跨线程的事都用 run_coroutine_threadsafe / call_soon_threadsafe。
@@ -563,6 +576,11 @@ class Gateway:
                 "context_window": session_payload.get("context_window"),
             },
         })
+        logger.info(
+            "gateway ready emitted: model=%s history=%s",
+            getattr(self.session.llm, "model", "unknown"),
+            len(session_payload.get("history", [])),
+        )
 
         # ready 事件发出后再启动 MCP 后台连接。这样 TUI 可以先渲染首屏和输入框，
         # 后续 mcp_status 事件会自然追加/更新状态；配置再多也不会卡住用户第一句。
@@ -574,6 +592,7 @@ class Gateway:
                 logger.exception("failed to start MCP background loading")
 
         await self._stop_event.wait()
+        logger.info("gateway serve stop requested")
 
     def _reader_loop(self) -> None:
         """stdin 读循环。EOF 或 transport 关闭后通知 loop 停。"""
