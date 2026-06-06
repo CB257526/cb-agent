@@ -24,6 +24,7 @@ import { AgentEvent, BuddyState, ChatItem, ContextWindow, RestoredHistoryMessage
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
+import { AttachmentQueue } from "./components/AttachmentQueue.js";
 import { ActivityPanel } from "./components/ActivityPanel.js";
 import { Banner } from "./components/Banner.js";
 import { SlashCommandPicker } from "./components/SlashCommandPicker.js";
@@ -31,6 +32,8 @@ import { SessionSwitcher } from "./components/SessionSwitcher.js";
 import { BuddySprite } from "./buddy/BuddySprite.js";
 import { HistoryStore } from "./historyStore.js";
 import { findCommand, SlashCommand, CommandCtx, formatMCPStatus } from "./commands.js";
+import { readClipboardImageAttachment } from "./clipboardImage.js";
+import type { PromptAttachmentInput, QueuedAttachment } from "./types.js";
 
 const STDERR_RING_MAX = 200;  // 内存里最多留 200 行，超出从头丢
 
@@ -120,6 +123,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [buddyState, setBuddyState] = useState<BuddyState | null>(null);
+  const [attachments, setAttachments] = useState<QueuedAttachment[]>([]);
   // 当前等待用户作答的问题 id：决定 EventStream 把输入路由给哪个 panel；
   // 同时 PromptInput 在问答期 disabled，避免误打字提交 prompt
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
@@ -163,6 +167,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const _flushCount = useRef(0);
   const _pendingDelta = useRef<{ reasoning: string; text: string; firstAt: number }>({ reasoning: "", text: "", firstAt: 0 });
   const _flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // prompt.submit 是 fire-and-forget RPC，但后端仍会立刻回一个 accepted/error。
+  // 附件队列等这个 ack 后再清空，避免 submit 本身被拒绝时用户需要重新挑文件。
+  const _pendingSubmitId = useRef<string | null>(null);
   // MCP 后台加载会按 server 状态变化发事件。这里只记录上一次展示文本，
   // 防止同一快照重复追加 system 行，保持对话流安静。
   const _lastMcpStatusText = useRef("");
@@ -522,12 +529,25 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       });
     };
 
+    const onResponse = (id: string | number, body: { result?: unknown; error?: { code: number; message: string } }) => {
+      if (id !== _pendingSubmitId.current) return;
+      _pendingSubmitId.current = null;
+      if (body.error) {
+        setBusy(false);
+        appendSystem(`提交失败：${body.error.message}`);
+        return;
+      }
+      setAttachments([]);
+    };
+
     transport.on("event", onEvent);
+    transport.on("response", onResponse);
     transport.on("protocolError", onProtoErr);
     transport.on("exit", onExit);
     transport.on("stderr", onStderr);
     return () => {
       transport.removeListener("event", onEvent);
+      transport.removeListener("response", onResponse);
       transport.removeListener("protocolError", onProtoErr);
       transport.removeListener("exit", onExit);
       transport.removeListener("stderr", onStderr);
@@ -572,6 +592,14 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       // 想保留前端可视历史的话以后可以拆成 Ctrl+L=只清屏 / /clear=连后端一起清
       setItems([]);
       clearScreen?.();
+    } else if (key.ctrl && (inputChar === "v" || inputChar === "\u0016")) {
+      if (busy || activeQuestionId !== null || showSessionSwitcher) return;
+      readClipboardImageAttachment()
+        .then((item) => {
+          setAttachments((prev) => [...prev, item]);
+          appendSystem(`已从剪贴板添加图片：${item.fileName}`);
+        })
+        .catch((e) => appendSystem(`剪贴板图片读取失败：${(e as Error).message}`));
     }
   });
 
@@ -590,16 +618,19 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       openSessionSwitcher,
       toggleActivity: () => setShowActivity((v) => !v),
       setBuddyState,
+      attachments,
+      setAttachments,
     };
     const ret = cmd.handler(ctx);
     if (ret instanceof Promise) {
       ret.catch((e) => appendSystem(`✗ 命令 ${cmd.name} 抛错：${(e as Error).message}`));
     }
     setInput("");
-  }, [transport, input, appendSystem, applySessionPayload, setContextWindow, resetContextWindow, openSessionSwitcher]);
+  }, [transport, input, appendSystem, applySessionPayload, setContextWindow, resetContextWindow, openSessionSwitcher, attachments]);
 
   const handleSubmit = useCallback((text: string) => {
-    if (!text.trim() || busy) return;
+    const pendingAttachments = attachments;
+    if ((!text.trim() && pendingAttachments.length === 0) || busy) return;
 
     // 斜杠命令：拦截，不走 prompt.submit，也不入历史
     if (text.startsWith("/")) {
@@ -613,12 +644,25 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       return;
     }
 
-    historyStore.push(text);
-    setItems((prev) => [...prev, { id: nextId(), role: "user", text }]);
+    if (text.trim()) historyStore.push(text);
+    const attachmentLines = pendingAttachments.map((item, index) => {
+      return `  ${index + 1}. ${item.fileName} (${item.source ?? "direct"})`;
+    });
+    const displayText = [
+      text.trim() || "请根据附件回答。",
+      attachmentLines.length ? "附件：\n" + attachmentLines.join("\n") : "",
+    ].filter(Boolean).join("\n\n");
+    const submitAttachments: PromptAttachmentInput[] = pendingAttachments.map(({ path, modality, source }) => ({
+      path,
+      modality,
+      source,
+    }));
+
+    setItems((prev) => [...prev, { id: nextId(), role: "user", text: displayText }]);
     setInput("");
     setBusy(true);
-    transport.sendPrompt(text);
-  }, [busy, transport, appendSystem, runCommand]);
+    _pendingSubmitId.current = transport.sendPrompt(text, submitAttachments);
+  }, [attachments, busy, transport, appendSystem, runCommand]);
 
   /** ↑/↓ 翻历史的回调：idx 0 = 最新一条，递增 = 更老。null 表示越界 */
   const getHistoryAt = useCallback((idx: number): string | null => {
@@ -676,6 +720,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             onCancel={() => setInput("")}
           />
         )}
+        <AttachmentQueue attachments={attachments} />
         <Box flexDirection="row" alignItems="flex-end">
           <Box flexGrow={1} flexShrink={1}>
             <PromptInput

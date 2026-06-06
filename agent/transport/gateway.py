@@ -153,21 +153,40 @@ class Gateway:
                 ))
 
     def _handle_prompt_submit(self, rpc_id: Any, params: Dict[str, Any]) -> None:
-        text = params.get("text")
-        if not isinstance(text, str) or not text.strip():
-            logger.warning("prompt rejected: invalid text id=%s", rpc_id)
+        text = params.get("text", "")
+        attachments = params.get("attachments") or []
+        if not isinstance(text, str):
+            logger.warning("prompt rejected: invalid text type id=%s", rpc_id)
             if rpc_id is not None:
                 self.transport.write(make_response(
                     rpc_id,
                     error={"code": _ERR_INVALID_PARAMS,
-                           "message": "params.text must be non-empty string"},
+                           "message": "params.text must be string"},
+                ))
+            return
+        if not isinstance(attachments, list) or not all(isinstance(item, dict) for item in attachments):
+            logger.warning("prompt rejected: invalid attachments id=%s", rpc_id)
+            if rpc_id is not None:
+                self.transport.write(make_response(
+                    rpc_id,
+                    error={"code": _ERR_INVALID_PARAMS,
+                           "message": "params.attachments must be object[]"},
+                ))
+            return
+        if not text.strip() and not attachments:
+            logger.warning("prompt rejected: empty text and attachments id=%s", rpc_id)
+            if rpc_id is not None:
+                self.transport.write(make_response(
+                    rpc_id,
+                    error={"code": _ERR_INVALID_PARAMS,
+                           "message": "params.text or params.attachments required"},
                 ))
             return
 
         # 单 session：拒绝并发 chat。UI 应该等上一个 done 事件再发下一个 prompt
         with self._busy_lock:
             if self._busy:
-                logger.info("prompt rejected: busy id=%s text_chars=%s", rpc_id, len(text))
+                logger.info("prompt rejected: busy id=%s text_chars=%s attachments=%s", rpc_id, len(text), len(attachments))
                 if rpc_id is not None:
                     self.transport.write(make_response(
                         rpc_id,
@@ -179,7 +198,7 @@ class Gateway:
         # 立刻 ack——chat 是异步任务，结果通过事件流送
         if rpc_id is not None:
             self.transport.write(make_response(rpc_id, result={"status": "accepted"}))
-        logger.info("prompt accepted: id=%s text_chars=%s", rpc_id, len(text))
+        logger.info("prompt accepted: id=%s text_chars=%s attachments=%s", rpc_id, len(text), len(attachments))
 
         # 投递到 asyncio loop
         loop = self._loop
@@ -188,13 +207,13 @@ class Gateway:
                 self._busy = False
             logger.error("prompt accepted but event loop unavailable: id=%s", rpc_id)
             return
-        asyncio.run_coroutine_threadsafe(self._run_chat(text), loop)
+        asyncio.run_coroutine_threadsafe(self._run_chat(text, attachments), loop)
 
-    async def _run_chat(self, text: str) -> None:
+    async def _run_chat(self, text: str, attachments: Optional[list] = None) -> None:
         token = CancelToken()
-        logger.info("chat task start: text_chars=%s", len(text))
+        logger.info("chat task start: text_chars=%s attachments=%s", len(text), len(attachments or []))
         try:
-            await self.session.chat_async(text, cancel_token=token)
+            await self.session.chat_async(text, cancel_token=token, attachments=attachments or [])
         except Exception as e:
             logger.exception("chat_async failed")
             # 兜底发一条 error 事件给 UI（normally 已经由 session 内部发过了）

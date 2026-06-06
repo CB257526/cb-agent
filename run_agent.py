@@ -161,6 +161,9 @@ class AgentRunner:
         self._attach_cli_renderer = attach_cli_renderer
         self._md_memory_provider = self._create_markdown_memory_provider()
         self.buddy_manager = BuddyManager()
+        # CLI 模式下的待发送附件队列。TUI 走 JSON-RPC attachments 字段；CLI 没有
+        # 前端状态容器，所以在 Runner 内保留一份轻量队列，发送成功后清空。
+        self.pending_attachments: List[Dict[str, Any]] = []
         self._mcp_lock = threading.RLock()
         self._mcp_thread: threading.Thread | None = None
         self._mcp_started = False
@@ -685,9 +688,12 @@ class AgentRunner:
                     return  # /quit
 
             self._dump_seen_count = 0
-            await self._run_chat(user_input)
+            attachments = list(self.pending_attachments)
+            ok = await self._run_chat(user_input, attachments=attachments)
+            if ok and attachments:
+                self.pending_attachments.clear()
 
-    async def _run_chat(self, user_input: str) -> None:
+    async def _run_chat(self, user_input: str, attachments: List[Dict[str, Any]] | None = None) -> bool:
         """跑一次 chat，期间安装临时 SIGINT handler 实现"中断而不退出"。"""
         from agent.cancel import CancelToken
 
@@ -715,10 +721,12 @@ class AgentRunner:
             prev_handler = None
 
         try:
-            await self.session.chat_async(user_input, cancel_token=token)
+            await self.session.chat_async(user_input, cancel_token=token, attachments=attachments or [])
+            return True
         except Exception as e:
             _err(f"本轮对话异常: {e}")
             traceback.print_exc()
+            return False
         finally:
             if prev_handler is not None:
                 try:
@@ -746,6 +754,9 @@ class AgentRunner:
                 "  /tools       列出所有已注册工具\n"
                 "  /mcp         查看 MCP 后台连接状态\n"
                 "  /buddy       查看/孵化/互动 Buddy 宠物\n"
+                "  /attach PATH 添加图片或音频附件到下一轮\n"
+                "  /attachments 查看待发送附件队列\n"
+                "  /detach N|all 移除待发送附件\n"
                 "  /skills      列出所有 Skill\n"
                 "  /skill NAME  手动加载指定 Skill\n"
                 "  /history     查看当前会话历史\n"
@@ -800,6 +811,12 @@ class AgentRunner:
             text = result.get("text") if isinstance(result, dict) else ""
             if text:
                 print("\n" + str(text) + "\n")
+        elif cmd == "/attach":
+            self._handle_attach_command(raw_arg)
+        elif cmd == "/attachments":
+            self._print_pending_attachments()
+        elif cmd == "/detach":
+            self._handle_detach_command(raw_arg)
         elif cmd == "/skills":
             skills = self._skill_manager.list_skills()
             print(f"\n已发现 {len(skills)} 个 Skill：")
@@ -878,6 +895,70 @@ class AgentRunner:
                 return True
             _err(f"未知命令 {cmd}，/help 查看可用命令")
         return True
+
+    def _handle_attach_command(self, raw_arg: str) -> None:
+        """把一个本地文件加入 CLI 待发送附件队列。
+
+        这里故意只做轻量路径存在性提示，不在 CLI 里调用 OCR/ASR。真正的格式识别、
+        大小限制、基模是否支持图片、以及 OCR/ASR 错误，都由
+        agent.multimodal_input 统一处理，保证 CLI/TUI/Web 未来共用同一套规则。
+        """
+        raw_path = raw_arg.strip().strip('"').strip("'")
+        if not raw_path:
+            _info("用法: /attach <path>")
+            return
+        path = Path(raw_path)
+        if path.is_absolute():
+            resolved = path
+        else:
+            try:
+                from tools.tools.bash_session import get_session
+                base_dir = Path(get_session().cwd)
+            except Exception:
+                base_dir = Path.cwd()
+            resolved = base_dir / path
+        if not resolved.exists() or not resolved.is_file():
+            _err(f"附件文件不存在或不是普通文件: {resolved}")
+            return
+        self.pending_attachments.append({
+            "path": str(resolved.resolve()),
+            "source": "direct",
+        })
+        _info(f"已添加附件 #{len(self.pending_attachments)}: {resolved.name} ({resolved.stat().st_size} bytes)")
+
+    def _print_pending_attachments(self) -> None:
+        """展示 CLI 下一轮会随 prompt 一起发送的附件。"""
+        if not self.pending_attachments:
+            _info("当前没有待发送附件。使用 /attach <path> 添加图片或音频。")
+            return
+        print("\n待发送附件：")
+        for index, item in enumerate(self.pending_attachments, start=1):
+            path = Path(str(item.get("path") or ""))
+            size = path.stat().st_size if path.exists() else 0
+            print(f"  {index}. {path.name}  {size} bytes  {path}")
+        print()
+
+    def _handle_detach_command(self, raw_arg: str) -> None:
+        """从 CLI 待发送附件队列移除一个附件或全部清空。"""
+        arg = raw_arg.strip().lower()
+        if not arg:
+            _info("用法: /detach <index|all>")
+            return
+        if arg == "all":
+            count = len(self.pending_attachments)
+            self.pending_attachments.clear()
+            _info(f"已清空 {count} 个待发送附件。")
+            return
+        try:
+            index = int(arg)
+        except ValueError:
+            _info("用法: /detach <index|all>")
+            return
+        if index < 1 or index > len(self.pending_attachments):
+            _err(f"附件序号超出范围: {index}")
+            return
+        removed = self.pending_attachments.pop(index - 1)
+        _info(f"已移除附件: {Path(str(removed.get('path') or '')).name}")
 
     def _handle_named_skill_command(self, cmd: str, raw_arg: str) -> bool:
         """处理 /pdf 这类按 Skill 名称直接触发的命令。"""

@@ -25,6 +25,7 @@
 | 跨轮工作上下文 | 每轮工具轨迹压成 `【工作记录】`，写入 `.cbagent/sessions/`，重启后可恢复 |
 | 多会话隔离 | 本地 session 可创建、切换、清理；不同会话 history/state/transcript 隔离 |
 | 上下文压缩 | TUI 支持 `/compact`；后端也会在上下文接近模型窗口 80% 时自动 compact |
+| 多模态输入 | 用户消息支持 `text + attachments[]`，图片可原生发给多模态基模，纯文本基模自动走 OCR，音频统一 ASR 成文本 |
 | TUI | Ink/React 终端界面，支持工具卡片、会话切换、Context 占用指标、日志面板 |
 | MCP | 读取 `mcp.json`，通过 stdio 启动 MCP server，并展开成可调用工具 |
 | Skills | Markdown + YAML frontmatter 描述能力，按需加载指令和脚本 |
@@ -44,6 +45,7 @@
 
 - Node.js `>=20`
 - npm
+- 剪贴板图片粘贴可选依赖：Windows 使用 PowerShell/.NET Clipboard；macOS 推荐安装 `pngpaste`；Linux 推荐安装 `wl-paste` 或 `xclip`
 
 如果要使用 MCP：
 
@@ -179,6 +181,9 @@ FEATURE_BUDDY=1
 | `TAVILY_API_KEY` | `my_advanced_search` 的 Tavily 搜索源 |
 | `SERPAPI_API_KEY` | `my_advanced_search` 的 SerpApi 搜索源 |
 | `FEATURE_BUDDY` | 设为 `1` / `true` / `on` 后启用 Buddy 宠物系统 |
+| `CBAGENT_ATTACHMENT_MAX_MB` | 单个多模态附件大小上限，默认 `20` MB |
+| `OCR_API_KEY` / `OCR_BASE_URL` / `OCR_MODEL_NAME` | 纯文本基模处理图片附件时使用的 OCR/视觉描述模型 |
+| `ASR_API_KEY` / `ASR_BASE_URL` / `ASR_MODEL_NAME` | 音频附件转写为文本时使用的 ASR 模型 |
 | `VECTOR_STORE_TYPE` / `QDRANT_URL` / `QDRANT_API_KEY` | full RAG/Memory 的向量存储 |
 | `GRAPH_STORE_TYPE` / `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` | full 语义记忆图存储 |
 | `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` / `EMBED_API_KEY` | full embedding 配置 |
@@ -270,8 +275,13 @@ TUI 快捷键：
 | `/switch <id>` | 切换到指定 session |
 | `/compact` | 手动压缩当前会话上下文 |
 | `/buddy` | 查看、孵化或互动 Buddy 宠物 |
+| `/attach <path>` | 添加本地图片或音频附件到下一轮消息 |
+| `/paste-image` | 从系统剪贴板读取图片并加入附件队列，终端不传 `Ctrl-V` 时优先用它 |
+| `/attachments` | 查看待发送附件队列 |
+| `/detach <index\|all>` | 移除一个或全部待发送附件 |
 | `/clear` | 清空前端显示并清空后端当前会话历史 |
 | `/log` 或 `Ctrl-O` | 切换后端日志面板 |
+| `Ctrl-V` | 尝试读取剪贴板图片；部分终端会拦截该快捷键，此时改用 `/paste-image` |
 | `Ctrl-L` | 清当前屏幕显示，保留后端 history |
 | `Ctrl-C` | busy 时取消当前回答；空闲时退出 |
 
@@ -283,7 +293,48 @@ TUI 底部状态栏会显示：
 - OpenAI usage 累计
 - 工具循环 round
 
-### 7. 验证安装是否正常
+### 7. 多模态输入
+
+cb-agent 的用户消息协议现在是 `text + attachments[]`。附件只在当前轮请求中参与模型推理；跨轮 history、transcript、compact 和 `context_window_usage` 只保存文本摘要和附件元数据，不保存图片/音频二进制，也不保存 data URI。
+
+CLI 和 TUI 都支持从本地文件添加附件：
+
+```text
+/attach C:\Users\cb135\Desktop\shot.png
+/attachments
+/detach 1
+/detach all
+```
+
+TUI 额外支持从系统剪贴板读取图片：
+
+```text
+/paste-image
+```
+
+`Ctrl-V` 也会尝试读取剪贴板图片，但很多终端会自己拦截粘贴快捷键，导致 TUI 收不到按键事件。遇到“Ctrl-V 没反应”时直接使用 `/paste-image`。
+
+剪贴板图片不会直接通过 JSON-RPC 传二进制。TUI 会先把图片保存到：
+
+```text
+~/.cb-agent/attachments/clipboard-<timestamp>.png
+```
+
+然后只把路径随 `prompt.submit` 发送给后端。后端会重新校验路径、格式、大小和 MIME。
+
+路由规则：
+
+| 附件 | 当前主模型能力 | 后端处理 |
+|---|---|---|
+| 图片 | `ConstantLLM.llm_dict[model]["image_ability"] == True` | 当前轮转为 `image_url` 发给主模型 |
+| 图片 | `image_ability == False` | 调用 `utils.multimodal.MultimodalProcessor.process_image()`，把 OCR/视觉描述文本发给主模型 |
+| 音频 | 任意主模型 | 调用 `process_audio()` 做 ASR，把转写文本发给主模型 |
+
+支持的图片格式：`png`、`jpg`、`jpeg`、`webp`、`gif`、`bmp`、`tiff`、`tif`。
+
+支持的音频格式：`mp3`、`wav`、`m4a`、`aac`、`flac`、`ogg`、`wma`。
+
+### 8. 验证安装是否正常
 
 Python 侧：
 
@@ -464,6 +515,9 @@ CONTEXT_USAGE_RATIO = 0.8
 | `/help` | 打印帮助 |
 | `/tools` | 列出所有已注册工具 |
 | `/buddy` | 查看、孵化或互动 Buddy 宠物 |
+| `/attach PATH` | 添加本地图片或音频附件到下一轮消息 |
+| `/attachments` | 查看待发送附件队列 |
+| `/detach N\|all` | 移除一个或全部待发送附件 |
 | `/skills` | 列出所有 Skill |
 | `/history` | 查看当前会话 history |
 | `/sessions` | 列出本地会话 |
@@ -606,6 +660,7 @@ python test/test_context_builder.py
 python test/test_session_renderer.py
 python test/test_transport.py
 python -m unittest discover -s test -p "test_buddy*.py"
+python -m unittest discover -s test -p "test_multimodal_input.py"
 ```
 
 TUI：
@@ -639,6 +694,8 @@ python test/test_rag_operations.py
 - [Stage5a stdio JSON-RPC 网关技术报告.md](<note/Stage5a stdio JSON-RPC 网关技术报告.md>)
 - [Bash 权限弹窗走 UI 通道技术报告.md](<note/Bash 权限弹窗走 UI 通道技术报告.md>)
 - [Bash 工具 UI 输出预览字段技术报告.md](<note/Bash 工具 UI 输出预览字段技术报告.md>)
+- [本地搜索与导航工具技术报告.md](<note/本地搜索与导航工具技术报告.md>)
+- [多模态输入与上下文管理技术报告.md](<note/多模态输入与上下文管理技术报告.md>)
 
 ## 常见问题
 

@@ -49,6 +49,7 @@ from agent.events import (
 )
 from agent.executor import ToolExecutor
 from agent.message_logger import MessageLogger
+from agent.multimodal_input import process_multimodal_prompt, sanitize_multimodal_payload
 from agent.question_registry import QuestionRegistry
 from constant.llm.constant_llm import ConstantLLM
 from context import (
@@ -393,6 +394,7 @@ class AgentSession:
         self,
         user_query: str,
         cancel_token: Optional[CancelToken] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """处理一次用户输入，返回最终答案字符串。
 
@@ -415,7 +417,7 @@ class AgentSession:
         # ToolExecutor 的并发分支会 copy_context 给 worker 用同一份 ContextVar
         ctx_token = set_current_cancel_token(token)
         try:
-            return self._chat_impl(user_query, token)
+            return self._chat_impl(user_query, token, attachments=attachments)
         finally:
             reset_current_cancel_token(ctx_token)
             self.current_cancel_token = None
@@ -424,6 +426,7 @@ class AgentSession:
         self,
         user_query: str,
         cancel_token: Optional[CancelToken] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """chat() 的 asyncio 包装。
 
@@ -436,12 +439,12 @@ class AgentSession:
           - **不要**对返回的 task 调 task.cancel()——asyncio 只会让 await
             点抛 CancelledError，下面那个线程仍在跑（线程池不可中断）。
         """
-        return await asyncio.to_thread(self.chat, user_query, cancel_token)
+        return await asyncio.to_thread(self.chat, user_query, cancel_token, attachments)
 
     def _build_chat_messages(
         self,
         *,
-        user_query: str,
+        user_content: Any,
         system_instructions: str,
     ) -> List[Dict[str, Any]]:
         """按当前 history/state 构造本轮初始 LLM messages。
@@ -530,7 +533,7 @@ class AgentSession:
         # 截尾历史
         for m in self.history[-self.history_window:]:
             messages.append(m.to_dict())
-        messages.append({"role": "user", "content": user_query})
+        messages.append({"role": "user", "content": user_content})
         return messages
 
     def _collect_skill_commands(self) -> List[Any]:
@@ -545,15 +548,27 @@ class AgentSession:
             logger.exception("skill_manager.list_commands 调用失败")
         return []
 
-    def _chat_impl(self, user_query: str, token: CancelToken) -> str:
+    def _chat_impl(
+        self,
+        user_query: str,
+        token: CancelToken,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         chat_started = time.perf_counter()
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
         user_query = self._prepend_background_notifications(user_query)
+        multimodal_prompt = process_multimodal_prompt(
+            text=user_query,
+            attachments=attachments,
+            model=getattr(self.llm, "model", None),
+        )
+        request_content = multimodal_prompt.request_content
+        history_user_text = multimodal_prompt.history_text
 
         system_instructions = self._build_system_instructions()
         auto_compactions: List[Dict[str, Any]] = [] #收集自动压缩（auto compaction）事件
         messages = self._build_chat_messages(
-            user_query=user_query,
+            user_content=request_content,
             system_instructions=system_instructions,
         )
 
@@ -563,8 +578,9 @@ class AgentSession:
             else None
         )
         logger.info(
-            "chat start: query_chars=%s history=%s messages=%s tools=%s function_calling=%s",
+            "chat start: query_chars=%s attachments=%s history=%s messages=%s tools=%s function_calling=%s",
             len(user_query),
+            len(multimodal_prompt.attachments),
             len(self.history),
             len(messages),
             len(tools_schema or []),
@@ -590,7 +606,7 @@ class AgentSession:
             auto_compactions.append(preflight)
             logger.info("auto compact before first think: %s", preflight)
             messages = self._build_chat_messages(
-                user_query=user_query,
+                user_content=request_content,
                 system_instructions=system_instructions,
             )
 
@@ -598,8 +614,8 @@ class AgentSession:
         if self.message_logger is not None:
             try:
                 self.message_logger.log(
-                    messages,
-                    label=f"会话开始 | query=\"{user_query[:100]}\"",
+                    sanitize_multimodal_payload(messages),
+                    label=f"会话开始 | query=\"{history_user_text[:100]}\"",
                 )
             except Exception:
                 logger.exception("message_logger 写入失败")
@@ -612,19 +628,21 @@ class AgentSession:
 
         # 跨轮历史仍然先保存用户输入和最终回答，保持原来的对话语义。
         # 下面的 work_record 是额外的普通 assistant 文本，不是 tool 消息。
-        self.history.append(Message.create_user_message(user_query))
+        # 跨轮 history 只保存文本摘要，不保存本轮 request_content 里的 image_url/data URI。
+        # 这保证 context_window_usage、/compact、session transcript 都不会被图片 base64 撑爆。
+        self.history.append(Message.create_user_message(history_user_text))
         if final_answer:
             self.history.append(Message.create_assistant_message(final_answer))
         # trace_collector 来自本轮工具循环，里面只有被压缩过的工具事实。
         # 如果本轮没有工具调用，就不会生成【工作记录】，避免无意义地撑大 history。
         work_record = self._make_work_record(
-            user_query=user_query,
+            user_query=history_user_text,
             final_answer=final_answer,
             trace_collector=trace_collector,
         )
         if work_record is not None and work_record.text:
             self.history.append(make_work_record_message(work_record))
-        self._persist_turn(user_query, final_answer, work_record)
+        self._persist_turn(history_user_text, final_answer, work_record)
 
         # 本轮结束后再看一次跨轮 state/history。工具轨迹落盘和 state 合并可能让
         # 下一轮动态上下文达到或超过安全窗口；此时自动执行与 /compact 同语义的压缩，
@@ -777,7 +795,9 @@ class AgentSession:
         的精确 token accounting，但足以做“是否接近窗口”的保守触发判断。
         """
         payload = {
-            "messages": messages,
+            # 当前轮请求可能包含 image_url data URI。token 估算和自动 compact 只需要
+            # 知道“这里有图片”，不应该把 base64 当成长期上下文文本来计数。
+            "messages": sanitize_multimodal_payload(messages),
             "tools": tools_schema or [],
         }
         try:
@@ -1002,14 +1022,15 @@ class AgentSession:
             )
             if self.messages_snapshot_hook is not None:
                 try:
-                    self.messages_snapshot_hook(messages, round_idx)
+                    # CLI 的 /msg dump 是落到终端/日志的调试视图，只展示脱敏副本。
+                    self.messages_snapshot_hook(sanitize_multimodal_payload(messages), round_idx)
                 except Exception:
                     logger.exception("messages_snapshot_hook 抛异常，已吞")
 
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        messages,
+                        sanitize_multimodal_payload(messages),
                         label=f"第 {round_idx} 轮 think 前",
                     )
                 except Exception:

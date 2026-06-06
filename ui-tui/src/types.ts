@@ -206,6 +206,20 @@ export interface BuddyCommandResult {
   state: BuddyState;
 }
 
+/** prompt.submit 的附件输入。后端会重新校验路径、格式、大小和 OCR/ASR 能力。 */
+export interface PromptAttachmentInput {
+  path: string;
+  modality?: "image" | "audio";
+  source?: "direct" | "clipboard" | "ocr" | "asr";
+}
+
+/** TUI 内部附件队列项。id 只服务前端列表渲染和 detach，不提交给后端。 */
+export interface QueuedAttachment extends PromptAttachmentInput {
+  id: string;
+  fileName: string;
+  size?: number | null;
+}
+
 export interface BuddyUpdated extends BaseEvent {
   type: "buddy_updated";
   state: BuddyState;

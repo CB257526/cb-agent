@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # 让单测从任意 cwd 都能 import（test/ 下直接跑、cb-agent/ 下跑都行）
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -159,6 +159,107 @@ class TestAgentSessionBasic(unittest.TestCase):
                 ConstantLLM.llm_dict.pop("fake", None)
             else:
                 ConstantLLM.llm_dict["fake"] = original
+
+    def test_image_capable_model_sends_image_but_history_keeps_summary(self):
+        """支持视觉的模型当前轮收到 image_url，但跨轮 history 不保存 data URI。"""
+        original = ConstantLLM.llm_dict.get("fake")
+        ConstantLLM.llm_dict["fake"] = {
+            "is_tool": True,
+            "is_reasoning": False,
+            "json_output": True,
+            "max_tokens": 100000,
+            "image_ability": True,
+        }
+        snapshots: List[List[Dict[str, Any]]] = []
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                image = Path(td) / "shot.png"
+                image.write_bytes(b"image bytes")
+                llm = FakeLLM([{"answer": "看到了", "tool_calls": []}])
+                s = self._make_session(
+                    llm,
+                    messages_snapshot_hook=lambda messages, _round: snapshots.append(messages),
+                )
+
+                s.chat("图里有什么", attachments=[{"path": str(image), "source": "direct"}])
+
+            first_messages = llm.calls[0]["messages"]
+            last_user = first_messages[-1]
+            self.assertIsInstance(last_user["content"], list)
+            image_parts = [p for p in last_user["content"] if p.get("type") == "image_url"]
+            self.assertEqual(len(image_parts), 1)
+            self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+            history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
+            self.assertIn("图片已原生发送", history_dump)
+            self.assertNotIn("data:image", history_dump)
+            self.assertNotIn("base64", history_dump)
+
+            # /msg dump 走 messages_snapshot_hook，应该只看到脱敏占位符。
+            snapshot_dump = json.dumps(snapshots, ensure_ascii=False)
+            self.assertIn("[data-uri omitted: image/png", snapshot_dump)
+            self.assertNotIn("data:image/png;base64", snapshot_dump)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_text_model_image_attachment_uses_ocr_text(self):
+        """纯文本主模型不能吃图片时，图片会先转换成文本块再进入请求和 history。"""
+        original = ConstantLLM.llm_dict.get("fake")
+        ConstantLLM.llm_dict["fake"] = {
+            "is_tool": True,
+            "is_reasoning": False,
+            "json_output": True,
+            "max_tokens": 100000,
+            "image_ability": False,
+        }
+
+        class FakeProcessor:
+            def process_image(self, file_path: str) -> Dict[str, str]:
+                return {"text": f"OCR 摘要: {Path(file_path).name}"}
+
+            def process_audio(self, file_path: str) -> Dict[str, str]:
+                return {"text": f"ASR 摘要: {Path(file_path).name}"}
+
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                image = Path(td) / "shot.png"
+                image.write_bytes(b"image bytes")
+                llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+                s = self._make_session(llm)
+
+                with patch("agent.multimodal_input.MultimodalProcessor", return_value=FakeProcessor()):
+                    s.chat("读图", attachments=[{"path": str(image)}])
+
+            request_dump = json.dumps(llm.calls[0]["messages"], ensure_ascii=False)
+            history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
+            self.assertIn("OCR 摘要: shot.png", request_dump)
+            self.assertIn("OCR 摘要: shot.png", history_dump)
+            self.assertNotIn("data:image", request_dump)
+            self.assertNotIn("data:image", history_dump)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_request_token_estimate_omits_data_uri_payload(self):
+        """自动 compact 的请求估算只统计脱敏占位符，不把 base64 当长期文本。"""
+        llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+        s = self._make_session(llm)
+        messages = [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + ("x" * 100_000)},
+            }],
+        }]
+
+        tokens = s._estimate_request_tokens(messages, [])
+
+        self.assertLess(tokens, 1000)
 
     def test_chat_with_tool_call_runs_two_rounds(self):
         # 第 1 轮：模型让调 file_read；第 2 轮：模型给最终答案

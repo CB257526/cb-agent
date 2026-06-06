@@ -184,6 +184,27 @@ describe("Transport answerQuestion RPC", () => {
     expect(msg.params.cancelled).toBe(true);
   });
 
+  it("serializes prompt.submit with optional attachments", () => {
+    const { t, written } = makeWithStdin();
+    t.sendPrompt("看图", [{ path: "C:\\tmp\\shot.png", modality: "image", source: "direct" }]);
+
+    const msg = JSON.parse(written[0].trim());
+    expect(msg.method).toBe("prompt.submit");
+    expect(msg.params).toEqual({
+      text: "看图",
+      attachments: [{ path: "C:\\tmp\\shot.png", modality: "image", source: "direct" }],
+    });
+  });
+
+  it("keeps sendPrompt(text) backward compatible", () => {
+    const { t, written } = makeWithStdin();
+    t.sendPrompt("hello");
+
+    const msg = JSON.parse(written[0].trim());
+    expect(msg.method).toBe("prompt.submit");
+    expect(msg.params).toEqual({ text: "hello", attachments: [] });
+  });
+
   it("serializes session list/create/switch/compact/mcp RPCs", () => {
     const { t, written } = makeWithStdin();
     t.listSessions();

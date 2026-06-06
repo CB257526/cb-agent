@@ -20,7 +20,7 @@ import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AgentEvent, BuddyCommandResult, BuddyState, CompactPayload, MCPStatusPayload, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, BuddyCommandResult, BuddyState, CompactPayload, MCPStatusPayload, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
@@ -169,8 +169,8 @@ export class Transport extends EventEmitter {
     });
   }
 
-  sendPrompt(text: string): string {
-    return this.sendRpc("prompt.submit", { text });
+  sendPrompt(text: string, attachments: PromptAttachmentInput[] = []): string {
+    return this.sendRpc("prompt.submit", { text, attachments });
   }
 
   cancel(): string {

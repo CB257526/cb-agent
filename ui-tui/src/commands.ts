@@ -8,7 +8,11 @@
  */
 
 import type { Transport } from "./transport.js";
-import type { BuddyState, ChatItem, ContextWindow, MCPStatusPayload, SessionPayload } from "./types.js";
+import { basename } from "node:path";
+import { statSync } from "node:fs";
+import type { Dispatch, SetStateAction } from "react";
+import type { BuddyState, ChatItem, ContextWindow, MCPStatusPayload, QueuedAttachment, SessionPayload } from "./types.js";
+import { readClipboardImageAttachment } from "./clipboardImage.js";
 
 export interface CommandCtx {
   transport: Transport;
@@ -31,6 +35,10 @@ export interface CommandCtx {
   toggleActivity: () => void;
   /** 更新 Buddy 附属状态，供输入框旁 sprite 使用。 */
   setBuddyState: (state: BuddyState | null) => void;
+  /** 当前待随下一条 prompt 一起提交的附件队列。 */
+  attachments: QueuedAttachment[];
+  /** 更新附件队列；命令只维护队列，不直接调用 OCR/ASR。 */
+  setAttachments: Dispatch<SetStateAction<QueuedAttachment[]>>;
 }
 
 export interface SlashCommand {
@@ -63,6 +71,47 @@ export function formatMCPStatus(status: MCPStatusPayload): string {
     lines.push(`  • ${name}: ${serverState}${suffix}`);
   }
   return lines.join("\n");
+}
+
+let attachmentSeq = 0;
+
+function nextAttachmentId(): string {
+  attachmentSeq += 1;
+  return `att_${Date.now()}_${attachmentSeq}`;
+}
+
+export function makeQueuedAttachment(path: string, source: QueuedAttachment["source"] = "direct"): QueuedAttachment {
+  const cleanPath = path.trim().replace(/^["']|["']$/g, "");
+  let size: number | null = null;
+  try {
+    const st = statSync(cleanPath);
+    if (st.isFile()) size = st.size;
+  } catch {
+    // 相对路径以 Python 后端 BashSession.cwd 为准，TUI 这里可能 stat 不到；保留未知大小即可。
+  }
+  return {
+    id: nextAttachmentId(),
+    path: cleanPath,
+    source,
+    fileName: basename(cleanPath) || cleanPath,
+    size,
+  };
+}
+
+function formatQueuedAttachments(attachments: QueuedAttachment[]): string {
+  if (!attachments.length) return "当前没有待发送附件。使用 /attach <path> 添加图片或音频。";
+  const lines = attachments.map((item, index) => {
+    const size = typeof item.size === "number" ? ` ${formatBytes(item.size)}` : "";
+    return `  ${index + 1}. ${item.fileName}${size} (${item.source ?? "direct"})`;
+  });
+  return "待发送附件：\n" + lines.join("\n");
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value < 1024) return `${value}B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`;
+  return `${(value / 1024 / 1024).toFixed(1)}MB`;
 }
 
 export const COMMANDS: readonly SlashCommand[] = [
@@ -196,6 +245,66 @@ export const COMMANDS: readonly SlashCommand[] = [
       } catch (e) {
         appendSystem(`✗ /buddy 失败：${(e as Error).message}`);
       }
+    },
+  },
+  {
+    name: "/attach",
+    description: "添加图片或音频附件：/attach <path>",
+    handler: ({ args, appendSystem, setAttachments }) => {
+      const path = args.trim();
+      if (!path) {
+        appendSystem("用法：/attach <path>");
+        return;
+      }
+      const item = makeQueuedAttachment(path, "direct");
+      setAttachments((prev) => [...prev, item]);
+      const size = typeof item.size === "number" ? `，${formatBytes(item.size)}` : "";
+      appendSystem(`已添加附件：${item.fileName}${size}。发送下一条消息时会一起提交。`);
+    },
+  },
+  {
+    name: "/paste-image",
+    description: "从系统剪贴板读取图片并加入附件队列",
+    handler: async ({ appendSystem, setAttachments }) => {
+      try {
+        const item = await readClipboardImageAttachment();
+        setAttachments((prev) => [...prev, item]);
+        appendSystem(`已从剪贴板添加图片：${item.fileName}。发送下一条消息时会一起提交。`);
+      } catch (e) {
+        appendSystem(`剪贴板图片读取失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
+    name: "/attachments",
+    description: "查看待发送附件队列",
+    handler: ({ attachments, appendSystem }) => {
+      appendSystem(formatQueuedAttachments(attachments));
+    },
+  },
+  {
+    name: "/detach",
+    description: "移除附件：/detach <index|all>",
+    handler: ({ args, attachments, appendSystem, setAttachments }) => {
+      const arg = args.trim().toLowerCase();
+      if (!arg) {
+        appendSystem("用法：/detach <index|all>");
+        return;
+      }
+      if (arg === "all") {
+        const count = attachments.length;
+        setAttachments(() => []);
+        appendSystem(`已清空 ${count} 个待发送附件。`);
+        return;
+      }
+      const index = Number.parseInt(arg, 10);
+      if (!Number.isInteger(index) || index < 1 || index > attachments.length) {
+        appendSystem(`附件序号超出范围：${arg}`);
+        return;
+      }
+      const removed = attachments[index - 1];
+      setAttachments((prev) => prev.filter((_, i) => i !== index - 1));
+      appendSystem(`已移除附件：${removed.fileName}`);
     },
   },
   {

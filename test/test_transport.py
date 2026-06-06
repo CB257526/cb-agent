@@ -41,6 +41,7 @@ from agent.session import AgentSession
 from agent.transport import Gateway, StdioTransport, make_event_message, make_response
 from agent.work_context import LocalSessionStore
 from agent.buddy import BuddyManager
+from constant.llm.constant_llm import ConstantLLM
 from skills.skill_manager import SkillManager
 
 
@@ -153,9 +154,15 @@ class FakeLLM:
 
     def __init__(self, outputs):
         self.outputs = list(outputs)
+        self.calls: List[Dict[str, Any]] = []
 
     def think(self, messages, tools=None, event_bus=None,
               cancel_event=None, round_idx=0):
+        self.calls.append({
+            "messages": list(messages),
+            "tools": tools,
+            "round_idx": round_idx,
+        })
         if not self.outputs:
             return {"answer": "", "tool_calls": []}
         out = self.outputs.pop(0)
@@ -360,6 +367,59 @@ class TestGatewayDispatch(unittest.TestCase):
             wait_for=2,
         )
         errs = [m for m in msgs if m.get("id") == "u1"]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0]["error"]["code"], -32602)
+
+    def test_gateway_accepts_prompt_with_attachments(self):
+        """prompt.submit 新协议允许 {text, attachments[]}，并保持旧 ack 语义。"""
+        with tempfile.TemporaryDirectory() as td:
+            image = Path(td) / "shot.png"
+            image.write_bytes(b"image bytes")
+            original = ConstantLLM.llm_dict.get("fake")
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True,
+                "is_reasoning": False,
+                "json_output": True,
+                "max_tokens": 100000,
+                "image_ability": True,
+            }
+            try:
+                llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+                msgs = self._run_gateway_with_msgs(
+                    llm,
+                    [json.dumps({"jsonrpc": "2.0", "id": "p_attach",
+                                 "method": "prompt.submit",
+                                 "params": {
+                                     "text": "看图",
+                                     "attachments": [{"path": str(image), "source": "direct"}],
+                                 }})],
+                    wait_done=True,
+                )
+            finally:
+                if original is None:
+                    ConstantLLM.llm_dict.pop("fake", None)
+                else:
+                    ConstantLLM.llm_dict["fake"] = original
+
+        accepts = [m for m in msgs if m.get("id") == "p_attach"]
+        self.assertEqual(len(accepts), 1)
+        self.assertEqual(accepts[0]["result"]["status"], "accepted")
+        self.assertTrue(llm.calls)
+        last_user = llm.calls[0]["messages"][-1]
+        image_parts = [p for p in last_user["content"] if p.get("type") == "image_url"]
+        self.assertEqual(len(image_parts), 1)
+        self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_gateway_rejects_invalid_attachments_shape(self):
+        llm = FakeLLM([])
+        msgs = self._run_gateway_with_msgs(
+            llm,
+            [json.dumps({"jsonrpc": "2.0", "id": "bad_attach",
+                         "method": "prompt.submit",
+                         "params": {"text": "hi", "attachments": ["not object"]}})],
+            wait_for=2,
+        )
+        errs = [m for m in msgs if m.get("id") == "bad_attach"]
         self.assertEqual(len(errs), 1)
         self.assertEqual(errs[0]["error"]["code"], -32602)
 

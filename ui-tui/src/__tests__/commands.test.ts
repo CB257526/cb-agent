@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { COMMANDS, filterCommands, findCommand, formatMCPStatus } from "../commands.js";
 import type { CommandCtx } from "../commands.js";
+import { readClipboardImageAttachment } from "../clipboardImage.js";
+
+vi.mock("../clipboardImage.js", () => ({
+  readClipboardImageAttachment: vi.fn(),
+}));
 
 describe("commands", () => {
   describe("filterCommands", () => {
@@ -52,6 +57,7 @@ describe("commands", () => {
     let openSessionSwitcherMock: ReturnType<typeof vi.fn>;
     let toggleActivityMock: ReturnType<typeof vi.fn>;
     let setBuddyStateMock: ReturnType<typeof vi.fn>;
+    let setAttachmentsMock: ReturnType<typeof vi.fn>;
     let transportMock: any;
 
     beforeEach(() => {
@@ -63,6 +69,7 @@ describe("commands", () => {
       openSessionSwitcherMock = vi.fn();
       toggleActivityMock = vi.fn();
       setBuddyStateMock = vi.fn();
+      setAttachmentsMock = vi.fn();
       transportMock = {
         clearHistory: vi.fn(),
         compactSession: vi.fn(),
@@ -85,6 +92,8 @@ describe("commands", () => {
         openSessionSwitcher: openSessionSwitcherMock,
         toggleActivity: toggleActivityMock,
         setBuddyState: setBuddyStateMock,
+        attachments: [],
+        setAttachments: setAttachmentsMock,
       };
     });
 
@@ -100,6 +109,10 @@ describe("commands", () => {
       expect(text).toContain("/compact");
       expect(text).toContain("/mcp");
       expect(text).toContain("/buddy");
+      expect(text).toContain("/attach");
+      expect(text).toContain("/paste-image");
+      expect(text).toContain("/attachments");
+      expect(text).toContain("/detach");
     });
 
     it("/clear 调 transport.clearHistory + 清 items + 给个提示", () => {
@@ -335,6 +348,118 @@ describe("commands", () => {
       const text = appendSystemMock.mock.calls[0][0];
       expect(text).toContain("✗");
       expect(text).toContain("buddy timeout");
+    });
+
+    it("/attach 添加本地附件到队列", () => {
+      const cmd = findCommand("/attach C:\\tmp\\shot.png")!;
+      cmd.handler({ ...ctx, args: "C:\\tmp\\shot.png" });
+
+      expect(setAttachmentsMock).toHaveBeenCalledOnce();
+      const updater = setAttachmentsMock.mock.calls[0][0];
+      const next = updater([]);
+      expect(next).toHaveLength(1);
+      expect(next[0]).toMatchObject({
+        path: "C:\\tmp\\shot.png",
+        source: "direct",
+        fileName: "shot.png",
+      });
+      expect(appendSystemMock.mock.calls[0][0]).toContain("已添加附件");
+    });
+
+    it("/attach 缺参数时提示用法", () => {
+      const cmd = findCommand("/attach")!;
+      cmd.handler({ ...ctx, args: "" });
+
+      expect(setAttachmentsMock).not.toHaveBeenCalled();
+      expect(appendSystemMock.mock.calls[0][0]).toContain("/attach <path>");
+    });
+
+    it("/paste-image 从剪贴板读取图片并加入队列", async () => {
+      vi.mocked(readClipboardImageAttachment).mockResolvedValue({
+        id: "clip_1",
+        path: "C:\\tmp\\clipboard.png",
+        fileName: "clipboard.png",
+        modality: "image",
+        source: "clipboard",
+        size: 10,
+      });
+
+      const cmd = findCommand("/paste-image")!;
+      await cmd.handler(ctx);
+
+      expect(readClipboardImageAttachment).toHaveBeenCalledOnce();
+      expect(setAttachmentsMock).toHaveBeenCalledOnce();
+      const updater = setAttachmentsMock.mock.calls[0][0];
+      expect(updater([])[0].fileName).toBe("clipboard.png");
+      expect(appendSystemMock.mock.calls[0][0]).toContain("已从剪贴板添加图片");
+    });
+
+    it("/paste-image 失败时展示错误", async () => {
+      vi.mocked(readClipboardImageAttachment).mockRejectedValue(new Error("剪贴板里没有图片"));
+
+      const cmd = findCommand("/paste-image")!;
+      await cmd.handler(ctx);
+
+      expect(setAttachmentsMock).not.toHaveBeenCalled();
+      expect(appendSystemMock.mock.calls[0][0]).toContain("剪贴板图片读取失败");
+    });
+
+    it("/attachments 展示队列", () => {
+      const cmd = findCommand("/attachments")!;
+      cmd.handler({
+        ...ctx,
+        attachments: [{
+          id: "a1",
+          path: "C:\\tmp\\shot.png",
+          fileName: "shot.png",
+          source: "direct",
+          size: 12,
+        }],
+      });
+
+      expect(appendSystemMock.mock.calls[0][0]).toContain("shot.png");
+      expect(appendSystemMock.mock.calls[0][0]).toContain("12B");
+    });
+
+    it("/detach all 清空队列", () => {
+      const cmd = findCommand("/detach all")!;
+      cmd.handler({
+        ...ctx,
+        args: "all",
+        attachments: [{
+          id: "a1",
+          path: "C:\\tmp\\shot.png",
+          fileName: "shot.png",
+          source: "direct",
+        }],
+      });
+
+      expect(setAttachmentsMock).toHaveBeenCalledOnce();
+      const updater = setAttachmentsMock.mock.calls[0][0];
+      expect(updater([{ id: "x" }])).toEqual([]);
+      expect(appendSystemMock.mock.calls[0][0]).toContain("已清空 1 个");
+    });
+
+    it("/detach index 移除指定附件", () => {
+      const attachments = [
+        { id: "a1", path: "one.png", fileName: "one.png", source: "direct" as const },
+        { id: "a2", path: "two.png", fileName: "two.png", source: "direct" as const },
+      ];
+      const cmd = findCommand("/detach 2")!;
+      cmd.handler({ ...ctx, args: "2", attachments });
+
+      expect(setAttachmentsMock).toHaveBeenCalledOnce();
+      const updater = setAttachmentsMock.mock.calls[0][0];
+      expect(updater(attachments).map((item: any) => item.fileName)).toEqual(["one.png"]);
+      expect(appendSystemMock.mock.calls[0][0]).toContain("two.png");
+    });
+
+    it("/detach 越界时给提示", () => {
+      const cmd = findCommand("/detach 9")!;
+      cmd.handler({ ...ctx, args: "9", attachments: [] });
+
+      expect(setAttachmentsMock).not.toHaveBeenCalled();
+      expect(appendSystemMock.mock.calls[0][0]).toContain("超出范围");
     });
 
     it("/log 触发 toggleActivity", () => {
