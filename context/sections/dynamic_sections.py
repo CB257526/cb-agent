@@ -134,10 +134,10 @@ def session_guidance_section(
                 "- The `bash` tool runs in a Unix-like shell even on Windows. Use forward "
                 "slashes in paths and POSIX redirection (`>/dev/null`, not `>NUL`)."
             )
-        if "file_read" in enabled_tools or "file_write" in enabled_tools:
+        if "file_read" in enabled_tools or "file_write" in enabled_tools or "file_edit" in enabled_tools:
             bits.append(
-                "- Prefer `file_read` / `file_write` for file I/O over invoking `cat` / "
-                "`echo` through bash."
+                "- Prefer `file_read` / `file_edit` / `file_write` for file I/O over invoking "
+                "`cat` / `echo` through bash. Use `file_edit` for local replacements in existing files."
             )
         if skill_commands:
             names = ", ".join(

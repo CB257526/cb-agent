@@ -81,6 +81,7 @@ from tools.tools.bash_task_tool import BashTaskTool
 from tools.tools.bash_permission_tool import BashPermissionTool
 from tools.tools.file_read_tool import FileReadTool
 from tools.tools.file_write_tool import FileWriteTool
+from tools.tools.file_edit_tool import FileEditTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
 from tools.tools.list_tools_tool import ListToolsTool
 
@@ -324,6 +325,7 @@ class AgentRunner:
             BashTaskTool(),
             BashPermissionTool(),
             FileReadTool(),
+            FileEditTool(),
             FileWriteTool(),
         ])
 

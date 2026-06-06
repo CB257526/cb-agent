@@ -96,7 +96,7 @@ def get_using_your_tools_section(enabled_tools: FrozenSet[str]) -> str:
     return (
         "# Using your tools\n"
         f"- Available tools: {tools_listing}.\n"
-        "- Prefer dedicated tools (file_read, file_write, bash) over re-implementing "
+        "- Prefer dedicated tools (file_read, file_edit, file_write, bash) over re-implementing "
         "their effects in code blocks the user has to copy-paste.\n"
         "- Make independent tool calls in parallel when possible. If two calls don't "
         "depend on each other's output, issue them in a single response.\n"

@@ -420,6 +420,7 @@ CONTEXT_USAGE_RATIO = 0.8
 | 工具 | 说明 |
 |---|---|
 | `file_read` | 读取文件 |
+| `file_edit` | 精确替换文件片段，配合 read-before-write 保护 |
 | `file_write` | 写文件，配合 read-before-write 保护 |
 | `bash` | 执行 shell 命令 |
 | `bash_task` | 后台任务管理 |

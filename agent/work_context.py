@@ -231,7 +231,7 @@ def _summarize_arguments(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]
     """生成可落盘的参数摘要。
 
     这里不能简单保存完整 arguments：
-    - file_write.content 可能是整份文件内容，必须丢弃；
+    - file_write.content / file_edit.old_string / file_edit.new_string 可能很长，必须丢弃；
     - bash stdout 不在 arguments 里，但 command 可能很长，也要截断；
     - 其他工具若带 content/stdout/stderr/result 这类高噪声字段，也不落盘。
 
@@ -240,6 +240,14 @@ def _summarize_arguments(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]
     if name == "file_write":
         keep = ("path",)
         return {k: _clip(arguments.get(k), 160) for k in keep if k in arguments}
+    if name == "file_edit":
+        keep = ("path", "replace_all")
+        summary = {k: _clip(arguments.get(k), 160) for k in keep if k in arguments}
+        if "old_string" in arguments:
+            summary["old_string_preview"] = _clip(arguments.get("old_string"), 160)
+        if "new_string" in arguments:
+            summary["new_string_preview"] = _clip(arguments.get("new_string"), 160)
+        return summary
     if name == "file_read":
         keep = ("path", "head", "tail", "start_line", "end_line")
         return {k: _clip(arguments.get(k), 160) for k in keep if k in arguments}
@@ -629,8 +637,8 @@ def trace_entry_from_tool_result(
             error = parsed.get("error")
             summary = _clip(error or content_preview, result_limit)
             is_error = is_error or bool(error)
-        elif name == "file_write":
-            # file_write 不保存写入内容，只保存结果状态和行数变化。
+        elif name in {"file_write", "file_edit"}:
+            # file_write/file_edit 不保存写入内容，只保存结果状态和行数变化。
             metadata = {
                 "path": parsed.get("path"),
                 "ok": parsed.get("ok"),
@@ -640,6 +648,9 @@ def trace_entry_from_tool_result(
                 "lines_removed": parsed.get("lines_removed"),
                 "message": parsed.get("message"),
             }
+            if name == "file_edit":
+                metadata["replacements"] = parsed.get("replacements")
+                metadata["replace_all"] = parsed.get("replace_all")
             summary = _clip(parsed.get("error") or parsed.get("message") or parsed, result_limit)
             is_error = is_error or bool(parsed.get("error")) or parsed.get("ok") is False
         elif name == "bash":

@@ -2,12 +2,12 @@
 
 把 LLM 一轮返回的 tool_calls 合理调度执行：
 - **全部是只读**（file_read / search / bash_task list/output/wait）→ 线程池并发
-- **任一非只读**（bash / file_write / todo / bash_permission / skill / MCP）→ 串行
+- **任一非只读**（bash / file_edit / file_write / todo / bash_permission / skill / MCP）→ 串行
 
 为什么不更激进地"按工具组合"细判：
 - bash 命令的"是否只读"是命令文本动态决定的（cat 只读 vs rm 写），但 cb-agent
   内部 bash_classify 判定逻辑分散，调度层不应反向耦合 bash 内部
-- file_read + file_write 看似可"并发不同文件"，但 file_write 的 stale check
+- file_read + file_edit/file_write 看似可"并发不同文件"，但写入工具的 stale check
   依赖 ReadStateRegistry 共享态，同时跑的并发收益不抵复杂度
 - 简单"全只读才并发"覆盖 80% 的真并发收益场景（一轮多个 grep / search /
   memory.search），剩余仍按原顺序串行执行，零回归风险
