@@ -51,6 +51,7 @@ describe("commands", () => {
     let resetContextWindowMock: ReturnType<typeof vi.fn>;
     let openSessionSwitcherMock: ReturnType<typeof vi.fn>;
     let toggleActivityMock: ReturnType<typeof vi.fn>;
+    let setBuddyStateMock: ReturnType<typeof vi.fn>;
     let transportMock: any;
 
     beforeEach(() => {
@@ -61,6 +62,7 @@ describe("commands", () => {
       resetContextWindowMock = vi.fn();
       openSessionSwitcherMock = vi.fn();
       toggleActivityMock = vi.fn();
+      setBuddyStateMock = vi.fn();
       transportMock = {
         clearHistory: vi.fn(),
         compactSession: vi.fn(),
@@ -69,6 +71,7 @@ describe("commands", () => {
         loadSkill: vi.fn(),
         createSession: vi.fn(),
         switchSession: vi.fn(),
+        runBuddyCommand: vi.fn(),
       };
       ctx = {
         transport: transportMock,
@@ -81,6 +84,7 @@ describe("commands", () => {
         resetContextWindow: resetContextWindowMock,
         openSessionSwitcher: openSessionSwitcherMock,
         toggleActivity: toggleActivityMock,
+        setBuddyState: setBuddyStateMock,
       };
     });
 
@@ -95,6 +99,7 @@ describe("commands", () => {
       expect(text).toContain("/sessions");
       expect(text).toContain("/compact");
       expect(text).toContain("/mcp");
+      expect(text).toContain("/buddy");
     });
 
     it("/clear 调 transport.clearHistory + 清 items + 给个提示", () => {
@@ -284,6 +289,52 @@ describe("commands", () => {
       const text = appendSystemMock.mock.calls[0][0];
       expect(text).toContain("✗");
       expect(text).toContain("mcp timeout");
+    });
+
+    it("/buddy 调后端命令并刷新 Buddy 状态", async () => {
+      const state = {
+        enabled: true,
+        status: "ready",
+        muted: false,
+        companion: { name: "Waddles" },
+      };
+      transportMock.runBuddyCommand.mockResolvedValue({
+        text: "Buddy 已孵化",
+        changed: true,
+        state,
+      });
+
+      const cmd = findCommand("/buddy hatch")!;
+      await cmd.handler({ ...ctx, args: "hatch" });
+
+      expect(transportMock.runBuddyCommand).toHaveBeenCalledWith("hatch");
+      expect(setBuddyStateMock).toHaveBeenCalledWith(state);
+      expect(appendSystemMock.mock.calls[0][0]).toContain("Buddy 已孵化");
+    });
+
+    it.each(["pet", "off", "on", "mute", "unmute", "rehatch"])(
+      "/buddy %s 原样交给后端",
+      async (sub) => {
+        transportMock.runBuddyCommand.mockResolvedValue({
+          text: "",
+          changed: true,
+          state: { enabled: true, status: "ready", muted: false, companion: null },
+        });
+
+        const cmd = findCommand(`/buddy ${sub}`)!;
+        await cmd.handler({ ...ctx, args: sub });
+
+        expect(transportMock.runBuddyCommand).toHaveBeenCalledWith(sub);
+      },
+    );
+
+    it("/buddy RPC 报错时输出错误信息", async () => {
+      transportMock.runBuddyCommand.mockRejectedValue(new Error("buddy timeout"));
+      const cmd = findCommand("/buddy pet")!;
+      await cmd.handler({ ...ctx, args: "pet" });
+      const text = appendSystemMock.mock.calls[0][0];
+      expect(text).toContain("✗");
+      expect(text).toContain("buddy timeout");
     });
 
     it("/log 触发 toggleActivity", () => {

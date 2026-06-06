@@ -45,7 +45,7 @@ from agent.cancel import (
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import (
-    BackgroundNotification, Cancelled, Done, Error, RoundEnd, RoundStart,
+    BackgroundNotification, BuddyUpdated, Cancelled, Done, Error, RoundEnd, RoundStart,
 )
 from agent.executor import ToolExecutor
 from agent.message_logger import MessageLogger
@@ -73,6 +73,7 @@ from agent.work_context import (
     make_compact_record_message,
     make_work_record_message,
 )
+from agent.buddy import BuddyManager
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,7 @@ class AgentSession:
         message_logger: Optional[MessageLogger] = None,
         language: Optional[str] = "Chinese",
         mcp_clients=None,
+        buddy_manager: Optional[BuddyManager] = None,
     ) -> None:
         """
         Args:
@@ -230,6 +232,7 @@ class AgentSession:
         self.message_logger = message_logger
         self.language = language
         self.mcp_clients = mcp_clients
+        self.buddy_manager = buddy_manager
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
         if self.session_store is not None:
@@ -633,6 +636,19 @@ class AgentSession:
         if post_turn_compaction is not None:
             auto_compactions.append(post_turn_compaction)
             logger.info("auto compact after turn: %s", post_turn_compaction)
+
+        # Buddy 是 UI 附属状态，不写 history。每轮结束后基于本轮用户输入和最终
+        # 回答生成轻量本地模板反应；如果触发了反应，就用事件流通知 TUI 刷新气泡。
+        if self.buddy_manager is not None:
+            try:
+                buddy_state = self.buddy_manager.maybe_react(
+                    user_query=user_query,
+                    assistant_answer=final_answer,
+                )
+                if buddy_state is not None:
+                    self.event_bus.emit(BuddyUpdated(state=buddy_state, reason="reaction"))
+            except Exception:
+                logger.exception("Buddy 本地反应生成失败")
 
         # Done 事件：让前端知道整轮结束
         elapsed = time.perf_counter() - chat_started
@@ -1406,6 +1422,15 @@ class AgentSession:
                     parts.append(overview)
             except Exception:
                 logger.exception("skill overview 构建失败")
+
+        if self.buddy_manager is not None:
+            try:
+                buddy_prompt = self.buddy_manager.prompt_section()
+                if buddy_prompt:
+                    parts.append("")
+                    parts.append(buddy_prompt)
+            except Exception:
+                logger.exception("Buddy prompt 段构建失败")
 
         return "\n".join(parts)
 

@@ -40,7 +40,7 @@ from typing import Any, Dict, Optional, TextIO
 
 from agent.cancel import CancelToken
 from agent.event_bus import EventBus
-from agent.events import Event
+from agent.events import BuddyUpdated, Event
 from agent.session import AgentSession
 from agent.transport.jsonrpc import StdioTransport, make_event_message, make_response
 
@@ -139,6 +139,10 @@ class Gateway:
             self._handle_load_skill(rpc_id, params)
         elif method == "session.answer_question":
             self._handle_answer_question(rpc_id, params)
+        elif method == "buddy.get_state":
+            self._handle_buddy_get_state(rpc_id)
+        elif method == "buddy.command":
+            self._handle_buddy_command(rpc_id, params)
         else:
             logger.warning("rpc unknown method: method=%r id=%s", method, rpc_id)
             if rpc_id is not None:
@@ -529,6 +533,87 @@ class Gateway:
             cancelled=cancelled,
         )
         self.transport.write(make_response(rpc_id, result={"delivered": delivered}))
+
+    def _handle_buddy_get_state(self, rpc_id: Any) -> None:
+        """返回 Buddy 当前状态。
+
+        Buddy 是 UI 附属状态，不需要等待 chat 空闲；用户即使在 agent 工作时
+        打开 TUI，也应该能看到当前是否已孵化、是否静音。
+        """
+        if rpc_id is None:
+            return
+        manager = getattr(self.session, "buddy_manager", None)
+        if manager is None:
+            self.transport.write(make_response(
+                rpc_id,
+                result={
+                    "enabled": False,
+                    "status": "disabled",
+                    "muted": False,
+                    "companion": None,
+                    "last_reaction": None,
+                    "reaction_at": None,
+                    "pet_at": None,
+                    "message": "Buddy manager unavailable",
+                },
+            ))
+            return
+        try:
+            state = manager.state()
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=state))
+
+    def _handle_buddy_command(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        """执行 /buddy 子命令并返回最新状态。
+
+        命令本身只改 Buddy 配置，不改会话 history；配置变化时额外广播
+        ``buddy_updated``，让同一前端不用等 RPC 回调也能按事件流统一刷新。
+        """
+        if rpc_id is None:
+            return
+        args = params.get("args", "")
+        if not isinstance(args, str):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "params.args must be string"},
+            ))
+            return
+        manager = getattr(self.session, "buddy_manager", None)
+        if manager is None:
+            self.transport.write(make_response(
+                rpc_id,
+                result={
+                    "text": "Buddy manager unavailable",
+                    "changed": False,
+                    "state": {
+                        "enabled": False,
+                        "status": "disabled",
+                        "muted": False,
+                        "companion": None,
+                        "last_reaction": None,
+                        "reaction_at": None,
+                        "pet_at": None,
+                        "message": "Buddy manager unavailable",
+                    },
+                },
+            ))
+            return
+        try:
+            result = manager.handle_command(args)
+            if result.get("changed"):
+                self.event_bus.emit(BuddyUpdated(state=result.get("state") or manager.state(), reason="command"))
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=result))
 
     def _is_busy(self) -> bool:
         """线程安全读取 busy 状态，供会话切换/新建等同步 RPC 使用。"""

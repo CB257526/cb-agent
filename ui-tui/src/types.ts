@@ -26,6 +26,7 @@ export type EventType =
   | "ask_user_question_answered"
   | "todo_list_updated"
   | "mcp_status"
+  | "buddy_updated"
   | "gateway_ready";  // gateway 自定义，不在 events.py 里
 
 export interface BaseEvent {
@@ -171,6 +172,46 @@ export interface MCPStatusEvent extends BaseEvent, MCPStatusPayload {
   type: "mcp_status";
 }
 
+export interface BuddyCompanion {
+  name: string;
+  personality: string;
+  seed: string;
+  hatched_at: number;
+  rarity: "common" | "uncommon" | "rare" | "epic" | "legendary" | string;
+  species: string;
+  eye: string;
+  hat: string;
+  shiny: boolean;
+  stats: Record<string, number>;
+  sprite: string[];
+  frames: string[][];
+  face: string;
+  rarity_stars: string;
+}
+
+export interface BuddyState {
+  enabled: boolean;
+  status: "disabled" | "empty" | "ready" | string;
+  muted: boolean;
+  companion?: BuddyCompanion | null;
+  last_reaction?: string | null;
+  reaction_at?: number | null;
+  pet_at?: number | null;
+  message?: string | null;
+}
+
+export interface BuddyCommandResult {
+  text: string;
+  changed: boolean;
+  state: BuddyState;
+}
+
+export interface BuddyUpdated extends BaseEvent {
+  type: "buddy_updated";
+  state: BuddyState;
+  reason?: string;
+}
+
 export type AgentEvent =
   | TextDelta
   | ReasoningDelta
@@ -187,6 +228,7 @@ export type AgentEvent =
   | AskUserQuestionAnswered
   | TodoListUpdated
   | MCPStatusEvent
+  | BuddyUpdated
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========

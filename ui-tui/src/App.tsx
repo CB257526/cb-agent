@@ -20,7 +20,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
-import { AgentEvent, ChatItem, ContextWindow, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, BuddyState, ChatItem, ContextWindow, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
@@ -28,6 +28,7 @@ import { ActivityPanel } from "./components/ActivityPanel.js";
 import { Banner } from "./components/Banner.js";
 import { SlashCommandPicker } from "./components/SlashCommandPicker.js";
 import { SessionSwitcher } from "./components/SessionSwitcher.js";
+import { BuddySprite } from "./buddy/BuddySprite.js";
 import { HistoryStore } from "./historyStore.js";
 import { findCommand, SlashCommand, CommandCtx, formatMCPStatus } from "./commands.js";
 
@@ -118,6 +119,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [showSessionSwitcher, setShowSessionSwitcher] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
+  const [buddyState, setBuddyState] = useState<BuddyState | null>(null);
   // 当前等待用户作答的问题 id：决定 EventStream 把输入路由给哪个 panel；
   // 同时 PromptInput 在问答期 disabled，避免误打字提交 prompt
   const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
@@ -343,6 +345,11 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           break;
         }
 
+        case "buddy_updated": {
+          setBuddyState((ev as any).state ?? null);
+          break;
+        }
+
         case "round_start":
           setRound((ev as any).round_idx);
           setMaxRounds((ev as any).max_rounds);
@@ -531,6 +538,20 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     };
   }, [transport, exit, appendSystem, flushNow, scheduleFlush, resetFlushRhythm]);
 
+  useEffect(() => {
+    let disposed = false;
+    transport.getBuddyState()
+      .then((state) => {
+        if (!disposed) setBuddyState(state ?? null);
+      })
+      .catch(() => {
+        if (!disposed) setBuddyState(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [transport]);
+
   // 键盘事件：Ctrl-C 在 busy 时中断/空闲时退出；Ctrl-O 切换后端日志面板
   useInput((inputChar, key) => {
     if (key.ctrl && inputChar === "c") {
@@ -568,6 +589,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       resetContextWindow,
       openSessionSwitcher,
       toggleActivity: () => setShowActivity((v) => !v),
+      setBuddyState,
     };
     const ret = cmd.handler(ctx);
     if (ret instanceof Promise) {
@@ -654,14 +676,19 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             onCancel={() => setInput("")}
           />
         )}
-        <PromptInput
-          value={input}
-          onChange={setInput}
-          onSubmit={handleSubmit}
-          disabled={busy || activeQuestionId !== null || showSessionSwitcher}
-          getHistoryAt={getHistoryAt}
-          delegateNavKeys={slashActive || activeQuestionId !== null || showSessionSwitcher}
-        />
+        <Box flexDirection="row" alignItems="flex-end">
+          <Box flexGrow={1} flexShrink={1}>
+            <PromptInput
+              value={input}
+              onChange={setInput}
+              onSubmit={handleSubmit}
+              disabled={busy || activeQuestionId !== null || showSessionSwitcher}
+              getHistoryAt={getHistoryAt}
+              delegateNavKeys={slashActive || activeQuestionId !== null || showSessionSwitcher}
+            />
+          </Box>
+          <BuddySprite state={buddyState} />
+        </Box>
         <Box marginTop={1}>
           <StatusBar
             model={model}

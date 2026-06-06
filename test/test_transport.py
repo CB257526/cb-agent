@@ -20,7 +20,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -40,6 +40,7 @@ from agent.executor import ToolExecutor
 from agent.session import AgentSession
 from agent.transport import Gateway, StdioTransport, make_event_message, make_response
 from agent.work_context import LocalSessionStore
+from agent.buddy import BuddyManager
 from skills.skill_manager import SkillManager
 
 
@@ -172,6 +173,7 @@ def _make_session_for_gateway(
     mcp_status_provider=None,
     mcp_background_loader=None,
     skill_manager=None,
+    buddy_manager=None,
 ):
     bus = EventBus()
     reg = MagicMock()
@@ -184,6 +186,7 @@ def _make_session_for_gateway(
         llm=llm, registry=reg, executor=ex, event_bus=bus,
         memory_loader=None, skill_manager=skill_manager, ctx_enabled=False,
         session_store=session_store,
+        buddy_manager=buddy_manager,
     )
     if mcp_status_provider is not None:
         s.mcp_status_provider = mcp_status_provider
@@ -228,7 +231,8 @@ class TestGatewayDispatch(unittest.TestCase):
                                 wait_done: bool = False, session_store=None,
                                 mcp_status_provider=None,
                                 mcp_background_loader=None,
-                                skill_manager=None) -> List[Dict[str, Any]]:
+                                skill_manager=None,
+                                buddy_manager=None) -> List[Dict[str, Any]]:
         """起 gateway，把 msgs 一行行喂进 stdin，等收到至少 wait_for 条 stdout 行
         （或看到 done 事件，wait_done=True 时），然后关 stdin、join 主线程。
         返回 stdout 解析出的所有 JSON 消息（顺序）。
@@ -239,6 +243,7 @@ class TestGatewayDispatch(unittest.TestCase):
             mcp_status_provider=mcp_status_provider,
             mcp_background_loader=mcp_background_loader,
             skill_manager=skill_manager,
+            buddy_manager=buddy_manager,
         )
         stdin = _PipeStdin()
         out = io.StringIO()
@@ -519,6 +524,53 @@ class TestGatewayDispatch(unittest.TestCase):
         result = replies[0]["result"]
         self.assertEqual(result["status"], "loading")
         self.assertEqual(result["servers"][0]["name"], "filesystem")
+
+    def test_gateway_buddy_get_state_disabled(self):
+        """buddy.get_state 返回当前 Buddy 快照，未启用时为 disabled。"""
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {}, clear=True):
+            manager = BuddyManager(Path(td) / "buddy.json")
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [json.dumps({"jsonrpc": "2.0", "id": "bd1", "method": "buddy.get_state"})],
+                wait_for=2,
+                buddy_manager=manager,
+            )
+
+            replies = [m for m in msgs if m.get("id") == "bd1"]
+            self.assertEqual(len(replies), 1)
+            result = replies[0]["result"]
+            self.assertFalse(result["enabled"])
+            self.assertEqual(result["status"], "disabled")
+
+    def test_gateway_buddy_command_hatch_broadcasts_update(self):
+        """buddy.command 执行 hatch 后返回文本并广播 buddy_updated。"""
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"FEATURE_BUDDY": "1"}, clear=True):
+            manager = BuddyManager(Path(td) / "buddy.json")
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "bd2",
+                    "method": "buddy.command",
+                    "params": {"args": "hatch"},
+                })],
+                wait_for=3,
+                buddy_manager=manager,
+            )
+
+            replies = [m for m in msgs if m.get("id") == "bd2"]
+            self.assertEqual(len(replies), 1)
+            result = replies[0]["result"]
+            self.assertTrue(result["changed"])
+            self.assertIn("Buddy 已孵化", result["text"])
+            self.assertIsNotNone(result["state"]["companion"])
+
+            buddy_events = [
+                m for m in msgs
+                if m.get("method") == "event" and m.get("params", {}).get("type") == "buddy_updated"
+            ]
+            self.assertGreaterEqual(len(buddy_events), 1)
+            self.assertEqual(buddy_events[-1]["params"]["reason"], "command")
 
     def test_gateway_session_create_list_and_switch(self):
         """session.* 会话 RPC 返回摘要和普通 history，且能切回旧会话。"""

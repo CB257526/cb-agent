@@ -127,7 +127,13 @@ export function PromptInput({ value, onChange, onSubmit, disabled, getHistoryAt,
   });
 
   return (
-    <Box borderStyle="round" borderColor={disabled ? theme.border : theme.borderActive} paddingX={1}>
+    <Box
+      borderStyle="round"
+      borderColor={disabled ? theme.border : theme.borderActive}
+      flexGrow={1}
+      paddingX={1}
+      width="100%"
+    >
       <Text color={disabled ? theme.border : theme.primary}>{"> "}</Text>
       {disabled
         ? <Text dimColor>（agent 正在工作，等待结束）</Text>

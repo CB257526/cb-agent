@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import Done, MCPStatus
+from agent.buddy import BuddyManager
 from agent.executor import ToolExecutor
 from agent.renderers.cli import CLIRenderer
 from agent.message_logger import MessageLogger
@@ -159,6 +160,7 @@ class AgentRunner:
         self.dump_messages = bool(attach_cli_renderer)
         self._attach_cli_renderer = attach_cli_renderer
         self._md_memory_provider = self._create_markdown_memory_provider()
+        self.buddy_manager = BuddyManager()
         self._mcp_lock = threading.RLock()
         self._mcp_thread: threading.Thread | None = None
         self._mcp_started = False
@@ -236,6 +238,7 @@ class AgentRunner:
             session_store=session_store,
             trace_summarizer=trace_summarizer,
             message_logger=message_logger,
+            buddy_manager=self.buddy_manager,
         )
         # Gateway 只持有 AgentSession，不直接知道 AgentRunner。这里把 MCP 运行态
         # 以“可选回调”的形式挂到 session 上：旧代码不需要感知这些属性；JSON-RPC
@@ -742,6 +745,7 @@ class AgentRunner:
                 "  /help        打印帮助\n"
                 "  /tools       列出所有已注册工具\n"
                 "  /mcp         查看 MCP 后台连接状态\n"
+                "  /buddy       查看/孵化/互动 Buddy 宠物\n"
                 "  /skills      列出所有 Skill\n"
                 "  /skill NAME  手动加载指定 Skill\n"
                 "  /history     查看当前会话历史\n"
@@ -789,6 +793,13 @@ class AgentRunner:
                     tail += f", error={error}"
                 print(f"  - {name}: {state}{tail}")
             print()
+        elif cmd == "/buddy":
+            # Buddy 是独立 UI 附属状态，不进入当前会话 history。CLI 下没有输入框旁
+            # sprite，但仍可以查看、孵化、摸摸、静音，TUI 会共享同一个配置文件。
+            result = self.buddy_manager.handle_command(raw_arg)
+            text = result.get("text") if isinstance(result, dict) else ""
+            if text:
+                print("\n" + str(text) + "\n")
         elif cmd == "/skills":
             skills = self._skill_manager.list_skills()
             print(f"\n已发现 {len(skills)} 个 Skill：")

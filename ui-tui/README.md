@@ -22,6 +22,18 @@ npm start
 
 启动后会自动 spawn Python 后端（默认从 `../venv/python.exe` 找解释器）。
 
+如果要使用 Buddy 宠物，先在项目根目录 `.env` 开启：
+
+```env
+FEATURE_BUDDY=1
+```
+
+然后重启 TUI，输入：
+
+```text
+/buddy hatch
+```
+
 退出：
 
 - `Ctrl-C`（agent 工作时）→ 中断当前 chat
@@ -41,6 +53,7 @@ ui-tui/
     ├── transport.ts     ← stdio JSON-RPC 客户端（NDJSON 行缓冲解析）
     ├── App.tsx          ← Ink 主组件：事件 → ChatItem 状态机 + 键盘
     ├── types.ts         ← cb-agent 事件类型 mirror
+    ├── buddy/           ← Buddy 输入框旁 sprite 和 /buddy 卡片渲染
     ├── components/
     │   ├── EventStream.tsx   对话流
     │   ├── ToolBlock.tsx     工具块
@@ -74,6 +87,8 @@ UI 发出的 RPC：
 transport.sendPrompt("帮我看看 X")  // → prompt.submit
 transport.cancel()                   // → session.cancel
 transport.clearHistory()             // → session.clear_history
+transport.getBuddyState()             // → buddy.get_state
+transport.runBuddyCommand("pet")      // → buddy.command
 transport.quit()                     // → session.quit
 ```
 
@@ -98,6 +113,27 @@ CB_AGENT_PYTHON=/path/to/python npm start
 
 `~/.cb-agent/logs/gateway-<timestamp>.log`。UI 启动时新建一个文件，把 Python stderr 全写过去。
 协议解析失败时 UI 会给出文件路径让用户去看。
+
+### Buddy 宠物
+
+Buddy 默认关闭。开启方式：
+
+```env
+FEATURE_BUDDY=1
+```
+
+可用命令：
+
+| 命令 | 说明 |
+|---|---|
+| `/buddy` 或 `/buddy status` | 查看当前 Buddy 状态 |
+| `/buddy hatch` | 第一次孵化 Buddy |
+| `/buddy rehatch` | 重新孵化并替换当前 Buddy |
+| `/buddy pet` | 摸摸 Buddy，触发心心动画和气泡反应 |
+| `/buddy mute` 或 `/buddy off` | 静音并隐藏输入框旁 Buddy |
+| `/buddy unmute` 或 `/buddy on` | 取消静音并重新显示 |
+
+TUI 启动后会调用 `buddy.get_state` 拉取当前状态；执行 `/buddy` 子命令会调用 `buddy.command`，后端状态变化时再广播 `buddy_updated`。Buddy 配置存储在 `~/.cbagent/buddy.json`，不写入当前聊天 history。
 
 ---
 

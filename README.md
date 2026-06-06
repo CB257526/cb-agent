@@ -29,6 +29,7 @@
 | MCP | 读取 `mcp.json`，通过 stdio 启动 MCP server，并展开成可调用工具 |
 | Skills | Markdown + YAML frontmatter 描述能力，按需加载指令和脚本 |
 | Bash 权限 | Bash 工具支持权限语义，TUI 模式下权限确认走 UI 通道 |
+| Buddy 宠物 | 可选虚拟宠物系统，支持孵化、摸摸、静音、TUI 输入框旁展示和本地气泡反应 |
 
 ## Quickstart
 
@@ -154,6 +155,14 @@ CBAGENT_LOG_DIR=.cbagent/logs
 
 运行日志默认写到 `.cbagent/logs/cb-agent-<timestamp>.log`；TUI 仍会把 Python stderr 镜像到 `~/.cb-agent/logs/gateway-<timestamp>.log`。
 
+Buddy 宠物默认关闭。需要使用时在 `.env` 里开启：
+
+```env
+FEATURE_BUDDY=1
+```
+
+开启后重启 CLI 或 TUI，再使用 `/buddy hatch` 孵化。Buddy 状态会持久化到 `~/.cbagent/buddy.json`，同一台机器上的 CLI 和 TUI 会共享同一只 Buddy。
+
 注意：`LLM_MODEL_ID` 必须在 [constant/llm/constant_llm.py](constant/llm/constant_llm.py) 的 `ConstantLLM.llm_dict` 里登记。新增模型时要补：
 
 - `is_tool`
@@ -169,6 +178,7 @@ CBAGENT_LOG_DIR=.cbagent/logs
 | `AMAP_MAPS_API_KEY` | `mcp.json` 里的高德 MCP server |
 | `TAVILY_API_KEY` | `my_advanced_search` 的 Tavily 搜索源 |
 | `SERPAPI_API_KEY` | `my_advanced_search` 的 SerpApi 搜索源 |
+| `FEATURE_BUDDY` | 设为 `1` / `true` / `on` 后启用 Buddy 宠物系统 |
 | `VECTOR_STORE_TYPE` / `QDRANT_URL` / `QDRANT_API_KEY` | full RAG/Memory 的向量存储 |
 | `GRAPH_STORE_TYPE` / `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` | full 语义记忆图存储 |
 | `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` / `EMBED_API_KEY` | full embedding 配置 |
@@ -259,6 +269,7 @@ TUI 快捷键：
 | `/new` | 新建并切换到空白会话 |
 | `/switch <id>` | 切换到指定 session |
 | `/compact` | 手动压缩当前会话上下文 |
+| `/buddy` | 查看、孵化或互动 Buddy 宠物 |
 | `/clear` | 清空前端显示并清空后端当前会话历史 |
 | `/log` 或 `Ctrl-O` | 切换后端日志面板 |
 | `Ctrl-L` | 清当前屏幕显示，保留后端 history |
@@ -389,6 +400,41 @@ CLI 支持：
 
 TUI 支持 `/sessions` 面板、`/new`、`/switch <id>`。
 
+## Buddy 宠物
+
+Buddy 是一个可选的本地虚拟宠物功能。它不会写入会话 history，也不会参与工具轨迹；它只作为 CLI/TUI 的附属状态存在。TUI 模式下，Buddy 会显示在输入框旁边，`pet` 时出现短暂爱心动画，有本地模板反应时会显示气泡。
+
+### 开启
+
+在 `.env` 中设置：
+
+```env
+FEATURE_BUDDY=1
+```
+
+然后重启 CLI 或 TUI。未开启时执行 `/buddy` 会提示设置 `FEATURE_BUDDY=1`。
+
+### 常用命令
+
+CLI 和 TUI 都支持：
+
+| 命令 | 说明 |
+|---|---|
+| `/buddy` 或 `/buddy status` | 查看当前 Buddy；还没孵化时提示先 hatch |
+| `/buddy hatch` | 第一次孵化 Buddy；已有 Buddy 时不会覆盖 |
+| `/buddy rehatch` | 重新孵化，替换当前 Buddy |
+| `/buddy pet` | 摸摸 Buddy，触发爱心动画和一条本地反应 |
+| `/buddy mute` 或 `/buddy off` | 静音并隐藏 Buddy |
+| `/buddy unmute` 或 `/buddy on` | 取消静音，重新显示 Buddy |
+
+状态文件默认在：
+
+```text
+~/.cbagent/buddy.json
+```
+
+如果要重新开始，可以用 `/buddy rehatch`。一般不建议手动编辑 `buddy.json`，除非是在调试持久化格式。
+
 ### 手动 compact
 
 TUI 支持：
@@ -417,6 +463,7 @@ CONTEXT_USAGE_RATIO = 0.8
 |---|---|
 | `/help` | 打印帮助 |
 | `/tools` | 列出所有已注册工具 |
+| `/buddy` | 查看、孵化或互动 Buddy 宠物 |
 | `/skills` | 列出所有 Skill |
 | `/history` | 查看当前会话 history |
 | `/sessions` | 列出本地会话 |
@@ -558,6 +605,7 @@ python -m py_compile agent_run_basic.py run_agent.py context/builder.py context/
 python test/test_context_builder.py
 python test/test_session_renderer.py
 python test/test_transport.py
+python -m unittest discover -s test -p "test_buddy*.py"
 ```
 
 TUI：
@@ -565,6 +613,7 @@ TUI：
 ```bash
 cd ui-tui
 npm test
+npm test -- commands.test.ts transport.test.ts buddySprite.test.ts buddyCard.test.ts
 npm run build
 ```
 

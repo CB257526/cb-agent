@@ -8,7 +8,7 @@
  */
 
 import type { Transport } from "./transport.js";
-import type { ChatItem, ContextWindow, MCPStatusPayload, SessionPayload } from "./types.js";
+import type { BuddyState, ChatItem, ContextWindow, MCPStatusPayload, SessionPayload } from "./types.js";
 
 export interface CommandCtx {
   transport: Transport;
@@ -29,6 +29,8 @@ export interface CommandCtx {
   openSessionSwitcher: () => void;
   /** 切换后端日志面板 */
   toggleActivity: () => void;
+  /** 更新 Buddy 附属状态，供输入框旁 sprite 使用。 */
+  setBuddyState: (state: BuddyState | null) => void;
 }
 
 export interface SlashCommand {
@@ -180,6 +182,19 @@ export const COMMANDS: readonly SlashCommand[] = [
         appendSystem(formatMCPStatus(status));
       } catch (e) {
         appendSystem(`✗ /mcp 失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
+    name: "/buddy",
+    description: "查看、孵化或互动 Buddy 宠物",
+    handler: async ({ transport, args, appendSystem, setBuddyState }) => {
+      try {
+        const result = await transport.runBuddyCommand(args);
+        setBuddyState(result.state ?? null);
+        if (result.text) appendSystem(result.text);
+      } catch (e) {
+        appendSystem(`✗ /buddy 失败：${(e as Error).message}`);
       }
     },
   },
