@@ -64,6 +64,7 @@ export function formatMCPStatus(status: MCPStatusPayload): string {
     const name = server.name || "unknown";
     const serverState = server.status || "unknown";
     const parts: string[] = [];
+    if (server.transport) parts.push(`transport=${server.transport}`);
     if (server.tools_count) parts.push(`tools=${server.tools_count}`);
     if (server.elapsed_seconds) parts.push(`${server.elapsed_seconds}s`);
     if (server.error) parts.push(`error=${server.error}`);

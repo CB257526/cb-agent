@@ -413,7 +413,9 @@ class AgentRunner:
             return
         _info("读取 MCP 配置（后台连接）")
         try:
-            server_configs = load_mcp_server_configs()
+            # collect_errors=True 可以把单个 server 的配置问题降级成该 server 的
+            # error 状态，避免一个缺失的 token 让其它 MCP server 全部无法加载。
+            server_configs = load_mcp_server_configs(collect_errors=True)
         except FileNotFoundError:
             with self._mcp_lock:
                 self._mcp_status = {
@@ -439,13 +441,20 @@ class AgentRunner:
             return
 
         servers = []
+        failed = 0
         for item in server_configs:
+            has_config_error = bool(item.get("config_error"))
+            if has_config_error:
+                failed += 1
             servers.append({
                 "name": item.get("name", ""),
-                "status": "pending",
+                # 只暴露 transport 类型，隐藏 command/env/headers 等敏感或冗长配置。
+                # 这样 /mcp 可以直接看出 server 是 stdio、http 还是 sse。
+                "transport": item.get("transport", "stdio"),
+                "status": "error" if has_config_error else "pending",
                 "tools_count": 0,
                 "elapsed_seconds": 0.0,
-                "error": None,
+                "error": item.get("config_error") if has_config_error else None,
                 "_config": item,
             })
         with self._mcp_lock:
@@ -454,7 +463,7 @@ class AgentRunner:
                 "servers": servers,
                 "total": len(servers),
                 "connected": 0,
-                "failed": 0,
+                "failed": failed,
             }
 
     def mcp_status(self) -> Dict[str, Any]:
@@ -541,6 +550,20 @@ class AgentRunner:
             started_at = time.monotonic()
             name = str(server.get("name") or f"mcp_{index + 1}")
             config = server.get("_config") if isinstance(server.get("_config"), dict) else {}
+            if config.get("config_error"):
+                # 配置层已经判定失败的 server 不再尝试网络连接。这样 /mcp 能立即显示
+                # “缺少哪个环境变量”，也不会对 GitHub 这类远端 MCP 发出无效请求。
+                with self._mcp_lock:
+                    current = self._mcp_status["servers"][index]
+                    current["status"] = "error"
+                    current["elapsed_seconds"] = 0.0
+                    current["error"] = config.get("config_error")
+                    self._mcp_status["failed"] = sum(
+                        1 for item in self._mcp_status["servers"]
+                        if item.get("status") == "error"
+                    )
+                self._emit_mcp_status()
+                continue
             with self._mcp_lock:
                 current = self._mcp_status["servers"][index]
                 current["status"] = "connecting"
@@ -551,7 +574,9 @@ class AgentRunner:
                 mcp_tool = MCPTool(
                     name=name,
                     server_command=config.get("server_command"),
+                    server_config=config,
                     env=config.get("env"),
+                    strict_discovery=True,
                 )
                 expanded = mcp_tool.get_expanded_tools()
                 registered_count = 0

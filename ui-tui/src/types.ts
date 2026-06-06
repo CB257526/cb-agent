@@ -153,6 +153,7 @@ export interface TodoListUpdated extends BaseEvent {
 
 export interface MCPServerStatus {
   name: string;
+  transport?: "stdio" | "http" | "sse" | string;
   status: "pending" | "connecting" | "connected" | "error" | "disabled" | string;
   tools_count?: number;
   elapsed_seconds?: number;
