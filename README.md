@@ -96,7 +96,7 @@ pip install -e .
 pip install -r requirements.txt
 ```
 
-完整安装，启用旧向量记忆/RAG、多模态 RAG、PDF/Web 搜索等可选依赖：
+完整安装，启用旧向量记忆/RAG、多模态 RAG、PDF 等可选依赖。Web 搜索只需要核心依赖里的 `requests` 和对应 API Key：
 
 ```bash
 pip install -e ".[full]"
@@ -607,7 +607,7 @@ python run_agent.py --memory-system full
 
 ### Web 搜索不可用
 
-`my_advanced_search` 需要 Tavily 或 SerpApi：
+`my_advanced_search` 使用核心依赖里的 `requests` 直连 Tavily 或 SerpApi，不需要额外 SDK。配置任意一个 API Key 后重启即可：
 
 ```env
 TAVILY_API_KEY=...
