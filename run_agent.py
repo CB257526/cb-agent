@@ -316,7 +316,7 @@ class AgentRunner:
 
         tools.extend([
             TodoTool(event_bus=self.event_bus),
-            ListToolsTool(),
+            ListToolsTool(self.registry),
             SearchTool(),
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),

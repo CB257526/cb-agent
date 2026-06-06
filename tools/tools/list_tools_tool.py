@@ -18,7 +18,7 @@ from tools.toolRegistry import global_registry
 class ListToolsTool(Tool):
     """查询当前系统中所有可用工具的列表和描述。"""
 
-    def __init__(self) -> None:
+    def __init__(self, registry=None) -> None:
         super().__init__(
             name="list_tools",
             description=(
@@ -28,6 +28,7 @@ class ListToolsTool(Tool):
                 "返回格式：每行一条，格式为 '- tool_name: description'。"
             ),
         )
+        self.registry = registry or global_registry
 
     def get_parameters(self) -> List[ToolParameter]:
         # 无需参数，直接返回全部工具列表
@@ -38,7 +39,7 @@ class ListToolsTool(Tool):
 
     def run(self, parameters: Dict[str, Any]) -> str:
         """返回全局 ToolRegistry 中所有工具的格式化描述。"""
-        desc = global_registry.get_tools_description()
+        desc = self.registry.get_tools_description()
         if not desc or desc == "暂无可用工具":
             return "（当前没有已注册的工具）"
         return desc
