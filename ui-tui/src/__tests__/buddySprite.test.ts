@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isNarrowBuddyLayout, shouldRenderBuddy } from "../buddy/BuddySprite.js";
+import { isNarrowBuddyLayout, selectStaticBuddyFrame, shouldRenderBuddy } from "../buddy/BuddySprite.js";
 import type { BuddyState } from "../types.js";
 
 const baseState: BuddyState = {
@@ -37,5 +37,18 @@ describe("BuddySprite helpers", () => {
     expect(isNarrowBuddyLayout(80)).toBe(true);
     expect(isNarrowBuddyLayout(90)).toBe(false);
     expect(isNarrowBuddyLayout(120)).toBe(false);
+  });
+
+  it("空闲状态固定使用第一帧，避免定时刷新终端", () => {
+    expect(selectStaticBuddyFrame({
+      ...baseState.companion!,
+      frames: [["frame-1"], ["frame-2"]],
+      sprite: ["fallback"],
+    })).toEqual(["frame-1"]);
+    expect(selectStaticBuddyFrame({
+      ...baseState.companion!,
+      frames: [],
+      sprite: ["fallback"],
+    })).toEqual(["fallback"]);
   });
 });

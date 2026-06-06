@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
 import { Box, Text } from "ink";
 import { theme } from "../theme.js";
 import type { BuddyCompanion, BuddyState } from "../types.js";
@@ -24,13 +24,6 @@ type VisibleBuddyState = BuddyState & { companion: BuddyCompanion };
 
 /** 输入框旁的 Buddy 附属视图。 */
 export function BuddySprite({ state, columns = process.stdout.columns ?? 120 }: BuddySpriteProps) {
-  const [, setTick] = useState(0);
-
-  useEffect(() => {
-    const timer = setInterval(() => setTick((n) => n + 1), 750);
-    return () => clearInterval(timer);
-  }, []);
-
   if (!shouldRenderBuddy(state)) return null;
 
   const companion = state.companion;
@@ -56,8 +49,9 @@ export function BuddySprite({ state, columns = process.stdout.columns ?? 120 }: 
     );
   }
 
-  const frames = companion.frames?.length ? companion.frames : [companion.sprite ?? []];
-  const frame = frames[Math.floor(now / 750) % frames.length] ?? [];
+  // 终端里的任何定时重绘都会干扰 scrollback、鼠标滚轮和文本选择。Buddy 在空闲
+  // 状态下固定使用第一帧，只在后端事件或用户输入导致 App 自然刷新时更新视图。
+  const frame = selectStaticBuddyFrame(companion);
   const spriteLines = petting ? ["   <3  <3   ", ...frame] : frame;
 
   return (
@@ -83,6 +77,11 @@ export function shouldRenderBuddy(state: BuddyState | null): state is VisibleBud
 
 export function isNarrowBuddyLayout(columns: number): boolean {
   return columns < NARROW_COLUMNS;
+}
+
+export function selectStaticBuddyFrame(companion: BuddyCompanion): string[] {
+  const frames = companion.frames?.length ? companion.frames : [companion.sprite ?? []];
+  return frames[0] ?? [];
 }
 
 function SpeechBubble({ text, color }: { text: string; color: string }) {
