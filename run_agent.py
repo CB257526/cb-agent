@@ -78,6 +78,7 @@ from skills.skill_manager import SkillManager
 from skills.skill_executor import SkillExecutor
 from tools.toolRegistry import ToolRegistry
 from tools.tools.search import SearchTool
+from tools.tools.local_search import GlobTool, GrepTool, LsTool
 from tools.tools.skill_tool import SkillTool
 from tools.tools.run_skill_script_tool import RunSkillScriptTool
 from tools.tools.todo_tool import TodoTool
@@ -340,6 +341,9 @@ class AgentRunner:
             TodoTool(event_bus=self.event_bus),
             ListToolsTool(self.registry),
             SearchTool(),
+            GlobTool(),
+            GrepTool(),
+            LsTool(),
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),
             BashTool(),

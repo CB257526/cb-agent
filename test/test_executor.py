@@ -57,7 +57,8 @@ class TestShouldParallelize(unittest.TestCase):
 
     def test_all_read_only_parallel(self):
         self.assertTrue(should_parallelize([
-            _tc("file_read"), _tc("search"), _tc("memory_search"),
+            _tc("file_read"), _tc("glob"), _tc("grep"), _tc("ls"),
+            _tc("search"), _tc("memory_search"),
         ]))
 
     def test_any_write_serial(self):
@@ -94,6 +95,9 @@ class TestShouldParallelize(unittest.TestCase):
     def test_all_known_tools_in_set(self):
         """sanity check：white list 跟实际工具名一致。"""
         self.assertIn("file_read", READ_ONLY_TOOLS)
+        self.assertIn("glob", READ_ONLY_TOOLS)
+        self.assertIn("grep", READ_ONLY_TOOLS)
+        self.assertIn("ls", READ_ONLY_TOOLS)
         self.assertIn("search", READ_ONLY_TOOLS)
         self.assertIn("bash_task", READ_ONLY_IF_ACTION)
         self.assertIn("memory", READ_ONLY_IF_ACTION)

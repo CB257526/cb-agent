@@ -143,7 +143,8 @@ class BashTool(Tool):
             name="bash",
             description=(
                 "执行 Shell 命令并返回输出。"
-                "用于：文件操作、代码搜索（grep/find）、程序执行、系统管理、Git 操作等。"
+                "用于：文件操作、程序执行、系统管理、Git 操作等。"
+                "代码搜索和目录浏览请优先使用 grep/glob/ls 专用工具，只有专用工具无法满足时再用 bash。"
                 "支持超时控制和后台执行。"
                 "工作目录在多次调用之间持久化，cd 命令会被记住。"
                 "高危命令（force push、TRUNCATE 等）会触发用户确认弹窗。"
