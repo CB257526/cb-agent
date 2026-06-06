@@ -175,7 +175,7 @@ class AgentSession:
     """
 
     # 工具调用循环最大轮数，防死循环
-    MAX_TOOL_ROUNDS = 20
+    MAX_TOOL_ROUNDS = 50
     # 当前工具循环的完整 tool result 被压缩进 messages 时，每条 tool message
     # 最多保留的字符数。它比跨轮 TraceCollector 的 100 字符略宽，是因为本轮
     # 模型还需要靠这条摘要继续推理；但仍然要有硬边界，防止 file_read/stdout
@@ -539,7 +539,7 @@ class AgentSession:
         user_query = self._prepend_background_notifications(user_query)
 
         system_instructions = self._build_system_instructions()
-        auto_compactions: List[Dict[str, Any]] = []
+        auto_compactions: List[Dict[str, Any]] = [] #收集自动压缩（auto compaction）事件
         messages = self._build_chat_messages(
             user_query=user_query,
             system_instructions=system_instructions,
@@ -578,6 +578,7 @@ class AgentSession:
             except Exception:
                 logger.exception("message_logger 写入失败")
 
+        #工具调用次数，最终回答，工具轨迹，本轮压缩事件
         rounds_used, final_answer, trace_collector, loop_compactions = self._tool_loop(
             messages, tools_schema, token,
         )
@@ -1323,7 +1324,6 @@ class AgentSession:
         不在 system prompt 里内联全部工具描述了（工具多时占用大量 token）。
         模型应通过调用 list_tools 工具来动态获取可用能力列表。
         """
-        total = len(self.registry.list_tools())
         parts = [
             "你是 cb-agent 的智能助手。",
             "遇到复杂问题时请务必调用 todo 工具分解任务。",

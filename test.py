@@ -115,47 +115,80 @@ from agent.cb_agents import CbAgentsLLM
 # print(manager.build_skills_overview())
 
 
-import asyncio
-from pathlib import Path
+# import asyncio
+# from pathlib import Path
 
-from tools.tools.memory_tool import MemoryTool
-from tools.tools.rag_tool import RAGTool
-from context import (
-    MemoryLoader,
-    OpenAICompatibleAdapter,
-    build_system_prompt_blocks,
-    get_system_prompt,
+# from tools.tools.memory_tool import MemoryTool
+# from tools.tools.rag_tool import RAGTool
+# from context import (
+#     MemoryLoader,
+#     OpenAICompatibleAdapter,
+#     build_system_prompt_blocks,
+#     get_system_prompt,
+# )
+# from core.message import Message
+
+# # 重构后:不再有 ContextBuilder 流水线。直接组装 system prompt + 历史。
+# loader = MemoryLoader(cwd=Path.cwd())
+# adapter = OpenAICompatibleAdapter()
+
+# user_query = "数据库连接超时怎么办"
+
+# async def _build():
+#     parts = await get_system_prompt(
+#         enabled_tools=frozenset(["memory", "rag"]),
+#         model="deepseek-v4-flash",
+#         memory_loader=loader,
+#         language="Chinese",
+#     )
+#     parts.append("你是资深 DBA")
+#     blocks = build_system_prompt_blocks(parts, use_global_cache_scope=False)
+#     return adapter.emit_system(blocks)
+
+# system_payload = asyncio.run(_build())
+
+# messages = [
+#     {"role": "system", "content": system_payload},
+#     Message.create_user_message("我们项目用的 PostgreSQL").to_dict(),
+#     Message.create_assistant_message("好的,记下了").to_dict(),
+#     {"role": "user", "content": user_query},
+# ]
+
+# # 直接喂给 LLM
+# llm = CbAgentsLLM()
+# result = llm.think(messages)
+# print("\n=== 模型回答 ===")
+# print(result.get("answer") if isinstance(result, dict) else result)
+
+
+
+#测试openai模型
+import os
+model_id = os.getenv("LLM_MODEL_ID")
+api_key = os.getenv("LLM_API_KEY")
+base_url = os.getenv("LLM_BASE_URL")
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from openai import OpenAI
+client = OpenAI(base_url=base_url, api_key=api_key)
+# 使用流式
+stream = client.chat.completions.create(
+    model=model_id,
+    messages=[
+        {"role": "user", "content": "你好"}
+    ],
+    temperature=0.5,
+    stream=True  # 开启流式
 )
-from core.message import Message
 
-# 重构后:不再有 ContextBuilder 流水线。直接组装 system prompt + 历史。
-loader = MemoryLoader(cwd=Path.cwd())
-adapter = OpenAICompatibleAdapter()
+# 逐块接收并拼接
+full_content = ""
+for chunk in stream:
+    if chunk.choices[0].delta.content is not None:
+        content = chunk.choices[0].delta.content
+        print(content, end="")
+        full_content += content
 
-user_query = "数据库连接超时怎么办"
-
-async def _build():
-    parts = await get_system_prompt(
-        enabled_tools=frozenset(["memory", "rag"]),
-        model="deepseek-v4-flash",
-        memory_loader=loader,
-        language="Chinese",
-    )
-    parts.append("你是资深 DBA")
-    blocks = build_system_prompt_blocks(parts, use_global_cache_scope=False)
-    return adapter.emit_system(blocks)
-
-system_payload = asyncio.run(_build())
-
-messages = [
-    {"role": "system", "content": system_payload},
-    Message.create_user_message("我们项目用的 PostgreSQL").to_dict(),
-    Message.create_assistant_message("好的,记下了").to_dict(),
-    {"role": "user", "content": user_query},
-]
-
-# 直接喂给 LLM
-llm = CbAgentsLLM()
-result = llm.think(messages)
-print("\n=== 模型回答 ===")
-print(result.get("answer") if isinstance(result, dict) else result)
+print(f"\n完整内容: {full_content}")

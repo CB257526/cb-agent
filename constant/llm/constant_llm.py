@@ -5,7 +5,7 @@ class ConstantLLM:
     # 当模型没有在 llm_dict 中登记 max_tokens 时使用的兜底窗口。
     # 这里保留 8000 是为了兼容测试 fake model、临时模型或旧配置，避免因为
     # 一条模型配置缺失就让状态栏/自动 compact 整体失效。
-    DEFAULT_MAX_TOKENS = 8000
+    DEFAULT_MAX_TOKENS = 128000
 
     # agent 实际用于构造 prompt 和触发自动 compact 的安全比例。
     # 用户确认希望“取模型上下文长度的 80% 作为上下文”，剩余 20% 留给模型输出、

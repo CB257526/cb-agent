@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # 订阅者签名：接受一个事件，返回值忽略
-Subscriber = Callable[[Event], None]
+Subscriber = Callable[[Event], None] #输入为event的方法
 
 
 class EventBus:
@@ -46,6 +46,11 @@ class EventBus:
         self._typed_subscribers: dict[Type[Event], List[Subscriber]] = {}
 
     # ---------- 订阅 / 取消订阅 ----------
+    """
+    可以理解为订阅者是一个入参为event的方法吗，假如发布者发布了一个event，
+    然后就会根据这个event的类型，去对应列表（self._typed_subscribers）找这些订阅者(输入event的方法),
+    然后一个个调用这些方法(订阅者)将这个event输入进去
+    """
 
     def subscribe(
         self,
@@ -97,15 +102,15 @@ class EventBus:
         - 单订阅者异常不传播
         """
         with self._lock:
-            all_subs = list(self._all_subscribers)
+            all_subs = list(self._all_subscribers) # 使用订阅者列表的快照，仿照在循环遍历过程中有订阅者使用unsubscribe导致列表被改变，从而会因锁而抛出RuntimeError
             typed_subs = list(self._typed_subscribers.get(type(event), []))
 
         for sub in all_subs:
-            self._safe_call(sub, event)
+            self._safe_call(sub, event) # 调用订阅者，将event输入进去
         for sub in typed_subs:
             self._safe_call(sub, event)
 
-    @staticmethod
+    @staticmethod # 静态方法，不需要实例化,直接调用即可
     def _safe_call(sub: Subscriber, event: Event) -> None:
         try:
             sub(event)

@@ -281,7 +281,9 @@ class CbAgentsLLM:
     def _is_able_Function_Calling(self) -> bool:
         """根据模型提供商判断是否支持函数调用"""
         #实现根据模型提供商判断是否支持函数调用的逻辑
-        return ConstantLLM.llm_dict[self.model]["is_tool"]
+        if self.model in ConstantLLM.llm_dict:
+            return ConstantLLM.llm_dict[self.model].get("is_tool", True)
+        return True
 
     def think(
         self,
