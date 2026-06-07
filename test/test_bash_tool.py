@@ -15,7 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -616,6 +616,31 @@ class TestBashToolEndToEnd(unittest.TestCase):
         self.assertIsNotNone(res["permission"]["matched_rule"])
         self.assertEqual(res["permission"]["matched_rule"]["prefix"], "python")
         self.assertEqual(res["permission"]["matched_rule"]["scope"], "global")
+
+    def test_dangerously_skip_permissions_bypasses_fatal_and_prompt(self):
+        """危险模式下 BashTool 不走 fatal 拦截，也不弹权限确认。"""
+        from tools.tools.bash_permission import PermissionGate, PermissionStore
+        reset_session()
+        gate = PermissionGate(
+            store=PermissionStore(store_path=Path(tempfile.mkdtemp()) / "p.json"),
+            strict=True,
+        )
+        gate.evaluate = MagicMock(side_effect=AssertionError("dangerous mode should not evaluate permissions"))
+        gate.prompt_user = MagicMock(side_effect=AssertionError("dangerous mode should not prompt"))
+        tool = BashTool(permission=gate, dangerously_skip_permissions=True)
+
+        with patch(
+            "tools.tools.bash_tool.check_fatal",
+            side_effect=AssertionError("dangerous mode should not call check_fatal"),
+        ):
+            res = json.loads(tool.run({"command": "echo skip-ok"}))
+
+        self.assertEqual(res["exit_code"], 0)
+        self.assertIn("skip-ok", res["stdout"])
+        self.assertEqual(res["permission"]["decision"], "allow")
+        self.assertTrue(res["permission"]["dangerously_skipped"])
+        gate.evaluate.assert_not_called()
+        gate.prompt_user.assert_not_called()
 
 
 class TestBashPermissionTool(unittest.TestCase):

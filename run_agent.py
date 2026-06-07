@@ -140,6 +140,16 @@ def _safe_runtime_name(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "session"))[:120] or "session"
 
 
+def _truthy_env(value: str | None) -> bool:
+    """解析布尔环境变量。
+
+    用于把 TUI/systemd/Docker 这类不方便直接追加 Python 参数的启动方式统一到
+    ``--dangerously-skip-permissions`` 同一语义上。
+    """
+
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ========== AgentRunner（装配 + REPL）==========
 
 
@@ -153,20 +163,23 @@ class AgentRunner:
         attach_cli_renderer: bool = True, # 是否 attach CLIRenderer 到 EventBus
         memory_system: str = "light",  # light=Markdown 记忆，full=旧 RAG/向量记忆，off=关闭记忆
         communication_platform: str | None = None,  # qq/wechat 等通讯平台模式；None 表示普通 CLI/TUI
+        dangerously_skip_permissions: bool = False,  # 是否跳过 Bash 权限确认和高危命令拦截
     ) -> None:
         self.logging_settings = _LOG_SETTINGS
         self.use_mcp = use_mcp and _HAS_MCP
         self.ctx_enabled = ctx_enabled
         self.memory_system = memory_system
         self.communication_platform = communication_platform
+        self.dangerously_skip_permissions = dangerously_skip_permissions
         logger.info(
-            "AgentRunner init: use_mcp=%s has_mcp=%s ctx_enabled=%s attach_cli_renderer=%s memory_system=%s communication_platform=%s log_level=%s",
+            "AgentRunner init: use_mcp=%s has_mcp=%s ctx_enabled=%s attach_cli_renderer=%s memory_system=%s communication_platform=%s dangerously_skip_permissions=%s log_level=%s",
             use_mcp,
             _HAS_MCP,
             ctx_enabled,
             attach_cli_renderer,
             memory_system,
             communication_platform,
+            dangerously_skip_permissions,
             self.logging_settings.verbosity,
         )
         # CLI 直接交互时保留 messages dump，方便开发者用 /msg on|off 看原始上下文；
@@ -257,6 +270,8 @@ class AgentRunner:
         _info(f"上下文构建器: {'开启' if self.ctx_enabled else '关闭'}")
         _info(f"记忆系统: {self.memory_system}")
         _info(f"MCP: {self._format_mcp_status_line(self.mcp_status())}")
+        if self.dangerously_skip_permissions:
+            _info("Bash 权限: 危险跳过模式已开启，所有 Bash 命令将不再弹窗或拦截")
         _info(f"messages dump: {'开启' if self.dump_messages else '关闭'} (用 /msg off 关闭)")
         print()
 
@@ -440,7 +455,7 @@ class AgentRunner:
             LsTool(),
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),
-            BashTool(),
+            BashTool(dangerously_skip_permissions=self.dangerously_skip_permissions),
             BashTaskTool(),
             BashPermissionTool(),
             FileReadTool(),
@@ -469,19 +484,27 @@ class AgentRunner:
             base = ""
         else:
             base = self._md_memory_provider.memory_instructions()
-        if not self.communication_platform:
-            return base
-        platform_note = (
-            "\n\n[通讯软件交互说明]\n"
-            f"当前会话来自通讯平台: {self.communication_platform}。\n"
-            "- 你可以正常用文本回复用户；最终回答会发送到通讯软件。\n"
-            "- 如果需要发送表情包、图片、音频、视频或文件，必须调用 send_message_asset 工具，"
-            "不要只在文字里声称已经发送。\n"
-            "- 如果需要用户在多个选项中做决定，可以调用 ask_user_question；通讯平台会把它渲染成编号选项，"
-            "用户回复 1/2 或 1,3 后工具会继续执行。\n"
-            "- todo 工具的更新会以简洁文本同步给通讯软件用户，工具执行细节默认不会刷屏。"
-        )
-        return (base + platform_note).strip()
+        parts = [base] if base else []
+        if self.dangerously_skip_permissions:
+            parts.append(
+                "[危险权限模式]\n"
+                "当前进程使用 --dangerously-skip-permissions 启动。Bash 工具拥有完全执行权限，"
+                "不会因为非只读命令、高危命令或 warnings 弹出用户确认，也不会执行 BashTool 的 fatal 拦截。"
+                "只有在用户明确要求或任务确实需要时才调用 bash；涉及删除、覆盖、网络执行、提权、提交/推送等操作前，"
+                "仍应在回答和计划中保持审慎。"
+            )
+        if self.communication_platform:
+            parts.append(
+                "[通讯软件交互说明]\n"
+                f"当前会话来自通讯平台: {self.communication_platform}。\n"
+                "- 你可以正常用文本回复用户；最终回答会发送到通讯软件。\n"
+                "- 如果需要发送表情包、图片、音频、视频或文件，必须调用 send_message_asset 工具，"
+                "不要只在文字里声称已经发送。\n"
+                "- 如果需要用户在多个选项中做决定，可以调用 ask_user_question；通讯平台会把它渲染成编号选项，"
+                "用户回复 1/2 或 1,3 后工具会继续执行。\n"
+                "- todo 工具的更新会以简洁文本同步给通讯软件用户，工具执行细节默认不会刷屏。"
+            )
+        return "\n\n".join(part for part in parts if part).strip()
 
     def _initial_mcp_status(self) -> Dict[str, Any]:
         """创建 MCP 状态快照的初始值。
@@ -1159,11 +1182,23 @@ def main() -> None:
             "full=旧 MemoryTool/RAGTool；off=关闭记忆"
         ),
     )
+    parser.add_argument(
+        "--dangerously-skip-permissions",
+        action="store_true",
+        help=(
+            "危险模式：跳过 BashTool 的权限确认和高危命令拦截，让 agent 拥有完全 Bash 执行权限。"
+            "仅在完全信任当前模型、提示词和运行环境时使用。"
+        ),
+    )
     args = parser.parse_args()
 
     use_mcp = not args.no_mcp
     ctx_enabled = not args.no_ctx
     memory_system = args.memory_system
+    dangerously_skip_permissions = (
+        args.dangerously_skip_permissions
+        or _truthy_env(os.getenv("CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS"))
+    )
 
     if args.transport == "jsonrpc":
         # gateway 模式：先把 stdout 切到 stderr，AgentRunner 启动期 print 不会污染协议
@@ -1175,6 +1210,7 @@ def main() -> None:
             ctx_enabled=ctx_enabled,
             attach_cli_renderer=False,
             memory_system=memory_system,
+            dangerously_skip_permissions=dangerously_skip_permissions,
         )
         from agent.transport import Gateway, StdioTransport
         gw = Gateway(
@@ -1196,6 +1232,7 @@ def main() -> None:
             attach_cli_renderer=False,
             memory_system=memory_system,
             communication_platform="qq",
+            dangerously_skip_permissions=dangerously_skip_permissions,
         )
         from agent.qq import QQConfig, QQNapCatAdapter
         adapter = QQNapCatAdapter(
@@ -1210,7 +1247,12 @@ def main() -> None:
         adapter.serve_forever()
         return
 
-    runner = AgentRunner(use_mcp=use_mcp, ctx_enabled=ctx_enabled, memory_system=memory_system)
+    runner = AgentRunner(
+        use_mcp=use_mcp,
+        ctx_enabled=ctx_enabled,
+        memory_system=memory_system,
+        dangerously_skip_permissions=dangerously_skip_permissions,
+    )
     runner.run()
 
 

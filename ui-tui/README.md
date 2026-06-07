@@ -109,6 +109,16 @@ transport.quit()                     // → session.quit
 CB_AGENT_PYTHON=/path/to/python npm start
 ```
 
+### 危险权限模式
+
+TUI 默认仍会让后端 BashTool 保持权限确认和高危命令拦截。如果你确认当前模型、提示词和工作目录都可信，可以用环境变量让 TUI spawn 的 Python 后端追加 `--dangerously-skip-permissions`：
+
+```bash
+CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS=1 npm start
+```
+
+开启后 BashTool 会跳过权限确认、非只读检查和高危命令拦截，agent 可以直接执行任意 shell 命令。工具结果里的 `permission.dangerously_skipped=true` 会标记这次放行来自危险模式。不要在共享服务器、公网服务、QQ 群聊或不可信模型/提示词场景开启。
+
 ### 后端日志位置
 
 `~/.cb-agent/logs/gateway-<timestamp>.log`。UI 启动时新建一个文件，把 Python stderr 全写过去。

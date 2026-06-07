@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { RUN_AGENT_ARGS, STDERR_UI_LINE_MAX, Transport } from "../transport.js";
+import { buildRunAgentArgs, RUN_AGENT_ARGS, STDERR_UI_LINE_MAX, Transport } from "../transport.js";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -23,6 +23,21 @@ describe("Transport launch args", () => {
       "--memory-system",
       "light",
     ]);
+  });
+
+  it("passes dangerous permission skip flag when env is enabled", () => {
+    expect(buildRunAgentArgs({ CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS: "1" })).toEqual([
+      "run_agent.py",
+      "--transport",
+      "jsonrpc",
+      "--memory-system",
+      "light",
+      "--dangerously-skip-permissions",
+    ]);
+  });
+
+  it("does not pass dangerous permission skip flag by default", () => {
+    expect(buildRunAgentArgs({})).toEqual(RUN_AGENT_ARGS);
   });
 });
 

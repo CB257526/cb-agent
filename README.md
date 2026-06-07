@@ -187,6 +187,7 @@ FEATURE_BUDDY=1
 | `TAVILY_API_KEY` | `my_advanced_search` 的 Tavily 搜索源 |
 | `SERPAPI_API_KEY` | `my_advanced_search` 的 SerpApi 搜索源 |
 | `FEATURE_BUDDY` | 设为 `1` / `true` / `on` 后启用 Buddy 宠物系统 |
+| `CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS` | 设为 `1` 后等价于 `--dangerously-skip-permissions`，BashTool 将跳过权限确认和高危命令拦截 |
 | `CBAGENT_ATTACHMENT_MAX_MB` | 单个多模态附件大小上限，默认 `20` MB |
 | `OCR_API_KEY` / `OCR_BASE_URL` / `OCR_MODEL_NAME` | 纯文本基模处理图片附件时使用的 OCR/视觉描述模型 |
 | `ASR_API_KEY` / `ASR_BASE_URL` / `ASR_MODEL_NAME` | 音频附件转写为文本时使用的 ASR 模型 |
@@ -232,6 +233,14 @@ python run_agent.py --memory-system full
 python run_agent.py --no-mcp
 python run_agent.py --no-ctx
 ```
+
+危险权限模式：
+
+```bash
+python run_agent.py --dangerously-skip-permissions
+```
+
+开启后 BashTool 会跳过权限确认、非只读检查和高危命令拦截，agent 可以直接执行任意 shell 命令。该模式适合你在完全受信任的本地环境里临时加速操作，不建议在公网服务、群聊 QQ、共享服务器或不可信模型/提示词场景开启。工具结果中的 `permission.dangerously_skipped=true` 会标记这次放行来自危险模式。
 
 CLI 里建议先跑：
 
@@ -281,6 +290,12 @@ macOS / Linux：
 
 ```bash
 CB_AGENT_PYTHON=/path/to/python npm start
+```
+
+TUI 需要开启危险权限模式时，用环境变量透传给 Python 后端：
+
+```bash
+CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS=1 npm start
 ```
 
 TUI 快捷键：

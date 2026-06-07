@@ -126,6 +126,22 @@ def _gate_result_to_dict(gate_res) -> Optional[Dict[str, Any]]:
     }
 
 
+def _dangerously_skipped_permission_dict() -> Dict[str, Any]:
+    """危险跳过模式的审计字段。
+
+    这里不伪装成 allowlist 命中，而是显式标记 dangerously_skipped，方便日志、
+    TUI 工具卡片和模型都能识别：这次放行来自启动参数，而不是用户逐条确认。
+    """
+
+    return {
+        "decision": "allow",
+        "reason": "启动参数 --dangerously-skip-permissions 已跳过 Bash 权限系统",
+        "matched_rule": None,
+        "permission_unavailable": False,
+        "dangerously_skipped": True,
+    }
+
+
 class BashTool(Tool):
     """Shell 命令执行工具。
 
@@ -139,7 +155,13 @@ class BashTool(Tool):
         permission: Optional[PermissionGate] = None,
         is_subagent: bool = False,
         question_channel: Optional[Any] = None,
+        dangerously_skip_permissions: bool = False,
     ):
+        permission_note = (
+            "当前进程已开启 --dangerously-skip-permissions，Bash 权限确认和高危命令拦截都会跳过。"
+            if dangerously_skip_permissions
+            else "高危命令（force push、TRUNCATE 等）会触发用户确认弹窗。"
+        )
         super().__init__(
             name="bash",
             description=(
@@ -148,7 +170,7 @@ class BashTool(Tool):
                 "代码搜索和目录浏览请优先使用 grep/glob/ls 专用工具，只有专用工具无法满足时再用 bash。"
                 "支持超时控制和后台执行。"
                 "工作目录在多次调用之间持久化，cd 命令会被记住。"
-                "高危命令（force push、TRUNCATE 等）会触发用户确认弹窗。"
+                f"{permission_note}"
             ),
         )
         # 子 agent 用独立 session 视图，避免污染主 agent 的 cwd
@@ -165,6 +187,10 @@ class BashTool(Tool):
         if question_channel is not None and self._permission.question_channel is None:
             self._permission.question_channel = question_channel
         self._is_subagent = is_subagent
+        # 危险模式由显式启动参数开启。开启后 BashTool 不做 fatal 拦截，也不走
+        # PermissionGate 弹窗，所有命令直接交给系统 shell。warnings 仍会计算并写入
+        # 结果，作为最基本的审计线索。
+        self._dangerously_skip_permissions = dangerously_skip_permissions
 
         self._last_command = ""
         self._last_elapsed = 0.0
@@ -254,8 +280,9 @@ class BashTool(Tool):
         run_in_background = bool(parameters.get("run_in_background", False))
         override_cwd = parameters.get("cwd")
 
-        # 安全检测
-        fatal = check_fatal(command)
+        # 安全检测。危险跳过模式下连 fatal 也放行，确保启动参数语义是“完全权限”；
+        # 这种模式只应在受信任环境中手动开启。
+        fatal = None if self._dangerously_skip_permissions else check_fatal(command)
         if fatal:
             logger.warning("bash: 拒绝危险命令 — %s", fatal)
             return json.dumps({
@@ -279,7 +306,14 @@ class BashTool(Tool):
         # - 子 agent 模式下永远 ALLOW（无人值守，没法弹窗，warnings 进字段透传给父 agent）
         # - 主 agent 模式下：fatal 上游已拦；只读命令直接 ALLOW；warnings 或非只读 → 弹窗
         gate_res = None
-        if not self._is_subagent:
+        permission_payload = None
+        if self._dangerously_skip_permissions:
+            logger.warning(
+                "bash: --dangerously-skip-permissions 已启用，跳过安全拦截和权限确认: %s",
+                command,
+            )
+            permission_payload = _dangerously_skipped_permission_dict()
+        elif not self._is_subagent:
             segments = parse_pipeline(command)
             gate_res = self._permission.evaluate(
                 command, segments, warnings, self._session.cwd,
@@ -322,6 +356,7 @@ class BashTool(Tool):
                         error_override=f"[权限拒绝] {gate_res.reason}",
                     ),
                 }, ensure_ascii=False)
+            permission_payload = _gate_result_to_dict(gate_res)
 
         self._last_command = command
         t0 = time.perf_counter()
@@ -333,7 +368,7 @@ class BashTool(Tool):
 
         # 后台分支：暂沿用旧字典实现，commit 6 抽出到 BackgroundRegistry
         if run_in_background:
-            return self._run_background(command, shell, all_cmd, warnings, gate_res)
+            return self._run_background(command, shell, all_cmd, warnings, permission_payload)
 
         # 前台同步
         proc = None
@@ -422,7 +457,7 @@ class BashTool(Tool):
             "warnings": warnings,
             "output_truncated": processed.output_truncated,
             "output_file": processed.output_file,
-            "permission": _gate_result_to_dict(gate_res),
+            "permission": permission_payload,
             "__display__": _build_bash_display(
                 stdout=processed.stdout,
                 stderr=processed.stderr,
@@ -435,7 +470,7 @@ class BashTool(Tool):
 
     # ========== 后台执行（走 BackgroundRegistry） ==========
 
-    def _run_background(self, command, shell, all_cmd, warnings, gate_res=None) -> str:
+    def _run_background(self, command, shell, all_cmd, warnings, permission_payload=None) -> str:
         registry = get_background_registry()
         task_id = uuid.uuid4().hex[:12]
         try:
@@ -453,7 +488,7 @@ class BashTool(Tool):
                 "background": False,
                 "classification": classify_command(command),
                 "warnings": warnings,
-                "permission": _gate_result_to_dict(gate_res),
+                "permission": permission_payload,
                 "__display__": _build_bash_display(error_override=f"后台启动失败: {e}"),
             }, ensure_ascii=False)
         return json.dumps({
@@ -473,7 +508,7 @@ class BashTool(Tool):
             "output_file": task.output_path,
             "classification": classify_command(command),
             "warnings": warnings,
-            "permission": _gate_result_to_dict(gate_res),
+            "permission": permission_payload,
             "__display__": _build_bash_display(
                 background=True, background_task_id=task.id,
             ),

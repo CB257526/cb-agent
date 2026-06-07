@@ -25,6 +25,18 @@ import { AgentEvent, BuddyCommandResult, BuddyState, CompactPayload, MCPStatusPa
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
 
+function isTruthyEnv(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
+}
+
+export function buildRunAgentArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const args = [...RUN_AGENT_ARGS];
+  if (isTruthyEnv(env.CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS)) {
+    args.push("--dangerously-skip-permissions");
+  }
+  return args;
+}
+
 function clipStderrForUi(line: string): string {
   if (line.length <= STDERR_UI_LINE_MAX) return line;
   const omitted = line.length - STDERR_UI_LINE_MAX;
@@ -73,10 +85,11 @@ export class Transport extends EventEmitter {
     const logsDir = join(homedir(), ".cb-agent", "logs");
     mkdirSync(logsDir, { recursive: true });
     this.stderrLogPath = opts.stderrLog ?? join(logsDir, `gateway-${Date.now()}.log`);
+    const childEnv = { ...process.env, ...opts.env, PYTHONIOENCODING: "utf-8" };
 
-    this.proc = spawn(python, RUN_AGENT_ARGS, {
+    this.proc = spawn(python, buildRunAgentArgs(childEnv), {
       cwd,
-      env: { ...process.env, ...opts.env, PYTHONIOENCODING: "utf-8" },
+      env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
