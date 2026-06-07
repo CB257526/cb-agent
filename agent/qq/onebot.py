@@ -10,6 +10,7 @@ from urllib.parse import quote, urlparse
 
 from agent.platforms.messages import ConversationKey, InboundAttachment, InboundMessage, OutboundSegment
 from agent.qq.config import QQConfig
+from agent.qq.file_delivery import is_external_file_reference, looks_like_posix_absolute_path
 
 _CQ_CODE_RE = re.compile(r"\[CQ:([A-Za-z0-9_]+)((?:,[^\]]*)?)\]")
 
@@ -295,6 +296,8 @@ def _strip_at_tokens(text: str) -> str:
 
 
 def _local_file_uri(path: str) -> str:
+    if is_external_file_reference(path) or looks_like_posix_absolute_path(path):
+        return str(path)
     p = Path(path).expanduser().resolve()
     try:
         return p.as_uri()

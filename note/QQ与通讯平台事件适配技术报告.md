@@ -107,7 +107,51 @@ TUI 可以渲染结构化卡片，但 QQ 只能接收普通消息和文件。`Pl
 - 记录 hash、大小、文件名用于审计；
 - history/compact 不保存二进制。
 
-QQ 中 `sticker/image` 转成 OneBot `image` 段，普通文件优先走 `upload_group_file` / `upload_private_file`。如果上传失败，会降级为文件路径提示。
+QQ 中 `sticker/image` 转成 OneBot `image` 段，普通文件优先走 `upload_group_file` / `upload_private_file`。如果发送失败，会降级为文件路径提示，并把交付失败原因发给用户，方便判断是 NapCat action 不支持、文件不存在，还是 Docker 路径不可见。
+
+## 出站文件交付层
+
+NapCat 和 cb-agent 同机运行时，旧实现直接把本地路径传给 OneBot action 就能工作。但 NapCat 放进 Docker 后，容器文件系统看不到宿主机路径，例如宿主机的 `C:\Users\...\run_agent.py` 或 `/home/cb/cb-agent/run_agent.py` 在容器里通常不存在。为了解决这个问题，本次新增 `agent/qq/file_delivery.py`，把“本地文件”先转换成 NapCat 可读取的引用，再交给 QQ 适配器发送。
+
+交付模式由 `QQ_FILE_DELIVERY_MODE` 控制：
+
+| 模式 | 行为 | 适用场景 |
+|---|---|---|
+| `path` | 保持旧行为，直接传 cb-agent 本机路径 | NapCat 与 cb-agent 同机运行，或容器内外路径完全一致 |
+| `mapped_path` | 复制到宿主机共享目录，再改写成 NapCat 容器内路径 | Docker 部署推荐方案 |
+| `http` | cb-agent 启动只读临时 HTTP 文件服务，NapCat 拉取 URL | 不方便挂共享卷、跨机器或容器网络可互通 |
+| `base64` | 小文件内联为 `base64://...` | 小图片、表情包兜底；不适合大文件 |
+| `auto` | 按 `mapped_path -> http -> base64 -> path` 生成候选并依次尝试 | 想自动兜底，但仍建议明确配置生产模式 |
+
+`mapped_path` 模式需要两段路径：
+
+```env
+QQ_FILE_DELIVERY_MODE=mapped_path
+QQ_FILE_HOST_PREFIX=/opt/cb-agent/outbound
+QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
+```
+
+对应 Docker 挂载：
+
+```bash
+docker run ... -v /opt/cb-agent/outbound:/app/cb-agent-outbound:ro ...
+```
+
+发送时，cb-agent 会把源文件复制到 `QQ_FILE_HOST_PREFIX`，生成带内容 hash 的文件名，避免同名文件覆盖；然后把这个路径改写成 `QQ_FILE_NAPCAT_PREFIX` 下的容器路径传给 NapCat。这样模型仍然只需要调用 `send_message_asset(path=...)`，不用知道 Docker 内部路径。
+
+`http` 模式会启动一个只读临时文件服务：
+
+```env
+QQ_FILE_DELIVERY_MODE=http
+QQ_FILE_HTTP_HOST=0.0.0.0
+QQ_FILE_HTTP_PORT=6200
+QQ_FILE_HTTP_PUBLIC_BASE_URL=http://宿主机内网IP:6200
+QQ_FILE_HTTP_TTL_SECONDS=300
+```
+
+生成的 URL 带随机 token，只暴露当前要发送的文件，并在 TTL 后失效。`QQ_FILE_HTTP_PUBLIC_BASE_URL` 必须是 NapCat 容器实际能访问到的地址；Docker Desktop 可尝试 `host.docker.internal`，Linux Docker 通常直接填宿主机内网 IP 更可靠。大文件不要使用 `base64`，否则会撑大 WebSocket 消息、日志和内存，所以默认 `QQ_FILE_BASE64_MAX_MB=3`。
+
+交付层对 `file/image/sticker/audio/video` 都生效。图片、表情、语音、视频不再盲目转成宿主机 `file://`，如果交付层返回的是 HTTP URL、`base64://` 或容器内 `/app/...` 路径，OneBot 消息段会保留原始引用。
 
 ## 入站附件
 
@@ -134,6 +178,7 @@ QQ_GROUP_MODE=mention
 QQ_WAKE_PREFIX=/agent
 CBAGENT_STICKER_DIR=./assets/stickers
 CBAGENT_OUTBOUND_FILE_MAX_MB=50
+QQ_FILE_DELIVERY_MODE=path
 IM_EVENT_VERBOSITY=normal
 ```
 
@@ -153,6 +198,6 @@ ws://127.0.0.1:6199/onebot/v11/ws
 
 当前实现已经按 `ConversationKey` 隔离 AgentSession。同一 QQ 群聊或好友私聊内会排队串行处理，不再因为上一条未完成而直接拒绝；不同群聊和不同好友可以并发运行。私聊会落盘恢复上下文，群聊默认只使用临时内存上下文。
 
-文件发送能力依赖 NapCat 对 OneBot action 的实际支持。普通文件优先使用上传 API，失败会降级文本提示；图片和表情包优先走 OneBot 图片段。
+文件发送能力依赖 NapCat 对 OneBot action 的实际支持。普通文件优先使用上传 API，失败会降级文本提示；图片和表情包优先走 OneBot 图片段。Docker 场景下优先使用 `mapped_path` 或 `http`，不要依赖默认 `path` 模式读取宿主机路径。
 
 微信接入时不需要重写 AgentSession 隔离、事件渲染器或 `send_message_asset` 工具，只需要新增微信平台适配器，把微信事件转成 `InboundMessage`，把 `OutboundMessage` 翻译为微信发送 API。真正需要额外处理的是微信侧鉴权、消息回调协议、文件上传/下载 API 和群聊唤醒策略。

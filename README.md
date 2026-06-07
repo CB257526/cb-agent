@@ -212,6 +212,11 @@ FEATURE_BUDDY=1
 | `IM_CONFIRM_QUESTION_ANSWER` | QQ 编号回答后是否发送“已选择”确认，默认 `1` |
 | `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；`send_message_asset(kind=sticker)` 会从这里查找图片 |
 | `CBAGENT_OUTBOUND_FILE_MAX_MB` | agent 发送本地文件到通讯软件的大小上限，默认 `50` MB |
+| `QQ_FILE_DELIVERY_MODE` | QQ/NapCat 出站文件交付方式：`path` 兼容旧行为，`mapped_path` 适合 Docker 共享卷，`http` 让 NapCat 拉临时 URL，`base64` 只适合小文件，`auto` 会按顺序尝试 |
+| `QQ_FILE_HOST_PREFIX` / `QQ_FILE_NAPCAT_PREFIX` | `mapped_path` 模式使用；前者是宿主机共享目录，后者是同一目录在 NapCat 容器内的路径 |
+| `QQ_FILE_HTTP_HOST` / `QQ_FILE_HTTP_PORT` / `QQ_FILE_HTTP_PUBLIC_BASE_URL` | `http` 模式使用；cb-agent 启动只读临时文件服务，公开 URL 必须是 NapCat 容器能访问到的地址 |
+| `QQ_FILE_HTTP_TTL_SECONDS` | HTTP 临时文件 URL 有效期，默认 `300` 秒 |
+| `QQ_FILE_BASE64_MAX_MB` | `base64` 模式或 `auto` 兜底允许内联的最大文件大小，默认 `3` MB |
 | `CBAGENT_PLATFORM_ATTACHMENT_DIR` | QQ 图片/音频入站 URL 下载目录，下载成功后交给多模态输入层处理 |
 | `VECTOR_STORE_TYPE` / `QDRANT_URL` / `QDRANT_API_KEY` | full RAG/Memory 的向量存储 |
 | `GRAPH_STORE_TYPE` / `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` | full 语义记忆图存储 |
@@ -397,6 +402,27 @@ CBAGENT_STICKER_DIR=./assets/stickers
 # agent 允许发送到 QQ 的本地文件大小上限，单位 MB。
 CBAGENT_OUTBOUND_FILE_MAX_MB=50
 
+# QQ/NapCat 出站文件交付方式。
+# path 保持旧行为；Docker 推荐 mapped_path 或 http。
+QQ_FILE_DELIVERY_MODE=path
+
+# mapped_path 示例:
+# Docker 挂载 -v /opt/cb-agent/outbound:/app/cb-agent-outbound:ro 后配置：
+# QQ_FILE_HOST_PREFIX=/opt/cb-agent/outbound
+# QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
+QQ_FILE_HOST_PREFIX=
+QQ_FILE_NAPCAT_PREFIX=
+
+# http 示例:
+# QQ_FILE_HTTP_HOST=0.0.0.0
+# QQ_FILE_HTTP_PORT=6200
+# QQ_FILE_HTTP_PUBLIC_BASE_URL=http://宿主机内网IP:6200
+QQ_FILE_HTTP_HOST=127.0.0.1
+QQ_FILE_HTTP_PORT=0
+QQ_FILE_HTTP_PUBLIC_BASE_URL=
+QQ_FILE_HTTP_TTL_SECONDS=300
+QQ_FILE_BASE64_MAX_MB=3
+
 # QQ 图片/音频 URL 下载目录。下载成功后只把本地路径交给多模态输入层。
 CBAGENT_PLATFORM_ATTACHMENT_DIR=.cbagent/platform_attachments/qq
 ```
@@ -467,7 +493,31 @@ assets/stickers/
 
 QQ 模式会额外注册 `send_message_asset` 工具。模型可以通过它发送表情包、图片、音频、视频或任意本地普通文件。工具会校验路径、大小、hash；history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
 
-文件发送有一个部署层限制：当前 QQ 适配器会把本地文件路径直接交给 NapCat 的 OneBot action。也就是说，NapCat 必须能读取 cb-agent 传过去的那个路径。最稳的部署方式是 cb-agent 和 NapCat 同机运行；如果放在不同容器或不同机器，需要挂载同一个共享目录，或者后续改成“cb-agent 先暴露 HTTP 静态文件 URL，再让 NapCat 拉取”的模式。
+文件发送现在支持多种交付模式，默认 `QQ_FILE_DELIVERY_MODE=path` 保持旧行为：直接把 cb-agent 本机路径交给 NapCat。这个模式最适合同机运行，或者 NapCat 容器内外路径完全一致的部署。
+
+NapCat 在 Docker 中时，推荐使用 `mapped_path`。cb-agent 会先把要发送的文件复制到共享目录，再把路径改写成容器内路径交给 NapCat：
+
+```bash
+docker run ... -v /opt/cb-agent/outbound:/app/cb-agent-outbound:ro ...
+```
+
+```env
+QQ_FILE_DELIVERY_MODE=mapped_path
+QQ_FILE_HOST_PREFIX=/opt/cb-agent/outbound
+QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
+```
+
+如果不方便挂载共享卷，可以使用 `http`。cb-agent 会启动一个只读临时文件服务，给 NapCat 一个带随机 token、会过期的下载 URL：
+
+```env
+QQ_FILE_DELIVERY_MODE=http
+QQ_FILE_HTTP_HOST=0.0.0.0
+QQ_FILE_HTTP_PORT=6200
+QQ_FILE_HTTP_PUBLIC_BASE_URL=http://宿主机内网IP:6200
+QQ_FILE_HTTP_TTL_SECONDS=300
+```
+
+Docker Desktop 有时可用 `http://host.docker.internal:6200`；Linux Docker 默认不一定支持这个域名，通常直接填宿主机内网 IP 更稳。`base64` 只建议给小图片/表情包兜底，大文件会撑爆 WebSocket、日志和内存。`auto` 会按 `mapped_path -> http -> base64 -> path` 的顺序生成候选并依次尝试。
 
 QQ 模式会按通讯会话隔离 `AgentSession`。每条 QQ 消息都会创建短生命周期 session 对象，工具系统、LLM、MCP 和 EventBus 仍在进程内共享，不会反复加载。私聊会根据 `ConversationKey(platform, kind, id)` 挂载独立本地会话目录，处理结束后追加落盘：
 
@@ -598,7 +648,7 @@ NapCat 在同一台机器时，反向 WebSocket 客户端地址填：
 ws://127.0.0.1:6199/onebot/v11/ws
 ```
 
-跨机器或 Docker 部署时，把 `QQ_HOST=0.0.0.0`，并强烈建议配置 `QQ_ACCESS_TOKEN`。如果 agent 需要发送本地文件或表情包，NapCat 还必须能访问同一份文件路径；容器场景建议把 `assets/stickers` 和需要发送的文件目录挂载为共享卷。
+跨机器或 Docker 部署时，把 `QQ_HOST=0.0.0.0`，并强烈建议配置 `QQ_ACCESS_TOKEN`。如果 agent 需要发送本地文件或表情包，请配置 `QQ_FILE_DELIVERY_MODE`：同机/同路径可继续用默认 `path`，Docker 推荐 `mapped_path` 共享卷，不方便挂卷时用 `http` 临时 URL。
 
 ### MCP 和 Playwright
 

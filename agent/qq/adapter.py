@@ -27,10 +27,12 @@ from agent.platforms.context import (
 from agent.platforms.messages import ConversationKey, InboundMessage, OutboundMessage, OutboundSegment
 from agent.platforms.renderer import PlatformEventRenderer
 from agent.qq.config import QQConfig
+from agent.qq.file_delivery import FileDeliveryError, QQFileDeliveryManager
 from agent.qq.onebot import outbound_segment_to_onebot, parse_onebot_event, parse_onebot_message_event
 from agent.session import AgentSession
 
 logger = logging.getLogger(__name__)
+_RESOURCE_SEGMENT_KINDS = {"file", "image", "sticker", "audio", "video"}
 
 
 @dataclass
@@ -74,6 +76,7 @@ class QQNapCatAdapter:
         self._conversation_queues: Dict[str, _ConversationQueueState] = {}
         self._conversation_queues_lock = asyncio.Lock()
         self._attachment_dir = _resolve_attachment_dir()
+        self._file_delivery = QQFileDeliveryManager(self.config)
         self._renderer = PlatformEventRenderer(
             event_bus=event_bus,
             send=self._enqueue_outbound,
@@ -371,13 +374,13 @@ class QQNapCatAdapter:
 
     async def send_outbound(self, message: OutboundMessage) -> None:
         for segment in message.segments:
-            if segment.kind == "file":
-                ok = await self._send_file_segment(message.conversation, segment)
+            if segment.kind in _RESOURCE_SEGMENT_KINDS:
+                ok, details = await self._send_resource_segment(message.conversation, segment)
                 if ok:
                     continue
                 await self._send_text(
                     message.conversation,
-                    f"文件发送失败，已降级为路径提示：{segment.file_name or segment.path}\n{segment.path}",
+                    _format_resource_send_failure(segment, details),
                 )
                 continue
             onebot_segments = outbound_segment_to_onebot(segment)
@@ -395,6 +398,82 @@ class QQNapCatAdapter:
         else:
             params["user_id"] = int(conversation.id) if str(conversation.id).isdigit() else conversation.id
         return await self.call_action(action, params)
+
+    async def _send_resource_segment(
+        self,
+        conversation: ConversationKey,
+        segment: OutboundSegment,
+    ) -> tuple[bool, list[str]]:
+        """按配置把本地资源交付给 NapCat。
+
+        旧实现只有“直接传宿主机路径”一种方式。这里先把本地文件转换成一个或多个
+        NapCat 可读候选引用，再逐个尝试。Docker 部署时可以用 mapped_path/http，
+        本机部署仍默认走 path，不破坏原有行为。
+        """
+
+        delivery = getattr(self, "_file_delivery", None)
+        if delivery is None:
+            # 兼容部分单测里没有调用 __init__ 的 DummyAdapter。
+            delivery = QQFileDeliveryManager(getattr(self, "config", QQConfig()))
+            self._file_delivery = delivery
+        try:
+            plan = await asyncio.to_thread(delivery.build_plan, segment.path)
+        except FileDeliveryError as exc:
+            logger.warning("QQ resource delivery plan failed: kind=%s path=%s error=%s", segment.kind, segment.path, exc)
+            return False, [str(exc)]
+
+        details = list(plan.errors)
+        if not plan.candidates:
+            return False, details or ["没有可用的文件交付方式"]
+
+        for candidate in plan.candidates:
+            # candidate.ref 可能是 URL、base64:// 或 Docker 容器内 POSIX 路径。
+            # 这里不能走 OutboundSegment.file_segment()，因为它会用 Path() 规范化，
+            # 在 Windows 宿主机上会把 /app/outbound/a.txt 改成 \app\outbound\a.txt。
+            routed = OutboundSegment(
+                kind=segment.kind,
+                path=candidate.ref,
+                file_name=segment.file_name or Path(candidate.source_path).name,
+                text=segment.text,
+                metadata={
+                    **segment.metadata,
+                    "delivery_method": candidate.method,
+                    "delivery_note": candidate.note,
+                    "source_path": candidate.source_path,
+                },
+            )
+            try:
+                if segment.kind == "file":
+                    ok = await self._send_file_segment(conversation, routed)
+                else:
+                    ok = await self._send_media_segment(conversation, routed)
+            except Exception as exc:
+                ok = False
+                logger.exception(
+                    "QQ resource send candidate failed: method=%s kind=%s path=%s",
+                    candidate.method,
+                    segment.kind,
+                    segment.path,
+                )
+                details.append(f"{candidate.method}: {type(exc).__name__}: {exc}")
+            if ok:
+                logger.info(
+                    "QQ resource sent: kind=%s method=%s source=%s ref=%s",
+                    segment.kind,
+                    candidate.method,
+                    candidate.source_path,
+                    _clip_log_ref(candidate.ref),
+                )
+                return True, details
+            details.append(f"{candidate.method}: NapCat action 返回失败")
+        return False, details
+
+    async def _send_media_segment(self, conversation: ConversationKey, segment: OutboundSegment) -> bool:
+        onebot_segments = outbound_segment_to_onebot(segment)
+        if not onebot_segments:
+            return False
+        result = await self._send_message_segments(conversation, onebot_segments)
+        return _action_ok(result)
 
     async def _send_file_segment(self, conversation: ConversationKey, segment: OutboundSegment) -> bool:
         params: Dict[str, Any]
@@ -465,6 +544,38 @@ def _action_data(result: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in result.items()
         if k not in {"status", "retcode", "echo", "wording"}
     }
+
+
+def _format_resource_send_failure(segment: OutboundSegment, details: list[str]) -> str:
+    """生成通讯软件端可读的资源发送失败提示。"""
+
+    name = segment.file_name or Path(str(segment.path or "")).name or "未命名文件"
+    lines = [
+        f"文件发送失败，已降级为路径提示：{name}",
+        str(segment.path or ""),
+    ]
+    clean_details = [item for item in details if item]
+    if clean_details:
+        lines.append("")
+        lines.append("失败原因：")
+        for item in clean_details[:4]:
+            lines.append(f"- {item}")
+        if len(clean_details) > 4:
+            lines.append(f"- ... 还有 {len(clean_details) - 4} 条")
+    lines.append("")
+    lines.append("如果 NapCat 在 Docker 中，请配置 QQ_FILE_DELIVERY_MODE=mapped_path 或 http。")
+    return "\n".join(lines).strip()
+
+
+def _clip_log_ref(value: str, limit: int = 220) -> str:
+    """日志里折叠长 URL/base64，避免把大文件内容刷进日志。"""
+
+    text = str(value or "")
+    if text.startswith("base64://"):
+        return f"base64://...({len(text)} chars)"
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
 
 
 def _maybe_int(value: Any) -> Any:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -228,14 +230,20 @@ class TestQQAdapterSend(unittest.TestCase):
         adapter = DummyAdapter()
 
         async def run() -> None:
-            await adapter.send_outbound(OutboundMessage.text(
-                ConversationKey("qq", "group", "100"),
-                "hello",
-            ))
-            await adapter.send_outbound(OutboundMessage(
-                conversation=ConversationKey("qq", "private", "200"),
-                segments=[OutboundSegment.file_segment(kind="file", path="C:/tmp/a.txt")],
-            ))
+            with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as fh:
+                fh.write(b"hello")
+                file_path = fh.name
+            try:
+                await adapter.send_outbound(OutboundMessage.text(
+                    ConversationKey("qq", "group", "100"),
+                    "hello",
+                ))
+                await adapter.send_outbound(OutboundMessage(
+                    conversation=ConversationKey("qq", "private", "200"),
+                    segments=[OutboundSegment.file_segment(kind="file", path=file_path)],
+                ))
+            finally:
+                Path(file_path).unlink(missing_ok=True)
 
         asyncio.run(run())
         self.assertEqual(adapter.calls[0][0], "send_group_msg")
@@ -259,16 +267,165 @@ class TestQQAdapterSend(unittest.TestCase):
         adapter = DummyAdapter()
 
         async def run() -> None:
-            await adapter.send_outbound(OutboundMessage(
-                conversation=ConversationKey("qq", "group", "100"),
-                segments=[OutboundSegment.file_segment(kind="file", path="C:/tmp/a.txt")],
-            ))
+            with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as fh:
+                fh.write(b"hello")
+                file_path = fh.name
+            try:
+                await adapter.send_outbound(OutboundMessage(
+                    conversation=ConversationKey("qq", "group", "100"),
+                    segments=[OutboundSegment.file_segment(kind="file", path=file_path)],
+                ))
+            finally:
+                Path(file_path).unlink(missing_ok=True)
 
         asyncio.run(run())
         self.assertEqual(adapter.calls[0][0], "upload_group_file")
         self.assertEqual(adapter.calls[1][0], "send_group_msg")
         fallback_text = adapter.calls[1][1]["message"][0]["data"]["text"]
         self.assertIn("文件发送失败", fallback_text)
+        self.assertIn("QQ_FILE_DELIVERY_MODE", fallback_text)
+
+    def test_mapped_path_delivery_sends_container_visible_path(self) -> None:
+        """Docker 场景下先复制到共享目录，再把路径改写成 NapCat 容器内路径。"""
+        from agent.qq.adapter import QQNapCatAdapter
+
+        class DummyAdapter(QQNapCatAdapter):
+            def __init__(self, config: QQConfig) -> None:
+                self.calls = []
+                self.config = config
+
+            async def call_action(self, action, params):  # type: ignore[override]
+                self.calls.append((action, params))
+                return {"status": "ok", "retcode": 0}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.txt"
+            host_shared = root / "shared"
+            source.write_text("docker file", encoding="utf-8")
+            adapter = DummyAdapter(QQConfig(
+                file_delivery_mode="mapped_path",
+                file_host_prefix=str(host_shared),
+                file_napcat_prefix="/app/outbound",
+            ))
+
+            async def run() -> None:
+                await adapter.send_outbound(OutboundMessage(
+                    conversation=ConversationKey("qq", "group", "100"),
+                    segments=[OutboundSegment.file_segment(kind="file", path=str(source))],
+                ))
+
+            asyncio.run(run())
+
+            self.assertEqual(adapter.calls[0][0], "upload_group_file")
+            sent_file = adapter.calls[0][1]["file"]
+            self.assertTrue(str(sent_file).startswith("/app/outbound/"))
+            self.assertNotIn(str(root), str(sent_file))
+            copied = list(host_shared.glob("source-*.txt"))
+            self.assertEqual(len(copied), 1)
+            self.assertEqual(copied[0].read_text(encoding="utf-8"), "docker file")
+
+    def test_media_segment_delivery_preserves_http_and_container_path(self) -> None:
+        """图片/表情这类消息段也要使用交付层结果，不能强制变成宿主机 file://。"""
+        from agent.qq.onebot import outbound_segment_to_onebot
+
+        http_seg = outbound_segment_to_onebot(OutboundSegment(kind="image", path="http://host/a.png"))
+        container_seg = outbound_segment_to_onebot(OutboundSegment(kind="image", path="/app/outbound/a.png"))
+
+        self.assertEqual(http_seg[0]["data"]["file"], "http://host/a.png")
+        self.assertEqual(container_seg[0]["data"]["file"], "/app/outbound/a.png")
+
+
+class TestQQFileDeliveryManager(unittest.TestCase):
+    def test_path_delivery_keeps_original_behavior(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "a.txt"
+            source.write_text("hello", encoding="utf-8")
+            manager = QQFileDeliveryManager(QQConfig(file_delivery_mode="path"))
+            plan = manager.build_plan(str(source))
+
+        self.assertEqual(plan.errors, [])
+        self.assertEqual(plan.candidates[0].method, "path")
+        self.assertEqual(Path(plan.candidates[0].ref), source.resolve())
+
+    def test_mapped_path_delivery_copies_file_and_rewrites_path(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "report.txt"
+            host_shared = root / "shared"
+            source.write_text("mapped", encoding="utf-8")
+            manager = QQFileDeliveryManager(QQConfig(
+                file_delivery_mode="mapped_path",
+                file_host_prefix=str(host_shared),
+                file_napcat_prefix="/app/outbound",
+            ))
+            plan = manager.build_plan(str(source))
+
+            self.assertEqual(plan.errors, [])
+            self.assertEqual(plan.candidates[0].method, "mapped_path")
+            self.assertTrue(plan.candidates[0].ref.startswith("/app/outbound/"))
+            copied = list(host_shared.glob("report-*.txt"))
+            self.assertEqual(len(copied), 1)
+            self.assertEqual(copied[0].read_text(encoding="utf-8"), "mapped")
+
+    def test_http_delivery_serves_temporary_url(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "asset.txt"
+            source.write_bytes(b"http body")
+            manager = QQFileDeliveryManager(QQConfig(
+                file_delivery_mode="http",
+                file_http_host="127.0.0.1",
+                file_http_port=0,
+                file_http_ttl_seconds=60,
+            ))
+            try:
+                plan = manager.build_plan(str(source))
+                self.assertEqual(plan.errors, [])
+                self.assertEqual(plan.candidates[0].method, "http")
+                with urllib.request.urlopen(plan.candidates[0].ref, timeout=5) as response:
+                    self.assertEqual(response.read(), b"http body")
+            finally:
+                manager.close()
+
+    def test_base64_delivery_inlines_small_file(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "small.txt"
+            source.write_bytes(b"small")
+            manager = QQFileDeliveryManager(QQConfig(
+                file_delivery_mode="base64",
+                file_base64_max_mb=1,
+            ))
+            plan = manager.build_plan(str(source))
+
+        self.assertEqual(plan.errors, [])
+        self.assertEqual(plan.candidates[0].method, "base64")
+        payload = plan.candidates[0].ref.removeprefix("base64://")
+        self.assertEqual(base64.b64decode(payload), b"small")
+
+    def test_auto_delivery_builds_fallback_candidates(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "small.txt"
+            source.write_bytes(b"small")
+            manager = QQFileDeliveryManager(QQConfig(
+                file_delivery_mode="auto",
+                file_http_host="0.0.0.0",
+                file_base64_max_mb=1,
+            ))
+            plan = manager.build_plan(str(source))
+
+        self.assertTrue(any("QQ_FILE_HOST_PREFIX" in item for item in plan.errors))
+        self.assertTrue(any("QQ_FILE_HTTP_PUBLIC_BASE_URL" in item for item in plan.errors))
+        self.assertEqual([item.method for item in plan.candidates], ["base64", "path"])
 
     def test_materialize_inbound_attachment_downloads_url_to_local_file(self) -> None:
         from agent.qq.adapter import QQNapCatAdapter

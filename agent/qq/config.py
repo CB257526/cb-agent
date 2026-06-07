@@ -21,12 +21,23 @@ class QQConfig:
     allowed_groups: Set[str] = field(default_factory=set)
     allowed_users: Set[str] = field(default_factory=set)
     action_timeout_seconds: float = 30.0
+    file_delivery_mode: str = "path"
+    file_host_prefix: str = ""
+    file_napcat_prefix: str = ""
+    file_http_host: str = "127.0.0.1"
+    file_http_port: int = 0
+    file_http_public_base_url: str = ""
+    file_http_ttl_seconds: int = 300
+    file_base64_max_mb: float = 3.0
 
     @classmethod
     def from_env(cls) -> "QQConfig":
         mode = (os.getenv("QQ_GROUP_MODE") or "mention").strip().lower()
         if mode not in {"mention", "prefix", "all"}:
             mode = "mention"
+        delivery_mode = (os.getenv("QQ_FILE_DELIVERY_MODE") or "path").strip().lower()
+        if delivery_mode not in {"path", "mapped_path", "http", "base64", "auto"}:
+            delivery_mode = "path"
         return cls(
             enabled=_env_bool("QQ_ENABLE", True),
             host=(os.getenv("QQ_HOST") or "127.0.0.1").strip() or "127.0.0.1",
@@ -37,6 +48,14 @@ class QQConfig:
             allowed_groups=_csv_set(os.getenv("QQ_ALLOWED_GROUPS")),
             allowed_users=_csv_set(os.getenv("QQ_ALLOWED_USERS")),
             action_timeout_seconds=max(1.0, _env_float("QQ_ACTION_TIMEOUT_SECONDS", 30.0)),
+            file_delivery_mode=delivery_mode,
+            file_host_prefix=(os.getenv("QQ_FILE_HOST_PREFIX") or "").strip(),
+            file_napcat_prefix=(os.getenv("QQ_FILE_NAPCAT_PREFIX") or "").strip(),
+            file_http_host=(os.getenv("QQ_FILE_HTTP_HOST") or "127.0.0.1").strip() or "127.0.0.1",
+            file_http_port=max(0, _env_int("QQ_FILE_HTTP_PORT", 0)),
+            file_http_public_base_url=(os.getenv("QQ_FILE_HTTP_PUBLIC_BASE_URL") or "").strip(),
+            file_http_ttl_seconds=max(30, _env_int("QQ_FILE_HTTP_TTL_SECONDS", 300)),
+            file_base64_max_mb=max(0.1, _env_float("QQ_FILE_BASE64_MAX_MB", 3.0)),
         )
 
 
