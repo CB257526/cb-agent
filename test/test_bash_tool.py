@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent.cancel import CancelToken, reset_current_cancel_token, set_current_cancel_token
 from tools.tools.bash_security import (
     parse_pipeline, check_fatal, check_warnings,
 )
@@ -448,6 +449,26 @@ class TestPermissionPromptChannel(unittest.TestCase):
         # 测试环境无 TTY，最终落到 unavailable
         self.assertEqual(res.decision, Decision.DENY)
         self.assertTrue(res.permission_unavailable)
+
+    def test_bash_permission_deny_cancels_current_session(self):
+        """用户拒绝 bash 权限后，当前 agent 回合应立即进入取消态。"""
+
+        class DenyChannel:
+            def ask(self, *_a, **_kw):
+                return {"answer": "拒绝", "cancelled": False}
+
+        gate = self._gate(channel=DenyChannel())
+        tool = BashTool(permission=gate)
+        token = CancelToken()
+        reset_token = set_current_cancel_token(token)
+        try:
+            result = json.loads(tool.run({"command": "python build.py"}))
+        finally:
+            reset_current_cancel_token(reset_token)
+
+        self.assertTrue(token.is_cancelled())
+        self.assertTrue(result["session_cancelled"])
+        self.assertIn("权限拒绝", result["stderr"])
 
 
 class TestFileRead(unittest.TestCase):

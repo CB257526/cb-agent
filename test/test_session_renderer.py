@@ -30,6 +30,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+from agent.cancel import get_current_cancel_token
 from agent.event_bus import EventBus, collect_all
 from agent.events import (
     BackgroundNotification, Cancelled, Done, Error, ReasoningDelta,
@@ -279,6 +280,43 @@ class TestAgentSessionBasic(unittest.TestCase):
         # 第 2 次 think 的 messages 里应有 tool 消息
         round2_msgs = llm.calls[1]["messages"]
         self.assertTrue(any(m.get("role") == "tool" for m in round2_msgs))
+
+    def test_cancelled_tool_result_stops_before_next_llm_round(self):
+        """Bash 权限拒绝会设置取消令牌，session 应在下一轮 think 前直接收束。"""
+
+        llm = FakeLLM([
+            {"answer": "", "tool_calls": [_tc("bash", '{"command":"python build.py"}')]},
+            {"answer": "不应该进入第二轮", "tool_calls": []},
+        ])
+
+        def deny_bash(_name, _args):  # noqa: ANN001
+            token = get_current_cancel_token()
+            self.assertIsNotNone(token)
+            assert token is not None
+            token.cancel()
+            return json.dumps({
+                "stdout": "",
+                "stderr": "[权限拒绝] 用户拒绝执行 bash",
+                "exit_code": 126,
+                "is_error": True,
+                "session_cancelled": True,
+            }, ensure_ascii=False)
+
+        self.registry.execute_tool = MagicMock(side_effect=deny_bash)
+        self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+        s = AgentSession(
+            llm=llm, registry=self.registry, executor=self.executor,
+            event_bus=self.bus, ctx_enabled=False,
+        )
+
+        answer = s.chat("运行构建")
+
+        self.assertEqual(answer, "")
+        self.assertEqual(len(llm.calls), 1)
+        self.assertTrue(any(isinstance(e, Cancelled) and e.where == "session_loop" for e in self.events))
+        dones = [e for e in self.events if isinstance(e, Done)]
+        self.assertTrue(dones)
+        self.assertTrue(dones[-1].cancelled)
 
     def test_tool_loop_auto_compresses_large_tool_result_without_breaking_protocol(self):
         """工具循环接近窗口时只压缩 tool.content，不破坏 role/tool_call_id 协议配对。"""

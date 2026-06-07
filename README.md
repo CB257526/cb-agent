@@ -27,6 +27,7 @@
 | 上下文压缩 | TUI 支持 `/compact`；后端也会在上下文接近模型窗口 80% 时自动 compact |
 | 多模态输入 | 用户消息支持 `text + attachments[]`，图片可原生发给多模态基模，纯文本基模自动走 OCR，音频统一 ASR 成文本 |
 | TUI | Ink/React 终端界面，支持工具卡片、会话切换、Context 占用指标、日志面板 |
+| QQ / NapCat | `--transport qq` 接入 OneBot V11 反向 WebSocket，支持文本、表情包/文件发送、编号问答、todo 事件降级，并按群聊/好友隔离 AgentSession |
 | MCP | 读取 `mcp.json`，通过 stdio 启动 MCP server，并展开成可调用工具 |
 | Skills | Markdown + YAML frontmatter 描述能力，按需加载指令和脚本 |
 | Bash 权限 | Bash 工具支持权限语义，TUI 模式下权限确认走 UI 通道 |
@@ -51,6 +52,11 @@
 
 - 能运行 `npx`
 - `mcp.json` 中相关服务需要的环境变量，例如 `AMAP_MAPS_API_KEY`
+
+如果要使用 QQ / NapCat：
+
+- 已登录并启用 OneBot V11 反向 WebSocket 的 NapCat
+- Python 依赖中的 `websockets`
 
 ### 1. 克隆并进入项目
 
@@ -184,6 +190,20 @@ FEATURE_BUDDY=1
 | `CBAGENT_ATTACHMENT_MAX_MB` | 单个多模态附件大小上限，默认 `20` MB |
 | `OCR_API_KEY` / `OCR_BASE_URL` / `OCR_MODEL_NAME` | 纯文本基模处理图片附件时使用的 OCR/视觉描述模型 |
 | `ASR_API_KEY` / `ASR_BASE_URL` / `ASR_MODEL_NAME` | 音频附件转写为文本时使用的 ASR 模型 |
+| `QQ_ENABLE` | 是否启用 QQ transport；设为 `1` 后，`python run_agent.py --transport qq` 会监听 NapCat 反向 WebSocket |
+| `QQ_HOST` | cb-agent 监听地址；本机 NapCat 用 `127.0.0.1`，跨机器/Docker 可用 `0.0.0.0` |
+| `QQ_PORT` | cb-agent 监听端口；NapCat 反向 WebSocket URL 的端口必须一致 |
+| `QQ_ACCESS_TOKEN` | 可选访问令牌；填写后 NapCat 侧也要配置同一个 token |
+| `QQ_GROUP_MODE` | 群聊唤醒策略：`mention`、`prefix` 或 `all`；私聊不受影响 |
+| `QQ_WAKE_PREFIX` | 群聊文本唤醒前缀，例如 `/agent 帮我查一下` |
+| `QQ_ALLOWED_GROUPS` | QQ 群白名单，逗号分隔群号；为空表示不限制群 |
+| `QQ_ALLOWED_USERS` | QQ 用户白名单，逗号分隔 QQ 号；为空表示不限制用户 |
+| `QQ_ACTION_TIMEOUT_SECONDS` | OneBot action 超时时间，影响发送消息和上传文件 |
+| `IM_EVENT_VERBOSITY` | 通讯软件事件输出等级：`normal` 默认只发关键事件，`full` 同步工具/round/token 等调试摘要 |
+| `IM_CONFIRM_QUESTION_ANSWER` | QQ 编号回答后是否发送“已选择”确认，默认 `1` |
+| `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；`send_message_asset(kind=sticker)` 会从这里查找图片 |
+| `CBAGENT_OUTBOUND_FILE_MAX_MB` | agent 发送本地文件到通讯软件的大小上限，默认 `50` MB |
+| `CBAGENT_PLATFORM_ATTACHMENT_DIR` | QQ 图片/音频入站 URL 下载目录，下载成功后交给多模态输入层处理 |
 | `VECTOR_STORE_TYPE` / `QDRANT_URL` / `QDRANT_API_KEY` | full RAG/Memory 的向量存储 |
 | `GRAPH_STORE_TYPE` / `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` | full 语义记忆图存储 |
 | `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` / `EMBED_API_KEY` | full embedding 配置 |
@@ -293,7 +313,99 @@ TUI 底部状态栏会显示：
 - OpenAI usage 累计
 - 工具循环 round
 
-### 7. 多模态输入
+### 7. 启动 QQ / NapCat
+
+QQ 接入使用 NapCat 的 OneBot V11 反向 WebSocket。cb-agent 负责启动 WebSocket 服务，NapCat 主动连接进来。
+
+`.env` 示例。最小可用配置只需要把 `QQ_ENABLE` 改成 `1`；其它字段按你的 NapCat 部署方式调整：
+
+```env
+# 开启 QQ transport。不开启时 --transport qq 会直接退出，不监听 WebSocket。
+QQ_ENABLE=1
+
+# cb-agent 监听地址和端口。NapCat 反向 WebSocket 要连到 ws://127.0.0.1:6199/onebot/v11/ws。
+# 如果 NapCat 不在同一台机器，把 QQ_HOST 改为 0.0.0.0，并建议设置 QQ_ACCESS_TOKEN。
+QQ_HOST=127.0.0.1
+QQ_PORT=6199
+
+# 可选访问令牌。为空表示不校验；填写后 NapCat 侧也要填写相同 token。
+QQ_ACCESS_TOKEN=
+
+# 群聊唤醒策略:
+# mention = 群聊 @机器人 或使用 QQ_WAKE_PREFIX 才响应；
+# prefix  = 只响应 QQ_WAKE_PREFIX；
+# all     = 群里每条消息都响应，容易刷屏。
+QQ_GROUP_MODE=mention
+QQ_WAKE_PREFIX=/agent
+
+# 白名单，逗号分隔。为空表示不限制。
+QQ_ALLOWED_GROUPS=
+QQ_ALLOWED_USERS=
+
+# OneBot action 超时时间，单位秒。发送消息和上传文件都会用到。
+QQ_ACTION_TIMEOUT_SECONDS=30
+
+# 通讯软件事件输出等级:
+# normal = 只发最终回答、编号问题、todo、错误、后台提示和文件资源；
+# full   = 额外发送工具开始/结束、round、token、MCP/Buddy 状态等调试摘要。
+IM_EVENT_VERBOSITY=normal
+
+# 用户回复编号后是否发“已选择: xxx”确认。0 表示静默确认。
+IM_CONFIRM_QUESTION_ANSWER=1
+
+# 表情包目录。send_message_asset(kind=sticker) 会按 sticker_name 在这里找图片。
+CBAGENT_STICKER_DIR=./assets/stickers
+
+# agent 允许发送到 QQ 的本地文件大小上限，单位 MB。
+CBAGENT_OUTBOUND_FILE_MAX_MB=50
+
+# QQ 图片/音频 URL 下载目录。下载成功后只把本地路径交给多模态输入层。
+CBAGENT_PLATFORM_ATTACHMENT_DIR=.cbagent/platform_attachments/qq
+```
+
+启动 cb-agent：
+
+```powershell
+..\venv\python.exe run_agent.py --transport qq
+```
+
+NapCat 侧配置反向 WebSocket：
+
+```text
+ws://127.0.0.1:6199/onebot/v11/ws
+```
+
+如果设置了 `QQ_ACCESS_TOKEN`，NapCat 侧也要填写相同 token。适配器支持 `Authorization: Bearer <token>`、`Authorization: <token>`，以及 URL 查询参数 `access_token=<token>`。
+
+群聊默认 `QQ_GROUP_MODE=mention`，只有 @机器人 或使用 `QQ_WAKE_PREFIX` 前缀时才会响应。私聊默认直接响应。`QQ_ALLOWED_GROUPS` 和 `QQ_ALLOWED_USERS` 为空时不做白名单限制；填写后分别按群号和 QQ 号过滤。
+
+通讯软件模式会把 TUI 风格事件降级成 QQ 可读消息：
+
+| Agent 事件 | QQ 中的表现 |
+|---|---|
+| `Done` | 发送最终回答 |
+| `ask_user_question` | 渲染为编号问题，用户回复 `1`、`1,3`、`其他: ...` 或 `取消`；群聊中只有发起请求的用户可以确认 |
+| `todo` | 渲染为简洁任务列表 |
+| `Error` / `Cancelled` | 发送简短状态提示 |
+| 工具开始/结束 | 默认不发；`IM_EVENT_VERBOSITY=full` 时发送摘要 |
+
+表情包放在：
+
+```text
+assets/stickers/
+```
+
+QQ 模式会额外注册 `send_message_asset` 工具。模型可以通过它发送表情包、图片、音频、视频或任意本地普通文件。工具会校验路径、大小、hash；history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
+
+QQ 模式会按通讯会话隔离 `AgentSession`。每条 QQ 消息都会创建短生命周期 session 对象，工具系统、LLM、MCP 和 EventBus 仍在进程内共享，不会反复加载。私聊会根据 `ConversationKey(platform, kind, id)` 挂载独立本地会话目录，处理结束后追加落盘：
+
+```text
+.cbagent/platform_sessions/qq/private_<QQ号>/sessions/
+```
+
+群聊默认不持久化 history/state/transcript/compact，避免群消息过多导致本地上下文无限增长。同一个群聊或好友内部使用按会话队列顺序处理消息；不同群聊、不同好友之间可以并发处理。事件回传会通过通讯平台上下文路由到对应会话。这个隔离层不影响 TUI：TUI 仍通过 `--transport jsonrpc` 使用普通 `.cbagent/sessions/`。
+
+### 8. 多模态输入
 
 cb-agent 的用户消息协议现在是 `text + attachments[]`。附件只在当前轮请求中参与模型推理；跨轮 history、transcript、compact 和 `context_window_usage` 只保存文本摘要和附件元数据，不保存图片/音频二进制，也不保存 data URI。
 
@@ -334,7 +446,7 @@ TUI 额外支持从系统剪贴板读取图片：
 
 支持的音频格式：`mp3`、`wav`、`m4a`、`aac`、`flac`、`ogg`、`wma`。
 
-### 8. 验证安装是否正常
+### 9. 验证安装是否正常
 
 Python 侧：
 
@@ -544,6 +656,7 @@ CONTEXT_USAGE_RATIO = 0.8
 | `skill` | 加载 Skill 指令 |
 | `run_skill_script` | 执行 Skill 附带脚本 |
 | `ask_user_question` | 工具循环中向用户提问 |
+| `send_message_asset` | 仅通讯软件模式注册，用于发送表情包、图片或本地文件 |
 | `my_advanced_search` | Tavily / SerpApi 搜索源可用时执行 Web 搜索 |
 | MCP 子工具 | 从 `mcp.json` 中展开 |
 
@@ -588,6 +701,8 @@ Skill 是 “Prompt as Capability”：用 Markdown + YAML frontmatter 写能力
 ```text
 cb-agent/
 ├── agent/                 AgentSession、LLM 客户端、事件、transport gateway
+│   ├── platforms/         通讯平台通用消息结构与事件渲染器
+│   └── qq/                NapCat / OneBot V11 适配器
 ├── context/               ContextBuilder 与 Markdown memory provider
 ├── core/                  Message 等核心结构
 ├── memory/                full 模式旧记忆/RAG/存储
@@ -650,6 +765,10 @@ TUI 通过 stdio JSON-RPC 与 Python 后端通信：
 
 详细见 [note/Stage5a stdio JSON-RPC 网关技术报告.md](<note/Stage5a stdio JSON-RPC 网关技术报告.md>)。
 
+### 通讯平台 transport
+
+QQ/NapCat 模式通过 `agent.platforms` 的平台无关消息层适配 EventBus 事件，再由 `agent.qq` 翻译成 OneBot V11 action。这个分层是为了后续接入微信等通讯软件时复用 `InboundMessage`、`OutboundMessage`、`PlatformEventRenderer` 和基于 `ConversationKey` 的会话隔离能力。
+
 ## 开发与测试
 
 Python：
@@ -661,6 +780,8 @@ python test/test_session_renderer.py
 python test/test_transport.py
 python -m unittest discover -s test -p "test_buddy*.py"
 python -m unittest discover -s test -p "test_multimodal_input.py"
+python -m unittest discover -s test -p "test_platform*.py"
+python -m unittest discover -s test -p "test_qq*.py"
 ```
 
 TUI：
@@ -689,6 +810,7 @@ python test/test_rag_operations.py
 
 - [跨轮工作上下文技术报告.md](<note/跨轮工作上下文技术报告.md>)
 - [多会话隔离与TUI切换技术报告.md](<note/多会话隔离与TUI切换技术报告.md>)
+- [项目级会话隔离实现思路.md](<note/项目级会话隔离实现思路.md>)
 - [Compact上下文压缩命令技术报告.md](<note/Compact上下文压缩命令技术报告.md>)
 - [轻量Markdown记忆系统技术报告.md](<note/轻量Markdown记忆系统技术报告.md>)
 - [Stage5a stdio JSON-RPC 网关技术报告.md](<note/Stage5a stdio JSON-RPC 网关技术报告.md>)
@@ -696,6 +818,7 @@ python test/test_rag_operations.py
 - [Bash 工具 UI 输出预览字段技术报告.md](<note/Bash 工具 UI 输出预览字段技术报告.md>)
 - [本地搜索与导航工具技术报告.md](<note/本地搜索与导航工具技术报告.md>)
 - [多模态输入与上下文管理技术报告.md](<note/多模态输入与上下文管理技术报告.md>)
+- [QQ与通讯平台事件适配技术报告.md](<note/QQ与通讯平台事件适配技术报告.md>)
 
 ## 常见问题
 

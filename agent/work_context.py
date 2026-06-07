@@ -928,9 +928,45 @@ class LocalSessionStore:
         for item in transcript_items[max(0, start_idx):]:
             messages.extend(_messages_from_transcript_item(item))
 
+        # 如果上一轮在收到用户消息后、生成最终回答前进程崩溃，pending_user.json
+        # 会留下那条未完成用户消息。恢复时把它放在尾部，确保“用户最后说了什么”
+        # 不会因为异常退出丢掉。正常完成的一轮会在 append_turn 后清除此文件。
+        pending = self._read_json(self.active_dir / "pending_user.json", {})
+        if isinstance(pending, dict) and pending.get("user_query"):
+            messages.append(Message.create_user_message(str(pending.get("user_query") or "")))
+
         if not messages:
             return []
         return _trim_restored_history(messages, max_messages)
+
+    def save_pending_user_message(self, user_query: str) -> None:
+        """收到用户消息后先写一份 pending 记录。
+
+        transcript.jsonl 仍只记录完整回合；pending_user.json 只用于崩溃恢复。这样可以
+        满足通讯平台“每条私聊消息先落盘”的需求，同时避免正常完成时 transcript 出现
+        一条 user-only 记录和一条完整记录的重复。
+        """
+
+        self.ensure_active()
+        self.active_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": _now_iso(),
+            "session_id": self.active_session_id,
+            "user_query": user_query,
+        }
+        self._write_json(self.active_dir / "pending_user.json", payload)
+
+    def clear_pending_user_message(self) -> None:
+        """清理当前会话的 pending 用户消息。"""
+
+        if not self.active_session_id:
+            return
+        path = self.active_dir / "pending_user.json"
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            logger.exception("failed to clear pending user message: %s", path)
 
     def save_compaction(
         self,
@@ -1073,6 +1109,7 @@ class LocalSessionStore:
         }
         with (self.active_dir / "transcript.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+        self.clear_pending_user_message()
         if work_record:
             self.merge_work_record(work_record, user_query=user_query)
         else:

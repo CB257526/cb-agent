@@ -21,6 +21,7 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
+from agent.cancel import get_current_cancel_token
 from tools.tool import Tool, ToolParameter
 from tools.tools.bash_security import check_fatal, check_warnings, parse_pipeline
 from tools.tools.bash_semantics import lookup_semantic
@@ -296,6 +297,12 @@ class BashTool(Tool):
                 )
             if gate_res.decision == Decision.DENY:
                 logger.warning("bash: 权限拒绝 — %s", gate_res.reason)
+                # 用户已经明确拒绝本次 bash 执行时，应结束当前 agent 回合，而不是
+                # 让模型在下一轮继续尝试同一个受限能力。这里通过当前 CancelToken
+                # 走统一取消路径，CLI/TUI/QQ 都会收到 Cancelled 事件并释放 busy。
+                token = get_current_cancel_token()
+                if token is not None:
+                    token.cancel()
                 return json.dumps({
                     "stdout": "",
                     "stderr": f"[权限拒绝] {gate_res.reason}",
@@ -310,6 +317,7 @@ class BashTool(Tool):
                     "permission_unavailable": gate_res.permission_unavailable,
                     "warnings": warnings,
                     "permission": _gate_result_to_dict(gate_res),
+                    "session_cancelled": True,
                     "__display__": _build_bash_display(
                         error_override=f"[权限拒绝] {gate_res.reason}",
                     ),

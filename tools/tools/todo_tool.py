@@ -14,6 +14,7 @@ from typing import Dict, Any, List, Optional
 from tools.tool import Tool, ToolParameter
 from agent.event_bus import EventBus
 from agent.events import TodoListUpdated
+from agent.platforms.context import get_current_platform_conversation
 
 # 有效的任务状态
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
@@ -157,9 +158,32 @@ class TodoTool(Tool):
             )
         )
         self.store = TodoStore()
+        # 普通 CLI/TUI 沿用 self.store；通讯软件模式下，TodoTool 实例仍是全局共享的，
+        # 因此必须按 ConversationKey 分配独立 TodoStore，避免 A 群的任务列表串到 B 群。
+        self._platform_stores: Dict[str, TodoStore] = {}
+        self._platform_stores_lock = threading.Lock()
         # 可选事件总线：写入后 emit TodoListUpdated 让 UI 单独渲染面板。
         # None 时不发事件（旧 CLI / 单测路径），保持原行为。
         self._bus = event_bus
+
+    def _current_store(self) -> TodoStore:
+        """返回当前执行流对应的 TodoStore。
+
+        QQ/微信等通讯平台会通过 ContextVar 绑定当前会话。ToolExecutor 会把这个
+        ContextVar 复制到工具线程，所以 todo 工具可以在不改工具参数的情况下实现
+        “每个群/好友一份任务列表”。普通 CLI/TUI 没有绑定会话时继续使用默认 store。
+        """
+
+        conversation = get_current_platform_conversation()
+        if conversation is None:
+            return self.store
+        key = conversation.stable_id
+        with self._platform_stores_lock:
+            store = self._platform_stores.get(key)
+            if store is None:
+                store = TodoStore()
+                self._platform_stores[key] = store
+            return store
 
     def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
         """验证工具参数"""
@@ -201,9 +225,10 @@ class TodoTool(Tool):
 
         todos = parameters.get("todos")
         merge = parameters.get("merge", False)
+        store = self._current_store()
 
         if todos is not None:
-            items = self.store.write(todos, merge)
+            items = store.write(todos, merge)
             # 写入操作才广播；纯读取不发事件（避免重复刷面板）
             if self._bus is not None:
                 try:
@@ -212,7 +237,7 @@ class TodoTool(Tool):
                     # bus 故障不影响工具结果；执行器还会捕一层
                     pass
         else:
-            items = self.store.read()
+            items = store.read()
 
         # 统计各状态数量
         pending = sum(1 for i in items if i["status"] == "pending")
@@ -278,4 +303,4 @@ class TodoTool(Tool):
 
         可被Agent在上下文压缩后调用，将活跃任务重新注入对话。
         """
-        return self.store.format_for_injection()
+        return self._current_store().format_for_injection()

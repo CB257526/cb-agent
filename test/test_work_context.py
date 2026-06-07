@@ -93,6 +93,41 @@ class TestWorkContext(unittest.TestCase):
             self.assertFalse((root / "index.json").exists())
             self.assertFalse(transcript.exists())
 
+    def test_pending_user_message_restores_and_is_cleared_after_turn(self):
+        """收到用户消息后先落 pending；完整回合落盘后再清理，避免重复历史。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+
+            store.append_turn(
+                user_query="上一轮问题",
+                final_answer="上一轮回答",
+                work_record=None,
+            )
+            store.save_pending_user_message("这条消息已经收到但还没回答")
+            pending_path = store.active_dir / "pending_user.json"
+            self.assertTrue(pending_path.exists())
+
+            restored = LocalSessionStore(root)
+            restored_history = restored.load_latest_history(max_messages=10)
+            restored_text = "\n".join(str(m.content) for m in restored_history)
+            self.assertIn("上一轮问题", restored_text)
+            self.assertIn("上一轮回答", restored_text)
+            self.assertIn("这条消息已经收到但还没回答", restored_text)
+
+            restored.append_turn(
+                user_query="这条消息已经收到但还没回答",
+                final_answer="现在回答完成",
+                work_record=None,
+            )
+            self.assertFalse((restored.active_dir / "pending_user.json").exists())
+
+            final_restore = LocalSessionStore(root)
+            final_history = final_restore.load_latest_history(max_messages=10)
+            final_text = "\n".join(str(m.content) for m in final_history)
+            self.assertEqual(final_text.count("这条消息已经收到但还没回答"), 1)
+            self.assertIn("现在回答完成", final_text)
+
     def test_local_session_store_lists_creates_and_switches_isolated_sessions(self):
         """多个 session 目录互相隔离，切换只恢复目标目录自己的 transcript/state。"""
         with tempfile.TemporaryDirectory() as td:

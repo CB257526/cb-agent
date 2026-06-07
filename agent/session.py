@@ -564,6 +564,14 @@ class AgentSession:
         )
         request_content = multimodal_prompt.request_content
         history_user_text = multimodal_prompt.history_text
+        if self.session_store is not None:
+            try:
+                # 通讯平台私聊会按“每条消息新建 AgentSession 对象”从磁盘恢复。
+                # 因此收到用户消息后先写 pending 记录：如果进程在 LLM 返回前崩溃，
+                # 下一次同一用户发消息时仍能从磁盘看到那条未完成输入。
+                self.session_store.save_pending_user_message(history_user_text)
+            except Exception:
+                logger.exception("保存 pending 用户消息失败")
 
         system_instructions = self._build_system_instructions()
         auto_compactions: List[Dict[str, Any]] = [] #收集自动压缩（auto compaction）事件

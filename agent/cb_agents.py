@@ -1,6 +1,7 @@
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from openai import OpenAI
@@ -15,6 +16,156 @@ from agent.events import (
 # 加载 .env 文件中的环境变量
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+LLM_CONSOLE_IO_ENV = "CBAGENT_LLM_CONSOLE_IO"
+
+
+def _console_io_mode() -> str:
+    """读取 LLM 控制台追踪模式。
+
+    - summary: 默认，只打印 role、长度、短预览和工具名，适合日常排障；
+    - full: 打印完整文本内容，但仍会强制折叠 data URI，避免图片 base64 刷屏；
+    - off: 不向控制台输出 LLM 入参/出参。
+
+    这里输出到 stderr，而不是 stdout。JSON-RPC/TUI 模式下 stdout 是协议通道，
+    一旦混入普通文本会让前端解析失败。
+    """
+
+    raw = (os.getenv(LLM_CONSOLE_IO_ENV) or "summary").strip().lower()
+    if raw in {"0", "false", "no", "off", "none"}:
+        return "off"
+    if raw in {"full", "all", "verbose"}:
+        return "full"
+    return "summary"
+
+
+def _clip_console_text(text: Any, limit: int) -> str:
+    value = "" if text is None else str(text)
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    if value.startswith("data:"):
+        return value[:120] + "...[data-uri omitted]"
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _format_console_content(content: Any, *, full: bool) -> str:
+    """把 OpenAI message content 转成控制台可读文本。
+
+    多模态 content 可能是数组；图片 data URI 不适合直接打到控制台，所以无论
+    full/summary 都只显示类型和短 URL/占位。
+    """
+
+    limit = 20000 if full else 500
+    if content is None:
+        return "(empty)"
+    if isinstance(content, str):
+        return _clip_console_text(content, limit)
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                parts.append(_clip_console_text(item, limit))
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "text":
+                parts.append(_clip_console_text(item.get("text") or "", limit))
+            elif item_type == "image_url":
+                url = str((item.get("image_url") or {}).get("url") or "")
+                parts.append("[image_url] " + _clip_console_text(url, 220))
+            elif item_type == "audio_url":
+                url = str((item.get("audio_url") or {}).get("url") or "")
+                parts.append("[audio_url] " + _clip_console_text(url, 220))
+            else:
+                parts.append(f"[{item_type or 'unknown_content_part'}]")
+        return "\n".join(p for p in parts if p).strip() or "(empty)"
+    return _clip_console_text(content, limit)
+
+
+def _format_console_tool_calls(tool_calls: Any, *, full: bool) -> str:
+    if not tool_calls:
+        return ""
+    lines: List[str] = []
+    for idx, tc in enumerate(tool_calls, start=1):
+        if not isinstance(tc, dict):
+            lines.append(f"  [{idx}] {tc}")
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        name = fn.get("name") or "?"
+        args = fn.get("arguments") or ""
+        args_text = _clip_console_text(args, 4000 if full else 500)
+        lines.append(f"  [{idx}] id={tc.get('id', '')} name={name} args={args_text}")
+    return "\n".join(lines)
+
+
+def _print_llm_request_to_console(
+    *,
+    model: str,
+    round_idx: int,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+) -> None:
+    mode = _console_io_mode()
+    if mode == "off":
+        return
+    full = mode == "full"
+    print(
+        f"\n[LLM 请求] model={model} round={round_idx} messages={len(messages or [])} tools={len(tools or [])}",
+        file=sys.stderr,
+        flush=True,
+    )
+    for idx, msg in enumerate(messages or []):
+        role = msg.get("role", "?")
+        content_text = _format_console_content(msg.get("content"), full=full)
+        print(f"  [{idx}] role={role} chars={len(content_text)}", file=sys.stderr)
+        print(content_text, file=sys.stderr)
+        tool_calls_text = _format_console_tool_calls(msg.get("tool_calls"), full=full)
+        if tool_calls_text:
+            print(tool_calls_text, file=sys.stderr)
+    if tools:
+        tool_names = [
+            str(((tool.get("function") or {}).get("name")) or "?")
+            for tool in tools
+            if isinstance(tool, dict)
+        ]
+        print(f"  tools={tool_names}", file=sys.stderr)
+    print("[LLM 请求结束]\n", file=sys.stderr, flush=True)
+
+
+def _print_llm_response_to_console(
+    *,
+    model: str,
+    round_idx: int,
+    result: Any,
+) -> None:
+    mode = _console_io_mode()
+    if mode == "off":
+        return
+    full = mode == "full"
+    print(f"\n[LLM 返回] model={model} round={round_idx}", file=sys.stderr, flush=True)
+    if isinstance(result, dict):
+        answer = str(result.get("answer") or "")
+        reasoning = str(result.get("reasoning_content") or "")
+        print(f"answer_chars={len(answer)}", file=sys.stderr)
+        if answer:
+            print(_clip_console_text(answer, 20000 if full else 1200), file=sys.stderr)
+        if reasoning:
+            print(f"reasoning_chars={len(reasoning)}", file=sys.stderr)
+            print(_clip_console_text(reasoning, 20000 if full else 1200), file=sys.stderr)
+        tool_calls_text = _format_console_tool_calls(result.get("tool_calls"), full=full)
+        if tool_calls_text:
+            print("tool_calls:", file=sys.stderr)
+            print(tool_calls_text, file=sys.stderr)
+        if result.get("usage"):
+            print(f"usage={result.get('usage')}", file=sys.stderr)
+    elif isinstance(result, list):
+        answer = str(result[0] or "") if result else ""
+        print(f"answer_chars={len(answer)}", file=sys.stderr)
+        if answer:
+            print(_clip_console_text(answer, 20000 if full else 1200), file=sys.stderr)
+    else:
+        print(_clip_console_text(result, 1200), file=sys.stderr)
+    print("[LLM 返回结束]\n", file=sys.stderr, flush=True)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -262,7 +413,10 @@ class CbAgentsLLM:
                         payload,
                         self.model,
                     )
-                    print(f"✅ 大语言模型响应成功（stream={stream_id}, {payload:.2f}s）:")
+                    print(
+                        f"✅ 大语言模型响应成功（stream={stream_id}, {payload:.2f}s）:",
+                        file=sys.stderr,
+                    )
                     continue
                 if kind == "chunk":
                     yield payload
@@ -353,7 +507,7 @@ class CbAgentsLLM:
                       流式读取并返回已累积内容（带 cancelled=True 标记）。
         round_idx: 工具循环当前轮次，1-based。仅作为事件元信息透传。
         """
-        print(f"🧠 正在调用 {self.model} 模型...")
+        print(f"🧠 正在调用 {self.model} 模型...", file=sys.stderr)
         logger.info(
             "LLM think start: round=%s model=%s messages=%s tools=%s function_calling=%s",
             round_idx,
@@ -362,22 +516,34 @@ class CbAgentsLLM:
             len(tools or []),
             self.is_Function_Calling,
         )
+        _print_llm_request_to_console(
+            model=self.model,
+            round_idx=round_idx,
+            messages=messages,
+            tools=tools,
+        )
         try:
             if self.is_Function_Calling:
                 # 支持函数调用的模型调用
-                return self._think_with_Function_Calling(
+                result = self._think_with_Function_Calling(
                     messages, temperature, tools,
                     event_bus=event_bus, cancel_event=cancel_event, round_idx=round_idx,
                 )
             else:
-                return self._think_no_Function_Calling(
+                result = self._think_no_Function_Calling(
                     messages, temperature,
                     event_bus=event_bus, cancel_event=cancel_event, round_idx=round_idx,
                 )
+            _print_llm_response_to_console(
+                model=self.model,
+                round_idx=round_idx,
+                result=result,
+            )
+            return result
 
         except Exception as e:
             logger.exception("LLM think failed: round=%s model=%s", round_idx, self.model)
-            print(f"❌ 调用LLM API时发生错误: {e}")
+            print(f"❌ 调用LLM API时发生错误: {e}", file=sys.stderr)
             return None
     
     #根据api厂商是否支持Function Calling进行不同的请求

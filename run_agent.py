@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -69,6 +70,7 @@ from agent.event_bus import EventBus
 from agent.events import Done, MCPStatus
 from agent.buddy import BuddyManager
 from agent.executor import ToolExecutor
+from agent.platforms.messages import ConversationKey
 from agent.renderers.cli import CLIRenderer
 from agent.message_logger import MessageLogger
 from agent.session import AgentSession
@@ -91,6 +93,7 @@ from tools.tools.file_write_tool import FileWriteTool
 from tools.tools.file_edit_tool import FileEditTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
 from tools.tools.list_tools_tool import ListToolsTool
+from tools.tools.send_message_asset_tool import SendMessageAssetTool
 
 try:
     from tools.mcp_tools.mcptools_add import load_mcp_server_configs
@@ -127,6 +130,16 @@ def _err(msg: str) -> None:
     print(f"[!] {msg}", file=sys.stderr)
 
 
+def _safe_runtime_name(value: str) -> str:
+    """把外部 ID 转成安全目录/文件名片段。
+
+    QQ 群号、用户 ID、未来微信会话 ID 都来自外部平台。它们可以作为隔离键，但不能
+    原样拼进路径；这里使用白名单字符集，避免路径分隔符、冒号等字符影响本地存储。
+    """
+
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "session"))[:120] or "session"
+
+
 # ========== AgentRunner（装配 + REPL）==========
 
 
@@ -139,18 +152,21 @@ class AgentRunner:
         ctx_enabled: bool = True,  # 是否开启 ContextBuilder
         attach_cli_renderer: bool = True, # 是否 attach CLIRenderer 到 EventBus
         memory_system: str = "light",  # light=Markdown 记忆，full=旧 RAG/向量记忆，off=关闭记忆
+        communication_platform: str | None = None,  # qq/wechat 等通讯平台模式；None 表示普通 CLI/TUI
     ) -> None:
         self.logging_settings = _LOG_SETTINGS
         self.use_mcp = use_mcp and _HAS_MCP
         self.ctx_enabled = ctx_enabled
         self.memory_system = memory_system
+        self.communication_platform = communication_platform
         logger.info(
-            "AgentRunner init: use_mcp=%s has_mcp=%s ctx_enabled=%s attach_cli_renderer=%s memory_system=%s log_level=%s",
+            "AgentRunner init: use_mcp=%s has_mcp=%s ctx_enabled=%s attach_cli_renderer=%s memory_system=%s communication_platform=%s log_level=%s",
             use_mcp,
             _HAS_MCP,
             ctx_enabled,
             attach_cli_renderer,
             memory_system,
+            communication_platform,
             self.logging_settings.verbosity,
         )
         # CLI 直接交互时保留 messages dump，方便开发者用 /msg on|off 看原始上下文；
@@ -170,7 +186,6 @@ class AgentRunner:
         self._mcp_status: Dict[str, Any] = self._initial_mcp_status()
         # dump 增量游标：每次 chat() 开始重置，让本轮第一次能打全量
         self._dump_seen_count = 0
-
         _section("初始化 cb-agent")
 
         # 1. LLM
@@ -196,59 +211,17 @@ class AgentRunner:
             max_workers=4,
         )
 
-        # 4. 上下文模块装配(对齐 Claude Code 重构后)
-        # MemoryLoader 替代旧 ContextBuilder + MarkdownMemoryProvider 组合,
-        # 走多级 CLAUDE.md 路径优先级链(Managed > User > Project > Local)。
-        # OpenAICompatibleAdapter 把分段 system prompt join 成单 string,适配
-        # 国内厂商的 OpenAI 兼容 API。
-        memory_loader = MemoryLoader(cwd=Path(_HERE)) if self.ctx_enabled else None
-        provider_adapter = OpenAICompatibleAdapter()
-        # 跨轮工作上下文采用项目级持久化:这些状态和当前仓库文件强绑定,
-        # 放在 .cbagent/sessions 比放到用户级 ~/.cb-agent 更容易理解和清理。
-        session_store = LocalSessionStore(Path(_HERE) / ".cbagent" / "sessions")
         # trace_summarizer 只在工具轨迹超过阈值时静默调用;小 trace 走规则压缩。
         # 它不会走主回答的 llm.think 流式路径,因此不会向 UI 误发 text_delta。
-        trace_summarizer = TraceSummarizer(self.llm)
-
-        # 消息日志:将所有发送给 LLM 的消息全文记录到独立文件,
-        # 包含 system/user/assistant/tool 全部角色的消息内容
-        message_logger = None
-        if self.logging_settings.message_log_mode != "off":
-            message_logger = MessageLogger(
-                self.logging_settings.log_dir / f"messages-{int(time.time())}.log",
-                mode=self.logging_settings.message_log_mode,
-            )
-            logger.info(
-                "message logger enabled: mode=%s path=%s",
-                self.logging_settings.message_log_mode,
-                message_logger.path,
-            )
-        else:
-            logger.info("message logger disabled at log level=%s", self.logging_settings.verbosity)
+        self._trace_summarizer = TraceSummarizer(self.llm)
 
         # 5. 会话核心(纯逻辑)
-        self.session = AgentSession(
-            llm=self.llm,
-            registry=self.registry,
-            executor=self.executor,
-            event_bus=self.event_bus,
-            memory_loader=memory_loader,
-            provider_adapter=provider_adapter,
-            skill_manager=self._skill_manager,
-            bash_prompt_provider=self._memory_prompt_provider,
-            ctx_enabled=self.ctx_enabled,
-            messages_snapshot_hook=self._on_messages_snapshot,
-            session_store=session_store,
-            trace_summarizer=trace_summarizer,
-            message_logger=message_logger,
-            buddy_manager=self.buddy_manager,
+        # 普通 CLI/TUI 仍使用项目级 .cbagent/sessions；通讯平台的会话目录由
+        # get_or_create_platform_session() 按群/好友另行创建。
+        self.session = self._create_agent_session(
+            session_store=LocalSessionStore(Path(_HERE) / ".cbagent" / "sessions"),
+            message_logger_scope="main",
         )
-        # Gateway 只持有 AgentSession，不直接知道 AgentRunner。这里把 MCP 运行态
-        # 以“可选回调”的形式挂到 session 上：旧代码不需要感知这些属性；JSON-RPC
-        # 模式则可以在 gateway_ready 后启动后台连接，并通过 session.mcp_status
-        # 查询当前进度。MCP 状态是运行时信息，不写入 history。
-        self.session.mcp_status_provider = self.mcp_status
-        self.session.mcp_background_loader = self.start_mcp_background_loading
 
         # 5b. 依赖 session 共享态的工具：AskUserQuestionTool 需要 session 的
         # question_registry + event_bus（跨工具线程同步），在 session 构造完后注册
@@ -286,6 +259,121 @@ class AgentRunner:
         _info(f"MCP: {self._format_mcp_status_line(self.mcp_status())}")
         _info(f"messages dump: {'开启' if self.dump_messages else '关闭'} (用 /msg off 关闭)")
         print()
+
+    # ---------- 会话创建 ----------
+
+    def _create_message_logger(self, scope: str) -> MessageLogger | None:
+        """按会话创建 LLM messages 日志。
+
+        CLI/TUI 只有一个主会话，日志名保持 ``main``；QQ/微信这类通讯平台会有很多
+        群聊和私聊并发运行，因此把会话 key 放进文件名，排查某个群的上下文时不用
+        在一整份全局日志里翻找。
+        """
+
+        if self.logging_settings.message_log_mode == "off":
+            logger.info("message logger disabled at log level=%s", self.logging_settings.verbosity)
+            return None
+        safe_scope = _safe_runtime_name(scope or "main")
+        path = self.logging_settings.log_dir / f"messages-{int(time.time())}-{safe_scope}.log"
+        message_logger = MessageLogger(
+            path,
+            mode=self.logging_settings.message_log_mode,
+        )
+        logger.info(
+            "message logger enabled: mode=%s path=%s",
+            self.logging_settings.message_log_mode,
+            message_logger.path,
+        )
+        return message_logger
+
+    def _create_agent_session(
+        self,
+        *,
+        session_store: LocalSessionStore | None,
+        message_logger_scope: str,
+    ) -> AgentSession:
+        """创建一个完整 AgentSession，并挂上 Runner 级运行态回调。
+
+        同一个进程里的多个通讯会话共享 LLM、ToolRegistry、ToolExecutor、MCP 和
+        EventBus，因此不会因为每条 QQ 消息都重新加载工具而变慢。真正需要隔离的是
+        ``AgentSession`` 的 history 和 ``LocalSessionStore``：
+
+        - 私聊传入独立 store，从该好友目录恢复并落盘；
+        - 群聊传入 None，使用临时内存 history，处理完对象释放，不写 transcript。
+        """
+
+        memory_loader = MemoryLoader(cwd=Path(_HERE)) if self.ctx_enabled else None
+        provider_adapter = OpenAICompatibleAdapter()
+        session = AgentSession(
+            llm=self.llm,
+            registry=self.registry,
+            executor=self.executor,
+            event_bus=self.event_bus,
+            memory_loader=memory_loader,
+            provider_adapter=provider_adapter,
+            skill_manager=self._skill_manager,
+            bash_prompt_provider=self._memory_prompt_provider,
+            ctx_enabled=self.ctx_enabled,
+            messages_snapshot_hook=self._on_messages_snapshot,
+            session_store=session_store,
+            trace_summarizer=self._trace_summarizer,
+            message_logger=self._create_message_logger(message_logger_scope),
+            buddy_manager=self.buddy_manager,
+        )
+        # Gateway/平台适配器只拿到 AgentSession，不直接知道 AgentRunner。这里把 MCP
+        # 运行态以回调形式挂到每个 session 上；状态只服务展示，不写入 history。
+        session.mcp_status_provider = self.mcp_status
+        session.mcp_background_loader = self.start_mcp_background_loading
+        return session
+
+    def _platform_session_store_root(self, conversation: ConversationKey) -> Path:
+        """返回某个通讯会话对应的持久化目录。"""
+
+        safe_id = _safe_runtime_name(f"{conversation.kind}_{conversation.id}")
+        return (
+            Path(_HERE)
+            / ".cbagent"
+            / "platform_sessions"
+            / _safe_runtime_name(conversation.platform)
+            / safe_id
+            / "sessions"
+        )
+
+    def _create_platform_session(self, conversation: ConversationKey) -> AgentSession:
+        """为通讯会话创建一个临时 AgentSession 对象。
+
+        私聊需要跨进程/跨轮上下文，因此挂上按好友 ID 隔离的 LocalSessionStore。
+        群聊消息量通常更大、参与者更多，默认不落盘；每条群消息只获得一个短生命周期
+        session，对象释放后 history 随之丢弃，避免群聊 transcript 无限增长。
+        """
+
+        session_store: LocalSessionStore | None = None
+        if conversation.kind == "private":
+            session_store = LocalSessionStore(self._platform_session_store_root(conversation))
+        session = self._create_agent_session(
+            session_store=session_store,
+            message_logger_scope=f"{conversation.platform}-{conversation.kind}-{conversation.id}",
+        )
+        # 工具注册表是全局共享的，ask_user_question 工具在启动时绑定的是主
+        # session 的 registry。这里显式同步属性，避免未来有代码从平台 session
+        # 读取 question_registry 时看到另一份空 registry。
+        session.question_registry = self.session.question_registry
+        logger.info(
+            "platform session object created: conversation=%s persisted=%s restored_history=%s",
+            conversation.stable_id,
+            session_store is not None,
+            len(session.history),
+        )
+        return session
+
+    def get_or_create_platform_session(self, conversation: ConversationKey) -> AgentSession:
+        """为通讯平台消息创建一个新的 AgentSession。
+
+        名字保留 ``get_or_create`` 是为了兼容 QQ 适配器的注入点，但语义已经调整为
+        “每条消息创建一个短生命周期对象”。同一会话的串行队列由 QQ 适配器维护；
+        Runner 只负责装配 session，并决定私聊是否挂本地持久化 store。
+        """
+        return self._create_platform_session(conversation)
 
     # ---------- 启动期工具注册 ----------
 
@@ -359,6 +447,10 @@ class AgentRunner:
             FileEditTool(),
             FileWriteTool(),
         ])
+        if self.communication_platform:
+            # 只有通讯软件模式才注册该工具。普通 CLI/TUI 下没有平台发送器，模型即便调用了
+            # 也无法真正投递文件；按模式注册可以避免工具列表误导模型。
+            tools.append(SendMessageAssetTool(project_root=Path(_HERE)))
 
         for tool in tools:
             try:
@@ -374,8 +466,22 @@ class AgentRunner:
         仍然受文件写入工具的 read-before-write 保护。
         """
         if self._md_memory_provider is None:
-            return ""
-        return self._md_memory_provider.memory_instructions()
+            base = ""
+        else:
+            base = self._md_memory_provider.memory_instructions()
+        if not self.communication_platform:
+            return base
+        platform_note = (
+            "\n\n[通讯软件交互说明]\n"
+            f"当前会话来自通讯平台: {self.communication_platform}。\n"
+            "- 你可以正常用文本回复用户；最终回答会发送到通讯软件。\n"
+            "- 如果需要发送表情包、图片、音频、视频或文件，必须调用 send_message_asset 工具，"
+            "不要只在文字里声称已经发送。\n"
+            "- 如果需要用户在多个选项中做决定，可以调用 ask_user_question；通讯平台会把它渲染成编号选项，"
+            "用户回复 1/2 或 1,3 后工具会继续执行。\n"
+            "- todo 工具的更新会以简洁文本同步给通讯软件用户，工具执行细节默认不会刷屏。"
+        )
+        return (base + platform_note).strip()
 
     def _initial_mcp_status(self) -> Dict[str, Any]:
         """创建 MCP 状态快照的初始值。
@@ -1028,13 +1134,13 @@ class AgentRunner:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="cb-agent",
-        description="cb-agent 命令行入口。默认进 CLI 交互；--transport jsonrpc 切到 stdio 网关模式给外部 UI 用。",
+        description="cb-agent 命令行入口。默认进 CLI 交互；--transport jsonrpc 给外部 UI 用，--transport qq 接 NapCat。",
     )
     parser.add_argument(
         "--transport",
-        choices=["cli", "jsonrpc"],
+        choices=["cli", "jsonrpc", "qq"],
         default="cli",
-        help="cli=REPL 直接打印；jsonrpc=stdio NDJSON 网关模式",
+        help="cli=REPL 直接打印；jsonrpc=stdio NDJSON 网关模式；qq=NapCat/OneBot 反向 WebSocket",
     )
     parser.add_argument(
         "--no-mcp", action="store_true",
@@ -1078,6 +1184,30 @@ def main() -> None:
             redirect_stdout_to_stderr=False,  # 上面已经切过了
         )
         gw.serve_forever()
+        return
+
+    if args.transport == "qq":
+        # QQ 模式也是服务模式：启动期输出走 stderr，真正的用户消息由 NapCat WebSocket
+        # 收发。这里不挂 CLI renderer，否则 EventBus 会同时打到终端和 QQ。
+        sys.stdout = sys.stderr
+        runner = AgentRunner(
+            use_mcp=use_mcp,
+            ctx_enabled=ctx_enabled,
+            attach_cli_renderer=False,
+            memory_system=memory_system,
+            communication_platform="qq",
+        )
+        from agent.qq import QQConfig, QQNapCatAdapter
+        adapter = QQNapCatAdapter(
+            session=runner.session,
+            event_bus=runner.event_bus,
+            config=QQConfig.from_env(),
+            session_factory=runner.get_or_create_platform_session,
+        )
+        # QQ 模式没有 gateway_ready 事件，因此这里像 CLI 一样主动触发 MCP 后台加载。
+        # 加载仍在 daemon 线程中进行，不会阻塞 NapCat WebSocket 服务启动。
+        runner.start_mcp_background_loading()
+        adapter.serve_forever()
         return
 
     runner = AgentRunner(use_mcp=use_mcp, ctx_enabled=ctx_enabled, memory_system=memory_system)

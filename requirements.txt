@@ -19,3 +19,4 @@ requests>=2.31
 colorama>=0.4.6
 pyyaml>=6.0
 bashlex>=0.18
+websockets>=13.0
