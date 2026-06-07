@@ -83,6 +83,14 @@ python -m pip install --upgrade pip
 
 macOS / Linux：
 
+检查你的python版本
+```bash
+python --version
+sudo apt update
+#假如是python3.10
+sudo apt install python3.10-venv -y
+```
+
 ```bash
 python3 -m venv ../venv
 source ../venv/bin/activate
@@ -412,14 +420,24 @@ NapCat 需要先安装并登录 QQ。去 [NapCatQQ Releases](https://github.com/
 在 NapCat WebUI 中打开“网络配置”，选择 **WebSocket 客户端**，让 NapCat 主动连接 cb-agent 提供的反向 WebSocket 服务。本地运行 cb-agent 和 NapCat 时，主机地址可以直接使用 `localhost` 或 `127.0.0.1`，地址填写为：
 
 ```text
-ws://127.0.0.1:6199/onebot/v11/ws
+ws://127.0.0.1:6199/ws
 ```
 
 也可以写成：
 
 ```text
-ws://localhost:6199/onebot/v11/ws
+ws://localhost:6199/ws
 ```
+
+注意:
+```text
+当napcat部署在docker时,则在webui界面上应该填使用宿主机内网 IP地址
+```
+```bash
+# Linux/macOS 获取内网 IP 的示例命令
+ip addr show | grep -E "inet " | grep -v 127.0.0.1
+```
+
 
 本地配置示例：
 
