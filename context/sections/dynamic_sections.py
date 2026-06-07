@@ -153,16 +153,22 @@ def session_guidance_section(
 ) -> Optional[SystemPromptSection]:
     """每个 session 在工具/技能集合上的指导文字。
 
-    示例: 当注册了 ``bash`` 工具时,提示 "Unix shell 语法,不要用 Windows
-    命令";当注册了 skill 时,列出 /skill 调用方式。
+    示例: 当前启用工具列表、当注册了 ``bash`` 工具时提示 "Unix shell
+    语法,不要用 Windows 命令";当注册了 skill 时,列出 /skill 调用方式。
+
+    注意: 工具集合会随启动模式(memory_system、MCP、QQ transport 等)变化,因此
+    这段刻意放在动态区,不要放回 static_sections,以免未来 provider prompt cache
+    的静态前缀因为工具列表变化而失效。
     """
-    if not enabled_tools and not skill_commands:
-        return None
     skills_key = ",".join(sorted(getattr(s, "name", str(s)) for s in skill_commands or []))
     name = f"session_guidance::{','.join(sorted(enabled_tools))}::{skills_key}"
 
     def compute() -> Optional[str]:
         bits: list[str] = []
+        if enabled_tools:
+            bits.append(f"- Available tools: {', '.join(sorted(enabled_tools))}.")
+        else:
+            bits.append("- Available tools: (no tools registered).")
         if "bash" in enabled_tools:
             bits.append(
                 "- The `bash` tool runs in a Unix-like shell even on Windows. Use forward "

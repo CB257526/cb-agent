@@ -2,8 +2,9 @@
 
 对应 claude-code/src/constants/prompts.ts:getSystemPrompt。
 
-组装顺序(严格对齐):
-    [intro, system, doing_tasks, actions, using_tools, output_efficiency,
+组装顺序:
+    [intro, user_cosplay, system, doing_tasks, actions, using_tools,
+     local_agent_guidance, output_efficiency,
      SYSTEM_PROMPT_DYNAMIC_BOUNDARY (条件),
      session_guidance, memory, current_time, env_info, language,
      mcp_instructions, token_budget]
@@ -32,9 +33,11 @@ from ..sections.static_sections import (
     get_actions_section,
     get_doing_tasks_section,
     get_intro_section,
+    get_local_agent_guidance_section,
     get_output_efficiency_section,
     get_system_section,
     get_using_your_tools_section,
+    get_user_cosplay_section,
 )
 from .boundary import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
 
@@ -65,10 +68,12 @@ async def get_system_prompt(
     """
     static_parts: list[str] = [
         get_intro_section(output_style),
+        get_user_cosplay_section(),
         get_system_section(),
         get_doing_tasks_section(),
         get_actions_section(),
         get_using_your_tools_section(enabled_tools),
+        get_local_agent_guidance_section(),
         get_output_efficiency_section(),
     ]
 

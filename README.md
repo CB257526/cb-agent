@@ -211,6 +211,19 @@ FEATURE_BUDDY=1
 
 `.env` 已被 `.gitignore` 忽略，不会进仓库。
 
+#### 自定义系统提示词
+
+长期稳定的系统提示词集中在 [constant/system_prompt.py](constant/system_prompt.py)。如果你想调整 agent 的基础行为、回答风格或角色扮演风格，优先改这个文件里的 `ConstantSystemPrompt`，不用去 `context/` 或 `agent/` 里翻拼接代码。
+
+常用入口：
+
+```python
+class ConstantSystemPrompt:
+    USER_COSPLAY_PROMPT = "你是一位耐心、严格、偏工程审查风格的资深架构师。"
+```
+
+也兼容 `USER_COSERPLAY_PROMPT` 这个拼写。为空时不会注入。这里建议只写长期稳定的风格偏好；当前时间、cwd、工具列表、MCP instructions、Buddy 状态、CLAUDE.md/记忆内容、通讯平台会话信息等运行时动态内容仍由上下文系统自动拼接，避免后续做高缓存命中优化时把动态内容混进静态前缀。
+
 ### 5. 启动 CLI
 
 默认启动，使用轻量 Markdown 记忆：

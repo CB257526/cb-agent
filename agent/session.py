@@ -450,9 +450,11 @@ class AgentSession:
         """按当前 history/state 构造本轮初始 LLM messages。
 
         重构后流程(对齐 Claude Code):
-        1. system_instructions 是 _build_system_instructions 返回的"项目自定义"段
-           (角色、bash prompt、Skill 概览),作为 user-appended 段加在新 system
-           prompt 末尾。
+        1. system_instructions 是 _build_system_instructions 返回的"运行时补充"段
+           (Bash 权限/通讯平台、Skill 概览、Buddy 状态),作为 user-appended
+           段加在新 system prompt 末尾。长期稳定的身份和行为规则已经集中在
+           constant.system_prompt.ConstantSystemPrompt,并由 context static sections
+           放在动态边界之前。
         2. get_system_prompt 异步组装完整 system prompt list[str](含 CLAUDE.md
            memory section、env_info、language 等)。
         3. build_system_prompt_blocks 切成带 cache scope 的 SystemPromptBlock。
@@ -1421,18 +1423,14 @@ class AgentSession:
         return "\n".join(lines) + "\n\n" + user_query
 
     def _build_system_instructions(self) -> str:
-        """组装 system prompt：角色 + 工具发现指引 + Bash prompt + Skill 概览。
+        """组装运行时 system prompt 补充段：Bash / Skill / Buddy。
 
-        不在 system prompt 里内联全部工具描述了（工具多时占用大量 token）。
-        模型应通过调用 list_tools 工具来动态获取可用能力列表。
+        固定身份、行为规则和用户 cosplay 风格已经放在
+        ``constant.system_prompt.ConstantSystemPrompt``。这里刻意只拼运行态内容，
+        这样未来启用 provider prompt cache 时，稳定前缀不会被 Bash 权限模式、
+        Skill 列表或 Buddy 状态这些易变信息破坏命中率。
         """
-        parts = [
-            "你是 cb-agent 的智能助手。",
-            "遇到复杂问题时请务必调用 todo 工具分解任务。",
-            "",
-            "调用工具时选最直接的那个，避免连续多轮无意义调用。",
-            "回答用中文，简明扼要。",
-        ]
+        parts: list[str] = []
 
         if self.bash_prompt_provider is not None:
             try:
