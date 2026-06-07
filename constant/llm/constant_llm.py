@@ -33,7 +33,15 @@ class ConstantLLM:
             "json_output": True,
             "max_tokens": 1000000,
             "image_ability": True,
+        },
+        "gemini-3.5-flash": {
+            "is_tool": True,
+            "is_reasoning": False,
+            "json_output": True,
+            "max_tokens": 1000000,
+            "image_ability": True,
         }
+
 
     }
 
