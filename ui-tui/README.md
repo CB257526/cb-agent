@@ -1,7 +1,7 @@
 # cb-agent TUI（Stage 5b）
 
 Claude Code 风格的终端 UI，用 [Ink](https://github.com/vadimdemedes/ink)（React for CLI）渲染。
-作为子进程 spawn `python run_agent.py --transport jsonrpc`，把 stdio JSON-RPC 事件流转成
+作为子进程 spawn `python/python3 run_agent.py --transport jsonrpc`，把 stdio JSON-RPC 事件流转成
 分区、可折叠工具块、底部输入框的 TUI。
 
 **这个目录跟 [`agent/`](../agent) 是物理隔离的**：Python 端不知道也不在乎 UI 的存在，UI 端只看
@@ -20,7 +20,7 @@ npm install
 npm start
 ```
 
-启动后会自动 spawn Python 后端（默认从 `../venv/python.exe` 找解释器）。
+启动后会自动 spawn Python 后端（默认从 `../venv/python.exe`、`../venv/Scripts/python.exe` 或 `../venv/bin/python` 找解释器）。
 
 如果要使用 Buddy 宠物，先在项目根目录 `.env` 开启：
 
@@ -102,12 +102,26 @@ transport.quit()                     // → session.quit
 
 1. 环境变量 `CB_AGENT_PYTHON`
 2. `../venv/python.exe`（Windows）/ `../venv/bin/python`（POSIX）/ `../venv/Scripts/python.exe`
-3. 系统 `python`
+3. Windows 兜底系统 `python`；Linux/macOS 兜底系统 `python3`
 
 ```bash
 # Linux/macOS 自定义示例
-CB_AGENT_PYTHON=/path/to/python npm start
+CB_AGENT_PYTHON=/path/to/cbAgent/venv/bin/python npm start
 ```
+
+Linux 服务器上建议显式设置 `CB_AGENT_PYTHON`，因为很多发行版只有 `python3` 命令，没有 `python` 命令。TUI 现在会在找不到虚拟环境时自动兜底 `python3`，但显式路径更容易排查部署问题。
+
+### Linux 剪贴板图片
+
+TUI 的 `/paste-image` 和 `Ctrl-V` 图片粘贴依赖桌面剪贴板工具：
+
+| 环境 | 依赖 | 不满足时 |
+|---|---|---|
+| Wayland | `wl-paste`（`wl-clipboard`） | 使用 `/attach <path>` |
+| X11 | `xclip` | 使用 `/attach <path>` |
+| SSH/headless | 通常没有系统剪贴板 | 使用 `/attach <path>` |
+
+如果只是服务器部署，不需要桌面环境；把图片上传到后端可读目录后，用 `/attach <path>` 是最稳定的入口。
 
 ### 危险权限模式
 

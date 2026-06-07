@@ -84,7 +84,7 @@ python -m pip install --upgrade pip
 macOS / Linux：
 
 ```bash
-python -m venv ../venv
+python3 -m venv ../venv
 source ../venv/bin/activate
 python -m pip install --upgrade pip
 ```
@@ -289,8 +289,10 @@ npm start
 macOS / Linux：
 
 ```bash
-CB_AGENT_PYTHON=/path/to/python npm start
+CB_AGENT_PYTHON=/path/to/cbAgent/venv/bin/python npm start
 ```
+
+如果没有显式配置 `CB_AGENT_PYTHON`，TUI 会先找项目父目录的 `../venv/bin/python`；仍找不到时，Linux/macOS 会兜底调用系统 `python3`。
 
 TUI 需要开启危险权限模式时，用环境变量透传给 Python 后端：
 
@@ -380,8 +382,16 @@ CBAGENT_PLATFORM_ATTACHMENT_DIR=.cbagent/platform_attachments/qq
 
 启动 cb-agent：
 
+Windows PowerShell：
+
 ```powershell
 ..\venv\python.exe run_agent.py --transport qq
+```
+
+Linux / macOS：
+
+```bash
+../venv/bin/python run_agent.py --transport qq
 ```
 
 NapCat 需要先安装并登录 QQ。去 [NapCatQQ Releases](https://github.com/NapNeko/NapCatQQ/releases) 下载最新版本，按 NapCat 自己的说明启动后进入 WebUI。
@@ -425,6 +435,8 @@ assets/stickers/
 ```
 
 QQ 模式会额外注册 `send_message_asset` 工具。模型可以通过它发送表情包、图片、音频、视频或任意本地普通文件。工具会校验路径、大小、hash；history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
+
+文件发送有一个部署层限制：当前 QQ 适配器会把本地文件路径直接交给 NapCat 的 OneBot action。也就是说，NapCat 必须能读取 cb-agent 传过去的那个路径。最稳的部署方式是 cb-agent 和 NapCat 同机运行；如果放在不同容器或不同机器，需要挂载同一个共享目录，或者后续改成“cb-agent 先暴露 HTTP 静态文件 URL，再让 NapCat 拉取”的模式。
 
 QQ 模式会按通讯会话隔离 `AgentSession`。每条 QQ 消息都会创建短生命周期 session 对象，工具系统、LLM、MCP 和 EventBus 仍在进程内共享，不会反复加载。私聊会根据 `ConversationKey(platform, kind, id)` 挂载独立本地会话目录，处理结束后追加落盘：
 
@@ -500,6 +512,110 @@ TUI 侧：
 cd ui-tui
 npm test
 npm run build
+```
+
+Linux 部署前也可以运行只读自检脚本，提前暴露 Python、Node/npx、MCP、`rg`、剪贴板、QQ/NapCat 配置缺口：
+
+```bash
+python3 scripts/check_linux_deploy.py
+```
+
+## Linux 部署
+
+核心 CLI/Agent 在 Linux 上可以直接运行；部署时主要要处理解释器路径、Node/npx、MCP、剪贴板桌面工具和 NapCat 文件路径这些外部依赖。
+
+### 推荐部署步骤
+
+```bash
+cd /opt/cbAgent/cb-agent
+python3 -m venv ../venv
+source ../venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+编辑 `.env`，至少填好 `LLM_MODEL_ID`、`LLM_API_KEY`、`LLM_BASE_URL`。如果要用 TUI，建议显式固定 Python 路径：
+
+```bash
+export CB_AGENT_PYTHON=/opt/cbAgent/venv/bin/python
+```
+
+启动 CLI：
+
+```bash
+../venv/bin/python run_agent.py
+```
+
+启动 TUI：
+
+```bash
+cd ui-tui
+npm install
+CB_AGENT_PYTHON=/opt/cbAgent/venv/bin/python npm start
+```
+
+启动 QQ / NapCat：
+
+```bash
+QQ_ENABLE=1 ../venv/bin/python run_agent.py --transport qq
+```
+
+NapCat 在同一台机器时，反向 WebSocket 客户端地址填：
+
+```text
+ws://127.0.0.1:6199/onebot/v11/ws
+```
+
+跨机器或 Docker 部署时，把 `QQ_HOST=0.0.0.0`，并强烈建议配置 `QQ_ACCESS_TOKEN`。如果 agent 需要发送本地文件或表情包，NapCat 还必须能访问同一份文件路径；容器场景建议把 `assets/stickers` 和需要发送的文件目录挂载为共享卷。
+
+### MCP 和 Playwright
+
+当前 [mcp.json](mcp.json) 里有多个 server 通过 `npx` 启动，所以 Linux 上需要安装 Node.js/npm，并保证 `npx` 在 PATH 中。Playwright MCP 首次使用浏览器能力时，通常还需要：
+
+```bash
+npx playwright install --with-deps
+```
+
+如果服务器暂时不需要 MCP，可以先用：
+
+```bash
+../venv/bin/python run_agent.py --no-mcp
+```
+
+### 剪贴板图片粘贴
+
+TUI 的 `/paste-image` 和 `Ctrl-V` 图片粘贴依赖桌面剪贴板：
+
+| 环境 | 依赖 | 说明 |
+|---|---|---|
+| Wayland | `wl-paste`（来自 `wl-clipboard`） | 有桌面会话时可用 |
+| X11 | `xclip` | 有桌面会话时可用 |
+| 纯 SSH / headless | 无稳定系统剪贴板 | 使用 `/attach <path>` |
+
+服务器上最稳的多模态输入方式是先把图片或音频放到后端可读路径，再在 TUI/CLI 里输入 `/attach <path>`。
+
+### systemd 示例
+
+下面示例只演示 QQ transport 常驻。请把路径、用户和环境变量文件改成你的实际部署值：
+
+```ini
+[Unit]
+Description=cb-agent QQ transport
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cbagent
+WorkingDirectory=/opt/cbAgent/cb-agent
+EnvironmentFile=/opt/cbAgent/cb-agent/.env
+ExecStart=/opt/cbAgent/venv/bin/python run_agent.py --transport qq
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ## 记忆系统
@@ -703,7 +819,9 @@ full 模式额外注册：
 | server | 说明 |
 |---|---|
 | `amap-maps` | 高德地图 MCP，需要 `AMAP_MAPS_API_KEY` |
-| `playwright` | Playwright MCP |
+| `playwright` | Playwright MCP，通过 `npx` 启动；Linux 首次使用浏览器能力时可能需要 `npx playwright install --with-deps` |
+| `tavily` | Tavily MCP，需要 `TAVILY_API_KEY` |
+| `github` | GitHub HTTP MCP，需要 `GITHUB_PAT`；如果不需要可从 `mcp.json` 中移除或启动时加 `--no-mcp` |
 
 启动时 `run_agent.py` 会读取 `mcp.json`，把每个 MCP server 的子工具展开注册。跳过 MCP 可用：
 

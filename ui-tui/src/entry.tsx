@@ -10,7 +10,7 @@
  * Python 路径解析优先级：
  *   1. CB_AGENT_PYTHON 环境变量
  *   2. ../venv/python.exe（Windows）或 ../venv/bin/python（POSIX）
- *   3. system "python"
+ *   3. POSIX 上兜底 system "python3"，Windows 上兜底 system "python"
  *
  * 故障 hint：
  *   - Python 端启动失败 → exit code 非 0 → App 显示 "进程退出"，stderr 全在
@@ -38,12 +38,14 @@ function resolvePython(projectRoot: string): string {
     join(projectRoot, "..", "venv", "Scripts", "python.exe"),       // Windows alt
     join(projectRoot, "..", "venv", "bin", "python"),               // POSIX
     join(projectRoot, "venv", "python.exe"),
+    join(projectRoot, "venv", "Scripts", "python.exe"),
     join(projectRoot, "venv", "bin", "python"),
   ];
   for (const p of candidates) {
     if (existsSync(p)) return p;
   }
-  return "python";
+  // 许多 Linux 发行版默认只提供 python3，不提供 python；Windows 则通常通过 python 启动器或安装目录暴露 python。
+  return process.platform === "win32" ? "python" : "python3";
 }
 
 function main() {

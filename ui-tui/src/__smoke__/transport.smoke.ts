@@ -26,9 +26,13 @@ function resolvePython(projectRoot: string): string {
     join(projectRoot, "..", "venv", "python.exe"),
     join(projectRoot, "..", "venv", "Scripts", "python.exe"),
     join(projectRoot, "..", "venv", "bin", "python"),
+    join(projectRoot, "venv", "python.exe"),
+    join(projectRoot, "venv", "Scripts", "python.exe"),
+    join(projectRoot, "venv", "bin", "python"),
   ];
   for (const p of candidates) if (existsSync(p)) return p;
-  return "python";
+  // Linux 服务器经常没有 python 命令，只提供 python3；这里和正式 TUI 入口保持一致。
+  return process.platform === "win32" ? "python" : "python3";
 }
 
 const projectRoot = resolve(__dirname, "..", "..", "..");
