@@ -11,7 +11,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.event_bus import EventBus
 from agent.events import (
@@ -192,6 +192,9 @@ class PlatformEventRenderer:
                 kind="status",
             )
             return
+        if isinstance(event, ToolStart):
+            self._emit_text(conversation, _format_tool_start(event), reason="tool_start", kind="status")
+            return
         if isinstance(event, ToolComplete) and event.name == "send_message_asset":
             self._on_asset_tool_complete(conversation, event)
             return
@@ -371,6 +374,69 @@ def _format_todo_items(items: List[Dict[str, str]]) -> str:
     if len(items) > 12:
         lines.append(f"... 还有 {len(items) - 12} 项")
     return "\n".join(lines)
+
+
+def _format_tool_start(event: ToolStart) -> str:
+    """把工具开始事件降级成 IM 中的一行状态消息。
+
+    QQ/微信没有 TUI 的工具卡片，所以每次工具开始时发一条短提示。参数只做预览：
+    既让用户知道 agent 正在干什么，又避免把超长文件内容或 token 泄露到群聊里。
+    """
+
+    if event.name == "bash":
+        command = str(event.arguments.get("command") or "").strip()
+        return f"（执行命令:{_clip_text(command or '<空命令>', 700)}）"
+    args = _format_tool_arguments(event.arguments)
+    return f"（调用工具:{event.name} {args}）"
+
+
+def _format_tool_arguments(arguments: Dict[str, Any]) -> str:
+    if not arguments:
+        return "{}"
+    safe = _sanitize_argument_value(arguments)
+    try:
+        text = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        text = str(safe)
+    return _clip_text(text, 900)
+
+
+def _sanitize_argument_value(value: Any, *, depth: int = 0, key: str = "") -> Any:
+    """生成适合发到通讯软件的参数预览。
+
+    这里只影响 QQ/微信里的状态提示，不改变实际工具入参。敏感键名脱敏，长字符串、
+    长列表和深层对象截断，避免 IM 消息泄露凭据或刷屏。
+    """
+
+    lowered_key = key.lower()
+    if any(token in lowered_key for token in ("key", "token", "secret", "password", "authorization", "cookie")):
+        return "<已脱敏>"
+    if depth >= 4:
+        return "<嵌套过深，已省略>"
+    if isinstance(value, dict):
+        items = list(value.items())
+        result: Dict[str, Any] = {}
+        for item_key, item_value in items[:12]:
+            text_key = str(item_key)
+            result[text_key] = _sanitize_argument_value(item_value, depth=depth + 1, key=text_key)
+        if len(items) > 12:
+            result["..."] = f"还有 {len(items) - 12} 项"
+        return result
+    if isinstance(value, list):
+        result = [_sanitize_argument_value(item, depth=depth + 1, key=key) for item in value[:8]]
+        if len(value) > 8:
+            result.append(f"... 还有 {len(value) - 8} 项")
+        return result
+    if isinstance(value, str):
+        return _clip_text(value, 220)
+    return value
+
+
+def _clip_text(text: str, limit: int) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"... [+{len(value) - limit} chars]"
 
 
 def _format_full_event(event: Event) -> str:

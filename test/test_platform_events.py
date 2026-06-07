@@ -56,11 +56,32 @@ class TestPlatformEventRenderer(unittest.TestCase):
         self.assertIn("后台任务 t1", texts[2])
         self.assertIn("写测试", texts[3])
 
-    def test_tool_events_are_silent_by_default(self) -> None:
-        self.bus.emit(ToolStart(call_id="c1", name="grep", arguments={}))
-        self.assertEqual(self.sent, [])
+    def test_tool_start_renders_by_default(self) -> None:
+        self.bus.emit(ToolStart(
+            call_id="c1",
+            name="grep",
+            arguments={"pattern": "TODO", "api_key": "secret-value"},
+        ))
 
-    def test_tool_events_render_when_full(self) -> None:
+        text = self.sent[-1].segments[0].text
+        self.assertIn("调用工具:grep", text)
+        self.assertIn("TODO", text)
+        self.assertNotIn("secret-value", text)
+        self.assertIn("<已脱敏>", text)
+
+    def test_bash_tool_start_renders_command(self) -> None:
+        self.bus.emit(ToolStart(
+            call_id="c1",
+            name="bash",
+            arguments={"command": "python -m pytest test/test_platform_events.py"},
+        ))
+
+        self.assertEqual(
+            self.sent[-1].segments[0].text,
+            "（执行命令:python -m pytest test/test_platform_events.py）",
+        )
+
+    def test_tool_complete_renders_when_full(self) -> None:
         self.renderer.close()
         self.sent.clear()
         self.renderer = PlatformEventRenderer(
@@ -70,8 +91,13 @@ class TestPlatformEventRenderer(unittest.TestCase):
         )
         self.renderer.begin_run(self.conversation)
 
-        self.bus.emit(ToolStart(call_id="c1", name="grep", arguments={}))
-        self.assertEqual(self.sent[0].segments[0].text, "开始调用工具：grep")
+        self.bus.emit(ToolComplete(
+            call_id="c1",
+            name="grep",
+            result="{}",
+            duration_seconds=0.2,
+        ))
+        self.assertEqual(self.sent[0].segments[0].text, "工具完成：grep，耗时 0.20s")
 
     def test_ask_user_question_supports_number_reply(self) -> None:
         registry = QuestionRegistry()

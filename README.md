@@ -208,7 +208,7 @@ FEATURE_BUDDY=1
 | `QQ_ALLOWED_GROUPS` | QQ 群白名单，逗号分隔群号；为空表示不限制群 |
 | `QQ_ALLOWED_USERS` | QQ 用户白名单，逗号分隔 QQ 号；为空表示不限制用户 |
 | `QQ_ACTION_TIMEOUT_SECONDS` | OneBot action 超时时间，影响发送消息和上传文件 |
-| `IM_EVENT_VERBOSITY` | 通讯软件事件输出等级：`normal` 默认只发关键事件，`full` 同步工具/round/token 等调试摘要 |
+| `IM_EVENT_VERBOSITY` | 通讯软件事件输出等级：`normal` 会发关键事件和工具开始提示，`full` 额外同步工具完成、round/token 等调试摘要 |
 | `IM_CONFIRM_QUESTION_ANSWER` | QQ 编号回答后是否发送“已选择”确认，默认 `1` |
 | `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；`send_message_asset(kind=sticker)` 会从这里查找图片 |
 | `CBAGENT_OUTBOUND_FILE_MAX_MB` | agent 发送本地文件到通讯软件的大小上限，默认 `50` MB |
@@ -389,8 +389,9 @@ QQ_ALLOWED_USERS=
 QQ_ACTION_TIMEOUT_SECONDS=30
 
 # 通讯软件事件输出等级:
-# normal = 只发最终回答、编号问题、todo、错误、后台提示和文件资源；
-# full   = 额外发送工具开始/结束、round、token、MCP/Buddy 状态等调试摘要。
+# normal = 发送最终回答、编号问题、todo、错误、后台提示、文件资源和工具开始提示；
+#          工具开始提示格式为“（调用工具:工具名 参数）”，bash 为“（执行命令:命令）”。
+# full   = 额外发送工具完成、round、token、MCP/Buddy 状态等调试摘要。
 IM_EVENT_VERBOSITY=normal
 
 # 用户回复编号后是否发“已选择: xxx”确认。0 表示静默确认。
@@ -483,7 +484,8 @@ ip addr show | grep -E "inet " | grep -v 127.0.0.1
 | `ask_user_question` | 渲染为编号问题，用户回复 `1`、`1,3`、`其他: ...` 或 `取消`；群聊中只有发起请求的用户可以确认 |
 | `todo` | 渲染为简洁任务列表 |
 | `Error` / `Cancelled` | 发送简短状态提示 |
-| 工具开始/结束 | 默认不发；`IM_EVENT_VERBOSITY=full` 时发送摘要 |
+| 工具开始 | 默认发送短提示：普通工具为 `（调用工具:工具名 参数）`，bash 为 `（执行命令:命令）`；参数会脱敏和截断 |
+| 工具结束 | 默认不发；`IM_EVENT_VERBOSITY=full` 时发送耗时等调试摘要 |
 
 表情包放在：
 
