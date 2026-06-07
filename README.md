@@ -444,6 +444,40 @@ Linux / macOS：
 
 NapCat 需要先安装并登录 QQ。去 [NapCatQQ Releases](https://github.com/NapNeko/NapCatQQ/releases) 下载最新版本，按 NapCat 自己的说明启动后进入 WebUI。
 
+Linux 服务器上也可以用 NapCat 安装脚本快速创建 Docker 部署：
+
+```bash
+# napcat Linux 一键配置。把 your_qq 改成实际 QQ 号。
+curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh && sudo bash napcat.sh --docker y --qq your_qq --mode ws --proxy 1 --confirm
+```
+
+如果 agent 需要给 QQ 发送本地文件，建议删除安装脚本创建的旧 NapCat 容器，只保留镜像，然后手动重新创建容器并加上共享目录挂载。下面示例把宿主机 `/root/CBAGENT/cb-agent/outbound` 挂载到容器内 `/app/cb-agent-outbound`，对应 `QQ_FILE_DELIVERY_MODE=mapped_path`：
+
+```bash
+docker run -d \
+  -e NAPCAT_GID=$(id -g) \
+  -e NAPCAT_UID=$(id -u) \
+  -e ACCOUNT=your_qq \
+  -e WS_ENABLE=true \
+  -p 3001:3001 \
+  -p 6099:6099 \
+  -v ./QQ:/app/.config/QQ \
+  -v ./config:/app/napcat/config \
+  -v ./plugins:/app/napcat/plugins \
+  -v /root/CBAGENT/cb-agent/outbound:/app/cb-agent-outbound:ro \
+  --name napcat \
+  --restart=always \
+  mlikiowa/napcat-docker:latest
+```
+
+cb-agent 侧配套填写：
+
+```env
+QQ_FILE_DELIVERY_MODE=mapped_path
+QQ_FILE_HOST_PREFIX=/root/CBAGENT/cb-agent/outbound
+QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
+```
+
 在 NapCat WebUI 中打开“网络配置”，选择 **WebSocket 客户端**，让 NapCat 主动连接 cb-agent 提供的反向 WebSocket 服务。本地运行 cb-agent 和 NapCat 时，主机地址可以直接使用 `localhost` 或 `127.0.0.1`，地址填写为：
 
 ```text
