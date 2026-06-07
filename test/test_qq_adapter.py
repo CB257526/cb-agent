@@ -541,8 +541,19 @@ class TestQQFileDeliveryManager(unittest.TestCase):
                 self.question_registry = QuestionRegistry()
                 self.calls = []
 
-            async def chat_async(self, text, cancel_token=None, attachments=None):  # noqa: ANN001
-                self.calls.append((text, attachments, get_current_platform_conversation()))
+            async def chat_async(  # noqa: ANN001
+                self,
+                text,
+                cancel_token=None,
+                attachments=None,
+                persistent_user_text=None,
+            ):
+                self.calls.append((
+                    text,
+                    attachments,
+                    get_current_platform_conversation(),
+                    persistent_user_text,
+                ))
                 await asyncio.sleep(0.01)
                 return self.name
 
@@ -577,6 +588,8 @@ class TestQQFileDeliveryManager(unittest.TestCase):
         self.assertIsNot(sessions[conv_a.stable_id], sessions[conv_b.stable_id])
         self.assertEqual(sessions[conv_a.stable_id].calls[0][2], conv_a)
         self.assertEqual(sessions[conv_b.stable_id].calls[0][2], conv_b)
+        self.assertEqual(sessions[conv_a.stable_id].calls[0][3], "来自 A")
+        self.assertEqual(sessions[conv_b.stable_id].calls[0][3], "来自 B")
 
     def test_private_conversation_refreshes_session_object_every_message(self) -> None:
         """私聊每条消息都创建新的 AgentSession 对象，由对象构造时从磁盘恢复上下文。"""
@@ -588,8 +601,14 @@ class TestQQFileDeliveryManager(unittest.TestCase):
                 self.question_registry = QuestionRegistry()
                 self.calls = []
 
-            async def chat_async(self, text, cancel_token=None, attachments=None):  # noqa: ANN001
-                self.calls.append(text)
+            async def chat_async(  # noqa: ANN001
+                self,
+                text,
+                cancel_token=None,
+                attachments=None,
+                persistent_user_text=None,
+            ):
+                self.calls.append((text, persistent_user_text))
                 return self.name
 
         main = DummySession("main")
@@ -621,8 +640,10 @@ class TestQQFileDeliveryManager(unittest.TestCase):
         self.assertIsNot(created[0], created[1])
         self.assertEqual(len(created[0].calls), 1)
         self.assertEqual(len(created[1].calls), 1)
-        self.assertIn("第一条", created[0].calls[0])
-        self.assertIn("第二条", created[1].calls[0])
+        self.assertIn("第一条", created[0].calls[0][0])
+        self.assertEqual(created[0].calls[0][1], "第一条")
+        self.assertIn("第二条", created[1].calls[0][0])
+        self.assertEqual(created[1].calls[0][1], "第二条")
 
     def test_group_conversation_uses_ephemeral_session_every_message(self) -> None:
         """群聊消息量大，默认每条消息使用临时 AgentSession，不在适配器里缓存。"""
@@ -634,8 +655,14 @@ class TestQQFileDeliveryManager(unittest.TestCase):
                 self.question_registry = QuestionRegistry()
                 self.calls = []
 
-            async def chat_async(self, text, cancel_token=None, attachments=None):  # noqa: ANN001
-                self.calls.append(text)
+            async def chat_async(  # noqa: ANN001
+                self,
+                text,
+                cancel_token=None,
+                attachments=None,
+                persistent_user_text=None,
+            ):
+                self.calls.append((text, persistent_user_text))
                 return self.name
 
         main = DummySession("main")
@@ -667,8 +694,10 @@ class TestQQFileDeliveryManager(unittest.TestCase):
         self.assertIsNot(created[0], created[1])
         self.assertEqual(len(created[0].calls), 1)
         self.assertEqual(len(created[1].calls), 1)
-        self.assertIn("第一条", created[0].calls[0])
-        self.assertIn("第二条", created[1].calls[0])
+        self.assertIn("第一条", created[0].calls[0][0])
+        self.assertEqual(created[0].calls[0][1], "第一条")
+        self.assertIn("第二条", created[1].calls[0][0])
+        self.assertEqual(created[1].calls[0][1], "第二条")
 
     def test_same_conversation_messages_are_queued_in_order(self) -> None:
         """同一 QQ 会话内消息排队处理，不再因为上一条未完成而直接拒绝。"""
@@ -679,7 +708,13 @@ class TestQQFileDeliveryManager(unittest.TestCase):
                 self.question_registry = QuestionRegistry()
                 self.calls = []
 
-            async def chat_async(self, text, cancel_token=None, attachments=None):  # noqa: ANN001
+            async def chat_async(  # noqa: ANN001
+                self,
+                text,
+                cancel_token=None,
+                attachments=None,
+                persistent_user_text=None,
+            ):
                 self.calls.append(text)
                 await asyncio.sleep(0.05)
                 return "ok"

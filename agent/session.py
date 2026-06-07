@@ -395,6 +395,7 @@ class AgentSession:
         user_query: str,
         cancel_token: Optional[CancelToken] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        persistent_user_text: Optional[str] = None,
     ) -> str:
         """处理一次用户输入，返回最终答案字符串。
 
@@ -417,7 +418,12 @@ class AgentSession:
         # ToolExecutor 的并发分支会 copy_context 给 worker 用同一份 ContextVar
         ctx_token = set_current_cancel_token(token)
         try:
-            return self._chat_impl(user_query, token, attachments=attachments)
+            return self._chat_impl(
+                user_query,
+                token,
+                attachments=attachments,
+                persistent_user_text=persistent_user_text,
+            )
         finally:
             reset_current_cancel_token(ctx_token)
             self.current_cancel_token = None
@@ -427,6 +433,7 @@ class AgentSession:
         user_query: str,
         cancel_token: Optional[CancelToken] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        persistent_user_text: Optional[str] = None,
     ) -> str:
         """chat() 的 asyncio 包装。
 
@@ -439,7 +446,13 @@ class AgentSession:
           - **不要**对返回的 task 调 task.cancel()——asyncio 只会让 await
             点抛 CancelledError，下面那个线程仍在跑（线程池不可中断）。
         """
-        return await asyncio.to_thread(self.chat, user_query, cancel_token, attachments)
+        return await asyncio.to_thread(
+            self.chat,
+            user_query,
+            cancel_token=cancel_token,
+            attachments=attachments,
+            persistent_user_text=persistent_user_text,
+        )
 
     def _build_chat_messages(
         self,
@@ -555,14 +568,21 @@ class AgentSession:
         user_query: str,
         token: CancelToken,
         attachments: Optional[List[Dict[str, Any]]] = None,
+        persistent_user_text: Optional[str] = None,
     ) -> str:
         chat_started = time.perf_counter()
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
         user_query = self._prepend_background_notifications(user_query)
+        history_source_text = (
+            str(persistent_user_text).strip()
+            if persistent_user_text is not None
+            else user_query
+        )
         multimodal_prompt = process_multimodal_prompt(
             text=user_query,
             attachments=attachments,
             model=getattr(self.llm, "model", None),
+            history_text=history_source_text,
         )
         request_content = multimodal_prompt.request_content
         history_user_text = multimodal_prompt.history_text

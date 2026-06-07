@@ -188,6 +188,7 @@ class QQNapCatAdapter:
                 inbound.prompt_text(),
                 cancel_token=token,
                 attachments=inbound.prompt_attachments(),
+                persistent_user_text=inbound.persistent_text(),
             )
         except Exception as exc:
             logger.exception("QQ agent run failed")

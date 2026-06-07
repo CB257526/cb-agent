@@ -79,14 +79,20 @@ def process_multimodal_prompt(
     model: Optional[str] = None,
     cwd: Optional[Path] = None,
     processor: Optional[MultimodalProcessor] = None,
+    history_text: Optional[str] = None,
 ) -> ProcessedMultimodalPrompt:
     """把用户文本和附件转换成“请求内容 + 跨轮摘要”。
 
     ``request_content`` 供本轮 OpenAI messages 使用；``history_text`` 供 history、
     transcript、compact 和 context_window_usage 使用。二者分开可以避免 data URI
     被长期保存或参与动态上下文估算。
+
+    ``history_text`` 参数用于通讯软件这类入口：当前轮请求需要带上平台来源头部，
+    方便模型知道消息来自 QQ/微信群；但长期会话恢复只应保留用户真正说的话。
+    这里让调用方传入“干净落盘文本”，附件仍只处理一次，避免重复 OCR/ASR。
     """
     clean_text = str(text or "").strip()
+    clean_history_text = str(history_text if history_text is not None else clean_text).strip()
     raw_attachments = list(attachments or [])
     if not clean_text and not raw_attachments:
         raise MultimodalInputError("请输入文本或至少添加一个附件。")
@@ -94,7 +100,7 @@ def process_multimodal_prompt(
     if not raw_attachments:
         return ProcessedMultimodalPrompt(
             request_content=clean_text,
-            history_text=clean_text,
+            history_text=clean_history_text,
             attachments=[],
         )
 
@@ -107,7 +113,8 @@ def process_multimodal_prompt(
 
     if clean_text:
         request_parts.append({"type": "text", "text": clean_text})
-        history_lines.append(clean_text)
+    if clean_history_text:
+        history_lines.append(clean_history_text)
 
     attachment_notes: List[str] = []
     for idx, item in enumerate(raw_attachments, start=1):
@@ -131,6 +138,7 @@ def process_multimodal_prompt(
 
     if not clean_text:
         request_parts.insert(0, {"type": "text", "text": "请根据以下附件回答用户问题。"})
+    if not clean_history_text:
         history_lines.insert(0, "请根据以下附件回答用户问题。")
 
     return ProcessedMultimodalPrompt(

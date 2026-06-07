@@ -364,7 +364,10 @@ class AgentRunner:
 
         session_store: LocalSessionStore | None = None
         if conversation.kind == "private":
-            session_store = LocalSessionStore(self._platform_session_store_root(conversation))
+            session_store = LocalSessionStore(
+                self._platform_session_store_root(conversation),
+                persist_trace_entries=False,
+            )
         session = self._create_agent_session(
             session_store=session_store,
             message_logger_scope=f"{conversation.platform}-{conversation.kind}-{conversation.id}",

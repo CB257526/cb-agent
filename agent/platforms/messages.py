@@ -93,6 +93,25 @@ class InboundMessage:
                 parts.append(f"[附件提示] {item.modality}: {desc}")
         return "\n".join(p for p in parts if p).strip()
 
+    def persistent_text(self) -> str:
+        """生成适合长期保存的用户文本。
+
+        通讯平台头部只服务“当前轮模型知道消息来源”，不应该反复落入私聊长期
+        history。这里保留用户原话、引用 ID 和未能下载的附件提示；已下载附件会由
+        多模态层追加安全摘要，不需要在这里重复路径和平台元信息。
+        """
+
+        parts = [self.text.strip()]
+        if self.reply_to_message_id:
+            parts.append(f"[引用消息] message_id={self.reply_to_message_id}")
+        for item in self.attachments:
+            if item.path:
+                continue
+            desc = item.description or item.url
+            if desc:
+                parts.append(f"[附件提示] {item.modality}: {desc}")
+        return "\n".join(p for p in parts if p).strip()
+
     def prompt_attachments(self) -> List[Dict[str, Any]]:
         return [
             payload

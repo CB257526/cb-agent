@@ -93,6 +93,65 @@ class TestWorkContext(unittest.TestCase):
             self.assertFalse((root / "index.json").exists())
             self.assertFalse(transcript.exists())
 
+    def test_local_session_store_can_skip_trace_entries_for_platform_chat(self):
+        """通讯平台私聊保留压缩工作记录，但不落完整工具明细。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root, persist_trace_entries=False)
+            entry = trace_entry_from_tool_result(
+                name="bash",
+                arguments={"command": "echo should-not-persist"},
+                result=json.dumps({
+                    "command": "echo should-not-persist",
+                    "exit_code": 0,
+                    "stdout": "工具输出不该进入 QQ 私聊长期上下文",
+                }, ensure_ascii=False),
+                is_error=False,
+                round_idx=1,
+            )
+            record = RuleTraceSummarizer().summarize(
+                user_query="干净用户原话",
+                final_answer="干净最终回复",
+                trace_entries=[entry],
+            )
+
+            store.append_turn(
+                user_query="干净用户原话",
+                final_answer="干净最终回复",
+                work_record=record,
+            )
+
+            transcript = store.active_dir / "transcript.jsonl"
+            raw = transcript.read_text(encoding="utf-8")
+            payload = json.loads(raw.splitlines()[0])
+            self.assertEqual(payload["user_query"], "干净用户原话")
+            self.assertEqual(payload["final_answer"], "干净最终回复")
+            self.assertIn("【工作记录】", payload["work_record"])
+            self.assertEqual(payload["trace_entries"], [])
+            self.assertIn("【工作记录】", store.state_text())
+
+            # 兼容旧版本已经写入的 trace_entries：恢复时仍只使用压缩 work_record，
+            # 不把逐工具明细还原成 OpenAI tool 协议或普通上下文。
+            old_item = {
+                "ts": "2026-06-07T00:00:00+00:00",
+                "user_query": "旧用户问题",
+                "final_answer": "旧助手回答",
+                "work_record": "【工作记录】调用工具：fetch_fetch 旧工具流水账",
+                "trace_entries": [entry.to_dict()],
+            }
+            with transcript.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(old_item, ensure_ascii=False) + "\n")
+
+            restored = LocalSessionStore(root, persist_trace_entries=False)
+            history = restored.load_latest_history(max_messages=10)
+            restored_text = "\n".join(str(m.content) for m in history)
+            self.assertIn("干净用户原话", restored_text)
+            self.assertIn("干净最终回复", restored_text)
+            self.assertIn("旧用户问题", restored_text)
+            self.assertIn("旧助手回答", restored_text)
+            self.assertIn("【工作记录】", restored_text)
+            self.assertIn("fetch_fetch", restored_text)
+
     def test_pending_user_message_restores_and_is_cleared_after_turn(self):
         """收到用户消息后先落 pending；完整回合落盘后再清理，避免重复历史。"""
         with tempfile.TemporaryDirectory() as td:

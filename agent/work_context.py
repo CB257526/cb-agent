@@ -738,11 +738,19 @@ class LocalSessionStore:
     Store 被 AgentSession 以依赖注入方式使用；单测不传 store 时完全不落盘。
     """
 
-    def __init__(self, root: Optional[Path | str] = None) -> None:
+    def __init__(
+        self,
+        root: Optional[Path | str] = None,
+        *,
+        persist_trace_entries: bool = True,
+    ) -> None:
         self.root = Path(root or Path.cwd() / ".cbagent" / "sessions")
         self.index_path = self.root / "index.json"
         self.active_session_id: Optional[str] = None
         self.state: Dict[str, Any] = {}
+        # work_record 是已经压缩过的跨轮工作事实，应该继续落盘和恢复；trace_entries
+        # 是逐工具明细，QQ/微信这类通讯平台可关闭它，避免 transcript 长期膨胀。
+        self.persist_trace_entries = bool(persist_trace_entries)
         self._load_or_create()
 
     @property
@@ -1104,7 +1112,7 @@ class LocalSessionStore:
             "work_record": work_record.text if work_record else "",
             "trace_entries": (
                 [e.to_dict() for e in work_record.trace_entries]
-                if work_record else []
+                if work_record and self.persist_trace_entries else []
             ),
         }
         with (self.active_dir / "transcript.jsonl").open("a", encoding="utf-8") as f:
