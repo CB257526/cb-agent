@@ -26,6 +26,10 @@
       "headers": {
         "Authorization": "Bearer ${GITHUB_PAT}"
       }
+    },
+    "fetch": {
+      "command": "python",
+      "args": ["-m", "mcp_server_fetch"]
     }
   }
 }
