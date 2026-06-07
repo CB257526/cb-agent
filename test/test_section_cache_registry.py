@@ -15,11 +15,12 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import pytest
-
+import context.sections.dynamic_sections as dynamic_sections
 from context.sections.cache import (
     SystemPromptSectionCache,
     _MISSING,
@@ -126,8 +127,11 @@ def test_dangerous_uncached_recomputes_each_time():
 
 
 def test_dangerous_uncached_requires_reason():
-    with pytest.raises(ValueError):
+    try:
         DANGEROUS_uncached_system_prompt_section("x", lambda: "y", reason="")
+    except ValueError:
+        return
+    raise AssertionError("empty reason should raise ValueError")
 
 
 def test_resolve_supports_async_compute():
@@ -148,3 +152,34 @@ def test_global_cache_singleton_clear():
     assert g.get("x") == "y"
     clear_system_prompt_sections()
     assert g.get("x") is _MISSING
+
+
+class TestCurrentTimeSection(unittest.TestCase):
+    def test_current_time_section_recomputes_each_time(self):
+        """当前时间必须每轮重算，避免 system prompt 长时间停留在旧日期。"""
+        from datetime import datetime as real_datetime
+        from datetime import timezone as real_timezone
+
+        class FakeDatetime(real_datetime):
+            calls = 0
+
+            @classmethod
+            def now(cls, tz=None):
+                cls.calls += 1
+                value = real_datetime(2026, 6, 7, 12, 0, cls.calls, tzinfo=real_timezone.utc)
+                if tz is None:
+                    return value
+                return value.astimezone(tz)
+
+        with patch.object(dynamic_sections, "datetime", FakeDatetime):
+            cache = SystemPromptSectionCache(max_entries=10)
+            section = dynamic_sections.current_time_section()
+            out1 = asyncio.run(resolve_system_prompt_sections([section], cache))
+            out2 = asyncio.run(resolve_system_prompt_sections([section], cache))
+
+        self.assertEqual(len(out1), 1)
+        self.assertEqual(len(out2), 1)
+        self.assertIn("# Current time", out1[0])
+        self.assertIn("Current local date: 2026-06-07", out1[0])
+        self.assertNotEqual(out1, out2)
+        self.assertIs(cache.get("current_time"), _MISSING)

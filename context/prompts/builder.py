@@ -5,7 +5,7 @@
 组装顺序(严格对齐):
     [intro, system, doing_tasks, actions, using_tools, output_efficiency,
      SYSTEM_PROMPT_DYNAMIC_BOUNDARY (条件),
-     session_guidance, memory, env_info, language,
+     session_guidance, memory, current_time, env_info, language,
      mcp_instructions, token_budget]
 
 返回 list[str](不预先 join 成单 string),下游 cache split 需要分段视图。
@@ -19,6 +19,7 @@ from typing import Any, Optional, Sequence
 from ..cache.scope import should_use_global_cache_scope
 from ..sections.cache import get_system_prompt_section_cache
 from ..sections.dynamic_sections import (
+    current_time_section,
     env_info_section,
     language_section,
     mcp_instructions_section,
@@ -79,6 +80,7 @@ async def get_system_prompt(
         dynamic_section_objs.append(sg)
     if memory_loader is not None:
         dynamic_section_objs.append(memory_section(memory_loader))
+    dynamic_section_objs.append(current_time_section())
     dynamic_section_objs.append(
         env_info_section(
             model=model,

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -66,6 +67,39 @@ def env_info_section(
         )
 
     return system_prompt_section(name, compute)
+
+
+def current_time_section() -> SystemPromptSection:
+    """当前时间元信息段。
+
+    这一段必须每轮重算，不能塞进 ``env_info_section``。env_info 会按 model/cwd
+    缓存，如果把时间放进去，模型看到的“今天”就可能停留在第一次组装 prompt 的
+    时间点，进而在联网搜索或判断 latest/today 时继续使用过期年份。
+    """
+
+    def compute() -> str:
+        local_now = datetime.now().astimezone()
+        utc_now = datetime.now(timezone.utc)
+        offset = local_now.strftime("%z")
+        if len(offset) == 5:
+            offset = f"{offset[:3]}:{offset[3:]}"
+
+        return (
+            "# Current time\n"
+            f"- Current local datetime: {local_now.isoformat(timespec='seconds')}\n"
+            f"- Current local date: {local_now.date().isoformat()}\n"
+            f"- Current UTC datetime: {utc_now.isoformat(timespec='seconds')}\n"
+            f"- Local UTC offset: {offset or 'unknown'}\n"
+            "- Treat relative dates like today, yesterday, tomorrow, now, latest, and most recent "
+            "as relative to this timestamp. For time-sensitive facts, verify current information "
+            "instead of relying on stale training data."
+        )
+
+    return DANGEROUS_uncached_system_prompt_section(
+        "current_time",
+        compute,
+        reason="The current timestamp changes every turn and stale cached time causes models to reason from old dates.",
+    )
 
 
 def language_section(language: Optional[str]) -> Optional[SystemPromptSection]:
@@ -177,6 +211,7 @@ def token_budget_section(*, budget_directive: Optional[str] = None) -> Optional[
 
 __all__ = [
     "memory_section",
+    "current_time_section",
     "env_info_section",
     "language_section",
     "mcp_instructions_section",

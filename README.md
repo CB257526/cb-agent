@@ -369,11 +369,25 @@ CBAGENT_PLATFORM_ATTACHMENT_DIR=.cbagent/platform_attachments/qq
 ..\venv\python.exe run_agent.py --transport qq
 ```
 
-NapCat 侧配置反向 WebSocket：
+NapCat 需要先安装并登录 QQ。去 [NapCatQQ Releases](https://github.com/NapNeko/NapCatQQ/releases) 下载最新版本，按 NapCat 自己的说明启动后进入 WebUI。
+
+在 NapCat WebUI 中打开“网络配置”，选择 **WebSocket 客户端**，让 NapCat 主动连接 cb-agent 提供的反向 WebSocket 服务。本地运行 cb-agent 和 NapCat 时，主机地址可以直接使用 `localhost` 或 `127.0.0.1`，地址填写为：
 
 ```text
 ws://127.0.0.1:6199/onebot/v11/ws
 ```
+
+也可以写成：
+
+```text
+ws://localhost:6199/onebot/v11/ws
+```
+
+本地配置示例：
+
+![NapCat WebSocket 客户端配置示例 1](img/napcat配置1.png)
+
+![NapCat WebSocket 客户端配置示例 2](img/napcat配置2.png)
 
 如果设置了 `QQ_ACCESS_TOKEN`，NapCat 侧也要填写相同 token。适配器支持 `Authorization: Bearer <token>`、`Authorization: <token>`，以及 URL 查询参数 `access_token=<token>`。
 
