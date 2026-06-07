@@ -492,7 +492,7 @@ ws://localhost:6199/ws
 
 注意:
 ```text
-当napcat部署在docker时,则在webui界面上应该填使用宿主机内网 IP地址
+当napcat部署在docker时,则在webui界面上应该填使用宿主机内网 IP地址比如ws://172.17.0.1:6299/ws
 ```
 ```bash
 # Linux/macOS 获取内网 IP 的示例命令
