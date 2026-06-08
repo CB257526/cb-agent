@@ -16,6 +16,8 @@ from agent.events import (
     BackgroundNotification,
     Done,
     Error,
+    ReasoningDelta,
+    RoundEnd,
     TodoListUpdated,
     ToolComplete,
     ToolStart,
@@ -98,6 +100,74 @@ class TestPlatformEventRenderer(unittest.TestCase):
             duration_seconds=0.2,
         ))
         self.assertEqual(self.sent[0].segments[0].text, "工具完成：grep，耗时 0.20s")
+
+    def test_reasoning_delta_is_hidden_by_default(self) -> None:
+        self.bus.emit(ReasoningDelta(delta="先想一下", accumulated="先想一下", round_idx=1))
+        self.bus.emit(RoundEnd(round_idx=1, has_tool_calls=False, final=True))
+
+        self.assertEqual(self.sent, [])
+
+    def test_reasoning_delta_renders_when_enabled_on_round_end(self) -> None:
+        self.renderer.close()
+        self.sent.clear()
+        self.renderer = PlatformEventRenderer(
+            event_bus=self.bus,
+            send=self.sent.append,
+            verbosity="normal",
+            show_reasoning=True,
+        )
+        self.renderer.begin_run(self.conversation)
+
+        self.bus.emit(ReasoningDelta(delta="先分析问题。", accumulated="先分析问题。", round_idx=1))
+        self.bus.emit(ReasoningDelta(delta="再调用工具。", accumulated="先分析问题。再调用工具。", round_idx=1))
+        self.bus.emit(RoundEnd(round_idx=1, has_tool_calls=False, final=True))
+
+        self.assertEqual(len(self.sent), 1)
+        text = self.sent[0].segments[0].text
+        self.assertIn("【思考｜第 1 轮】", text)
+        self.assertIn("先分析问题。再调用工具。", text)
+
+    def test_reasoning_delta_flushes_before_tool_start(self) -> None:
+        self.renderer.close()
+        self.sent.clear()
+        self.renderer = PlatformEventRenderer(
+            event_bus=self.bus,
+            send=self.sent.append,
+            verbosity="normal",
+            show_reasoning=True,
+        )
+        self.renderer.begin_run(self.conversation)
+
+        self.bus.emit(ReasoningDelta(delta="需要先搜索。", accumulated="需要先搜索。", round_idx=2))
+        self.bus.emit(ToolStart(call_id="c1", name="grep", arguments={"pattern": "TODO"}, round_idx=2))
+
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("需要先搜索。", self.sent[0].segments[0].text)
+        self.assertIn("调用工具:grep", self.sent[1].segments[0].text)
+
+    def test_reasoning_delta_respects_max_chars(self) -> None:
+        self.renderer.close()
+        self.sent.clear()
+        with patch.dict("os.environ", {
+            "IM_REASONING_MAX_CHARS": "10",
+            "IM_REASONING_CHUNK_CHARS": "200",
+        }):
+            self.renderer = PlatformEventRenderer(
+                event_bus=self.bus,
+                send=self.sent.append,
+                verbosity="normal",
+                show_reasoning=True,
+            )
+        self.renderer.begin_run(self.conversation)
+
+        self.bus.emit(ReasoningDelta(delta="1234567890abcdef", accumulated="1234567890abcdef", round_idx=1))
+        self.bus.emit(RoundEnd(round_idx=1, has_tool_calls=False, final=True))
+
+        self.assertEqual(len(self.sent), 1)
+        text = self.sent[0].segments[0].text
+        self.assertIn("1234567890", text)
+        self.assertIn("后续已省略", text)
+        self.assertNotIn("abcdef", text)
 
     def test_ask_user_question_supports_number_reply(self) -> None:
         registry = QuestionRegistry()

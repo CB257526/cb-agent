@@ -11,7 +11,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from agent.event_bus import EventBus
 from agent.events import (
@@ -66,6 +66,7 @@ class PlatformEventRenderer:
         send: Callable[[OutboundMessage], None],
         verbosity: Optional[str] = None,
         confirm_question_answer: Optional[bool] = None,
+        show_reasoning: Optional[bool] = None,
     ) -> None:
         self._bus = event_bus
         self._send = send
@@ -75,11 +76,21 @@ class PlatformEventRenderer:
             if confirm_question_answer is None
             else bool(confirm_question_answer)
         )
+        self._show_reasoning = (
+            _env_bool("IM_SHOW_REASONING", default=False)
+            if show_reasoning is None
+            else bool(show_reasoning)
+        )
+        self._reasoning_chunk_chars = _env_int("IM_REASONING_CHUNK_CHARS", default=1200, minimum=200)
+        self._reasoning_max_chars = _env_int("IM_REASONING_MAX_CHARS", default=8000, minimum=0)
         self._lock = threading.RLock()
         self._active_conversation: Optional[ConversationKey] = None
         self._active_sender_id: Optional[str] = None
         self._pending_by_conversation: Dict[str, PendingPlatformQuestion] = {}
         self._pending_by_question: Dict[str, PendingPlatformQuestion] = {}
+        self._reasoning_buffers: Dict[str, str] = {}
+        self._reasoning_sent_chars: Dict[str, int] = {}
+        self._reasoning_omitted: Set[str] = set()
         self._subscription = self._bus.subscribe(self._on_event)
 
     def close(self) -> None:
@@ -157,7 +168,10 @@ class PlatformEventRenderer:
     # ---------- EventBus 回调 ----------
 
     def _on_event(self, event: Event) -> None:
-        if isinstance(event, (TextDelta, ReasoningDelta)):
+        if isinstance(event, TextDelta):
+            return
+        if isinstance(event, ReasoningDelta):
+            self._on_reasoning_delta(event)
             return
 
         if isinstance(event, AskUserQuestion):
@@ -172,16 +186,26 @@ class PlatformEventRenderer:
             return
 
         if isinstance(event, Done):
+            self._flush_all_reasoning(conversation, finish=True)
             if event.final_answer:
                 self._emit_text(conversation, event.final_answer, reason="done")
+            return
+        if isinstance(event, RoundEnd):
+            self._flush_reasoning_for_round(conversation, event.round_idx, finish=True)
+            if self._verbosity == "full":
+                text = _format_full_event(event)
+                if text:
+                    self._emit_text(conversation, text, reason="event_full", kind="status")
             return
         if isinstance(event, TodoListUpdated):
             self._emit_text(conversation, _format_todo_items(event.items), reason="todo", kind="todo")
             return
         if isinstance(event, Error):
+            self._flush_all_reasoning(conversation, finish=True)
             self._emit_text(conversation, f"发生错误：{event.message}", reason="error", kind="status")
             return
         if isinstance(event, Cancelled):
+            self._flush_all_reasoning(conversation, finish=True)
             self._emit_text(conversation, "当前回复已取消。", reason="cancelled", kind="status")
             return
         if isinstance(event, BackgroundNotification):
@@ -193,6 +217,7 @@ class PlatformEventRenderer:
             )
             return
         if isinstance(event, ToolStart):
+            self._flush_reasoning_for_round(conversation, event.round_idx)
             self._emit_text(conversation, _format_tool_start(event), reason="tool_start", kind="status")
             return
         if isinstance(event, ToolComplete) and _is_permission_denied_result(event.result):
@@ -211,6 +236,48 @@ class PlatformEventRenderer:
             text = _format_full_event(event)
             if text:
                 self._emit_text(conversation, text, reason="event_full", kind="status")
+
+    def _on_reasoning_delta(self, event: ReasoningDelta) -> None:
+        """把模型 reasoning_content 分段转成通讯软件状态消息。
+
+        思考流可能非常碎，逐 token 发到 QQ 会刷屏。因此这里先按会话+轮次缓冲，
+        到达一定长度或轮次结束/工具开始时再发送。默认关闭，用户显式设置
+        ``IM_SHOW_REASONING=1`` 后才会启用。
+        """
+
+        if not self._show_reasoning:
+            return
+        conversation = self._current_conversation()
+        if conversation is None:
+            return
+        delta = str(event.delta or "")
+        if not delta:
+            return
+
+        key = _reasoning_key(conversation, event.round_idx)
+        should_flush = False
+        with self._lock:
+            buffered = self._reasoning_buffers.get(key, "")
+            sent = self._reasoning_sent_chars.get(key, 0)
+            piece = delta
+            if self._reasoning_max_chars > 0:
+                remaining = self._reasoning_max_chars - sent - len(buffered)
+                if remaining <= 0:
+                    if key in self._reasoning_omitted:
+                        return
+                    piece = "（思考内容超过上限，后续已省略。）"
+                    self._reasoning_omitted.add(key)
+                elif len(delta) > remaining:
+                    piece = delta[:remaining] + "\n\n（思考内容超过上限，后续已省略。）"
+                    self._reasoning_omitted.add(key)
+                    should_flush = True
+            buffered += piece
+            self._reasoning_buffers[key] = buffered
+            if len(buffered) >= self._reasoning_chunk_chars:
+                should_flush = True
+
+        if should_flush:
+            self._flush_reasoning_for_round(conversation, event.round_idx)
 
     def _on_ask_user_question(self, event: AskUserQuestion) -> None:
         conversation = self._current_conversation()
@@ -272,6 +339,44 @@ class PlatformEventRenderer:
             metadata=payload,
         ))
         self._send(OutboundMessage(conversation=conversation, segments=segments, reason="asset"))
+
+    def _flush_reasoning_for_round(
+        self,
+        conversation: ConversationKey,
+        round_idx: int,
+        *,
+        finish: bool = False,
+    ) -> None:
+        if not self._show_reasoning:
+            return
+        key = _reasoning_key(conversation, round_idx)
+        with self._lock:
+            text = self._reasoning_buffers.pop(key, "")
+            if text:
+                self._reasoning_sent_chars[key] = self._reasoning_sent_chars.get(key, 0) + len(text)
+            if finish:
+                self._reasoning_sent_chars.pop(key, None)
+                self._reasoning_omitted.discard(key)
+        if text:
+            self._emit_text(
+                conversation,
+                _format_reasoning_text(text, round_idx),
+                reason="reasoning",
+                kind="status",
+            )
+
+    def _flush_all_reasoning(self, conversation: ConversationKey, *, finish: bool = False) -> None:
+        if not self._show_reasoning:
+            return
+        prefix = conversation.stable_id + ":"
+        with self._lock:
+            round_indices = [
+                int(key.rsplit(":", 1)[1])
+                for key in self._reasoning_buffers
+                if key.startswith(prefix) and key.rsplit(":", 1)[1].isdigit()
+            ]
+        for round_idx in sorted(set(round_indices)):
+            self._flush_reasoning_for_round(conversation, round_idx, finish=finish)
 
     # ---------- helpers ----------
 
@@ -384,6 +489,15 @@ def _format_todo_items(items: List[Dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _reasoning_key(conversation: ConversationKey, round_idx: int) -> str:
+    return f"{conversation.stable_id}:{int(round_idx or 0)}"
+
+
+def _format_reasoning_text(text: str, round_idx: int) -> str:
+    title = f"【思考｜第 {round_idx} 轮】" if round_idx else "【思考】"
+    return f"{title}\n{str(text or '').strip()}"
+
+
 def _format_tool_start(event: ToolStart) -> str:
     """把工具开始事件降级成 IM 中的一行状态消息。
 
@@ -490,6 +604,14 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _env_int(name: str, *, default: int, minimum: int) -> int:
+    try:
+        value = int(os.getenv(name) or default)
+    except Exception:
+        value = default
+    return max(minimum, value)
 
 
 __all__ = ["PlatformEventRenderer", "PendingPlatformQuestion"]

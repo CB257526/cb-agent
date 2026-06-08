@@ -212,6 +212,9 @@ FEATURE_BUDDY=1
 | `CBAGENT_MCP_PUBLIC_PREFIXES` / `CBAGENT_MCP_SENSITIVE_PREFIXES` | 自定义 MCP 展开工具名前缀的权限分类；默认 `fetch_`、`tavily_`、`amap-maps_` 普通可用，`github_`、`playwright_` 需要 root |
 | `QQ_ACTION_TIMEOUT_SECONDS` | OneBot action 超时时间，影响发送消息和上传文件 |
 | `IM_EVENT_VERBOSITY` | 通讯软件事件输出等级：`normal` 会发关键事件和工具开始提示，`full` 额外同步工具完成、round/token 等调试摘要 |
+| `IM_SHOW_REASONING` | 是否把思考模型的 `reasoning_content` 同步到 QQ/微信，默认 `0` 关闭 |
+| `IM_REASONING_CHUNK_CHARS` | `IM_SHOW_REASONING=1` 时每段“思考”消息的字符数，默认 `1200` |
+| `IM_REASONING_MAX_CHARS` | `IM_SHOW_REASONING=1` 时每轮最多展示的思考字符数，默认 `8000`，`0` 表示不限制 |
 | `IM_CONFIRM_QUESTION_ANSWER` | QQ 编号回答后是否发送“已选择”确认，默认 `1` |
 | `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；`send_message_asset(kind=sticker)` 会从这里查找图片 |
 | `CBAGENT_OUTBOUND_FILE_MAX_MB` | agent 发送本地文件到通讯软件的大小上限，默认 `50` MB |
@@ -407,6 +410,12 @@ QQ_ACTION_TIMEOUT_SECONDS=30
 # full   = 额外发送工具完成、round、token、MCP/Buddy 状态等调试摘要。
 IM_EVENT_VERBOSITY=normal
 
+# 是否把思考模型的 reasoning_content 发到 QQ/微信。
+# 默认关闭；开启后会发送“【思考】”状态消息，适合私聊调试，不建议在大群常开。
+IM_SHOW_REASONING=0
+IM_REASONING_CHUNK_CHARS=1200
+IM_REASONING_MAX_CHARS=8000
+
 # 用户回复编号后是否发“已选择: xxx”确认。0 表示静默确认。
 IM_CONFIRM_QUESTION_ANSWER=1
 
@@ -537,6 +546,7 @@ QQ/通讯平台模式还会做一层敏感工具门禁。`QQ_ALLOWED_USERS` 只�
 | `Error` / `Cancelled` | 发送简短状态提示 |
 | 工具开始 | 默认发送短提示：普通工具为 `（调用工具:工具名 参数）`，bash 为 `（执行命令:命令）`；参数会脱敏和截断 |
 | 敏感工具被拒绝 | 发送 `（已拒绝敏感工具调用:...）`，真实工具不会执行 |
+| 思考流 | 默认不发；`IM_SHOW_REASONING=1` 时把模型 `reasoning_content` 分段发送为 `【思考】` 状态消息 |
 | 工具结束 | 默认不发；`IM_EVENT_VERBOSITY=full` 时发送耗时等调试摘要 |
 
 表情包放在：
