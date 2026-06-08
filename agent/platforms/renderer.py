@@ -67,6 +67,7 @@ class PlatformEventRenderer:
         verbosity: Optional[str] = None,
         confirm_question_answer: Optional[bool] = None,
         show_reasoning: Optional[bool] = None,
+        group_tool_messages: Optional[bool] = None,
     ) -> None:
         self._bus = event_bus
         self._send = send
@@ -80,6 +81,11 @@ class PlatformEventRenderer:
             _env_bool("IM_SHOW_REASONING", default=False)
             if show_reasoning is None
             else bool(show_reasoning)
+        )
+        self._group_tool_messages = (
+            _env_bool("IM_GROUP_TOOL_MESSAGES", default=True)
+            if group_tool_messages is None
+            else bool(group_tool_messages)
         )
         self._reasoning_chunk_chars = _env_int("IM_REASONING_CHUNK_CHARS", default=1200, minimum=200)
         self._reasoning_max_chars = _env_int("IM_REASONING_MAX_CHARS", default=8000, minimum=0)
@@ -218,7 +224,8 @@ class PlatformEventRenderer:
             return
         if isinstance(event, ToolStart):
             self._flush_reasoning_for_round(conversation, event.round_idx)
-            self._emit_text(conversation, _format_tool_start(event), reason="tool_start", kind="status")
+            if self._should_emit_tool_message(conversation):
+                self._emit_text(conversation, _format_tool_start(event), reason="tool_start", kind="status")
             return
         if isinstance(event, ToolComplete) and _is_permission_denied_result(event.result):
             self._emit_text(
@@ -233,6 +240,8 @@ class PlatformEventRenderer:
             return
 
         if self._verbosity == "full":
+            if _is_tool_progress_event(event) and not self._should_emit_tool_message(conversation):
+                return
             text = _format_full_event(event)
             if text:
                 self._emit_text(conversation, text, reason="event_full", kind="status")
@@ -410,6 +419,19 @@ class PlatformEventRenderer:
             return
         self._send(OutboundMessage.text(conversation, clean, reason=reason, kind=kind))
 
+    def _should_emit_tool_message(self, conversation: ConversationKey) -> bool:
+        """判断当前会话是否应该把工具过程提示发到通讯软件。
+
+        群聊里的工具开始/完成提示很容易打断正常聊天，因此用
+        ``IM_GROUP_TOOL_MESSAGES`` 单独控制；私聊保持原行为，方便用户观察 agent 正在
+        使用哪些工具。这个开关只影响过程提示，不影响最终回答、编号确认、敏感工具拒绝
+        提示，也不影响 send_message_asset 真正发送文件或表情包。
+        """
+
+        if str(conversation.kind).lower() == "group":
+            return self._group_tool_messages
+        return True
+
 
 def _format_question(event: AskUserQuestion) -> str:
     lines = [event.question.strip(), "", "请选择："]
@@ -576,6 +598,16 @@ def _clip_text(text: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + f"... [+{len(value) - limit} chars]"
+
+
+def _is_tool_progress_event(event: Event) -> bool:
+    """识别只用于展示工具过程的调试事件。
+
+    敏感工具拒绝和 send_message_asset 的真实资源发送在 ``_on_event`` 前面已经单独处理，
+    不会走到这里；这里主要服务于 ``IM_EVENT_VERBOSITY=full`` 时的群聊降噪。
+    """
+
+    return isinstance(event, (ToolStart, ToolComplete, ToolCallPlanned))
 
 
 def _format_full_event(event: Event) -> str:

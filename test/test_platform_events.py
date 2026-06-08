@@ -40,6 +40,7 @@ class TestPlatformEventRenderer(unittest.TestCase):
             send=self.sent.append,
             verbosity="normal",
             confirm_question_answer=True,
+            group_tool_messages=True,
         )
         self.renderer.begin_run(self.conversation)
 
@@ -83,6 +84,58 @@ class TestPlatformEventRenderer(unittest.TestCase):
             "（执行命令:python -m pytest test/test_platform_events.py）",
         )
 
+    def test_group_tool_messages_can_be_disabled_by_env(self) -> None:
+        self.renderer.close()
+        self.sent.clear()
+        with patch.dict("os.environ", {"IM_GROUP_TOOL_MESSAGES": "0"}):
+            self.renderer = PlatformEventRenderer(
+                event_bus=self.bus,
+                send=self.sent.append,
+                verbosity="normal",
+            )
+        self.renderer.begin_run(self.conversation)
+
+        self.bus.emit(ToolStart(call_id="c1", name="grep", arguments={"pattern": "TODO"}))
+
+        self.assertEqual(self.sent, [])
+
+    def test_private_tool_messages_ignore_group_switch(self) -> None:
+        self.renderer.close()
+        self.sent.clear()
+        private = ConversationKey(platform="qq", kind="private", id="20002")
+        with patch.dict("os.environ", {"IM_GROUP_TOOL_MESSAGES": "0"}):
+            self.renderer = PlatformEventRenderer(
+                event_bus=self.bus,
+                send=self.sent.append,
+                verbosity="normal",
+            )
+        self.renderer.begin_run(private)
+
+        self.bus.emit(ToolStart(call_id="c1", name="grep", arguments={"pattern": "TODO"}))
+
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("调用工具:grep", self.sent[0].segments[0].text)
+
+    def test_full_tool_progress_respects_group_switch(self) -> None:
+        self.renderer.close()
+        self.sent.clear()
+        with patch.dict("os.environ", {"IM_GROUP_TOOL_MESSAGES": "0"}):
+            self.renderer = PlatformEventRenderer(
+                event_bus=self.bus,
+                send=self.sent.append,
+                verbosity="full",
+            )
+        self.renderer.begin_run(self.conversation)
+
+        self.bus.emit(ToolComplete(
+            call_id="c1",
+            name="grep",
+            result="{}",
+            duration_seconds=0.2,
+        ))
+
+        self.assertEqual(self.sent, [])
+
     def test_tool_complete_renders_when_full(self) -> None:
         self.renderer.close()
         self.sent.clear()
@@ -90,6 +143,7 @@ class TestPlatformEventRenderer(unittest.TestCase):
             event_bus=self.bus,
             send=self.sent.append,
             verbosity="full",
+            group_tool_messages=True,
         )
         self.renderer.begin_run(self.conversation)
 
@@ -115,6 +169,7 @@ class TestPlatformEventRenderer(unittest.TestCase):
             send=self.sent.append,
             verbosity="normal",
             show_reasoning=True,
+            group_tool_messages=True,
         )
         self.renderer.begin_run(self.conversation)
 
@@ -135,6 +190,7 @@ class TestPlatformEventRenderer(unittest.TestCase):
             send=self.sent.append,
             verbosity="normal",
             show_reasoning=True,
+            group_tool_messages=True,
         )
         self.renderer.begin_run(self.conversation)
 
