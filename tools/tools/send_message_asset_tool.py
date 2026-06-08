@@ -38,6 +38,9 @@ class SendMessageAssetTool(Tool):
             description=(
                 "在通讯软件回复中发送本地资源文件。适用于发送表情包、图片、音频、视频或普通文件。"
                 "发送表情包时优先传 sticker_name，工具会从表情包目录查找；发送任意文件时传 path。"
+                "用户要求生成、下载、制作并发回的文件，应先保存到 /tmp/cb-agent-outputs/ "
+                "或系统临时目录，再传 path 发送。不要把项目目录、服务器目录、配置目录里的"
+                "现有本地文件复制到临时目录后发送，这属于绕过权限检查。"
                 "本工具只应在 QQ/微信等通讯平台会话中使用，不要用纯文本假装已经发送文件。"
             ),
         )
@@ -58,7 +61,11 @@ class SendMessageAssetTool(Tool):
                 name="path",
                 type="string",
                 required=False,
-                description="要发送的本地文件路径。允许任意普通文件路径，但会校验存在性、大小和可读性。",
+                description=(
+                    "要发送的本地文件路径。普通通讯用户只能发送系统临时目录里的新产物；"
+                    "发送项目文件、配置文件、服务器文件等现有本地文件需要 root 用户权限。"
+                    "工具会校验存在性、大小和可读性。"
+                ),
             ),
             ToolParameter(
                 name="sticker_name",

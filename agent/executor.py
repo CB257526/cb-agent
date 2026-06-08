@@ -32,6 +32,10 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from agent.cancel import CancelToken
 from agent.event_bus import EventBus
 from agent.events import Cancelled, ToolComplete, ToolStart
+from agent.platforms.permissions import (
+    check_platform_tool_permission,
+    permission_denied_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +273,27 @@ class ToolExecutor:
             call_id,
             sorted(args.keys()),
         )
+
+        permission = check_platform_tool_permission(name, args)
+        if permission.denied:
+            result = permission_denied_payload(name, args, permission)
+            logger.warning(
+                "tool denied by platform permission: round=%s name=%s call_id=%s reason=%s",
+                round_idx,
+                name,
+                call_id,
+                permission.reason,
+            )
+            if self._bus is not None:
+                self._bus.emit(ToolComplete(
+                    call_id=call_id, name=name, result=result,
+                    duration_seconds=0.0, is_error=True,
+                    round_idx=round_idx,
+                ))
+            return ToolCallResult(
+                call_id=call_id, name=name, arguments=args,
+                result=result, duration_seconds=0.0, is_error=True,
+            )
 
         if self._bus is not None:
             self._bus.emit(ToolStart(

@@ -80,6 +80,7 @@ class InboundMessage:
         header = (
             f"[通讯软件消息 platform={self.conversation.platform} "
             f"conversation={self.conversation.kind}:{self.conversation.id} "
+            f"sender_id={self.sender_id} "
             f"sender={self.sender_name or self.sender_id}]"
         )
         parts = [header, self.text.strip()]

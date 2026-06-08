@@ -15,6 +15,11 @@ import sys
 import threading
 import time
 import unittest
+import json
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 if sys.platform == "win32":
     try:
@@ -35,6 +40,13 @@ from agent.executor import (
     READ_ONLY_IF_ACTION, READ_ONLY_TOOLS,
     ToolCallResult, ToolExecutor, should_parallelize,
 )
+from agent.platforms.context import (
+    reset_current_platform_conversation,
+    reset_current_platform_sender,
+    set_current_platform_conversation,
+    set_current_platform_sender,
+)
+from agent.platforms.messages import ConversationKey
 
 
 def _tc(name: str, args_json: str = "{}", call_id: str = "") -> dict:
@@ -266,6 +278,341 @@ class TestCancelTokenContextVars(unittest.TestCase):
         self.assertEqual(len(seen), 3)
         for t in seen:
             self.assertIs(t, token)
+
+
+class TestPlatformToolPermission(unittest.TestCase):
+    def setUp(self):
+        self.bus = EventBus()
+        self.events = collect_all(self.bus)
+        self.conversation = ConversationKey("qq", "group", "10001")
+
+    def _run_as_sender(self, sender_id: str, tool_name: str, args_json: str, *, env=None):
+        calls = []
+
+        def runner(name, args):
+            calls.append((name, args))
+            return json.dumps({"ok": True}, ensure_ascii=False)
+
+        ex = ToolExecutor(runner, self.bus)
+        conv_token = set_current_platform_conversation(self.conversation)
+        sender_token = set_current_platform_sender(sender_id)
+        try:
+            guard_env = {
+                "QQ_ROOT_USERS": "",
+                "IM_ROOT_USERS": "",
+                "CBAGENT_MCP_PUBLIC_PREFIXES": "",
+                "CBAGENT_MCP_SENSITIVE_PREFIXES": "",
+            }
+            guard_env.update(env or {})
+            with patch.dict("os.environ", guard_env, clear=False):
+                results = ex.execute([_tc(tool_name, args_json, call_id="call_guard")], round_idx=7)
+        finally:
+            reset_current_platform_sender(sender_token)
+            reset_current_platform_conversation(conv_token)
+        return calls, results
+
+    def test_local_cli_context_is_not_restricted(self):
+        calls = []
+
+        def runner(name, args):
+            calls.append(name)
+            return "{}"
+
+        ex = ToolExecutor(runner)
+        result = ex.execute([_tc("file_write", '{"path":"a.txt","content":"x"}')])
+        self.assertEqual(calls, ["file_write"])
+        self.assertFalse(result[0].is_error)
+
+    def test_non_root_qq_user_cannot_write_files(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "file_write",
+            '{"path":"a.txt","content":"x"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        self.assertTrue(results[0].is_error)
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("file_write", payload["error"])
+
+        starts = [e for e in self.events if isinstance(e, ToolStart)]
+        completes = [e for e in self.events if isinstance(e, ToolComplete)]
+        self.assertEqual(starts, [])
+        self.assertEqual(len(completes), 1)
+        self.assertTrue(completes[0].is_error)
+
+    def test_sensitive_tools_default_deny_when_root_users_not_configured(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "file_edit",
+            '{"path":"a.txt","old_string":"a","new_string":"b"}',
+            env={"QQ_ROOT_USERS": "", "IM_ROOT_USERS": ""},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("不是 root 用户", payload["error"])
+
+    def test_root_qq_user_can_run_sensitive_tool(self):
+        calls, results = self._run_as_sender(
+            "100",
+            "file_write",
+            '{"path":"a.txt","content":"x"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["file_write"])
+        self.assertFalse(results[0].is_error)
+
+    def test_im_root_users_also_grants_root_permission(self):
+        calls, results = self._run_as_sender(
+            "300",
+            "file_write",
+            '{"path":"a.txt","content":"x"}',
+            env={"QQ_ROOT_USERS": "", "IM_ROOT_USERS": "300"},
+        )
+        self.assertEqual([name for name, _ in calls], ["file_write"])
+        self.assertFalse(results[0].is_error)
+
+    def test_file_read_and_content_grep_are_denied_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "file_read",
+            '{"path":"run_agent.py"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("本地文件内容", payload["error"])
+
+        calls, results = self._run_as_sender(
+            "200",
+            "grep",
+            '{"pattern":"class AgentRunner","output_mode":"content"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("匹配内容", payload["error"])
+
+    def test_grep_file_list_mode_is_allowed_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "grep",
+            '{"pattern":"class AgentRunner","output_mode":"files_with_matches"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["grep"])
+        self.assertFalse(results[0].is_error)
+
+    def test_bash_task_list_allowed_but_output_denied_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "bash_task",
+            '{"action":"list"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["bash_task"])
+        self.assertFalse(results[0].is_error)
+
+        calls, results = self._run_as_sender(
+            "200",
+            "bash_task",
+            '{"action":"output","task_id":"t1"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("后台任务输出", payload["error"])
+
+    def test_readonly_bash_is_allowed_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "bash",
+            '{"command":"git status --short"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["bash"])
+        self.assertFalse(results[0].is_error)
+
+    def test_write_bash_is_denied_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "bash",
+            '{"command":"git reset --hard HEAD"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("不是只读白名单", payload["error"])
+
+    def test_bash_file_content_commands_are_denied_for_non_root(self):
+        for command in ("cat run_agent.py", "Get-Content run_agent.py", "git diff"):
+            with self.subTest(command=command):
+                calls, results = self._run_as_sender(
+                    "200",
+                    "bash",
+                    json.dumps({"command": command}, ensure_ascii=False),
+                    env={"QQ_ROOT_USERS": "100"},
+                )
+                self.assertEqual(calls, [])
+                payload = json.loads(results[0].result)
+                self.assertTrue(payload["permission_denied"])
+                self.assertIn("本地文件内容", payload["error"])
+
+    def test_sticker_name_is_allowed_but_path_asset_is_denied(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "send_message_asset",
+            '{"kind":"sticker","sticker_name":"happy"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["send_message_asset"])
+        self.assertFalse(results[0].is_error)
+
+        calls, results = self._run_as_sender(
+            "200",
+            "send_message_asset",
+            '{"kind":"file","path":"/root/CBAGENT/cb-agent/run_agent.py"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("外发任意本地文件", payload["error"])
+
+    def test_non_root_can_create_and_send_temp_artifact(self):
+        temp_output = Path(tempfile.gettempdir()) / "cb-agent-outputs" / "report.txt"
+
+        calls, results = self._run_as_sender(
+            "200",
+            "file_write",
+            json.dumps({"path": str(temp_output), "content": "hello"}, ensure_ascii=False),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["file_write"])
+        self.assertFalse(results[0].is_error)
+
+        calls, results = self._run_as_sender(
+            "200",
+            "send_message_asset",
+            json.dumps({"kind": "file", "path": str(temp_output)}, ensure_ascii=False),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["send_message_asset"])
+        self.assertFalse(results[0].is_error)
+
+    def test_temp_symlink_to_project_is_not_treated_as_safe_artifact(self):
+        with tempfile.TemporaryDirectory() as td:
+            link = Path(td) / "project-link"
+            try:
+                os.symlink(Path.cwd(), link, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"当前平台不能创建目录软链接: {exc}")
+
+            calls, results = self._run_as_sender(
+                "200",
+                "send_message_asset",
+                json.dumps({"kind": "file", "path": str(link / "run_agent.py")}, ensure_ascii=False),
+                env={"QQ_ROOT_USERS": "100"},
+            )
+            self.assertEqual(calls, [])
+            payload = json.loads(results[0].result)
+            self.assertTrue(payload["permission_denied"])
+            self.assertIn("外发任意本地文件", payload["error"])
+
+    def test_non_root_can_download_public_url_to_temp_but_not_localhost(self):
+        temp_output = Path(tempfile.gettempdir()) / "cb-agent-outputs" / "image.png"
+        shell_output = temp_output.as_posix()
+
+        calls, results = self._run_as_sender(
+            "200",
+            "bash",
+            json.dumps(
+                {"command": f"curl -o {shell_output} https://example.com/image.png"},
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["bash"])
+        self.assertFalse(results[0].is_error)
+
+        calls, results = self._run_as_sender(
+            "200",
+            "bash",
+            json.dumps(
+                {"command": f"curl -o {shell_output} http://127.0.0.1:8000/secret"},
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("不是只读白名单", payload["error"])
+
+        calls, results = self._run_as_sender(
+            "200",
+            "bash",
+            json.dumps(
+                {"command": f"curl -L -o {shell_output} https://example.com/image.png"},
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+
+    def test_non_root_cannot_copy_local_file_to_temp_with_bash(self):
+        temp_output = Path(tempfile.gettempdir()) / "cb-agent-outputs" / "run_agent.py"
+        calls, results = self._run_as_sender(
+            "200",
+            "bash",
+            json.dumps({"command": f"cp run_agent.py {temp_output}"}, ensure_ascii=False),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("不是只读白名单", payload["error"])
+
+    def test_run_skill_script_is_denied_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "run_skill_script",
+            '{"skill":"demo","script":"run.py"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("skill 脚本", payload["error"])
+
+    def test_public_mcp_allowed_sensitive_mcp_denied(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "fetch_fetch",
+            '{"url":"https://example.com"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["fetch_fetch"])
+        self.assertFalse(results[0].is_error)
+
+        calls, results = self._run_as_sender(
+            "200",
+            "github_create_issue",
+            '{"title":"x"}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("MCP", payload["error"])
 
 
 if __name__ == "__main__":

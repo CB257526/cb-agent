@@ -34,6 +34,8 @@ class TestOneBotParsing(unittest.TestCase):
         assert msg is not None
         self.assertEqual(msg.conversation, ConversationKey("qq", "private", "123"))
         self.assertEqual(msg.text, "你好")
+        self.assertIn("sender_id=123", msg.prompt_text())
+        self.assertNotIn("sender_id=123", msg.persistent_text())
 
     def test_group_mention_required_by_default(self) -> None:
         cfg = QQConfig(group_mode="mention")

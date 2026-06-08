@@ -195,6 +195,14 @@ class PlatformEventRenderer:
         if isinstance(event, ToolStart):
             self._emit_text(conversation, _format_tool_start(event), reason="tool_start", kind="status")
             return
+        if isinstance(event, ToolComplete) and _is_permission_denied_result(event.result):
+            self._emit_text(
+                conversation,
+                _format_permission_denied(event),
+                reason="tool_permission_denied",
+                kind="status",
+            )
+            return
         if isinstance(event, ToolComplete) and event.name == "send_message_asset":
             self._on_asset_tool_complete(conversation, event)
             return
@@ -399,6 +407,23 @@ def _format_tool_arguments(arguments: Dict[str, Any]) -> str:
     except Exception:
         text = str(safe)
     return _clip_text(text, 900)
+
+
+def _is_permission_denied_result(result: str) -> bool:
+    try:
+        data = json.loads(result)
+    except Exception:
+        return False
+    return bool(isinstance(data, dict) and data.get("permission_denied"))
+
+
+def _format_permission_denied(event: ToolComplete) -> str:
+    try:
+        data = json.loads(event.result)
+    except Exception:
+        data = {}
+    error = str(data.get("error") or "当前通讯平台用户无权执行该敏感操作")
+    return f"（已拒绝敏感工具调用:{event.name}，{_clip_text(error, 500)}）"
 
 
 def _sanitize_argument_value(value: Any, *, depth: int = 0, key: str = "") -> Any:

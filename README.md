@@ -207,6 +207,9 @@ FEATURE_BUDDY=1
 | `QQ_WAKE_PREFIX` | 群聊文本唤醒前缀，例如 `/agent 帮我查一下` |
 | `QQ_ALLOWED_GROUPS` | QQ 群白名单，逗号分隔群号；为空表示不限制群 |
 | `QQ_ALLOWED_USERS` | QQ 用户白名单，逗号分隔 QQ 号；为空表示不限制用户 |
+| `QQ_ROOT_USERS` | QQ root 用户，逗号分隔 QQ 号；只有这些用户能在 QQ 中触发敏感工具，未配置时通讯平台敏感工具默认拒绝 |
+| `IM_ROOT_USERS` | 通用通讯平台 root 用户；未来微信/Telegram 也会检查它，QQ 会同时检查 `QQ_ROOT_USERS` |
+| `CBAGENT_MCP_PUBLIC_PREFIXES` / `CBAGENT_MCP_SENSITIVE_PREFIXES` | 自定义 MCP 展开工具名前缀的权限分类；默认 `fetch_`、`tavily_`、`amap-maps_` 普通可用，`github_`、`playwright_` 需要 root |
 | `QQ_ACTION_TIMEOUT_SECONDS` | OneBot action 超时时间，影响发送消息和上传文件 |
 | `IM_EVENT_VERBOSITY` | 通讯软件事件输出等级：`normal` 会发关键事件和工具开始提示，`full` 额外同步工具完成、round/token 等调试摘要 |
 | `IM_CONFIRM_QUESTION_ANSWER` | QQ 编号回答后是否发送“已选择”确认，默认 `1` |
@@ -385,6 +388,16 @@ QQ_WAKE_PREFIX=/agent
 QQ_ALLOWED_GROUPS=
 QQ_ALLOWED_USERS=
 
+# root 用户，逗号分隔。不是“谁能聊天”，而是“谁能执行敏感工具”。
+# 未配置时，QQ/未来微信等通讯平台触发的敏感工具默认拒绝；TUI/CLI 不受影响。
+QQ_ROOT_USERS=
+IM_ROOT_USERS=
+
+# MCP 展开工具名前缀权限分类。默认 fetch_/tavily_/amap-maps_ 普通可用，
+# github_/playwright_ 需要 root；自定义 MCP server 可在这里补前缀。
+CBAGENT_MCP_PUBLIC_PREFIXES=
+CBAGENT_MCP_SENSITIVE_PREFIXES=
+
 # OneBot action 超时时间，单位秒。发送消息和上传文件都会用到。
 QQ_ACTION_TIMEOUT_SECONDS=30
 
@@ -510,6 +523,10 @@ ip addr show | grep -E "inet " | grep -v 127.0.0.1
 
 群聊默认 `QQ_GROUP_MODE=mention`，只有 @机器人 或使用 `QQ_WAKE_PREFIX` 前缀时才会响应。私聊默认直接响应。`QQ_ALLOWED_GROUPS` 和 `QQ_ALLOWED_USERS` 为空时不做白名单限制；填写后分别按群号和 QQ 号过滤。
 
+QQ/通讯平台模式还会做一层敏感工具门禁。`QQ_ALLOWED_USERS` 只决定谁能触发 agent 聊天，`QQ_ROOT_USERS` / `IM_ROOT_USERS` 决定谁能执行敏感工具。敏感范围包括读取或外发本地文件内容、写项目/服务器文件、非只读 bash、git 回滚/提交/推送、`bash_permission` 授权变更、memory/rag 写操作、`run_skill_script`、发送项目/服务器本地文件、敏感 MCP 工具等。未配置 root 用户时，QQ/未来微信等通讯平台触发的敏感工具会在执行前直接拒绝；本地 TUI/CLI 继续使用原来的权限机制。
+
+普通通讯用户有一个受限例外：如果用户要求生成、下载或制作新文件并发回，agent 应把新产物放到系统临时目录，Linux 通常是 `/tmp/cb-agent-outputs/`，再通过 `send_message_asset(path=...)` 发送。不要把项目源码、配置、日志、密钥、服务器隐私文件复制或移动到 `/tmp` 后发送，这属于绕过权限检查。普通用户用 bash 下载文件时也只允许 `curl/wget` 从公网 `http(s)` URL 明确写入临时目录；localhost、内网地址、`file://`、管道脚本和本地复制仍会被拒绝。
+
 通讯软件模式会把 TUI 风格事件降级成 QQ 可读消息：
 
 | Agent 事件 | QQ 中的表现 |
@@ -519,6 +536,7 @@ ip addr show | grep -E "inet " | grep -v 127.0.0.1
 | `todo` | 渲染为简洁任务列表 |
 | `Error` / `Cancelled` | 发送简短状态提示 |
 | 工具开始 | 默认发送短提示：普通工具为 `（调用工具:工具名 参数）`，bash 为 `（执行命令:命令）`；参数会脱敏和截断 |
+| 敏感工具被拒绝 | 发送 `（已拒绝敏感工具调用:...）`，真实工具不会执行 |
 | 工具结束 | 默认不发；`IM_EVENT_VERBOSITY=full` 时发送耗时等调试摘要 |
 
 表情包放在：
@@ -527,7 +545,7 @@ ip addr show | grep -E "inet " | grep -v 127.0.0.1
 assets/stickers/
 ```
 
-QQ 模式会额外注册 `send_message_asset` 工具。模型可以通过它发送表情包、图片、音频、视频或任意本地普通文件。工具会校验路径、大小、hash；history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
+QQ 模式会额外注册 `send_message_asset` 工具。模型可以通过它发送表情包、图片、音频、视频或文件；普通用户只能发送表情包目录里的 sticker，或发送系统临时目录里的新产物，发送项目/服务器现有文件需要 root 用户权限。工具会校验路径、大小、hash；history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
 
 文件发送现在支持多种交付模式，默认 `QQ_FILE_DELIVERY_MODE=path` 保持旧行为：直接把 cb-agent 本机路径交给 NapCat。这个模式最适合同机运行，或者 NapCat 容器内外路径完全一致的部署。
 
