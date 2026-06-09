@@ -133,7 +133,7 @@ NapCat 和 cb-agent 同机运行时，旧实现直接把本地路径传给 OneBo
 | `mapped_path` | 复制到宿主机共享目录，再改写成 NapCat 容器内路径 | Docker 部署推荐方案 |
 | `http` | cb-agent 启动只读临时 HTTP 文件服务，NapCat 拉取 URL | 不方便挂共享卷、跨机器或容器网络可互通 |
 | `base64` | 小文件内联为 `base64://...` | 小图片、表情包兜底；不适合大文件 |
-| `auto` | 按 `mapped_path -> http -> base64 -> path` 生成候选并依次尝试 | 想自动兜底，但仍建议明确配置生产模式 |
+| `auto` | 按 `mapped_path -> base64 -> 可访问 http -> path` 生成候选并依次尝试 | 默认兜底；Docker 生产环境仍建议显式配置 `mapped_path` 或 `http` |
 
 `mapped_path` 模式需要两段路径：
 
@@ -141,6 +141,8 @@ NapCat 和 cb-agent 同机运行时，旧实现直接把本地路径传给 OneBo
 QQ_FILE_DELIVERY_MODE=mapped_path
 QQ_FILE_HOST_PREFIX=/opt/cb-agent/outbound
 QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
+QQ_FILE_SHARED_TTL_SECONDS=86400
+QQ_FILE_SHARED_MAX_FILES=1000
 ```
 
 对应 Docker 挂载：
@@ -149,7 +151,7 @@ QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
 docker run ... -v /opt/cb-agent/outbound:/app/cb-agent-outbound:ro ...
 ```
 
-发送时，cb-agent 会把源文件复制到 `QQ_FILE_HOST_PREFIX`，生成带内容 hash 的文件名，避免同名文件覆盖；然后把这个路径改写成 `QQ_FILE_NAPCAT_PREFIX` 下的容器路径传给 NapCat。这样模型仍然只需要调用 `send_message_asset(path=...)`，不用知道 Docker 内部路径。
+发送时，cb-agent 会把源文件复制到 `QQ_FILE_HOST_PREFIX`，生成带内容 hash 的文件名，避免同名文件覆盖；然后把这个路径改写成 `QQ_FILE_NAPCAT_PREFIX` 下的容器路径传给 NapCat。这样模型仍然只需要调用 `send_message_asset(path=...)`，不用知道 Docker 内部路径。共享目录清理只处理交付层生成的 `name-16hex.ext` 文件，默认清理超过 86400 秒或超过 1000 个的旧文件，避免误删手工放入共享卷的内容。
 
 `http` 模式会启动一个只读临时文件服务：
 
@@ -190,7 +192,7 @@ QQ_GROUP_MODE=mention
 QQ_WAKE_PREFIX=/agent
 CBAGENT_STICKER_DIR=./assets/stickers
 CBAGENT_OUTBOUND_FILE_MAX_MB=50
-QQ_FILE_DELIVERY_MODE=path
+QQ_FILE_DELIVERY_MODE=auto
 IM_EVENT_VERBOSITY=normal
 ```
 
@@ -210,6 +212,6 @@ ws://127.0.0.1:6199/onebot/v11/ws
 
 当前实现已经按 `ConversationKey` 隔离 AgentSession。同一 QQ 群聊或好友私聊内会排队串行处理，不再因为上一条未完成而直接拒绝；不同群聊和不同好友可以并发运行。私聊会落盘恢复上下文，群聊默认只使用临时内存上下文。
 
-文件发送能力依赖 NapCat 对 OneBot action 的实际支持。普通文件优先使用上传 API，失败会降级文本提示；图片和表情包优先走 OneBot 图片段。Docker 场景下优先使用 `mapped_path` 或 `http`，不要依赖默认 `path` 模式读取宿主机路径。
+文件发送能力依赖 NapCat 对 OneBot action 的实际支持。普通文件优先使用上传 API，失败会降级文本提示；图片和表情包优先走 OneBot 图片段。Docker 场景下优先使用 `mapped_path` 或 `http`，不要依赖 `path` 模式读取宿主机路径。
 
 微信接入时不需要重写 AgentSession 隔离、事件渲染器或 `send_message_asset` 工具，只需要新增微信平台适配器，把微信事件转成 `InboundMessage`，把 `OutboundMessage` 翻译为微信发送 API。真正需要额外处理的是微信侧鉴权、消息回调协议、文件上传/下载 API 和群聊唤醒策略。

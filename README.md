@@ -228,8 +228,9 @@ FEATURE_BUDDY=1
 | `IM_CONFIRM_QUESTION_ANSWER` | 通讯平台编号回答后是否发送“已选择”确认，默认 `1` |
 | `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；QQ/微信模式下可通过平台专用工具上传这里的图片作为 sticker/image |
 | `CBAGENT_OUTBOUND_FILE_MAX_MB` | agent 发送本地文件到通讯软件的大小上限，默认 `50` MB |
-| `QQ_FILE_DELIVERY_MODE` | QQ/NapCat 出站文件交付方式：`path` 兼容旧行为，`mapped_path` 适合 Docker 共享卷，`http` 让 NapCat 拉临时 URL，`base64` 只适合小文件，`auto` 会按顺序尝试 |
+| `QQ_FILE_DELIVERY_MODE` | QQ/NapCat 出站文件交付方式，默认 `auto`：按 `mapped_path -> base64 -> 可访问 http -> path` 尝试；`path` 仅适合同机或容器内外路径一致 |
 | `QQ_FILE_HOST_PREFIX` / `QQ_FILE_NAPCAT_PREFIX` | `mapped_path` 模式使用；前者是宿主机共享目录，后者是同一目录在 NapCat 容器内的路径 |
+| `QQ_FILE_SHARED_TTL_SECONDS` / `QQ_FILE_SHARED_MAX_FILES` | `mapped_path` 共享目录清理策略，默认保留 86400 秒、最多 1000 个交付层生成文件；设为 `0` 关闭对应策略 |
 | `QQ_FILE_HTTP_HOST` / `QQ_FILE_HTTP_PORT` / `QQ_FILE_HTTP_PUBLIC_BASE_URL` | `http` 模式使用；cb-agent 启动只读临时文件服务，公开 URL 必须是 NapCat 容器能访问到的地址 |
 | `QQ_FILE_HTTP_TTL_SECONDS` | HTTP 临时文件 URL 有效期，默认 `300` 秒 |
 | `QQ_FILE_BASE64_MAX_MB` | `base64` 模式或 `auto` 兜底允许内联的最大文件大小，默认 `3` MB |
@@ -457,8 +458,9 @@ CBAGENT_STICKER_DIR=./assets/stickers
 CBAGENT_OUTBOUND_FILE_MAX_MB=50
 
 # QQ/NapCat 出站文件交付方式。
-# path 保持旧行为；Docker 推荐 mapped_path 或 http。
-QQ_FILE_DELIVERY_MODE=path
+# auto 默认会先尝试 mapped_path、base64、小心加入可访问 http，最后才用 path 兜底。
+# Docker 生产部署推荐显式配置 mapped_path；不方便挂卷时用 http。
+QQ_FILE_DELIVERY_MODE=auto
 
 # mapped_path 示例:
 # Docker 挂载 -v /opt/cb-agent/outbound:/app/cb-agent-outbound:ro 后配置：
@@ -466,6 +468,8 @@ QQ_FILE_DELIVERY_MODE=path
 # QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
 QQ_FILE_HOST_PREFIX=
 QQ_FILE_NAPCAT_PREFIX=
+QQ_FILE_SHARED_TTL_SECONDS=86400
+QQ_FILE_SHARED_MAX_FILES=1000
 
 # http 示例:
 # QQ_FILE_HTTP_HOST=0.0.0.0
@@ -608,7 +612,7 @@ QQ 模式会额外注册 `qqtool` 工具，CLI/TUI 不会注入它。模型需�
 
 `send_message_asset` 的模型入口已不再默认注册；底层资源校验和事件兼容逻辑仍保留，避免旧 transcript 或测试路径失效。普通用户只能通过 `qqtool` 操作当前会话，发送表情包目录里的图片，或发送系统临时目录里的新产物；发送项目/服务器现有文件、跨会话发消息、读取历史消息、设置资料、Ark 分享、`raw_action` 等需要 root 用户权限。文件类 funname 会复用 Docker/HTTP/base64/path 文件交付层，history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
 
-文件发送现在支持多种交付模式，默认 `QQ_FILE_DELIVERY_MODE=path` 保持旧行为：直接把 cb-agent 本机路径交给 NapCat。这个模式最适合同机运行，或者 NapCat 容器内外路径完全一致的部署。
+文件发送现在支持多种交付模式，默认 `QQ_FILE_DELIVERY_MODE=auto`。它会优先尝试配置齐全的 `mapped_path`，小文件用 `base64` 兜底；只有配置了 NapCat 容器可访问的 HTTP 地址时才加入 `http` 候选；最后才用 `path` 作为同机/同路径部署的兜底。
 
 NapCat 在 Docker 中时，推荐使用 `mapped_path`。cb-agent 会先把要发送的文件复制到共享目录，再把路径改写成容器内路径交给 NapCat：
 
@@ -620,7 +624,11 @@ docker run ... -v /opt/cb-agent/outbound:/app/cb-agent-outbound:ro ...
 QQ_FILE_DELIVERY_MODE=mapped_path
 QQ_FILE_HOST_PREFIX=/opt/cb-agent/outbound
 QQ_FILE_NAPCAT_PREFIX=/app/cb-agent-outbound
+QQ_FILE_SHARED_TTL_SECONDS=86400
+QQ_FILE_SHARED_MAX_FILES=1000
 ```
+
+`mapped_path` 会把发送文件复制到共享目录。清理逻辑只删除交付层生成的 `name-16hex.ext` 文件，默认清理超过 86400 秒或超过 1000 个的旧文件，不会递归删除共享卷里的手工文件。
 
 如果不方便挂载共享卷，可以使用 `http`。cb-agent 会启动一个只读临时文件服务，给 NapCat 一个带随机 token、会过期的下载 URL：
 
@@ -632,7 +640,7 @@ QQ_FILE_HTTP_PUBLIC_BASE_URL=http://宿主机内网IP:6200
 QQ_FILE_HTTP_TTL_SECONDS=300
 ```
 
-Docker Desktop 有时可用 `http://host.docker.internal:6200`；Linux Docker 默认不一定支持这个域名，通常直接填宿主机内网 IP 更稳。`base64` 只建议给小图片/表情包兜底，大文件会撑爆 WebSocket、日志和内存。`auto` 会按 `mapped_path -> http -> base64 -> path` 的顺序生成候选并依次尝试。
+Docker Desktop 有时可用 `http://host.docker.internal:6200`；Linux Docker 默认不一定支持这个域名，通常直接填宿主机内网 IP 更稳。`base64` 只建议给小图片/表情包兜底，大文件会撑爆 WebSocket、日志和内存。`auto` 会按 `mapped_path -> base64 -> 可访问 http -> path` 的顺序生成候选并依次尝试；默认 loopback HTTP 不会自动加入候选。
 
 QQ 模式会按通讯会话隔离 `AgentSession`。每条 QQ 消息都会创建短生命周期 session 对象，工具系统、LLM、MCP 和 EventBus 仍在进程内共享，不会反复加载。私聊会根据 `ConversationKey(platform, kind, id)` 挂载独立本地会话目录，处理结束后追加落盘：
 
@@ -835,7 +843,7 @@ NapCat 在同一台机器时，反向 WebSocket 客户端地址填：
 ws://127.0.0.1:6199/onebot/v11/ws
 ```
 
-跨机器或 Docker 部署时，把 `QQ_HOST=0.0.0.0`，并强烈建议配置 `QQ_ACCESS_TOKEN`。如果 agent 需要发送本地文件或表情包，请配置 `QQ_FILE_DELIVERY_MODE`：同机/同路径可继续用默认 `path`，Docker 推荐 `mapped_path` 共享卷，不方便挂卷时用 `http` 临时 URL。
+跨机器或 Docker 部署时，把 `QQ_HOST=0.0.0.0`，并强烈建议配置 `QQ_ACCESS_TOKEN`。如果 agent 需要发送本地文件或表情包，Docker 推荐显式配置 `QQ_FILE_DELIVERY_MODE=mapped_path` 共享卷，不方便挂卷时用 `http` 临时 URL；同机/同路径部署才适合 `path`。
 
 启动微信 OC：
 

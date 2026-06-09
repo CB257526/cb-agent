@@ -28,7 +28,7 @@ from agent.platforms.messages import ConversationKey, InboundMessage, OutboundMe
 from agent.platforms.renderer import PlatformEventRenderer
 from agent.qq.action_bridge import global_qq_action_bridge
 from agent.qq.config import QQConfig
-from agent.qq.file_delivery import FileDeliveryError, QQFileDeliveryManager
+from agent.qq.file_delivery import FileDeliveryError, QQFileDeliveryManager, delivery_metadata
 from agent.qq.onebot import outbound_segment_to_onebot, parse_onebot_event, parse_onebot_message_event
 
 if TYPE_CHECKING:
@@ -97,6 +97,7 @@ class QQNapCatAdapter:
             return
         self._loop = asyncio.get_running_loop()
         logger.info("QQ/NapCat reverse websocket serving on %s:%s", self.config.host, self.config.port)
+        _log_file_delivery_config(self.config)
         async with serve(
             self._handle_connection,
             self.config.host,
@@ -535,13 +536,7 @@ class QQNapCatAdapter:
             detail = "；".join(item for item in plan.errors if item) or "没有可用的文件交付方式"
             raise FileDeliveryError(detail)
         candidate = plan.candidates[0]
-        return candidate.ref, {
-            "delivery_method": candidate.method,
-            "delivery_note": candidate.note,
-            "source_path": candidate.source_path,
-            "size": candidate.size,
-            "errors": plan.errors,
-        }
+        return candidate.ref, delivery_metadata(candidate, plan)
 
     async def _send_media_segment(self, conversation: ConversationKey, segment: OutboundSegment) -> bool:
         onebot_segments = outbound_segment_to_onebot(segment)
@@ -605,6 +600,56 @@ def _action_ok(result: Dict[str, Any]) -> bool:
     if retcode is not None:
         return retcode in {0, "0"}
     return True
+
+
+def _log_file_delivery_config(config: QQConfig) -> None:
+    """启动时提示 QQ/NapCat 文件交付配置风险。"""
+
+    mode = (config.file_delivery_mode or "auto").strip().lower()
+    if mode == "path":
+        logger.warning(
+            "QQ file delivery mode is path: NapCat in Docker usually cannot read host paths. "
+            "Use QQ_FILE_DELIVERY_MODE=mapped_path with QQ_FILE_HOST_PREFIX/QQ_FILE_NAPCAT_PREFIX, "
+            "or QQ_FILE_DELIVERY_MODE=http with a container-reachable QQ_FILE_HTTP_PUBLIC_BASE_URL."
+        )
+        return
+    if mode == "mapped_path":
+        missing = []
+        if not (config.file_host_prefix or "").strip():
+            missing.append("QQ_FILE_HOST_PREFIX")
+        if not (config.file_napcat_prefix or "").strip():
+            missing.append("QQ_FILE_NAPCAT_PREFIX")
+        if missing:
+            logger.warning("QQ mapped_path delivery is selected but missing %s", ", ".join(missing))
+        else:
+            logger.info(
+                "QQ mapped_path delivery enabled: host=%s napcat=%s cleanup_ttl=%ss max_files=%s",
+                config.file_host_prefix,
+                config.file_napcat_prefix,
+                config.file_shared_ttl_seconds,
+                config.file_shared_max_files,
+            )
+        return
+    if mode == "http":
+        host = (config.file_http_host or "").strip().lower()
+        public_base = (config.file_http_public_base_url or "").strip()
+        if not public_base:
+            logger.warning(
+                "QQ http delivery has no QQ_FILE_HTTP_PUBLIC_BASE_URL. NapCat in Docker will not "
+                "be able to use a loopback-only generated URL reliably."
+            )
+        if host in {"127.0.0.1", "localhost", "::1"}:
+            logger.warning(
+                "QQ http delivery listens on %s. NapCat in Docker usually needs QQ_FILE_HTTP_HOST=0.0.0.0 "
+                "and QQ_FILE_HTTP_PUBLIC_BASE_URL pointing at the host IP.",
+                config.file_http_host,
+            )
+        return
+    if mode == "auto":
+        logger.info(
+            "QQ file delivery mode auto: trying mapped_path when configured, then base64 for small files, "
+            "then http only when explicitly reachable, then path as final same-filesystem fallback."
+        )
 
 
 def _action_data(result: Dict[str, Any]) -> Dict[str, Any]:

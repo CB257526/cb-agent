@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 from urllib.parse import quote, unquote
 
@@ -34,7 +35,13 @@ def run_qq_function(funname: str, args: Dict[str, Any], *, timeout: float | None
     clean_args = dict(args or {})
     try:
         action, params, meta = _build_action_payload(spec, clean_args, timeout=timeout)
-        response = global_qq_action_bridge.call(action, params, timeout=timeout)
+        response, params, public_meta = _call_action_with_delivery_retries(
+            spec,
+            action,
+            params,
+            meta,
+            timeout=timeout,
+        )
         ok = _action_ok(response)
         data = response.get("data") if isinstance(response, dict) else response
         return _result(
@@ -44,7 +51,7 @@ def run_qq_function(funname: str, args: Dict[str, Any], *, timeout: float | None
             params=_redact_params(params),
             data=_clip_data(data, limit=spec.result_limit),
             summary=_summarize_result(spec, data, ok=ok),
-            metadata=meta,
+            metadata=public_meta,
             error="" if ok else _action_error_text(response),
             duration_ms=_elapsed_ms(started),
         )
@@ -104,6 +111,188 @@ def _build_action_payload(
         if message_meta:
             meta["message_file_delivery"] = message_meta
     return spec.action, params, meta
+
+
+def _call_action_with_delivery_retries(
+    spec: QQFunctionSpec,
+    action: str,
+    params: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    timeout: float | None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    max_attempts = _delivery_attempt_count(meta)
+    last_response: Dict[str, Any] = {}
+    last_params = params
+    failures: List[Dict[str, Any]] = []
+    for attempt_index in range(max_attempts):
+        attempt_params = _params_for_delivery_attempt(spec, params, meta, attempt_index)
+        response = global_qq_action_bridge.call(action, attempt_params, timeout=timeout)
+        last_response = response
+        last_params = attempt_params
+        if _action_ok(response):
+            return response, attempt_params, _public_delivery_meta(meta, attempt_index, failures)
+        if max_attempts > 1:
+            failures.append(_delivery_attempt_failure(meta, attempt_index, response))
+    return last_response, last_params, _public_delivery_meta(meta, max_attempts - 1, failures)
+
+
+def _delivery_attempt_count(meta: Dict[str, Any]) -> int:
+    count = 1
+    for item in _iter_delivery_meta(meta):
+        candidates = _delivery_candidates(item)
+        if candidates:
+            count = max(count, len(candidates))
+    return count
+
+
+def _params_for_delivery_attempt(
+    spec: QQFunctionSpec,
+    params: Dict[str, Any],
+    meta: Dict[str, Any],
+    attempt_index: int,
+) -> Dict[str, Any]:
+    if attempt_index <= 0:
+        return params
+    result = deepcopy(params)
+    file_meta = meta.get("file_delivery")
+    if spec.file_param and isinstance(file_meta, dict):
+        ref = _delivery_candidate_ref(file_meta, attempt_index)
+        if ref:
+            result[spec.file_param] = ref
+
+    message_meta = meta.get("message_file_delivery")
+    if isinstance(message_meta, list) and message_meta:
+        result["message"] = _message_for_delivery_attempt(
+            result.get("message"),
+            message_meta,
+            attempt_index,
+        )
+    return result
+
+
+def _message_for_delivery_attempt(message: Any, metas: List[Any], attempt_index: int) -> Any:
+    if isinstance(message, list):
+        resource_index = 0
+        updated: List[Any] = []
+        for seg in message:
+            if not isinstance(seg, dict):
+                updated.append(seg)
+                continue
+            item = dict(seg)
+            seg_type = str(item.get("type") or "").strip().lower()
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            if seg_type in {"image", "record", "audio", "video", "file"} and data.get("file"):
+                meta = metas[resource_index] if resource_index < len(metas) else None
+                resource_index += 1
+                ref = _delivery_candidate_ref(meta, attempt_index)
+                if ref:
+                    new_data = dict(data)
+                    new_data["file"] = ref
+                    item["data"] = new_data
+            updated.append(item)
+        return updated
+
+    if isinstance(message, str):
+        resource_index = 0
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal resource_index
+            meta = metas[resource_index] if resource_index < len(metas) else None
+            resource_index += 1
+            ref = _delivery_candidate_ref(meta, attempt_index)
+            if not ref:
+                return match.group(0)
+            return f"{match.group('prefix')}{quote(ref, safe=':/?&=#%._+-')}"
+
+        return re.sub(
+            r"(?P<prefix>\[CQ:[^\]]*?(?:^|,)file=)(?P<value>[^,\]]+)",
+            replace,
+            message,
+        )
+    return message
+
+
+def _iter_delivery_meta(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    file_meta = meta.get("file_delivery")
+    if isinstance(file_meta, dict):
+        items.append(file_meta)
+    message_meta = meta.get("message_file_delivery")
+    if isinstance(message_meta, list):
+        items.extend(item for item in message_meta if isinstance(item, dict))
+    return items
+
+
+def _delivery_candidates(meta: Any) -> List[Dict[str, Any]]:
+    if not isinstance(meta, dict):
+        return []
+    raw = meta.get("_delivery_candidates")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _delivery_candidate(meta: Any, attempt_index: int) -> Dict[str, Any] | None:
+    candidates = _delivery_candidates(meta)
+    if not candidates:
+        return None
+    index = min(max(0, attempt_index), len(candidates) - 1)
+    return candidates[index]
+
+
+def _delivery_candidate_ref(meta: Any, attempt_index: int) -> str:
+    candidate = _delivery_candidate(meta, attempt_index)
+    return str((candidate or {}).get("ref") or "")
+
+
+def _delivery_attempt_failure(
+    meta: Dict[str, Any],
+    attempt_index: int,
+    response: Dict[str, Any],
+) -> Dict[str, Any]:
+    methods: List[str] = []
+    for item in _iter_delivery_meta(meta):
+        candidate = _delivery_candidate(item, attempt_index)
+        method = str((candidate or {}).get("method") or "")
+        if method and method not in methods:
+            methods.append(method)
+    return {
+        "attempt": attempt_index + 1,
+        "methods": methods,
+        "error": _action_error_text(response)[:500],
+    }
+
+
+def _public_delivery_meta(
+    meta: Dict[str, Any],
+    attempt_index: int,
+    failures: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    public = _strip_internal_delivery_meta(meta, attempt_index)
+    if failures:
+        public["delivery_attempt_failures"] = failures
+    return public
+
+
+def _strip_internal_delivery_meta(value: Any, attempt_index: int) -> Any:
+    if isinstance(value, list):
+        return [_strip_internal_delivery_meta(item, attempt_index) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result: Dict[str, Any] = {}
+    candidate = _delivery_candidate(value, attempt_index)
+    for key, item in value.items():
+        if key == "_delivery_candidates":
+            continue
+        result[key] = _strip_internal_delivery_meta(item, attempt_index)
+    if candidate is not None:
+        result["delivery_method"] = str(candidate.get("method") or result.get("delivery_method") or "")
+        result["delivery_note"] = str(candidate.get("note") or result.get("delivery_note") or "")
+        result["source_path"] = str(candidate.get("source_path") or result.get("source_path") or "")
+        result["size"] = candidate.get("size", result.get("size", 0))
+        result["candidate_count"] = len(_delivery_candidates(value))
+    return result
 
 
 def _apply_current_conversation_defaults(funname: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -290,13 +479,21 @@ def _summarize_result(spec: QQFunctionSpec, data: Any, *, ok: bool) -> str:
 def _redact_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """日志/工具结果里折叠 base64，避免把大文件内容写入上下文。"""
 
-    result: Dict[str, Any] = {}
-    for key, value in params.items():
-        if isinstance(value, str) and value.startswith("base64://"):
-            result[key] = f"base64://...({len(value)} chars)"
-        else:
-            result[key] = value
-    return result
+    redacted = _redact_value(params)
+    return redacted if isinstance(redacted, dict) else {}
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        if value.startswith("base64://"):
+            return f"base64://...({len(value)} chars)"
+        if value.startswith("data:") and ";base64," in value[:120].lower():
+            return f"data:...base64...({len(value)} chars)"
+    return value
 
 
 def _is_missing(value: Any) -> bool:

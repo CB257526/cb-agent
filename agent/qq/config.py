@@ -21,7 +21,7 @@ class QQConfig:
     allowed_groups: Set[str] = field(default_factory=set)
     allowed_users: Set[str] = field(default_factory=set)
     action_timeout_seconds: float = 30.0
-    file_delivery_mode: str = "path"
+    file_delivery_mode: str = "auto"
     file_host_prefix: str = ""
     file_napcat_prefix: str = ""
     file_http_host: str = "127.0.0.1"
@@ -29,6 +29,8 @@ class QQConfig:
     file_http_public_base_url: str = ""
     file_http_ttl_seconds: int = 300
     file_base64_max_mb: float = 3.0
+    file_shared_ttl_seconds: int = 86400
+    file_shared_max_files: int = 1000
     group_context_messages: int = 50
     group_context_max_chars: int = 8000
 
@@ -37,9 +39,9 @@ class QQConfig:
         mode = (os.getenv("QQ_GROUP_MODE") or "mention").strip().lower()
         if mode not in {"mention", "prefix", "all"}:
             mode = "mention"
-        delivery_mode = (os.getenv("QQ_FILE_DELIVERY_MODE") or "path").strip().lower()
+        delivery_mode = (os.getenv("QQ_FILE_DELIVERY_MODE") or "auto").strip().lower()
         if delivery_mode not in {"path", "mapped_path", "http", "base64", "auto"}:
-            delivery_mode = "path"
+            delivery_mode = "auto"
         return cls(
             enabled=_env_bool("QQ_ENABLE", True),
             host=(os.getenv("QQ_HOST") or "127.0.0.1").strip() or "127.0.0.1",
@@ -58,6 +60,8 @@ class QQConfig:
             file_http_public_base_url=(os.getenv("QQ_FILE_HTTP_PUBLIC_BASE_URL") or "").strip(),
             file_http_ttl_seconds=max(30, _env_int("QQ_FILE_HTTP_TTL_SECONDS", 300)),
             file_base64_max_mb=max(0.1, _env_float("QQ_FILE_BASE64_MAX_MB", 3.0)),
+            file_shared_ttl_seconds=max(0, _env_int("QQ_FILE_SHARED_TTL_SECONDS", 86400)),
+            file_shared_max_files=max(0, _env_int("QQ_FILE_SHARED_MAX_FILES", 1000)),
             # 群聊没有长期上下文落盘，所以每次被唤醒时临时拉取最近群消息，帮助模型
             # 理解“刚才大家在聊什么”。设为 0 可以完全关闭，避免额外 NapCat action。
             group_context_messages=max(0, _env_int("QQ_GROUP_CONTEXT_MESSAGES", 50)),

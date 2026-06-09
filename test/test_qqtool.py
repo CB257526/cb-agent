@@ -167,6 +167,51 @@ class TestQQTool(unittest.TestCase):
         self.assertEqual(calls[1][0], "send_group_msg")
         self.assertEqual(calls[1][1]["message"][0]["data"]["file"], "/app/cb-agent-outbound/a.png")
 
+    def test_prepared_mapped_path_is_not_delivered_twice(self) -> None:
+        bridge = QQActionBridge()
+        calls = []
+
+        async def caller(action, params):  # noqa: ANN001
+            calls.append((action, params))
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 1}}
+
+        async def run() -> None:
+            token = bridge.register(asyncio.get_running_loop(), caller)
+            try:
+                with patch("tools.tools.qq.functions.global_qq_action_bridge", bridge), patch(
+                    "tools.tools.qq.media.global_qq_action_bridge", bridge
+                ), patch.dict(
+                    "os.environ",
+                    {"QQ_FILE_NAPCAT_PREFIX": "/app/cb-agent-outbound"},
+                    clear=False,
+                ):
+                    result = await asyncio.to_thread(
+                        run_qq_function,
+                        "send_group_msg",
+                        {
+                            "group_id": "100",
+                            "message": [
+                                {
+                                    "type": "image",
+                                    "data": {"file": "/app/cb-agent-outbound/a.png"},
+                                }
+                            ],
+                        },
+                    )
+            finally:
+                bridge.unregister(token)
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                result["metadata"]["message_file_delivery"][0]["delivery_method"],
+                "prepared_mapped_path",
+            )
+
+        asyncio.run(run())
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "send_group_msg")
+        self.assertEqual(calls[0][1]["message"][0]["data"]["file"], "/app/cb-agent-outbound/a.png")
+
     def test_cq_image_string_uses_delivery_layer(self) -> None:
         bridge = QQActionBridge()
         calls = []
@@ -212,6 +257,114 @@ class TestQQTool(unittest.TestCase):
         self.assertEqual(calls[0], ("__cbagent_prepare_resource_reference__", {"path": str(source)}))
         self.assertEqual(calls[1][0], "send_group_msg")
         self.assertEqual(calls[1][1]["message"], "[CQ:image,file=/app/cb-agent-outbound/a.png]")
+
+    def test_file_upload_retries_next_delivery_candidate_on_napcat_failure(self) -> None:
+        bridge = QQActionBridge()
+        calls = []
+
+        async def caller(action, params):  # noqa: ANN001
+            calls.append((action, params))
+            if action == "__cbagent_prepare_resource_reference__":
+                return {
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {
+                        "ref": "/app/cb-agent-outbound/report.txt",
+                        "metadata": {
+                            "delivery_method": "mapped_path",
+                            "delivery_note": "mapped",
+                            "source_path": "report.txt",
+                            "size": 5,
+                            "errors": [],
+                            "_delivery_candidates": [
+                                {
+                                    "method": "mapped_path",
+                                    "ref": "/app/cb-agent-outbound/report.txt",
+                                    "source_path": "report.txt",
+                                    "size": 5,
+                                    "note": "mapped",
+                                },
+                                {
+                                    "method": "base64",
+                                    "ref": "base64://aGVsbG8=",
+                                    "source_path": "report.txt",
+                                    "size": 5,
+                                    "note": "inline",
+                                },
+                            ],
+                        },
+                    },
+                }
+            if action == "upload_group_file" and params["file"].startswith("/app/"):
+                return {"status": "failed", "retcode": 1404, "wording": "file not found"}
+            return {"status": "ok", "retcode": 0, "data": {"message": "ok"}}
+
+        async def run() -> dict:
+            token = bridge.register(asyncio.get_running_loop(), caller)
+            try:
+                with patch("tools.tools.qq.functions.global_qq_action_bridge", bridge), patch(
+                    "tools.tools.qq.media.global_qq_action_bridge", bridge
+                ):
+                    return await asyncio.to_thread(
+                        run_qq_function,
+                        "upload_group_file",
+                        {"group_id": "100", "file": "report.txt", "name": "report.txt"},
+                    )
+            finally:
+                bridge.unregister(token)
+
+        result = asyncio.run(run())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[1], (
+            "upload_group_file",
+            {"group_id": "100", "file": "/app/cb-agent-outbound/report.txt", "name": "report.txt"},
+        ))
+        self.assertEqual(calls[2][0], "upload_group_file")
+        self.assertEqual(calls[2][1]["file"], "base64://aGVsbG8=")
+        self.assertEqual(result["params"]["file"], "base64://...(17 chars)")
+        self.assertEqual(result["metadata"]["file_delivery"]["delivery_method"], "base64")
+        self.assertEqual(result["metadata"]["file_delivery"]["candidate_count"], 2)
+        self.assertEqual(result["metadata"]["delivery_attempt_failures"][0]["methods"], ["mapped_path"])
+        self.assertNotIn("_delivery_candidates", json.dumps(result["metadata"], ensure_ascii=False))
+
+    def test_message_segment_base64_is_redacted_recursively(self) -> None:
+        bridge = QQActionBridge()
+
+        async def caller(action, params):  # noqa: ANN001
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 1}}
+
+        async def run() -> dict:
+            token = bridge.register(asyncio.get_running_loop(), caller)
+            try:
+                with patch("tools.tools.qq.functions.global_qq_action_bridge", bridge):
+                    return await asyncio.to_thread(
+                        run_qq_function,
+                        "send_group_msg",
+                        {
+                            "group_id": "100",
+                            "message": [
+                                {
+                                    "type": "image",
+                                    "data": {"file": "base64://aGVsbG8="},
+                                },
+                                {
+                                    "type": "text",
+                                    "data": {"text": "done"},
+                                },
+                            ],
+                        },
+                    )
+            finally:
+                bridge.unregister(token)
+
+        result = asyncio.run(run())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["params"]["message"][0]["data"]["file"],
+            "base64://...(17 chars)",
+        )
 
     def test_current_group_conversation_defaults_group_id_before_required_check(self) -> None:
         bridge = QQActionBridge()

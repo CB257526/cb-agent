@@ -75,12 +75,13 @@ class QQFileDeliveryManager:
     - ``mapped_path``：复制到宿主机共享目录，并把路径改写为容器内路径。
     - ``http``：启动只读临时 HTTP 文件服务，让 NapCat 通过 URL 下载。
     - ``base64``：小文件内联成 ``base64://``，避免路径共享。
-    - ``auto``：按 mapped_path -> http -> base64 -> path 生成候选。
+    - ``auto``：按 mapped_path -> base64 -> http -> path 生成候选；未显式配置可访问 HTTP 时跳过 http。
     """
 
     def __init__(self, config: QQConfig) -> None:
         self.config = config
         self._http_lock = threading.RLock()
+        self._shared_cleanup_lock = threading.RLock()
         self._http_server: Optional[ThreadingHTTPServer] = None
         self._http_thread: Optional[threading.Thread] = None
         self._http_entries: Dict[str, _HttpFileEntry] = {}
@@ -149,12 +150,22 @@ class QQFileDeliveryManager:
             server.server_close()
 
     def _candidate_methods(self, mode: str) -> List[str]:
-        clean = (mode or "path").strip().lower()
+        clean = (mode or "auto").strip().lower()
         if clean == "auto":
-            return ["mapped_path", "http", "base64", "path"]
+            methods = ["mapped_path", "base64"]
+            if self._auto_should_include_http():
+                methods.append("http")
+            methods.append("path")
+            return methods
         if clean in {"path", "mapped_path", "http", "base64"}:
             return [clean]
-        return ["path"]
+        return self._candidate_methods("auto")
+
+    def _auto_should_include_http(self) -> bool:
+        host = (self.config.file_http_host or "").strip().lower()
+        if (self.config.file_http_public_base_url or "").strip():
+            return True
+        return host not in {"", "127.0.0.1", "localhost", "::1", "0.0.0.0", "::"}
 
     def _build_candidate(self, method: str, source: Path) -> DeliveryCandidate:
         if method == "path":
@@ -177,6 +188,7 @@ class QQFileDeliveryManager:
             raise FileDeliveryError("未配置 QQ_FILE_NAPCAT_PREFIX")
 
         host_root.mkdir(parents=True, exist_ok=True)
+        self._cleanup_mapped_path_root(host_root)
         digest = _file_sha256(source)[:16]
         target_name = f"{_safe_stem(source.stem)}-{digest}{source.suffix}"
         target = (host_root / target_name).resolve()
@@ -195,6 +207,48 @@ class QQFileDeliveryManager:
             size=target.stat().st_size,
             note=f"已复制到共享目录：{target}",
         )
+
+    def _cleanup_mapped_path_root(self, host_root: Path) -> None:
+        """清理交付层复制到共享目录的旧文件。
+
+        只处理形如 ``name-<16位sha256>.ext`` 的文件，避免误删用户手动放在共享卷里的
+        其他内容。``QQ_FILE_SHARED_TTL_SECONDS=0`` 和 ``QQ_FILE_SHARED_MAX_FILES=0``
+        分别表示关闭对应清理策略。
+        """
+
+        ttl = int(getattr(self.config, "file_shared_ttl_seconds", 86400) or 0)
+        max_files = int(getattr(self.config, "file_shared_max_files", 1000) or 0)
+        if ttl <= 0 and max_files <= 0:
+            return
+
+        with self._shared_cleanup_lock:
+            try:
+                entries = [
+                    item
+                    for item in host_root.iterdir()
+                    if item.is_file() and _looks_like_managed_shared_file(item.name)
+                ]
+            except OSError as exc:
+                logger.warning("QQ mapped_path cleanup skipped: root=%s error=%s", host_root, exc)
+                return
+
+            now = time.time()
+            kept: List[Path] = []
+            for item in entries:
+                try:
+                    stat = item.stat()
+                except OSError:
+                    continue
+                if ttl > 0 and stat.st_mtime < now - ttl:
+                    _unlink_quietly(item)
+                    continue
+                kept.append(item)
+
+            if max_files <= 0 or len(kept) <= max_files:
+                return
+            kept.sort(key=lambda item: _safe_mtime(item))
+            for item in kept[: max(0, len(kept) - max_files)]:
+                _unlink_quietly(item)
 
     def _build_http_candidate(self, source: Path) -> DeliveryCandidate:
         public_base = self._public_http_base_url()
@@ -391,6 +445,52 @@ def _safe_stem(value: str) -> str:
     return clean[:80] or "file"
 
 
+def _looks_like_managed_shared_file(name: str) -> bool:
+    return bool(re.match(r"^.+-[0-9a-f]{16}(?:\.[^\\/]+)?$", name))
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("QQ mapped_path cleanup could not remove %s: %s", path, exc)
+
+
+def delivery_metadata(candidate: DeliveryCandidate, plan: DeliveryPlan) -> Dict[str, object]:
+    """生成文件交付元数据。
+
+    ``_delivery_candidates`` 是 qqtool 执行层内部用于 NapCat 失败后重试的完整候选表；
+    返回给模型前会被执行层剥离，避免把长 URL/base64 写入上下文。
+    """
+
+    return {
+        "delivery_method": candidate.method,
+        "delivery_note": candidate.note,
+        "source_path": candidate.source_path,
+        "size": candidate.size,
+        "errors": plan.errors,
+        "_delivery_candidates": [
+            {
+                "method": item.method,
+                "ref": item.ref,
+                "source_path": item.source_path,
+                "size": item.size,
+                "note": item.note,
+            }
+            for item in plan.candidates
+        ],
+    }
+
+
 def _join_remote_path(prefix: str, relative: Path) -> str:
     rel = "/".join(part for part in relative.parts if part not in {"", "."})
     if not rel:
@@ -415,6 +515,7 @@ __all__ = [
     "DeliveryPlan",
     "FileDeliveryError",
     "QQFileDeliveryManager",
+    "delivery_metadata",
     "is_external_file_reference",
     "looks_like_posix_absolute_path",
 ]

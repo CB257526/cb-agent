@@ -294,8 +294,9 @@ class TestQQAdapterSend(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(adapter.calls[0][0], "upload_group_file")
-        self.assertEqual(adapter.calls[1][0], "send_group_msg")
-        fallback_text = adapter.calls[1][1]["message"][0]["data"]["text"]
+        self.assertEqual(adapter.calls[1][0], "upload_group_file")
+        self.assertEqual(adapter.calls[2][0], "send_group_msg")
+        fallback_text = adapter.calls[2][1]["message"][0]["data"]["text"]
         self.assertIn("文件发送失败", fallback_text)
         self.assertIn("QQ_FILE_DELIVERY_MODE", fallback_text)
 
@@ -438,8 +439,84 @@ class TestQQFileDeliveryManager(unittest.TestCase):
             plan = manager.build_plan(str(source))
 
         self.assertTrue(any("QQ_FILE_HOST_PREFIX" in item for item in plan.errors))
-        self.assertTrue(any("QQ_FILE_HTTP_PUBLIC_BASE_URL" in item for item in plan.errors))
+        self.assertFalse(any("QQ_FILE_HTTP_PUBLIC_BASE_URL" in item for item in plan.errors))
         self.assertEqual([item.method for item in plan.candidates], ["base64", "path"])
+
+    def test_auto_delivery_default_skips_loopback_http_candidate(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "small.txt"
+            source.write_bytes(b"small")
+            manager = QQFileDeliveryManager(QQConfig(
+                file_delivery_mode="auto",
+                file_http_port=6200,
+                file_base64_max_mb=1,
+            ))
+            plan = manager.build_plan(str(source))
+
+        self.assertTrue(any("QQ_FILE_HOST_PREFIX" in item for item in plan.errors))
+        self.assertFalse(any("QQ_FILE_HTTP_PUBLIC_BASE_URL" in item for item in plan.errors))
+        self.assertEqual([item.method for item in plan.candidates], ["base64", "path"])
+
+    def test_auto_delivery_includes_http_when_public_base_is_configured(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        manager = QQFileDeliveryManager(QQConfig(
+            file_delivery_mode="auto",
+            file_http_public_base_url="http://host.docker.internal:6200",
+        ))
+
+        self.assertTrue(manager._auto_should_include_http())  # noqa: SLF001
+
+    def test_invalid_delivery_mode_falls_back_to_auto_candidates(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "small.txt"
+            source.write_bytes(b"small")
+            manager = QQFileDeliveryManager(QQConfig(
+                file_delivery_mode="bad-mode",
+                file_base64_max_mb=1,
+            ))
+            plan = manager.build_plan(str(source))
+
+        self.assertTrue(any("QQ_FILE_HOST_PREFIX" in item for item in plan.errors))
+        self.assertEqual([item.method for item in plan.candidates], ["base64", "path"])
+
+    def test_mapped_path_cleanup_only_removes_old_managed_files(self) -> None:
+        from agent.qq.file_delivery import QQFileDeliveryManager
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "report.txt"
+            shared = root / "shared"
+            shared.mkdir()
+            source.write_text("fresh", encoding="utf-8")
+            old_managed = shared / "old-aaaaaaaaaaaaaaaa.txt"
+            fresh_managed = shared / "fresh-bbbbbbbbbbbbbbbb.txt"
+            manual = shared / "manual.txt"
+            old_managed.write_text("old", encoding="utf-8")
+            fresh_managed.write_text("fresh", encoding="utf-8")
+            manual.write_text("manual", encoding="utf-8")
+            old_time = 1
+            import os
+
+            os.utime(old_managed, (old_time, old_time))
+
+            manager = QQFileDeliveryManager(QQConfig(
+                file_delivery_mode="mapped_path",
+                file_host_prefix=str(shared),
+                file_napcat_prefix="/app/outbound",
+                file_shared_ttl_seconds=30,
+                file_shared_max_files=0,
+            ))
+            plan = manager.build_plan(str(source))
+
+            self.assertEqual(plan.candidates[0].method, "mapped_path")
+            self.assertFalse(old_managed.exists())
+            self.assertTrue(fresh_managed.exists())
+            self.assertTrue(manual.exists())
 
     def test_materialize_inbound_attachment_downloads_url_to_local_file(self) -> None:
         from agent.qq.adapter import QQNapCatAdapter

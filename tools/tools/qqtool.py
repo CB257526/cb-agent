@@ -26,6 +26,8 @@ class QQTool(Tool):
                 "上传群文件 {\"funname\":\"upload_group_file\",\"args\":{\"group_id\":123,\"file\":\"/tmp/cb-agent-outputs/report.pdf\",\"name\":\"report.pdf\"}}；"
                 "戳一戳 {\"funname\":\"send_poke\",\"args\":{\"group_id\":123,\"user_id\":456}}。"
                 "当前 QQ 群聊或私聊内，如果省略当前会话自身的 group_id/user_id，系统会尽量从 ConversationKey 安全补齐。"
+                "发送图片或文件时直接传本地临时产物路径，不需要手动调用 __cbagent_prepare_resource_reference__；"
+                "如果参数已经是 QQ_FILE_NAPCAT_PREFIX 下的容器映射路径，也会直接透传。"
                 "模型的最终回答、思考内容、工具过程提示、ask_user_question 仍由系统事件自动发送；"
                 "只有需要主动执行 QQ 操作时才调用本工具。"
                 "普通用户只能操作当前会话和临时产物，root 用户才可跨会话、读历史、改资料或 raw_action。"

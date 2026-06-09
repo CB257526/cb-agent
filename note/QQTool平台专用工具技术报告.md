@@ -71,6 +71,8 @@
 
 如果模型使用 OneBot CQ 字符串，例如 `[CQ:image,file=/tmp/cb-agent-outputs/a.png]`，执行层也会提取 `file=` 并走同一套交付转换。新实现仍推荐消息段数组，因为结构化参数更不容易被逗号、空格和转义规则影响。
 
+如果 `file` 已经是 `QQ_FILE_NAPCAT_PREFIX` 下的容器映射路径，例如 `/app/cb-agent-outbound/a.png`，`prepare_file_reference()` 会识别它已经是 NapCat 可读引用并直接透传，不再把它当作宿主机本地路径二次交付。这个处理专门避免“内部 prepare 成功生成 /app 路径，随后 send_group_msg 又报宿主机文件不存在”的循环排查问题。
+
 安全边界同步放在权限层：普通 QQ 用户可以发送 `http(s)`、`base64://`、`data:`、表情包目录资源，以及系统临时目录里的新产物；不能通过 image/file/record/video 消息段把项目源码、配置、日志、密钥或任意本地文件外发。`file://` 不被视为外部资源，也不能绕过本地文件检查。
 
 首批覆盖能力包括：
@@ -103,7 +105,7 @@ Docker 部署 NapCat 时，cb-agent 宿主机路径通常不能被容器直接�
 - `mapped_path`：先复制到 `QQ_FILE_HOST_PREFIX`，再改写成 `QQ_FILE_NAPCAT_PREFIX` 容器路径，推荐 Docker 部署。
 - `http`：启动只读临时 HTTP 文件服务，给 NapCat 一个带随机 token、会过期的 URL。
 - `base64`：小文件内联成 `base64://`，不适合大文件。
-- `auto`：按 `mapped_path -> http -> base64 -> path` 生成候选。
+- `auto`：按 `mapped_path -> base64 -> 可访问 http -> path` 生成候选；默认 loopback HTTP 不会自动加入候选。
 
 `qqtool` 优先通过 bridge 调 adapter 内部 action `__cbagent_prepare_resource_reference__`，这样能复用正在运行的 adapter 配置和 HTTP 服务。离线单测或没有连接时，再退回到本地 `QQFileDeliveryManager(QQConfig.from_env())`。
 
