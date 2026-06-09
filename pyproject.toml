@@ -24,6 +24,8 @@ dependencies = [
     "pyyaml>=6.0",            # Skill SKILL.md frontmatter
     "bashlex>=0.18",          # BashTool 命令 AST 解析（POSIX shell）
     "websockets>=13.0",       # QQ/NapCat OneBot 反向 WebSocket（使用 websockets.asyncio API）
+    "pycryptodome>=3.20",     # 微信 OC 媒体 CDN AES-ECB 加解密
+    "qrcode>=7.4",            # 微信 OC 扫码登录终端二维码
 ]
 
 # full：完整能力，把所有可选模块的依赖一并装上

@@ -1,9 +1,14 @@
 """通讯平台工具权限策略。
 
-这一层专门处理“QQ/微信等远程入口是谁在让 agent 调工具”的问题。TUI/CLI 是本机
-交互，继续沿用原来的 Bash 权限弹窗和文件工具保护；通讯平台没有可信本地身份，因
-此必须在工具真正执行前做一层硬拦截，避免群友或普通好友通过模型间接执行写文件、
+这一层专门处理“多人 IM 入口是谁在让 agent 调工具”的问题。TUI/CLI 是本机交互，
+继续沿用原来的 Bash 权限弹窗和文件工具保护；QQ/NapCat 这类入口可能面对群友或
+普通好友，因此必须在工具真正执行前做一层硬拦截，避免他们通过模型间接执行写文件、
 回滚代码、发送项目文件等敏感操作。
+
+微信 OC 接入比较特殊：openclaw-weixin 是在当前账号里创建一个私聊 bot，并不是把
+一个独立机器人账号暴露给多人使用。当前实现把微信视为“账号持有人自用入口”，不再
+按 root/普通用户分级拦截；工具自身的参数校验、Bash 权限机制和显式
+``--dangerously-skip-permissions`` 语义仍保持原样。
 """
 
 from __future__ import annotations
@@ -33,8 +38,8 @@ READ_ONLY_MCP_ACTIONS = {
     "get_prompt",
 }
 
-# 这些命令虽然“只读”，但会把本地文件正文或代码片段带回通讯软件。QQ/微信入口面向
-# 远程用户，读取项目文件内容本身就属于敏感信息外发，必须只允许 root 用户触发。
+# 这些命令虽然“只读”，但会把本地文件正文或代码片段带回通讯软件。QQ/NapCat 入口面向
+# 多人远程用户，读取项目文件内容本身就属于敏感信息外发，必须只允许 root 用户触发。
 LOCAL_FILE_DISCLOSURE_PREFIXES = {
     "cat",
     "head",
@@ -97,14 +102,20 @@ def check_platform_tool_permission(
 ) -> PermissionDecision:
     """判断当前通讯平台用户是否允许执行这次工具调用。
 
-    ``conversation`` / ``sender_id`` 默认来自 ContextVar，QQ 适配器在每次 inbound
-    运行前已经绑定它们；未来微信适配器只要也设置这两个上下文，就能复用本策略。
+    ``conversation`` / ``sender_id`` 默认来自 ContextVar，通讯平台适配器在每次 inbound
+    运行前都会绑定它们；后续新增平台只要也设置这两个上下文，就能复用本策略。
     没有通讯平台上下文时认为是本地 CLI/TUI，不额外拦截。
     """
 
     conversation = conversation if conversation is not None else get_current_platform_conversation()
     sender_id = sender_id if sender_id is not None else get_current_platform_sender()
     if conversation is None:
+        return PermissionDecision(allowed=True, sensitive=False)
+
+    # 微信 OC bot 是当前账号里的私聊入口，真实使用者就是账号持有人；它不像 QQ/NapCat
+    # 群聊那样需要区分 root 和普通群友。这里仅跳过“通讯平台 root 门禁”，不改变工具
+    # 自身的校验、Bash 权限弹窗或 --dangerously-skip-permissions 的显式语义。
+    if conversation.platform.strip().lower() == "wechat":
         return PermissionDecision(allowed=True, sensitive=False)
 
     sensitive_reason = sensitive_tool_reason(tool_name, arguments)
@@ -128,7 +139,8 @@ def sensitive_tool_reason(tool_name: str, arguments: Dict[str, Any]) -> str:
     """返回工具调用的敏感原因；空字符串表示普通通讯用户也可执行。
 
     判断规则偏保守：本地读文件、搜索、todo、表情包名称发送等常见聊天能力放行；凡是
-    会修改磁盘/记忆/知识库/权限，或可能外发任意本地文件的能力，都要求 root QQ 号。
+    会修改磁盘/记忆/知识库/权限，或可能外发任意本地文件的能力，都要求多人 IM 平台
+    的 root 用户。微信 OC 自用入口会在 ``check_platform_tool_permission`` 提前放行。
     """
 
     name = (tool_name or "").strip()
@@ -174,6 +186,9 @@ def sensitive_tool_reason(tool_name: str, arguments: Dict[str, Any]) -> str:
     if name == "qqtool":
         return _sensitive_qqtool_reason(args)
 
+    if name == "wechattool":
+        return _sensitive_wechattool_reason(args)
+
     if name == "memory":
         action = str(args.get("action") or "").strip().lower()
         if action not in {"search", "summary", "stats", "list"}:
@@ -195,9 +210,9 @@ def sensitive_tool_reason(tool_name: str, arguments: Dict[str, Any]) -> str:
 def is_platform_root_user(platform: str, sender_id: Optional[str]) -> bool:
     """检查某个平台用户是否在 root 名单中。
 
-    通用 ``IM_ROOT_USERS`` 适合未来微信/Telegram 共用；``QQ_ROOT_USERS`` 用于 QQ
-    单独配置。只要任一名单命中就视为 root。未配置 root 时，通讯平台敏感工具默认
-    拒绝，这比“忘配就全放行”安全。
+    通用 ``IM_ROOT_USERS`` 适合 QQ/后续 Telegram 等多人平台共用；``QQ_ROOT_USERS``
+    用于 QQ 单独配置。只要任一名单命中就视为 root。未配置 root 时，多人平台敏感工具
+    默认拒绝，这比“忘配就全放行”安全。
     """
 
     sender = str(sender_id or "").strip()
@@ -225,7 +240,7 @@ def permission_denied_payload(
         "error": decision.reason or "通讯平台用户无权执行该敏感工具",
         "tool": tool_name,
         "sensitive": decision.sensitive,
-        "hint": "请让 .env 中 QQ_ROOT_USERS/IM_ROOT_USERS 配置的 root 用户重新发起该操作。",
+        "hint": "请让 .env 中为当前多人通讯平台配置的 root 用户重新发起该操作。",
     }
     if tool_name == "bash":
         payload["command"] = str((arguments or {}).get("command") or "")[:500]
@@ -306,6 +321,16 @@ def _sensitive_qqtool_reason(arguments: Dict[str, Any]) -> str:
             return ""
         return f"qqtool(funname={spec.funname}) 可能外发任意本地文件"
 
+    return ""
+
+
+def _sensitive_wechattool_reason(arguments: Dict[str, Any]) -> str:
+    """微信 OC 是当前账号自用入口，平台权限层不再给 wechattool 分级。
+
+    QQ/NapCat 暴露给群友和好友，需要 root/普通用户门禁；openclaw-weixin 的微信 OC
+    bot 只存在于当前账号私聊里，使用者就是账号持有人。这里恒定返回空字符串，具体
+    参数合法性和网络/API 错误交给 wechattool 与 adapter 自己处理。
+    """
     return ""
 
 

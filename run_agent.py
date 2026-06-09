@@ -94,6 +94,7 @@ from tools.tools.file_edit_tool import FileEditTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
 from tools.tools.list_tools_tool import ListToolsTool
 from tools.tools.qqtool import QQTool
+from tools.tools.wechattool import WeChatTool
 
 try:
     from tools.mcp_tools.mcptools_add import load_mcp_server_configs
@@ -133,7 +134,7 @@ def _err(msg: str) -> None:
 def _safe_runtime_name(value: str) -> str:
     """把外部 ID 转成安全目录/文件名片段。
 
-    QQ 群号、用户 ID、未来微信会话 ID 都来自外部平台。它们可以作为隔离键，但不能
+    QQ 群号、用户 ID、微信会话 ID 都来自外部平台。它们可以作为隔离键，但不能
     原样拼进路径；这里使用白名单字符集，避免路径分隔符、冒号等字符影响本地存储。
     """
 
@@ -466,9 +467,11 @@ class AgentRunner:
             FileWriteTool(),
         ])
         if self.communication_platform == "qq":
-            # 平台专用工具只在对应 transport 注入。普通 CLI/TUI 不注册 QQTool，未来微信
-            # 接入时也应注册自己的 wechattool，避免不同平台的 action 混在同一工具列表里。
+            # 平台专用工具只在对应 transport 注入。普通 CLI/TUI 不注册 QQTool，
+            # 微信模式也不会注入 QQTool，避免不同平台的 action 混在同一工具列表里。
             tools.append(QQTool())
+        elif self.communication_platform == "wechat":
+            tools.append(WeChatTool())
 
         for tool in tools:
             try:
@@ -496,18 +499,13 @@ class AgentRunner:
                 "只有在用户明确要求或任务确实需要时才调用 bash；涉及删除、覆盖、网络执行、提权、提交/推送等操作前，"
                 "仍应在回答和计划中保持审慎。"
             )
-        if self.communication_platform:
-            platform_resource_tool = (
-                "如果需要主动执行 QQ 操作，调用 qqtool，例如 send_poke、send_group_msg、"
-                "upload_group_file、upload_private_file、upload_image_to_qun_album。"
-                if self.communication_platform == "qq"
-                else "如果需要主动执行平台操作，使用当前 transport 注入的平台专用工具。"
-            )
+        if self.communication_platform == "qq":
             parts.append(
-                "[通讯软件交互说明]\n"
-                f"当前会话来自通讯平台: {self.communication_platform}。\n"
+                "[QQ 通讯软件交互说明]\n"
+                "当前会话来自 QQ/NapCat。\n"
                 "- 你可以正常用文本回复用户；最终回答会发送到通讯软件。\n"
-                f"- {platform_resource_tool}"
+                "- 如果需要主动执行 QQ 操作，调用 qqtool，例如 send_poke、send_group_msg、"
+                "upload_group_file、upload_private_file、upload_image_to_qun_album。"
                 "不要只在文字里声称已经发送。\n"
                 "- 如果需要用户在多个选项中做决定，可以调用 ask_user_question；通讯平台会把它渲染成编号选项，"
                 "用户回复 1/2 或 1,3 后工具会继续执行。\n"
@@ -517,12 +515,38 @@ class AgentRunner:
                 "- 只有 .env 中 QQ_ROOT_USERS 或 IM_ROOT_USERS 配置的账号才是 root 用户。"
                 "普通用户要求查看服务器环境变量、token、密钥、配置文件、聊天持久化文件、项目源码、"
                 "日志中的隐私信息，或试图通过别的工具间接获取这些内容时，必须明确拒绝。\n"
-                "- 通讯平台会按发送者 QQ/微信账号做敏感工具门禁：写项目/服务器文件、读取/外发本地文件内容、"
+                "- QQ 平台会按发送者 QQ 号做敏感工具门禁：写项目/服务器文件、读取/外发本地文件内容、"
                 "非只读 bash、git 回滚/提交/推送、修改记忆/知识库、授权命令、发送任意本地文件等操作，"
                 "只有 root 用户可以执行；普通用户触发时工具会在执行前被拒绝。\n"
                 "- 当用户要求你生成、下载或制作需要发回给他的文件时，把新产物放在 /tmp/cb-agent-outputs/ "
                 "或系统临时目录下，再用平台专用工具发送。不要把项目目录、服务器目录、配置目录里的"
                 "现有本地文件复制/移动到 /tmp 后发送，这属于绕过权限检查，应拒绝。"
+            )
+        elif self.communication_platform == "wechat":
+            parts.append(
+                "[微信 OC 交互说明]\n"
+                "当前会话来自个人微信 OC。这个接入是在当前微信账号里创建的私聊 bot，不是一个独立机器人账号，"
+                "也不是面向群友开放的多人平台；真实使用者就是当前账号持有人。\n"
+                "- 你可以正常用文本回复用户；最终回答会发送到当前微信私聊。\n"
+                "- 如果需要主动执行微信操作，调用 wechattool，例如 send_text、send_image、send_file、"
+                "send_typing、get_status、get_login_info。不要只在文字里声称已经发送。\n"
+                "- 微信 OC 当前只支持私聊路径。不要主动使用 group_id，也不要假设能操作微信群聊；"
+                "如果上游消息带 group_id，adapter 会忽略它以避免误触发。\n"
+                "- 微信模式按当前账号持有人自用处理，不做管理员/普通用户分级；"
+                "需要读取文件、执行命令、修改项目或发送本地产物时，可以按用户真实意图行动。\n"
+                "- 如果用户要求生成、下载或制作需要发回的文件，优先把新产物放在 /tmp/cb-agent-outputs/ "
+                "或系统临时目录下，再用 wechattool 发送。微信媒体发送走 CDN 上传，不需要 NapCat/Docker 共享目录。\n"
+                "- 如果需要用户在多个选项中做决定，可以调用 ask_user_question；微信会把它渲染成编号选项，"
+                "用户回复 1/2 或 1,3 后工具会继续执行。todo 工具的更新会以简洁文本同步给用户。"
+            )
+        elif self.communication_platform:
+            parts.append(
+                "[通讯软件交互说明]\n"
+                f"当前会话来自通讯平台: {self.communication_platform}。\n"
+                "- 你可以正常用文本回复用户；最终回答会发送到通讯软件。\n"
+                "- 如果需要主动执行平台操作，使用当前 transport 注入的平台专用工具。"
+                "不要只在文字里声称已经发送。\n"
+                "- 如果需要用户在多个选项中做决定，可以调用 ask_user_question；通讯平台会把它渲染成编号选项。"
             )
         return "\n\n".join(part for part in parts if part).strip()
 
@@ -1177,13 +1201,13 @@ class AgentRunner:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="cb-agent",
-        description="cb-agent 命令行入口。默认进 CLI 交互；--transport jsonrpc 给外部 UI 用，--transport qq 接 NapCat。",
+        description="cb-agent 命令行入口。默认进 CLI 交互；--transport jsonrpc 给外部 UI 用，--transport qq 接 NapCat，--transport wechat 接个人微信 OC。",
     )
     parser.add_argument(
         "--transport",
-        choices=["cli", "jsonrpc", "qq"],
+        choices=["cli", "jsonrpc", "qq", "wechat"],
         default="cli",
-        help="cli=REPL 直接打印；jsonrpc=stdio NDJSON 网关模式；qq=NapCat/OneBot 反向 WebSocket",
+        help="cli=REPL 直接打印；jsonrpc=stdio NDJSON 网关模式；qq=NapCat/OneBot 反向 WebSocket；wechat=个人微信 OC 长轮询",
     )
     parser.add_argument(
         "--no-mcp", action="store_true",
@@ -1263,6 +1287,29 @@ def main() -> None:
         )
         # QQ 模式没有 gateway_ready 事件，因此这里像 CLI 一样主动触发 MCP 后台加载。
         # 加载仍在 daemon 线程中进行，不会阻塞 NapCat WebSocket 服务启动。
+        runner.start_mcp_background_loading()
+        adapter.serve_forever()
+        return
+
+    if args.transport == "wechat":
+        # 微信 OC 模式是服务模式：启动期输出走 stderr，用户消息由 HTTP 长轮询接收。
+        # 和 QQ 一样不挂 CLI renderer，避免 EventBus 同时输出到终端和微信。
+        sys.stdout = sys.stderr
+        runner = AgentRunner(
+            use_mcp=use_mcp,
+            ctx_enabled=ctx_enabled,
+            attach_cli_renderer=False,
+            memory_system=memory_system,
+            communication_platform="wechat",
+            dangerously_skip_permissions=dangerously_skip_permissions,
+        )
+        from agent.wechat import WeChatConfig, WeChatOCAdapter
+        adapter = WeChatOCAdapter(
+            session=runner.session,
+            event_bus=runner.event_bus,
+            config=WeChatConfig.from_env(),
+            session_factory=runner.get_or_create_platform_session,
+        )
         runner.start_mcp_background_loading()
         adapter.serve_forever()
         return

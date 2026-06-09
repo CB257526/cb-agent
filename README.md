@@ -28,6 +28,7 @@
 | 多模态输入 | 用户消息支持 `text + attachments[]`，图片可原生发给多模态基模，纯文本基模自动走 OCR，音频统一 ASR 成文本 |
 | TUI | Ink/React 终端界面，支持工具卡片、会话切换、Context 占用指标、日志面板 |
 | QQ / NapCat | `--transport qq` 接入 OneBot V11 反向 WebSocket，支持文本、表情包/文件发送、编号问答、todo 事件降级，并按群聊/好友隔离 AgentSession |
+| 微信 OC | `--transport wechat` 接入个人微信 OC HTTP 长轮询，支持扫码登录、私聊持久化、媒体上传、事件自动发送和平台专用 `wechattool` |
 | MCP | 读取 `mcp.json`，通过 stdio 启动 MCP server，并展开成可调用工具 |
 | Skills | Markdown + YAML frontmatter 描述能力，按需加载指令和脚本 |
 | Bash 权限 | Bash 工具支持权限语义，TUI 模式下权限确认走 UI 通道 |
@@ -57,6 +58,12 @@
 
 - 已登录并启用 OneBot V11 反向 WebSocket 的 NapCat
 - Python 依赖中的 `websockets`
+
+如果要使用微信 OC：
+
+- 能访问个人微信 OC HTTP API（默认 `https://ilinkai.weixin.qq.com`）
+- Python 依赖中的 `requests`、`pycryptodome` 和 `qrcode`
+- 首次启动需要在终端扫码登录；token 会保存到 `.cbagent/wechat/state.json`
 
 ### 1. 克隆并进入项目
 
@@ -208,7 +215,7 @@ FEATURE_BUDDY=1
 | `QQ_ALLOWED_GROUPS` | QQ 群白名单，逗号分隔群号；为空表示不限制群 |
 | `QQ_ALLOWED_USERS` | QQ 用户白名单，逗号分隔 QQ 号；为空表示不限制用户 |
 | `QQ_ROOT_USERS` | QQ root 用户，逗号分隔 QQ 号；只有这些用户能在 QQ 中触发敏感工具，未配置时通讯平台敏感工具默认拒绝 |
-| `IM_ROOT_USERS` | 通用通讯平台 root 用户；未来微信/Telegram 也会检查它，QQ 会同时检查 `QQ_ROOT_USERS` |
+| `IM_ROOT_USERS` | 通用多人通讯平台 root 用户；QQ 会同时检查它和 `QQ_ROOT_USERS`，微信 OC 是当前账号私聊 bot，不检查该配置 |
 | `CBAGENT_MCP_PUBLIC_PREFIXES` / `CBAGENT_MCP_SENSITIVE_PREFIXES` | 自定义 MCP 展开工具名前缀的权限分类；默认 `fetch_`、`tavily_`、`amap-maps_` 普通可用，`github_`、`playwright_` 需要 root |
 | `QQ_ACTION_TIMEOUT_SECONDS` | OneBot action 超时时间，影响发送消息和上传文件 |
 | `IM_EVENT_VERBOSITY` | 通讯软件事件输出等级：`normal` 会发关键事件和工具开始提示，`full` 额外同步工具完成、round/token 等调试摘要 |
@@ -216,8 +223,8 @@ FEATURE_BUDDY=1
 | `IM_SHOW_REASONING` | 是否把思考模型的 `reasoning_content` 同步到 QQ/微信，默认 `0` 关闭 |
 | `IM_REASONING_CHUNK_CHARS` | `IM_SHOW_REASONING=1` 时每段“思考”消息的字符数，默认 `1200` |
 | `IM_REASONING_MAX_CHARS` | `IM_SHOW_REASONING=1` 时每轮最多展示的思考字符数，默认 `8000`，`0` 表示不限制 |
-| `IM_CONFIRM_QUESTION_ANSWER` | QQ 编号回答后是否发送“已选择”确认，默认 `1` |
-| `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；QQ 模式下可通过 `qqtool` 上传这里的图片作为 sticker/image |
+| `IM_CONFIRM_QUESTION_ANSWER` | 通讯平台编号回答后是否发送“已选择”确认，默认 `1` |
+| `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；QQ/微信模式下可通过平台专用工具上传这里的图片作为 sticker/image |
 | `CBAGENT_OUTBOUND_FILE_MAX_MB` | agent 发送本地文件到通讯软件的大小上限，默认 `50` MB |
 | `QQ_FILE_DELIVERY_MODE` | QQ/NapCat 出站文件交付方式：`path` 兼容旧行为，`mapped_path` 适合 Docker 共享卷，`http` 让 NapCat 拉临时 URL，`base64` 只适合小文件，`auto` 会按顺序尝试 |
 | `QQ_FILE_HOST_PREFIX` / `QQ_FILE_NAPCAT_PREFIX` | `mapped_path` 模式使用；前者是宿主机共享目录，后者是同一目录在 NapCat 容器内的路径 |
@@ -225,6 +232,15 @@ FEATURE_BUDDY=1
 | `QQ_FILE_HTTP_TTL_SECONDS` | HTTP 临时文件 URL 有效期，默认 `300` 秒 |
 | `QQ_FILE_BASE64_MAX_MB` | `base64` 模式或 `auto` 兜底允许内联的最大文件大小，默认 `3` MB |
 | `CBAGENT_PLATFORM_ATTACHMENT_DIR` | QQ 图片/音频入站 URL 下载目录，下载成功后交给多模态输入层处理 |
+| `WECHAT_ENABLE` | 是否启用微信 OC transport；设为 `1` 后，`python run_agent.py --transport wechat` 会启动扫码登录和 HTTP 长轮询 |
+| `WECHAT_BASE_URL` | 微信 OC API 地址，默认 `https://ilinkai.weixin.qq.com` |
+| `WECHAT_CDN_BASE_URL` | 微信媒体 CDN 地址；图片、视频和文件会先上传 CDN，再通过 `sendmessage` 发出 |
+| `WECHAT_TOKEN` / `WECHAT_ACCOUNT_ID` | 微信登录凭据；可留空扫码登录，成功后会写入 `WECHAT_STATE_FILE` |
+| `WECHAT_BOT_TYPE` | 微信 OC 扫码登录使用的 bot_type，默认 `3` |
+| `WECHAT_API_TIMEOUT_MS` / `WECHAT_LONG_POLL_TIMEOUT_MS` | 普通 API 与 `getupdates` 长轮询超时，单位毫秒 |
+| `WECHAT_STATE_FILE` | 微信 token、account_id、sync_buf 和 context token 的本地状态文件，默认 `.cbagent/wechat/state.json` |
+| `CBAGENT_PLATFORM_ATTACHMENT_DIR_WECHAT` | 微信图片/文件/语音入站媒体下载目录，默认 `.cbagent/platform_attachments/wechat` |
+| `WECHAT_ACTION_TIMEOUT_SECONDS` | `wechattool` 调用微信 adapter action 的超时时间 |
 | `VECTOR_STORE_TYPE` / `QDRANT_URL` / `QDRANT_API_KEY` | full RAG/Memory 的向量存储 |
 | `GRAPH_STORE_TYPE` / `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` | full 语义记忆图存储 |
 | `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` / `EMBED_API_KEY` | full embedding 配置 |
@@ -393,7 +409,7 @@ QQ_ALLOWED_GROUPS=
 QQ_ALLOWED_USERS=
 
 # root 用户，逗号分隔。不是“谁能聊天”，而是“谁能执行敏感工具”。
-# 未配置时，QQ/未来微信等通讯平台触发的敏感工具默认拒绝；TUI/CLI 不受影响。
+# 未配置时，QQ 等多人通讯平台触发的敏感工具默认拒绝；TUI/CLI/微信 OC 不受影响。
 QQ_ROOT_USERS=
 IM_ROOT_USERS=
 
@@ -424,11 +440,11 @@ IM_REASONING_MAX_CHARS=8000
 # 用户回复编号后是否发“已选择: xxx”确认。0 表示静默确认。
 IM_CONFIRM_QUESTION_ANSWER=1
 
-# 表情包目录。QQ 模式下模型可用 qqtool 上传这里的图片作为 sticker/image。
+# 表情包目录。QQ/微信模式下模型可用平台专用工具上传这里的图片作为 sticker/image。
 # 旧 send_message_asset 入口保留给事件兼容，但默认不再注册给模型。
 CBAGENT_STICKER_DIR=./assets/stickers
 
-# agent 允许发送到 QQ 的本地文件大小上限，单位 MB。
+# agent 允许发送到通讯软件的本地文件大小上限，单位 MB。
 CBAGENT_OUTBOUND_FILE_MAX_MB=50
 
 # QQ/NapCat 出站文件交付方式。
@@ -538,13 +554,13 @@ ip addr show | grep -E "inet " | grep -v 127.0.0.1
 
 群聊默认 `QQ_GROUP_MODE=mention`，只有 @机器人 或使用 `QQ_WAKE_PREFIX` 前缀时才会响应。私聊默认直接响应。`QQ_ALLOWED_GROUPS` 和 `QQ_ALLOWED_USERS` 为空时不做白名单限制；填写后分别按群号和 QQ 号过滤。
 
-QQ/通讯平台模式还会做一层敏感工具门禁。`QQ_ALLOWED_USERS` 只决定谁能触发 agent 聊天，`QQ_ROOT_USERS` / `IM_ROOT_USERS` 决定谁能执行敏感工具。敏感范围包括读取或外发本地文件内容、写项目/服务器文件、非只读 bash、git 回滚/提交/推送、`bash_permission` 授权变更、memory/rag 写操作、`run_skill_script`、发送项目/服务器本地文件、敏感 MCP 工具等。未配置 root 用户时，QQ/未来微信等通讯平台触发的敏感工具会在执行前直接拒绝；本地 TUI/CLI 继续使用原来的权限机制。
+QQ 模式还会做一层敏感工具门禁。`QQ_ALLOWED_USERS` 只决定谁能触发 agent 聊天，`QQ_ROOT_USERS` / `IM_ROOT_USERS` 决定谁能执行敏感工具。敏感范围包括读取或外发本地文件内容、写项目/服务器文件、非只读 bash、git 回滚/提交/推送、`bash_permission` 授权变更、memory/rag 写操作、`run_skill_script`、发送项目/服务器本地文件、敏感 MCP 工具等。未配置 root 用户时，QQ 触发的敏感工具会在执行前直接拒绝；本地 TUI/CLI 继续使用原来的权限机制。微信 OC 是当前账号里的私聊 bot，不走这套 root/普通用户门禁。
 
-普通通讯用户有一个受限例外：如果用户要求生成、下载或制作新文件并发回，agent 应把新产物放到系统临时目录，Linux 通常是 `/tmp/cb-agent-outputs/`，再通过 QQ 模式注入的 `qqtool` 上传或发送。不要把项目源码、配置、日志、密钥、服务器隐私文件复制或移动到 `/tmp` 后发送，这属于绕过权限检查。普通用户用 bash 下载文件时也只允许 `curl/wget` 从公网 `http(s)` URL 明确写入临时目录；localhost、内网地址、`file://`、管道脚本和本地复制仍会被拒绝。
+普通 QQ 用户有一个受限例外：如果用户要求生成、下载或制作新文件并发回，agent 应把新产物放到系统临时目录，Linux 通常是 `/tmp/cb-agent-outputs/`，再通过 `qqtool` 上传或发送。不要把项目源码、配置、日志、密钥、服务器隐私文件复制或移动到 `/tmp` 后发送，这属于绕过权限检查。普通用户用 bash 下载文件时也只允许 `curl/wget` 从公网 `http(s)` URL 明确写入临时目录；localhost、内网地址、`file://`、管道脚本和本地复制仍会被拒绝。
 
-通讯软件模式会把 TUI 风格事件降级成 QQ 可读消息：
+通讯软件模式会把 TUI 风格事件降级成 QQ/微信可读消息：
 
-| Agent 事件 | QQ 中的表现 |
+| Agent 事件 | 通讯软件中的表现 |
 |---|---|
 | `Done` | 发送最终回答 |
 | `ask_user_question` | 渲染为编号问题，用户回复 `1`、`1,3`、`其他: ...` 或 `取消`；群聊中只有发起请求的用户可以确认 |
@@ -599,7 +615,79 @@ QQ 模式会按通讯会话隔离 `AgentSession`。每条 QQ 消息都会创建�
 
 群聊默认不持久化 history/state/transcript/compact，避免群消息过多导致本地上下文无限增长。同一个群聊或好友内部使用按会话队列顺序处理消息；不同群聊、不同好友之间可以并发处理。事件回传会通过通讯平台上下文路由到对应会话。这个隔离层不影响 TUI：TUI 仍通过 `--transport jsonrpc` 使用普通 `.cbagent/sessions/`。
 
-### 8. 多模态输入
+### 8. 启动微信 OC
+
+微信接入使用个人微信 OC HTTP 协议。cb-agent 主动扫码登录、长轮询 `getupdates` 收消息，并通过 `sendmessage` 与微信 CDN 上传发送文本、图片和文件。
+
+`.env` 最小配置：
+
+```env
+WECHAT_ENABLE=1
+WECHAT_BASE_URL=https://ilinkai.weixin.qq.com
+WECHAT_CDN_BASE_URL=https://novac2c.cdn.weixin.qq.com/c2c
+WECHAT_STATE_FILE=.cbagent/wechat/state.json
+CBAGENT_PLATFORM_ATTACHMENT_DIR_WECHAT=.cbagent/platform_attachments/wechat
+```
+
+启动：
+
+Windows PowerShell：
+
+```powershell
+..\venv\python.exe run_agent.py --transport wechat
+```
+
+Linux / macOS：
+
+```bash
+../venv/bin/python run_agent.py --transport wechat
+```
+
+第一次启动时，如果 `.env` 没有 `WECHAT_TOKEN`，终端会打印登录二维码。用手机微信扫码确认后，adapter 会把 `token`、`account_id`、`sync_buf` 和最近会话的 `context_token` 写到：
+
+```text
+.cbagent/wechat/state.json
+```
+
+后续重启会优先从这个状态文件恢复登录。这个文件等同于登录凭据，已经位于 `.cbagent` 私有运行目录内，不要提交或公开。
+
+微信模式复用 QQ 已经搭好的通讯平台层：
+
+| 能力 | 微信模式行为 |
+|---|---|
+| 最终回答 | 由 `PlatformEventRenderer` 自动发送到当前微信会话 |
+| 思考内容 | `IM_SHOW_REASONING=1` 时自动分段发送 `【思考】` |
+| 工具过程 | 私聊默认发送工具开始提示 |
+| `ask_user_question` | 渲染成编号问题，用户回复 `1`、`1,3`、`其他: ...` 或 `取消` |
+| todo | 渲染成简洁任务列表 |
+| 会话隔离 | 私聊按 `wechat/private_<wxid>` 持久化；带 `group_id` 的上游消息会被忽略 |
+| 权限模型 | 当前微信账号自用入口，不做管理员/普通用户分级，平台权限层直接放行 |
+
+私聊持久化路径形如：
+
+```text
+.cbagent/platform_sessions/wechat/private_<wxid>/sessions/
+```
+
+openclaw-weixin 的 OC bot 是当前微信账号里的 `direct` 私聊 bot，不是独立机器人账号，也不是群聊机器人。cb-agent 因此只处理私聊消息；如果上游接口未来下发 `group_id`，adapter 会忽略该消息，避免在微信群里误触发。
+
+微信模式会额外注册 `wechattool`，CLI/TUI/QQ 模式不会注入它。模型需要主动发送额外内容时，可以调用：
+
+```text
+wechattool(funname="send_text", args={"text": "一条额外消息"})
+wechattool(funname="send_image", args={"path": "/tmp/cb-agent-outputs/demo.png"})
+wechattool(funname="send_file", args={"path": "/tmp/cb-agent-outputs/report.pdf"})
+wechattool(funname="send_typing", args={})
+wechattool(funname="get_status", args={})
+```
+
+最终回答、思考内容、工具过程提示、编号问答这些事件仍由事件系统自动发送，不需要模型自己调用 `wechattool(send_text)` 补发。`get_login_info` 在微信模式下也可用，因为微信 OC 是当前账号自用入口。
+
+微信媒体发送和 QQ/NapCat 不同：它不把本机路径交给另一个进程读取，而是 cb-agent 直接 `getuploadurl -> CDN upload -> sendmessage`。因此 Docker 路径共享问题只影响 QQ/NapCat，不影响微信。用户让 agent 生成、下载或制作要发回的文件时，仍建议把新产物放在 `/tmp/cb-agent-outputs/` 或系统临时目录，再用 `wechattool` 发送，便于审计和清理。
+
+入站微信图片会下载到 `CBAGENT_PLATFORM_ATTACHMENT_DIR_WECHAT`，再交给多模态输入层处理。微信语音常见 SILK 编码，当前会先保存为临时文件并在 prompt 中提示路径；现有 ASR 附件管线暂不直接处理 `.silk`，后续可以接 SILK 转 WAV 后再转写。
+
+### 9. 多模态输入
 
 cb-agent 的用户消息协议现在是 `text + attachments[]`。附件只在当前轮请求中参与模型推理；跨轮 history、transcript、compact 和 `context_window_usage` 只保存文本摘要和附件元数据，不保存图片/音频二进制，也不保存 data URI。
 
@@ -640,7 +728,7 @@ TUI 额外支持从系统剪贴板读取图片：
 
 支持的音频格式：`mp3`、`wav`、`m4a`、`aac`、`flac`、`ogg`、`wma`。
 
-### 9. 验证安装是否正常
+### 10. 验证安装是否正常
 
 Python 侧：
 
@@ -722,6 +810,14 @@ ws://127.0.0.1:6199/onebot/v11/ws
 
 跨机器或 Docker 部署时，把 `QQ_HOST=0.0.0.0`，并强烈建议配置 `QQ_ACCESS_TOKEN`。如果 agent 需要发送本地文件或表情包，请配置 `QQ_FILE_DELIVERY_MODE`：同机/同路径可继续用默认 `path`，Docker 推荐 `mapped_path` 共享卷，不方便挂卷时用 `http` 临时 URL。
 
+启动微信 OC：
+
+```bash
+WECHAT_ENABLE=1 ../venv/bin/python run_agent.py --transport wechat
+```
+
+第一次启动会在终端打印二维码，扫码后登录态写入 `.cbagent/wechat/state.json`。微信媒体发送走 CDN 上传，不需要像 NapCat Docker 那样配置共享目录；但服务器仍需能访问 `WECHAT_BASE_URL` 和 `WECHAT_CDN_BASE_URL`。
+
 ### MCP 和 Playwright
 
 当前 [mcp.json](mcp.json) 里有多个 server 通过 `npx` 启动，所以 Linux 上需要安装 Node.js/npm，并保证 `npx` 在 PATH 中。Playwright MCP 首次使用浏览器能力时，通常还需要：
@@ -750,7 +846,7 @@ TUI 的 `/paste-image` 和 `Ctrl-V` 图片粘贴依赖桌面剪贴板：
 
 ### systemd 示例
 
-下面示例只演示 QQ transport 常驻。请把路径、用户和环境变量文件改成你的实际部署值：
+下面示例只演示 QQ transport 常驻。微信常驻时把 `ExecStart` 里的 `--transport qq` 改成 `--transport wechat`，并在 `.env` 中设置 `WECHAT_ENABLE=1`。请把路径、用户和环境变量文件改成你的实际部署值：
 
 ```ini
 [Unit]
@@ -955,6 +1051,7 @@ CONTEXT_USAGE_RATIO = 0.8
 | `run_skill_script` | 执行 Skill 附带脚本 |
 | `ask_user_question` | 工具循环中向用户提问 |
 | `qqtool` | 仅 QQ transport 注册，封装 NapCat/OneBot action；用于发消息、戳一戳、上传文件/相册、查群/好友信息等 |
+| `wechattool` | 仅微信 transport 注册，封装微信 OC action；用于额外发文本、图片、文件、输入状态和查看运行状态 |
 | `my_advanced_search` | Tavily / SerpApi 搜索源可用时执行 Web 搜索 |
 | MCP 子工具 | 从 `mcp.json` 中展开 |
 
@@ -1002,7 +1099,8 @@ Skill 是 “Prompt as Capability”：用 Markdown + YAML frontmatter 写能力
 cb-agent/
 ├── agent/                 AgentSession、LLM 客户端、事件、transport gateway
 │   ├── platforms/         通讯平台通用消息结构与事件渲染器
-│   └── qq/                NapCat / OneBot V11 适配器
+│   ├── qq/                NapCat / OneBot V11 适配器
+│   └── wechat/            个人微信 OC HTTP 长轮询适配器
 ├── context/               ContextBuilder 与 Markdown memory provider
 ├── core/                  Message 等核心结构
 ├── memory/                full 模式旧记忆/RAG/存储
@@ -1067,7 +1165,7 @@ TUI 通过 stdio JSON-RPC 与 Python 后端通信：
 
 ### 通讯平台 transport
 
-QQ/NapCat 模式通过 `agent.platforms` 的平台无关消息层适配 EventBus 事件，再由 `agent.qq` 翻译成 OneBot V11 action。这个分层是为了后续接入微信等通讯软件时复用 `InboundMessage`、`OutboundMessage`、`PlatformEventRenderer` 和基于 `ConversationKey` 的会话隔离能力。
+QQ/NapCat 与微信 OC 都通过 `agent.platforms` 的平台无关消息层适配 EventBus 事件。`agent.qq` 负责翻译 OneBot V11 action，`agent.wechat` 负责翻译微信 OC HTTP API、扫码登录、长轮询和 CDN 媒体上传。这个分层让 `InboundMessage`、`OutboundMessage`、`PlatformEventRenderer`、`ConversationKey` 会话隔离、QQ 敏感权限和编号问答都能跨平台复用。
 
 ## 开发与测试
 
@@ -1082,6 +1180,7 @@ python -m unittest discover -s test -p "test_buddy*.py"
 python -m unittest discover -s test -p "test_multimodal_input.py"
 python -m unittest discover -s test -p "test_platform*.py"
 python -m unittest discover -s test -p "test_qq*.py"
+python -m unittest discover -s test -p "test_wechat*.py"
 ```
 
 TUI：
@@ -1119,6 +1218,7 @@ python test/test_rag_operations.py
 - [本地搜索与导航工具技术报告.md](<note/本地搜索与导航工具技术报告.md>)
 - [多模态输入与上下文管理技术报告.md](<note/多模态输入与上下文管理技术报告.md>)
 - [QQ与通讯平台事件适配技术报告.md](<note/QQ与通讯平台事件适配技术报告.md>)
+- [微信OC接入技术报告.md](<note/微信OC接入技术报告.md>)
 
 ## 常见问题
 
