@@ -467,17 +467,28 @@ class TestPlatformToolPermission(unittest.TestCase):
     def test_sticker_name_is_allowed_but_path_asset_is_denied(self):
         calls, results = self._run_as_sender(
             "200",
-            "send_message_asset",
-            '{"kind":"sticker","sticker_name":"happy"}',
+            "qqtool",
+            '{"funname":"upload_group_file","args":{"group_id":"10001","file":"https://example.com/happy.png","name":"happy.png"}}',
             env={"QQ_ROOT_USERS": "100"},
         )
-        self.assertEqual([name for name, _ in calls], ["send_message_asset"])
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
         self.assertFalse(results[0].is_error)
 
         calls, results = self._run_as_sender(
             "200",
-            "send_message_asset",
-            '{"kind":"file","path":"/root/CBAGENT/cb-agent/run_agent.py"}',
+            "qqtool",
+            '{"funname":"upload_group_file","args":{"group_id":"10001","file":"/root/CBAGENT/cb-agent/run_agent.py"}}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("外发任意本地文件", payload["error"])
+
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            '{"funname":"upload_group_file","args":{"group_id":"10001","file":"file:///root/CBAGENT/cb-agent/run_agent.py"}}',
             env={"QQ_ROOT_USERS": "100"},
         )
         self.assertEqual(calls, [])
@@ -499,11 +510,14 @@ class TestPlatformToolPermission(unittest.TestCase):
 
         calls, results = self._run_as_sender(
             "200",
-            "send_message_asset",
-            json.dumps({"kind": "file", "path": str(temp_output)}, ensure_ascii=False),
+            "qqtool",
+            json.dumps(
+                {"funname": "upload_group_file", "args": {"group_id": "10001", "file": str(temp_output)}},
+                ensure_ascii=False,
+            ),
             env={"QQ_ROOT_USERS": "100"},
         )
-        self.assertEqual([name for name, _ in calls], ["send_message_asset"])
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
         self.assertFalse(results[0].is_error)
 
     def test_temp_symlink_to_project_is_not_treated_as_safe_artifact(self):
@@ -516,8 +530,11 @@ class TestPlatformToolPermission(unittest.TestCase):
 
             calls, results = self._run_as_sender(
                 "200",
-                "send_message_asset",
-                json.dumps({"kind": "file", "path": str(link / "run_agent.py")}, ensure_ascii=False),
+                "qqtool",
+                json.dumps(
+                    {"funname": "upload_group_file", "args": {"group_id": "10001", "file": str(link / "run_agent.py")}},
+                    ensure_ascii=False,
+                ),
                 env={"QQ_ROOT_USERS": "100"},
             )
             self.assertEqual(calls, [])
@@ -613,6 +630,59 @@ class TestPlatformToolPermission(unittest.TestCase):
         payload = json.loads(results[0].result)
         self.assertTrue(payload["permission_denied"])
         self.assertIn("MCP", payload["error"])
+
+    def test_qqtool_root_only_and_cross_conversation_are_denied_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            '{"funname":"get_friend_list","args":{}}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("root-only", payload["error"])
+
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            '{"funname":"send_group_msg","args":{"group_id":"999","message":"hi"}}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("非当前群聊", payload["error"])
+
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            '{"funname":"send_poke","args":{"user_id":"200"}}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("非当前群聊", payload["error"])
+
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            '{"funname":"send_poke","args":{"group_id":"10001","user_id":"200"}}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
+        self.assertFalse(results[0].is_error)
+
+    def test_qqtool_root_user_can_run_sensitive_funname(self):
+        calls, results = self._run_as_sender(
+            "100",
+            "qqtool",
+            '{"funname":"get_friend_list","args":{}}',
+            env={"QQ_ROOT_USERS": "100"},
+        )
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
+        self.assertFalse(results[0].is_error)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import requests
 from websockets.asyncio.server import ServerConnection, serve
@@ -26,10 +26,15 @@ from agent.platforms.context import (
 )
 from agent.platforms.messages import ConversationKey, InboundMessage, OutboundMessage, OutboundSegment
 from agent.platforms.renderer import PlatformEventRenderer
+from agent.qq.action_bridge import global_qq_action_bridge
 from agent.qq.config import QQConfig
 from agent.qq.file_delivery import FileDeliveryError, QQFileDeliveryManager
 from agent.qq.onebot import outbound_segment_to_onebot, parse_onebot_event, parse_onebot_message_event
-from agent.session import AgentSession
+
+if TYPE_CHECKING:
+    # 仅用于类型标注。运行时导入 AgentSession 会连带加载上下文/token 统计等较重依赖，
+    # 让只想使用 QQ action bridge 或 adapter 文件交付能力的测试也必须安装完整依赖。
+    from agent.session import AgentSession
 
 logger = logging.getLogger(__name__)
 _RESOURCE_SEGMENT_KINDS = {"file", "image", "sticker", "audio", "video"}
@@ -112,10 +117,15 @@ class QQNapCatAdapter:
                     pass
             self._connection = websocket
         logger.info("QQ/NapCat connected: remote=%s", getattr(websocket, "remote_address", None))
+        bridge_token = ""
+        if self._loop is not None:
+            bridge_token = global_qq_action_bridge.register(self._loop, self.call_action)
         try:
             async for raw in websocket:
                 await self._handle_raw_message(raw)
         finally:
+            if bridge_token:
+                global_qq_action_bridge.unregister(bridge_token)
             async with self._connection_lock:
                 if self._connection is websocket:
                     self._connection = None
@@ -469,6 +479,30 @@ class QQNapCatAdapter:
             details.append(f"{candidate.method}: NapCat action 返回失败")
         return False, details
 
+    async def prepare_resource_reference(self, path: str) -> tuple[str, Dict[str, Any]]:
+        """把宿主机文件路径转换成 NapCat 可读取的资源引用。
+
+        这是给 ``qqtool`` 复用的轻量入口。事件渲染器仍走 ``send_outbound``；模型主动
+        调 QQ 文件/相册接口时，只需要先通过这里拿到 Docker/HTTP/base64 兼容的引用。
+        """
+
+        delivery = getattr(self, "_file_delivery", None)
+        if delivery is None:
+            delivery = QQFileDeliveryManager(getattr(self, "config", QQConfig()))
+            self._file_delivery = delivery
+        plan = await asyncio.to_thread(delivery.build_plan, path)
+        if not plan.candidates:
+            detail = "；".join(item for item in plan.errors if item) or "没有可用的文件交付方式"
+            raise FileDeliveryError(detail)
+        candidate = plan.candidates[0]
+        return candidate.ref, {
+            "delivery_method": candidate.method,
+            "delivery_note": candidate.note,
+            "source_path": candidate.source_path,
+            "size": candidate.size,
+            "errors": plan.errors,
+        }
+
     async def _send_media_segment(self, conversation: ConversationKey, segment: OutboundSegment) -> bool:
         onebot_segments = outbound_segment_to_onebot(segment)
         if not onebot_segments:
@@ -500,6 +534,9 @@ class QQNapCatAdapter:
             return False
 
     async def call_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if action == "__cbagent_prepare_resource_reference__":
+            ref, metadata = await self.prepare_resource_reference(str((params or {}).get("path") or ""))
+            return {"status": "ok", "retcode": 0, "data": {"ref": ref, "metadata": metadata}}
         connection = self._connection
         if connection is None:
             raise RuntimeError("NapCat websocket is not connected")

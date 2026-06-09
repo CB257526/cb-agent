@@ -217,7 +217,7 @@ FEATURE_BUDDY=1
 | `IM_REASONING_CHUNK_CHARS` | `IM_SHOW_REASONING=1` 时每段“思考”消息的字符数，默认 `1200` |
 | `IM_REASONING_MAX_CHARS` | `IM_SHOW_REASONING=1` 时每轮最多展示的思考字符数，默认 `8000`，`0` 表示不限制 |
 | `IM_CONFIRM_QUESTION_ANSWER` | QQ 编号回答后是否发送“已选择”确认，默认 `1` |
-| `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；`send_message_asset(kind=sticker)` 会从这里查找图片 |
+| `CBAGENT_STICKER_DIR` | 表情包目录，默认 `./assets/stickers`；QQ 模式下可通过 `qqtool` 上传这里的图片作为 sticker/image |
 | `CBAGENT_OUTBOUND_FILE_MAX_MB` | agent 发送本地文件到通讯软件的大小上限，默认 `50` MB |
 | `QQ_FILE_DELIVERY_MODE` | QQ/NapCat 出站文件交付方式：`path` 兼容旧行为，`mapped_path` 适合 Docker 共享卷，`http` 让 NapCat 拉临时 URL，`base64` 只适合小文件，`auto` 会按顺序尝试 |
 | `QQ_FILE_HOST_PREFIX` / `QQ_FILE_NAPCAT_PREFIX` | `mapped_path` 模式使用；前者是宿主机共享目录，后者是同一目录在 NapCat 容器内的路径 |
@@ -424,7 +424,8 @@ IM_REASONING_MAX_CHARS=8000
 # 用户回复编号后是否发“已选择: xxx”确认。0 表示静默确认。
 IM_CONFIRM_QUESTION_ANSWER=1
 
-# 表情包目录。send_message_asset(kind=sticker) 会按 sticker_name 在这里找图片。
+# 表情包目录。QQ 模式下模型可用 qqtool 上传这里的图片作为 sticker/image。
+# 旧 send_message_asset 入口保留给事件兼容，但默认不再注册给模型。
 CBAGENT_STICKER_DIR=./assets/stickers
 
 # agent 允许发送到 QQ 的本地文件大小上限，单位 MB。
@@ -539,7 +540,7 @@ ip addr show | grep -E "inet " | grep -v 127.0.0.1
 
 QQ/通讯平台模式还会做一层敏感工具门禁。`QQ_ALLOWED_USERS` 只决定谁能触发 agent 聊天，`QQ_ROOT_USERS` / `IM_ROOT_USERS` 决定谁能执行敏感工具。敏感范围包括读取或外发本地文件内容、写项目/服务器文件、非只读 bash、git 回滚/提交/推送、`bash_permission` 授权变更、memory/rag 写操作、`run_skill_script`、发送项目/服务器本地文件、敏感 MCP 工具等。未配置 root 用户时，QQ/未来微信等通讯平台触发的敏感工具会在执行前直接拒绝；本地 TUI/CLI 继续使用原来的权限机制。
 
-普通通讯用户有一个受限例外：如果用户要求生成、下载或制作新文件并发回，agent 应把新产物放到系统临时目录，Linux 通常是 `/tmp/cb-agent-outputs/`，再通过 `send_message_asset(path=...)` 发送。不要把项目源码、配置、日志、密钥、服务器隐私文件复制或移动到 `/tmp` 后发送，这属于绕过权限检查。普通用户用 bash 下载文件时也只允许 `curl/wget` 从公网 `http(s)` URL 明确写入临时目录；localhost、内网地址、`file://`、管道脚本和本地复制仍会被拒绝。
+普通通讯用户有一个受限例外：如果用户要求生成、下载或制作新文件并发回，agent 应把新产物放到系统临时目录，Linux 通常是 `/tmp/cb-agent-outputs/`，再通过 QQ 模式注入的 `qqtool` 上传或发送。不要把项目源码、配置、日志、密钥、服务器隐私文件复制或移动到 `/tmp` 后发送，这属于绕过权限检查。普通用户用 bash 下载文件时也只允许 `curl/wget` 从公网 `http(s)` URL 明确写入临时目录；localhost、内网地址、`file://`、管道脚本和本地复制仍会被拒绝。
 
 通讯软件模式会把 TUI 风格事件降级成 QQ 可读消息：
 
@@ -560,7 +561,9 @@ QQ/通讯平台模式还会做一层敏感工具门禁。`QQ_ALLOWED_USERS` 只�
 assets/stickers/
 ```
 
-QQ 模式会额外注册 `send_message_asset` 工具。模型可以通过它发送表情包、图片、音频、视频或文件；普通用户只能发送表情包目录里的 sticker，或发送系统临时目录里的新产物，发送项目/服务器现有文件需要 root 用户权限。工具会校验路径、大小、hash；history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
+QQ 模式会额外注册 `qqtool` 工具，CLI/TUI 不会注入它。模型需要主动执行 QQ 操作时，通过 `qqtool(funname,args)` 调用 NapCat action，例如 `send_poke`、`send_group_msg`、`upload_group_file`、`upload_private_file`、`upload_image_to_qun_album`、`get_group_member_list`、`get_login_info` 等。最终回答、思考内容、工具过程提示和 `ask_user_question` 编号问题仍由事件系统自动发送，不需要模型自己再调用 `qqtool` 补发。
+
+`send_message_asset` 的模型入口已不再默认注册；底层资源校验和事件兼容逻辑仍保留，避免旧 transcript 或测试路径失效。普通用户只能通过 `qqtool` 操作当前会话，发送表情包目录里的图片，或发送系统临时目录里的新产物；发送项目/服务器现有文件、跨会话发消息、读取历史消息、设置资料、Ark 分享、`raw_action` 等需要 root 用户权限。文件类 funname 会复用 Docker/HTTP/base64/path 文件交付层，history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
 
 文件发送现在支持多种交付模式，默认 `QQ_FILE_DELIVERY_MODE=path` 保持旧行为：直接把 cb-agent 本机路径交给 NapCat。这个模式最适合同机运行，或者 NapCat 容器内外路径完全一致的部署。
 
@@ -951,7 +954,7 @@ CONTEXT_USAGE_RATIO = 0.8
 | `skill` | 加载 Skill 指令 |
 | `run_skill_script` | 执行 Skill 附带脚本 |
 | `ask_user_question` | 工具循环中向用户提问 |
-| `send_message_asset` | 仅通讯软件模式注册，用于发送表情包、图片或本地文件 |
+| `qqtool` | 仅 QQ transport 注册，封装 NapCat/OneBot action；用于发消息、戳一戳、上传文件/相册、查群/好友信息等 |
 | `my_advanced_search` | Tavily / SerpApi 搜索源可用时执行 Web 搜索 |
 | MCP 子工具 | 从 `mcp.json` 中展开 |
 

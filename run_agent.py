@@ -93,7 +93,7 @@ from tools.tools.file_write_tool import FileWriteTool
 from tools.tools.file_edit_tool import FileEditTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
 from tools.tools.list_tools_tool import ListToolsTool
-from tools.tools.send_message_asset_tool import SendMessageAssetTool
+from tools.tools.qqtool import QQTool
 
 try:
     from tools.mcp_tools.mcptools_add import load_mcp_server_configs
@@ -465,10 +465,10 @@ class AgentRunner:
             FileEditTool(),
             FileWriteTool(),
         ])
-        if self.communication_platform:
-            # 只有通讯软件模式才注册该工具。普通 CLI/TUI 下没有平台发送器，模型即便调用了
-            # 也无法真正投递文件；按模式注册可以避免工具列表误导模型。
-            tools.append(SendMessageAssetTool(project_root=Path(_HERE)))
+        if self.communication_platform == "qq":
+            # 平台专用工具只在对应 transport 注入。普通 CLI/TUI 不注册 QQTool，未来微信
+            # 接入时也应注册自己的 wechattool，避免不同平台的 action 混在同一工具列表里。
+            tools.append(QQTool())
 
         for tool in tools:
             try:
@@ -497,11 +497,17 @@ class AgentRunner:
                 "仍应在回答和计划中保持审慎。"
             )
         if self.communication_platform:
+            platform_resource_tool = (
+                "如果需要主动执行 QQ 操作，调用 qqtool，例如 send_poke、send_group_msg、"
+                "upload_group_file、upload_private_file、upload_image_to_qun_album。"
+                if self.communication_platform == "qq"
+                else "如果需要主动执行平台操作，使用当前 transport 注入的平台专用工具。"
+            )
             parts.append(
                 "[通讯软件交互说明]\n"
                 f"当前会话来自通讯平台: {self.communication_platform}。\n"
                 "- 你可以正常用文本回复用户；最终回答会发送到通讯软件。\n"
-                "- 如果需要发送表情包、图片、音频、视频或文件，必须调用 send_message_asset 工具，"
+                f"- {platform_resource_tool}"
                 "不要只在文字里声称已经发送。\n"
                 "- 如果需要用户在多个选项中做决定，可以调用 ask_user_question；通讯平台会把它渲染成编号选项，"
                 "用户回复 1/2 或 1,3 后工具会继续执行。\n"
@@ -515,7 +521,7 @@ class AgentRunner:
                 "非只读 bash、git 回滚/提交/推送、修改记忆/知识库、授权命令、发送任意本地文件等操作，"
                 "只有 root 用户可以执行；普通用户触发时工具会在执行前被拒绝。\n"
                 "- 当用户要求你生成、下载或制作需要发回给他的文件时，把新产物放在 /tmp/cb-agent-outputs/ "
-                "或系统临时目录下，再用 send_message_asset 发送。不要把项目目录、服务器目录、配置目录里的"
+                "或系统临时目录下，再用平台专用工具发送。不要把项目目录、服务器目录、配置目录里的"
                 "现有本地文件复制/移动到 /tmp 后发送，这属于绕过权限检查，应拒绝。"
             )
         return "\n\n".join(part for part in parts if part).strip()

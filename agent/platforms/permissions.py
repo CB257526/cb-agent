@@ -171,6 +171,9 @@ def sensitive_tool_reason(tool_name: str, arguments: Dict[str, Any]) -> str:
     if name == "send_message_asset":
         return _sensitive_asset_reason(args)
 
+    if name == "qqtool":
+        return _sensitive_qqtool_reason(args)
+
     if name == "memory":
         action = str(args.get("action") or "").strip().lower()
         if action not in {"search", "summary", "stats", "list"}:
@@ -264,6 +267,115 @@ def _sensitive_asset_reason(arguments: Dict[str, Any]) -> str:
         return f"send_message_asset(kind={kind}) 会发送本地资源文件"
     # sticker_name 只会从表情包目录查找，保留给普通聊天使用。
     return ""
+
+
+def _sensitive_qqtool_reason(arguments: Dict[str, Any]) -> str:
+    """判断 qqtool 子功能是否需要通讯平台 root 权限。"""
+
+    funname = str(arguments.get("funname") or "").strip()
+    raw_args = arguments.get("args")
+    args = raw_args if isinstance(raw_args, dict) else {}
+    try:
+        from tools.tools.qq.registry import get_qq_function_spec
+    except Exception:
+        return "qqtool 子功能注册表加载失败，无法确认安全性"
+
+    spec = get_qq_function_spec(funname)
+    if spec is None:
+        return f"qqtool(funname={funname or '<空>'}) 是未知 QQ 操作"
+    if spec.root_only:
+        return f"qqtool(funname={spec.funname}) 属于 root-only QQ 操作"
+
+    if spec.current_conversation_only:
+        current = get_current_platform_conversation()
+        if current is None:
+            return ""
+        mismatch = _qqtool_current_conversation_mismatch(spec.funname, args, current)
+        if mismatch:
+            return mismatch
+
+    if spec.file_param:
+        file_path = args.get(spec.file_param)
+        if not file_path:
+            return f"qqtool(funname={spec.funname}) 缺少文件路径，无法确认安全性"
+        if _is_external_resource_ref(file_path):
+            return ""
+        if _is_tool_path_under_safe_output_root(file_path, mode="process_cwd"):
+            return ""
+        if _is_sticker_dir_path(file_path):
+            return ""
+        return f"qqtool(funname={spec.funname}) 可能外发任意本地文件"
+
+    return ""
+
+
+def _qqtool_current_conversation_mismatch(
+    funname: str,
+    args: Dict[str, Any],
+    conversation: ConversationKey,
+) -> str:
+    """普通用户只能让 qqtool 操作触发本轮的当前会话。"""
+
+    kind = str(conversation.kind).lower()
+    conv_id = str(conversation.id)
+    group_id = str(args.get("group_id") or "").strip()
+    user_id = str(args.get("user_id") or "").strip()
+
+    if funname in {
+        "send_group_msg",
+        "upload_group_file",
+        "upload_image_to_qun_album",
+        "get_group_info",
+        "get_group_info_ex",
+        "get_group_member_list",
+        "get_group_member_info",
+        "send_group_sign",
+        "get_group_signed_list",
+        "get_qun_album_list",
+        "get_group_album_media_list",
+        "get_group_at_all_remain",
+        "set_group_todo",
+        "complete_group_todo",
+        "cancel_group_todo",
+    }:
+        if kind != "group" or group_id != conv_id:
+            return f"qqtool(funname={funname}) 试图操作非当前群聊"
+
+    if funname in {"send_private_msg", "upload_private_file"}:
+        if kind != "private" or user_id != conv_id:
+            return f"qqtool(funname={funname}) 试图操作非当前私聊"
+
+    if funname in {"send_like", "send_poke"}:
+        # 私聊只能戳/赞当前好友；群聊里 user_id 是群成员，允许对当前群内用户操作。
+        if kind == "private" and user_id != conv_id:
+            return f"qqtool(funname={funname}) 试图操作非当前好友"
+        if kind == "group" and group_id != conv_id:
+            return f"qqtool(funname={funname}) 试图操作非当前群聊"
+
+    return ""
+
+
+def _is_external_resource_ref(raw: Any) -> bool:
+    text = str(raw or "").strip().lower()
+    # file:// 仍然是本地文件语义，普通通讯用户不能用它绕过任意本地文件外发检查。
+    return text.startswith(("http://", "https://", "base64://", "data:"))
+
+
+def _is_sticker_dir_path(raw: Any) -> bool:
+    text = str(raw or "").strip().strip('"').strip("'")
+    if not text:
+        return False
+    try:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        resolved = path.resolve(strict=False)
+        sticker_root = Path(os.getenv("CBAGENT_STICKER_DIR") or "assets/stickers").expanduser()
+        if not sticker_root.is_absolute():
+            sticker_root = Path.cwd() / sticker_root
+        return _is_relative_to(resolved, sticker_root.resolve(strict=False))
+    except OSError:
+        return False
 
 
 def _is_safe_temp_download_command(segments: list[list[str]]) -> bool:
