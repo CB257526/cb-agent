@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent.platforms.context import reset_current_platform_conversation, set_current_platform_conversation
+from agent.platforms.messages import ConversationKey
 from agent.qq.action_bridge import QQActionBridge, global_qq_action_bridge
 from agent.qq.config import QQConfig
 from tools.toolRegistry import ToolRegistry
@@ -23,8 +25,25 @@ class TestQQTool(unittest.TestCase):
         self.assertIn("funname", params)
         self.assertIn("args", params)
         self.assertTrue(tool.validate_parameters({"funname": "get_login_info", "args": {}}))
+        self.assertTrue(tool.validate_parameters({"funname": "send_group_msg", "args": "{\"group_id\":\"100\",\"message\":\"hi\"}"}))
         self.assertFalse(tool.validate_parameters({"funname": "", "args": {}}))
         self.assertFalse(tool.validate_parameters({"funname": "get_login_info", "args": []}))
+
+    def test_run_auto_parses_json_string_args(self) -> None:
+        tool = QQTool()
+
+        def fake_run(funname, args):  # noqa: ANN001
+            return {"ok": True, "funname": funname, "action": "send_group_msg", "params": args, "duration_ms": 0}
+
+        with patch("tools.tools.qqtool.run_qq_function", fake_run):
+            payload = json.loads(tool.run({
+                "funname": "send_group_msg",
+                "args": "{\"group_id\":\"100\",\"message\":\"hi\"}",
+            }))
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["params"], {"group_id": "100", "message": "hi"})
+        self.assertTrue(payload["metadata"]["args_auto_parsed"])
 
     def test_unconnected_bridge_returns_clear_error(self) -> None:
         tool = QQTool()
@@ -101,6 +120,124 @@ class TestQQTool(unittest.TestCase):
             self.assertEqual(calls[1][0], "upload_group_file")
             self.assertTrue(str(calls[1][1]["file"]).startswith("/app/cb-agent-outbound/"))
             self.assertEqual(len(list(shared.glob("report-*.txt"))), 1)
+
+    def test_message_image_segment_uses_delivery_layer(self) -> None:
+        bridge = QQActionBridge()
+        calls = []
+
+        async def caller(action, params):  # noqa: ANN001
+            calls.append((action, params))
+            if action == "__cbagent_prepare_resource_reference__":
+                return {
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {
+                        "ref": "/app/cb-agent-outbound/a.png",
+                        "metadata": {"delivery_method": "mapped_path"},
+                    },
+                }
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 1}}
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "a.png"
+            source.write_bytes(b"png")
+
+            async def run() -> None:
+                token = bridge.register(asyncio.get_running_loop(), caller)
+                try:
+                    with patch("tools.tools.qq.functions.global_qq_action_bridge", bridge), patch(
+                        "tools.tools.qq.media.global_qq_action_bridge", bridge
+                    ):
+                        result = await asyncio.to_thread(
+                            run_qq_function,
+                            "send_group_msg",
+                            {
+                                "group_id": "100",
+                                "message": [{"type": "image", "data": {"file": str(source)}}],
+                            },
+                        )
+                finally:
+                    bridge.unregister(token)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["metadata"]["message_file_delivery"][0]["delivery_method"], "mapped_path")
+
+            asyncio.run(run())
+
+        self.assertEqual(calls[0], ("__cbagent_prepare_resource_reference__", {"path": str(source)}))
+        self.assertEqual(calls[1][0], "send_group_msg")
+        self.assertEqual(calls[1][1]["message"][0]["data"]["file"], "/app/cb-agent-outbound/a.png")
+
+    def test_cq_image_string_uses_delivery_layer(self) -> None:
+        bridge = QQActionBridge()
+        calls = []
+
+        async def caller(action, params):  # noqa: ANN001
+            calls.append((action, params))
+            if action == "__cbagent_prepare_resource_reference__":
+                return {
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {
+                        "ref": "/app/cb-agent-outbound/a.png",
+                        "metadata": {"delivery_method": "mapped_path"},
+                    },
+                }
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 1}}
+
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "a.png"
+            source.write_bytes(b"png")
+
+            async def run() -> None:
+                token = bridge.register(asyncio.get_running_loop(), caller)
+                try:
+                    with patch("tools.tools.qq.functions.global_qq_action_bridge", bridge), patch(
+                        "tools.tools.qq.media.global_qq_action_bridge", bridge
+                    ):
+                        result = await asyncio.to_thread(
+                            run_qq_function,
+                            "send_group_msg",
+                            {
+                                "group_id": "100",
+                                "message": f"[CQ:image,file={source}]",
+                            },
+                        )
+                finally:
+                    bridge.unregister(token)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["metadata"]["message_file_delivery"][0]["delivery_method"], "mapped_path")
+
+            asyncio.run(run())
+
+        self.assertEqual(calls[0], ("__cbagent_prepare_resource_reference__", {"path": str(source)}))
+        self.assertEqual(calls[1][0], "send_group_msg")
+        self.assertEqual(calls[1][1]["message"], "[CQ:image,file=/app/cb-agent-outbound/a.png]")
+
+    def test_current_group_conversation_defaults_group_id_before_required_check(self) -> None:
+        bridge = QQActionBridge()
+        calls = []
+
+        async def caller(action, params):  # noqa: ANN001
+            calls.append((action, params))
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 1}}
+
+        async def run() -> None:
+            token = bridge.register(asyncio.get_running_loop(), caller)
+            conv_token = set_current_platform_conversation(ConversationKey("qq", "group", "100"))
+            try:
+                with patch("tools.tools.qq.functions.global_qq_action_bridge", bridge):
+                    result = await asyncio.to_thread(
+                        run_qq_function,
+                        "send_group_msg",
+                        {"message": "hi"},
+                    )
+            finally:
+                reset_current_platform_conversation(conv_token)
+                bridge.unregister(token)
+            self.assertTrue(result["ok"])
+
+        asyncio.run(run())
+        self.assertEqual(calls, [("send_group_msg", {"message": "hi", "group_id": "100"})])
 
     def test_registry_can_register_qqtool_without_send_message_asset(self) -> None:
         registry = ToolRegistry()

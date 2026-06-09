@@ -29,6 +29,8 @@ class QQConfig:
     file_http_public_base_url: str = ""
     file_http_ttl_seconds: int = 300
     file_base64_max_mb: float = 3.0
+    group_context_messages: int = 50
+    group_context_max_chars: int = 8000
 
     @classmethod
     def from_env(cls) -> "QQConfig":
@@ -56,6 +58,10 @@ class QQConfig:
             file_http_public_base_url=(os.getenv("QQ_FILE_HTTP_PUBLIC_BASE_URL") or "").strip(),
             file_http_ttl_seconds=max(30, _env_int("QQ_FILE_HTTP_TTL_SECONDS", 300)),
             file_base64_max_mb=max(0.1, _env_float("QQ_FILE_BASE64_MAX_MB", 3.0)),
+            # 群聊没有长期上下文落盘，所以每次被唤醒时临时拉取最近群消息，帮助模型
+            # 理解“刚才大家在聊什么”。设为 0 可以完全关闭，避免额外 NapCat action。
+            group_context_messages=max(0, _env_int("QQ_GROUP_CONTEXT_MESSAGES", 50)),
+            group_context_max_chars=max(500, _env_int("QQ_GROUP_CONTEXT_MAX_CHARS", 8000)),
         )
 
 

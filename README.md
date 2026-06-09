@@ -218,6 +218,8 @@ FEATURE_BUDDY=1
 | `IM_ROOT_USERS` | 通用多人通讯平台 root 用户；QQ 会同时检查它和 `QQ_ROOT_USERS`，微信 OC 是当前账号私聊 bot，不检查该配置 |
 | `CBAGENT_MCP_PUBLIC_PREFIXES` / `CBAGENT_MCP_SENSITIVE_PREFIXES` | 自定义 MCP 展开工具名前缀的权限分类；默认 `fetch_`、`tavily_`、`amap-maps_` 普通可用，`github_`、`playwright_` 需要 root |
 | `QQ_ACTION_TIMEOUT_SECONDS` | OneBot action 超时时间，影响发送消息和上传文件 |
+| `QQ_GROUP_CONTEXT_MESSAGES` | QQ 群聊被唤醒时注入最近多少条群消息作为本轮背景，默认 `50`；设为 `0` 关闭 |
+| `QQ_GROUP_CONTEXT_MAX_CHARS` | QQ 群聊最近消息背景最大字符数，默认 `8000`，超出时优先保留较新的消息 |
 | `IM_EVENT_VERBOSITY` | 通讯软件事件输出等级：`normal` 会发关键事件和工具开始提示，`full` 额外同步工具完成、round/token 等调试摘要 |
 | `IM_GROUP_TOOL_MESSAGES` | 群聊是否显示工具过程消息，默认 `1`；设为 `0` 后群聊不再发送“调用工具/执行命令/工具完成”等过程提示，私聊不受影响 |
 | `IM_SHOW_REASONING` | 是否把思考模型的 `reasoning_content` 同步到 QQ/微信，默认 `0` 关闭 |
@@ -421,6 +423,11 @@ CBAGENT_MCP_SENSITIVE_PREFIXES=
 # OneBot action 超时时间，单位秒。发送消息和上传文件都会用到。
 QQ_ACTION_TIMEOUT_SECONDS=30
 
+# 群聊被唤醒时，额外拉取最近多少条群消息作为本轮背景。
+# 只注入当前轮 prompt，不写入群聊持久化记录；设为 0 可关闭。
+QQ_GROUP_CONTEXT_MESSAGES=50
+QQ_GROUP_CONTEXT_MAX_CHARS=8000
+
 # 通讯软件事件输出等级:
 # normal = 发送最终回答、编号问题、todo、错误、后台提示、文件资源和工具开始提示；
 #          工具开始提示格式为“（调用工具:工具名 参数）”，bash 为“（执行命令:命令）”。
@@ -554,6 +561,8 @@ ip addr show | grep -E "inet " | grep -v 127.0.0.1
 
 群聊默认 `QQ_GROUP_MODE=mention`，只有 @机器人 或使用 `QQ_WAKE_PREFIX` 前缀时才会响应。私聊默认直接响应。`QQ_ALLOWED_GROUPS` 和 `QQ_ALLOWED_USERS` 为空时不做白名单限制；填写后分别按群号和 QQ 号过滤。
 
+QQ 群聊被唤醒后，adapter 会默认调用 NapCat `get_group_msg_history` 拉取最近 `QQ_GROUP_CONTEXT_MESSAGES=50` 条群消息，整理成“最近群聊消息背景”注入本轮模型上下文。它只帮助模型理解“上面/刚才/这个”等指代，不会写入 history/state/transcript/compact；如果你的 NapCat 不支持该 action，或希望减少一次 action 调用，可以设 `QQ_GROUP_CONTEXT_MESSAGES=0` 关闭。
+
 QQ 模式还会做一层敏感工具门禁。`QQ_ALLOWED_USERS` 只决定谁能触发 agent 聊天，`QQ_ROOT_USERS` / `IM_ROOT_USERS` 决定谁能执行敏感工具。敏感范围包括读取或外发本地文件内容、写项目/服务器文件、非只读 bash、git 回滚/提交/推送、`bash_permission` 授权变更、memory/rag 写操作、`run_skill_script`、发送项目/服务器本地文件、敏感 MCP 工具等。未配置 root 用户时，QQ 触发的敏感工具会在执行前直接拒绝；本地 TUI/CLI 继续使用原来的权限机制。微信 OC 是当前账号里的私聊 bot，不走这套 root/普通用户门禁。
 
 普通 QQ 用户有一个受限例外：如果用户要求生成、下载或制作新文件并发回，agent 应把新产物放到系统临时目录，Linux 通常是 `/tmp/cb-agent-outputs/`，再通过 `qqtool` 上传或发送。不要把项目源码、配置、日志、密钥、服务器隐私文件复制或移动到 `/tmp` 后发送，这属于绕过权限检查。普通用户用 bash 下载文件时也只允许 `curl/wget` 从公网 `http(s)` URL 明确写入临时目录；localhost、内网地址、`file://`、管道脚本和本地复制仍会被拒绝。
@@ -578,6 +587,22 @@ assets/stickers/
 ```
 
 QQ 模式会额外注册 `qqtool` 工具，CLI/TUI 不会注入它。模型需要主动执行 QQ 操作时，通过 `qqtool(funname,args)` 调用 NapCat action，例如 `send_poke`、`send_group_msg`、`upload_group_file`、`upload_private_file`、`upload_image_to_qun_album`、`get_group_member_list`、`get_login_info` 等。最终回答、思考内容、工具过程提示和 `ask_user_question` 编号问题仍由事件系统自动发送，不需要模型自己再调用 `qqtool` 补发。
+
+`qqtool` 的正确调用形态是一个对象参数，`args` 也必须是对象，不要把 `args` 二次编码成 JSON 字符串。当前运行时会自动解析常见的字符串化错误，但正确写法始终是：
+
+```json
+{"funname":"send_group_msg","args":{"group_id":123456,"message":"hello"}}
+```
+
+如果想把图片直接显示在群/私聊聊天框里，优先用 `send_group_msg` 或 `send_private_msg` 的 OneBot 图片消息段，而不是上传成群文件：
+
+```json
+{"funname":"send_group_msg","args":{"group_id":123456,"message":[{"type":"image","data":{"file":"/tmp/cb-agent-outputs/a.png"}}]}}
+```
+
+这类图片、语音、视频、文件消息段里的本地路径也会复用 Docker/HTTP/base64/path 文件交付层。普通 QQ 用户只能发送系统临时目录里的新产物或表情包目录资源；项目源码、配置、日志、密钥等现有本地文件仍会被权限层拦截。模型在当前群聊或私聊里省略当前会话的 `group_id/user_id` 时，权限层和执行层会尽量用当前 `ConversationKey` 安全补齐，减少无意义重试。
+
+如果必须使用 OneBot CQ 字符串，也可以写成 `[CQ:image,file=/tmp/cb-agent-outputs/a.png]`；执行层会对其中的 `file=` 路径做同样的文件交付转换。不过新代码更推荐上面的数组消息段，结构更清晰，也更不容易被逗号、空格等字符影响。
 
 `send_message_asset` 的模型入口已不再默认注册；底层资源校验和事件兼容逻辑仍保留，避免旧 transcript 或测试路径失效。普通用户只能通过 `qqtool` 操作当前会话，发送表情包目录里的图片，或发送系统临时目录里的新产物；发送项目/服务器现有文件、跨会话发消息、读取历史消息、设置资料、Ark 分享、`raw_action` 等需要 root 用户权限。文件类 funname 会复用 Docker/HTTP/base64/path 文件交付层，history/compact 只记录文件摘要，不保存二进制。QQ 图片/音频入站 URL 会尽量下载到 `.cbagent/platform_attachments/qq/`，再复用多模态附件流程；下载失败时会把 URL 作为文本提示交给模型。
 

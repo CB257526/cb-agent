@@ -107,6 +107,18 @@ class TestOneBotParsing(unittest.TestCase):
         self.assertEqual(msg.attachments[0].modality, "image")
         self.assertIn("http://x/a.jpg", msg.prompt_text())
 
+    def test_transient_context_only_enters_prompt_text(self) -> None:
+        msg = InboundMessage(
+            conversation=ConversationKey("qq", "group", "456"),
+            sender_id="123",
+            sender_name="群友",
+            text="请接着说",
+            transient_context="[最近群聊消息背景]\n- A: 上文",
+        )
+
+        self.assertIn("最近群聊消息背景", msg.prompt_text())
+        self.assertNotIn("最近群聊消息背景", msg.persistent_text())
+
     def test_cq_string_message_parses_mention_and_image(self) -> None:
         cfg = QQConfig(group_mode="mention")
         event = {
@@ -533,6 +545,92 @@ class TestQQFileDeliveryManager(unittest.TestCase):
         self.assertEqual(adapter.action[0], "get_msg")
         self.assertIn("被引用内容", inbound.text)
         self.assertIn("请总结", inbound.text)
+
+    def test_group_recent_history_is_injected_as_transient_context(self) -> None:
+        from agent.qq.adapter import QQNapCatAdapter
+
+        class DummyAdapter(QQNapCatAdapter):
+            def __init__(self) -> None:
+                self.config = QQConfig(group_context_messages=3, group_context_max_chars=2000)
+                self.calls = []
+
+            async def call_action(self, action, params):  # type: ignore[override]
+                self.calls.append((action, params))
+                return {
+                    "status": "ok",
+                    "data": {
+                        "messages": [
+                            {
+                                "message_id": 1,
+                                "time": 10,
+                                "user_id": 111,
+                                "sender": {"card": "甲"},
+                                "message": [{"type": "text", "data": {"text": "前情一"}}],
+                            },
+                            {
+                                "message_id": 2,
+                                "time": 11,
+                                "user_id": 222,
+                                "sender": {"nickname": "乙"},
+                                "message": [
+                                    {"type": "text", "data": {"text": "看这个"}},
+                                    {"type": "image", "data": {"file": "a.jpg"}},
+                                ],
+                            },
+                            {
+                                "message_id": 9,
+                                "time": 12,
+                                "user_id": 333,
+                                "sender": {"nickname": "当前"},
+                                "message": [{"type": "text", "data": {"text": "当前消息不应重复"}}],
+                            },
+                        ],
+                    },
+                }
+
+        adapter = DummyAdapter()
+        inbound = InboundMessage(
+            conversation=ConversationKey("qq", "group", "100"),
+            sender_id="333",
+            sender_name="当前",
+            text="请总结",
+            message_id="9",
+        )
+
+        asyncio.run(adapter._append_group_recent_context(inbound))
+
+        self.assertEqual(adapter.calls[0], ("get_group_msg_history", {"group_id": 100, "count": 3}))
+        self.assertIn("最近群聊消息背景", inbound.transient_context)
+        self.assertIn("甲(111): 前情一", inbound.transient_context)
+        self.assertIn("乙(222): 看这个[图片 a.jpg]", inbound.transient_context)
+        self.assertNotIn("当前消息不应重复", inbound.transient_context)
+        self.assertIn("最近群聊消息背景", inbound.prompt_text())
+        self.assertNotIn("最近群聊消息背景", inbound.persistent_text())
+
+    def test_group_recent_history_can_be_disabled(self) -> None:
+        from agent.qq.adapter import QQNapCatAdapter
+
+        class DummyAdapter(QQNapCatAdapter):
+            def __init__(self) -> None:
+                self.config = QQConfig(group_context_messages=0)
+                self.calls = []
+
+            async def call_action(self, action, params):  # type: ignore[override]
+                self.calls.append((action, params))
+                return {"status": "ok", "data": {"messages": []}}
+
+        adapter = DummyAdapter()
+        inbound = InboundMessage(
+            conversation=ConversationKey("qq", "group", "100"),
+            sender_id="333",
+            sender_name="当前",
+            text="请总结",
+        )
+
+        asyncio.run(adapter._append_group_recent_context(inbound))
+
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(inbound.transient_context, "")
 
     def test_conversation_sessions_are_isolated_and_context_is_bound(self) -> None:
         from agent.qq.adapter import QQNapCatAdapter

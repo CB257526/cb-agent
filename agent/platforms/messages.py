@@ -69,6 +69,7 @@ class InboundMessage:
     attachments: List[InboundAttachment] = field(default_factory=list)
     message_id: Optional[str] = None
     reply_to_message_id: Optional[str] = None
+    transient_context: str = ""
 
     def prompt_text(self) -> str:
         """生成传给 Agent 的用户文本。
@@ -83,7 +84,12 @@ class InboundMessage:
             f"sender_id={self.sender_id} "
             f"sender={self.sender_name or self.sender_id}]"
         )
-        parts = [header, self.text.strip()]
+        parts = [header]
+        if self.transient_context.strip():
+            # transient_context 只服务当前轮推理，例如 QQ 群最近消息摘要。它不能进入
+            # persistent_text，否则群聊噪声会被写进私聊/群聊长期上下文。
+            parts.append(self.transient_context.strip())
+        parts.append(self.text.strip())
         if self.reply_to_message_id:
             parts.append(f"[引用消息] message_id={self.reply_to_message_id}")
         for item in self.attachments:

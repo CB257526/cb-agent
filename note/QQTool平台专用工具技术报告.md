@@ -33,6 +33,46 @@
 
 `funname` 是 cb-agent 稳定暴露给模型的功能名，真实 NapCat action 集中维护在 `tools/tools/qq/registry.py`。这样后续 NapCat Apifox 文档更新或 action 名调整时，只需要改注册表，不需要改工具描述、权限层和 prompt。
 
+## 参数容错与当前会话默认值
+
+实际 QQ 测试里发现，模型虽然能看到 `qqtool` 的 schema，但仍可能把 `args` 对象二次 JSON 编码成字符串，例如：
+
+```json
+{"funname":"send_group_msg","args":"{\"group_id\":123,\"message\":\"hello\"}"}
+```
+
+这会导致工具循环反复试错。因此本次在 `QQTool.run()` 和 `validate_parameters()` 入口增加 `_coerce_args()`：如果 `args` 是 JSON 字符串且解析后是对象，就自动转回 dict，并在返回 metadata 中标记 `args_auto_parsed=true`。工具描述和 README 仍强调正确格式应为对象：
+
+```json
+{"funname":"send_group_msg","args":{"group_id":123,"message":"hello"}}
+```
+
+权限层也必须做同样的解析。因为 `ToolExecutor` 会先调用 `agent/platforms/permissions.py` 再执行工具，如果权限层仍把字符串化 `args` 当成非法或空对象，工具入口就没有机会容错。现在 `_sensitive_qqtool_reason()` 通过 `_coerce_object()` 解析字符串化参数，保证权限判断和真实执行使用同一套语义。
+
+另一个高频试错来自当前群聊/私聊目标 ID。模型在当前群里常会调用 `send_group_msg` 但漏写 `group_id`。权限层和执行层现在都会读取 `ConversationKey`，在普通用户只能操作当前会话的前提下自动补齐当前 `group_id/user_id`。执行层的补齐发生在必填校验之前，避免先报“缺少 group_id”再让模型进入探索循环。
+
+## 图片消息段与文件交付
+
+此前模型想“直接发图片到聊天框”时，容易退而求其次调用 `upload_group_file`，导致图片作为群文件出现。现在 `send_private_msg` / `send_group_msg` 支持 OneBot 图片、语音、视频、文件消息段里的本地路径：
+
+```json
+{
+  "funname": "send_group_msg",
+  "args": {
+    "group_id": 123,
+    "message": [
+      {"type": "image", "data": {"file": "/tmp/cb-agent-outputs/a.png"}}
+    ]
+  }
+}
+```
+
+执行层会把 `data.file` 交给 `prepare_file_reference()`，复用 `mapped_path/http/base64/path` 文件交付策略。这样 NapCat 在 Docker 里运行时，也能把宿主机临时产物转换成容器可读路径或 HTTP/base64 引用。
+
+如果模型使用 OneBot CQ 字符串，例如 `[CQ:image,file=/tmp/cb-agent-outputs/a.png]`，执行层也会提取 `file=` 并走同一套交付转换。新实现仍推荐消息段数组，因为结构化参数更不容易被逗号、空格和转义规则影响。
+
+安全边界同步放在权限层：普通 QQ 用户可以发送 `http(s)`、`base64://`、`data:`、表情包目录资源，以及系统临时目录里的新产物；不能通过 image/file/record/video 消息段把项目源码、配置、日志、密钥或任意本地文件外发。`file://` 不被视为外部资源，也不能绕过本地文件检查。
+
 首批覆盖能力包括：
 
 - 消息互动：`send_private_msg`、`send_group_msg`、`send_poke`。

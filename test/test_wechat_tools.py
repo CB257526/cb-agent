@@ -174,8 +174,25 @@ class TestWeChatTool(unittest.TestCase):
         self.assertIn("funname", params)
         self.assertIn("args", params)
         self.assertTrue(tool.validate_parameters({"funname": "get_status", "args": {}}))
+        self.assertTrue(tool.validate_parameters({"funname": "send_text", "args": "{\"text\":\"hi\"}"}))
         self.assertFalse(tool.validate_parameters({"funname": "", "args": {}}))
         self.assertFalse(tool.validate_parameters({"funname": "get_status", "args": []}))
+
+    def test_run_auto_parses_json_string_args(self) -> None:
+        tool = WeChatTool()
+
+        def fake_run(funname, args):  # noqa: ANN001
+            return {"ok": True, "funname": funname, "action": "send_text", "params": args, "duration_ms": 0}
+
+        with patch("tools.tools.wechattool.run_wechat_function", fake_run):
+            payload = json.loads(tool.run({
+                "funname": "send_text",
+                "args": "{\"text\":\"hi\"}",
+            }))
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["params"], {"text": "hi"})
+        self.assertTrue(payload["metadata"]["args_auto_parsed"])
 
     def test_unconnected_bridge_returns_clear_error(self) -> None:
         payload = json.loads(WeChatTool().run({"funname": "get_status", "args": {}}))

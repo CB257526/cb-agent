@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import ipaddress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from agent.platforms.context import (
     get_current_platform_conversation,
@@ -288,8 +289,7 @@ def _sensitive_qqtool_reason(arguments: Dict[str, Any]) -> str:
     """判断 qqtool 子功能是否需要通讯平台 root 权限。"""
 
     funname = str(arguments.get("funname") or "").strip()
-    raw_args = arguments.get("args")
-    args = raw_args if isinstance(raw_args, dict) else {}
+    args = _coerce_object(arguments.get("args"))
     try:
         from tools.tools.qq.registry import get_qq_function_spec
     except Exception:
@@ -300,6 +300,7 @@ def _sensitive_qqtool_reason(arguments: Dict[str, Any]) -> str:
         return f"qqtool(funname={funname or '<空>'}) 是未知 QQ 操作"
     if spec.root_only:
         return f"qqtool(funname={spec.funname}) 属于 root-only QQ 操作"
+    args = _qqtool_args_with_current_defaults(spec.funname, args)
 
     if spec.current_conversation_only:
         current = get_current_platform_conversation()
@@ -320,6 +321,11 @@ def _sensitive_qqtool_reason(arguments: Dict[str, Any]) -> str:
         if _is_sticker_dir_path(file_path):
             return ""
         return f"qqtool(funname={spec.funname}) 可能外发任意本地文件"
+
+    if spec.funname in {"send_private_msg", "send_group_msg"}:
+        resource_reason = _qqtool_message_resource_reason(spec.funname, args.get("message"))
+        if resource_reason:
+            return resource_reason
 
     return ""
 
@@ -378,6 +384,125 @@ def _qqtool_current_conversation_mismatch(
             return f"qqtool(funname={funname}) 试图操作非当前群聊"
 
     return ""
+
+
+def _qqtool_args_with_current_defaults(funname: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """按当前 QQ 会话补齐常见目标 ID，减少模型因漏传 group_id/user_id 试错。
+
+    这里只补当前会话本身，不补任意目标成员。真正的跨会话检查仍由
+    ``_qqtool_current_conversation_mismatch`` 完成。
+    """
+
+    if not isinstance(args, dict):
+        return {}
+    current = get_current_platform_conversation()
+    if current is None or current.platform != "qq":
+        return args
+    result = dict(args)
+    group_fun = {
+        "send_group_msg",
+        "upload_group_file",
+        "upload_image_to_qun_album",
+        "get_group_info",
+        "get_group_info_ex",
+        "get_group_member_list",
+        "get_group_member_info",
+        "send_group_sign",
+        "get_group_signed_list",
+        "get_qun_album_list",
+        "get_group_album_media_list",
+        "get_group_at_all_remain",
+        "set_group_todo",
+        "complete_group_todo",
+        "cancel_group_todo",
+    }
+    private_fun = {"send_private_msg", "upload_private_file"}
+    if current.kind == "group" and (funname in group_fun or funname in {"send_poke", "send_like"}):
+        result.setdefault("group_id", current.id)
+    if current.kind == "private" and (funname in private_fun or funname in {"send_poke", "send_like"}):
+        result.setdefault("user_id", current.id)
+    return result
+
+
+def _qqtool_message_resource_reason(funname: str, message: Any) -> str:
+    """检查 send_*_msg 消息段是否夹带了本地资源路径。
+
+    普通 QQ 用户可以发送文本、外部 URL 资源、表情包目录资源和系统临时目录里的新产物；
+    不能通过 OneBot image/file 段直接把项目文件或服务器隐私文件发出去。
+    """
+
+    for ref in _iter_onebot_message_file_refs(message):
+        if _is_allowed_qq_resource_ref(ref):
+            continue
+        return f"qqtool(funname={funname}) 消息段可能外发任意本地文件：{ref}"
+    return ""
+
+
+def _iter_onebot_message_file_refs(message: Any) -> Iterable[str]:
+    """从 OneBot 消息段或 CQ 字符串中提取 file 字段。"""
+
+    if isinstance(message, dict):
+        segments: Iterable[Any] = [message]
+    elif isinstance(message, list):
+        segments = message
+    elif isinstance(message, str):
+        for match in re.finditer(r"\[CQ:[^\]]*?(?:^|,)file=([^,\]]+)", message):
+            value = unquote(match.group(1).strip())
+            if value:
+                yield value
+        return
+    else:
+        return
+
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = str(seg.get("type") or "").strip().lower()
+        if seg_type not in {"image", "record", "audio", "video", "file"}:
+            continue
+        data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        value = str(data.get("file") or "").strip()
+        if value:
+            yield value
+
+
+def _is_allowed_qq_resource_ref(raw: Any) -> bool:
+    """判断普通 QQ 用户是否能在消息段中发送该资源引用。"""
+
+    text = str(raw or "").strip()
+    if not text:
+        return True
+    lower = text.lower()
+    if lower.startswith(("http://", "https://", "base64://", "data:")):
+        return True
+    if lower.startswith("file://"):
+        parsed = urlparse(text)
+        path_text = unquote(parsed.path or "")
+        if parsed.netloc and os.name == "nt":
+            path_text = f"//{parsed.netloc}{path_text}"
+        text = path_text
+    if _is_tool_path_under_safe_output_root(text, mode="process_cwd"):
+        return True
+    if _is_sticker_dir_path(text):
+        return True
+    return False
+
+
+def _coerce_object(raw: Any) -> Dict[str, Any]:
+    """把模型误传的 JSON 字符串对象解析成 dict，供权限层和工具入口保持一致。"""
+
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _is_external_resource_ref(raw: Any) -> bool:

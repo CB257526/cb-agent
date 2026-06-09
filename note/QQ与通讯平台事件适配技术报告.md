@@ -54,6 +54,17 @@ QQ 群聊、QQ 好友私聊、未来微信好友和微信群都统一使用 `Con
 
 群聊默认不挂 `LocalSessionStore`，所以不写 history/state/transcript/compact。每条群消息仍会获得临时 `AgentSession`，但处理完成后对象释放，避免群消息过多时把本地磁盘和后续上下文撑大。
 
+为了让群聊回复仍能理解“上面/刚才/这个”等指代，QQ 适配器会在群消息真正触发 agent 后，额外调用 NapCat `get_group_msg_history` 拉取最近群消息，并把整理后的摘要放入 `InboundMessage.transient_context`。这段内容会出现在当前轮 `prompt_text()` 中，但不会进入 `persistent_text()`，因此不会写入 history/state/transcript/compact。
+
+相关配置：
+
+```env
+QQ_GROUP_CONTEXT_MESSAGES=50
+QQ_GROUP_CONTEXT_MAX_CHARS=8000
+```
+
+`QQ_GROUP_CONTEXT_MESSAGES=0` 可以关闭这次额外 action。注入文本会明确标注为“最近群聊消息背景”，系统提示词也会提醒模型：这只是理解上下文的背景，不是本轮用户指令，真正需要执行的是当前 `sender_id` 对应用户的新消息。
+
 QQ 适配器内部使用 `_conversation_queues[conversation.stable_id]` 维护轻量队列。同一个群聊或好友内部按消息到达顺序串行处理，避免两条消息并发写同一份私聊 history/state；不同 `ConversationKey` 可以并发执行。
 
 EventBus 事件本身没有携带会话 ID。为了解决并发回传路由，平台层新增 `agent.platforms.context`，在每轮 `chat_async()` 前用 `ContextVar` 绑定当前 `ConversationKey`。`PlatformEventRenderer` 渲染 `Done`、`TodoListUpdated`、`AskUserQuestion`、`send_message_asset` 等事件时，优先读取这个上下文，从而把最终回答、todo 更新、编号问题和文件资源发回正确的 QQ 会话。

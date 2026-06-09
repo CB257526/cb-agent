@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Dict, List, Tuple
+from urllib.parse import quote, unquote
 
+from agent.platforms.context import get_current_platform_conversation
 from agent.qq.action_bridge import global_qq_action_bridge
 
 from .media import prepare_file_reference
@@ -76,11 +79,14 @@ def _build_action_payload(
             raise ValueError("raw_action.params 必须是对象")
         return action, dict(params), {}
 
-    missing = [key for key in spec.required if _is_missing(args.get(key))]
+    # 先按当前 QQ 会话补齐 group_id/user_id，再做必填校验。
+    # 否则模型在当前群里省略 group_id 时会先被“缺少必填参数”挡住，
+    # 即使我们本来可以从 ConversationKey 安全地推导出目标会话。
+    params = _apply_current_conversation_defaults(spec.funname, dict(args))
+    missing = [key for key in spec.required if _is_missing(params.get(key))]
     if missing:
         raise ValueError(f"{spec.funname} 缺少必填参数：{', '.join(missing)}")
 
-    params = dict(args)
     meta: Dict[str, Any] = {}
     if spec.file_param:
         raw_file = params.get(spec.file_param)
@@ -91,20 +97,136 @@ def _build_action_payload(
         meta["file_delivery"] = delivery_meta
 
     if spec.funname in {"send_private_msg", "send_group_msg"}:
-        params["message"] = _normalize_message(params.get("message"))
+        params["message"], message_meta = _normalize_message_for_send(
+            params.get("message"),
+            timeout=timeout,
+        )
+        if message_meta:
+            meta["message_file_delivery"] = message_meta
     return spec.action, params, meta
 
 
-def _normalize_message(message: Any) -> Any:
-    """兼容纯文本、OneBot 消息段数组和简单对象。"""
+def _apply_current_conversation_defaults(funname: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """按当前 QQ 会话补齐常见目标 ID。
+
+    模型在当前群聊里调用 ``send_group_msg`` 时，经常能从 prompt 中知道“当前群”，
+    但仍忘记把 ``group_id`` 写进 args。权限层已经只允许操作当前会话；这里再把
+    当前 ConversationKey 补进 action 参数，减少模型因为缺字段反复试错。
+    """
+
+    current = get_current_platform_conversation()
+    if current is None or current.platform != "qq":
+        return args
+    params = dict(args)
+    group_fun = {
+        "send_group_msg",
+        "upload_group_file",
+        "upload_image_to_qun_album",
+        "get_group_info",
+        "get_group_info_ex",
+        "get_group_member_list",
+        "get_group_member_info",
+        "send_group_sign",
+        "get_group_signed_list",
+        "get_qun_album_list",
+        "get_group_album_media_list",
+        "get_group_at_all_remain",
+        "set_group_todo",
+        "complete_group_todo",
+        "cancel_group_todo",
+    }
+    private_fun = {"send_private_msg", "upload_private_file"}
+    if current.kind == "group" and (funname in group_fun or funname in {"send_poke", "send_like"}):
+        params.setdefault("group_id", current.id)
+    if current.kind == "private" and (funname in private_fun or funname in {"send_poke", "send_like"}):
+        params.setdefault("user_id", current.id)
+    return params
+
+
+def _normalize_message_for_send(
+    message: Any,
+    *,
+    timeout: float | None,
+) -> Tuple[Any, List[Dict[str, Any]]]:
+    """兼容纯文本、OneBot 消息段数组和简单对象，并处理本地媒体路径。
+
+    模型常会通过 ``send_group_msg`` 发送图片段：
+    ``{"type":"image","data":{"file":"/tmp/a.png"}}``。如果 NapCat 在 Docker
+    中，直接把宿主机路径交给它会失败；这里复用文件交付层，把本机路径转换成
+    mapped_path/http/base64/path 候选里的第一个可用引用。
+    """
 
     if isinstance(message, str):
-        return message
+        return _normalize_cq_message_string(message, timeout=timeout)
     if isinstance(message, list):
-        return message
+        return _normalize_message_segments(message, timeout=timeout)
     if isinstance(message, dict):
-        return [message]
-    return str(message or "")
+        segments, meta = _normalize_message_segments([message], timeout=timeout)
+        return segments, meta
+    return str(message or ""), []
+
+
+def _normalize_message_segments(
+    segments: List[Any],
+    *,
+    timeout: float | None,
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    normalized: List[Any] = []
+    delivery_meta: List[Dict[str, Any]] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            normalized.append(seg)
+            continue
+        item = dict(seg)
+        seg_type = str(item.get("type") or "").strip().lower()
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        if seg_type in {"image", "record", "audio", "video", "file"} and data.get("file"):
+            new_data = dict(data)
+            ref, meta = prepare_file_reference(str(new_data.get("file") or ""), timeout=timeout)
+            new_data["file"] = ref
+            item["data"] = new_data
+            delivery_meta.append({
+                "segment_type": seg_type,
+                "source": str(data.get("file") or ""),
+                **meta,
+            })
+        normalized.append(item)
+    return normalized, delivery_meta
+
+
+def _normalize_cq_message_string(
+    message: str,
+    *,
+    timeout: float | None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """处理 CQ 字符串中的 file= 本地路径。
+
+    OneBot 既支持消息段数组，也支持 ``[CQ:image,file=...]`` 这种字符串写法。权限层
+    已经会检查 CQ 字符串里的 file 字段；执行层也要同步把本地路径转换成 NapCat 可读
+    引用，否则 Docker 部署时数组段能发、CQ 字符串却会因为容器读不到宿主机路径失败。
+    """
+
+    delivery_meta: List[Dict[str, Any]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        prefix = match.group("prefix")
+        raw_value = unquote(match.group("value").strip())
+        if not raw_value:
+            return match.group(0)
+        ref, meta = prepare_file_reference(raw_value, timeout=timeout)
+        delivery_meta.append({
+            "segment_type": "cq",
+            "source": raw_value,
+            **meta,
+        })
+        return f"{prefix}{quote(ref, safe=':/?&=#%._+-')}"
+
+    normalized = re.sub(
+        r"(?P<prefix>\[CQ:[^\]]*?(?:^|,)file=)(?P<value>[^,\]]+)",
+        replace,
+        message,
+    )
+    return normalized, delivery_meta
 
 
 def _action_ok(result: Dict[str, Any]) -> bool:

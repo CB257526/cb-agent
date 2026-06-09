@@ -520,6 +520,120 @@ class TestPlatformToolPermission(unittest.TestCase):
         self.assertEqual([name for name, _ in calls], ["qqtool"])
         self.assertFalse(results[0].is_error)
 
+    def test_qqtool_json_string_args_are_checked_like_object_args(self):
+        nested_args = json.dumps({"group_id": "10001", "message": "hi"}, ensure_ascii=False)
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            json.dumps(
+                {"funname": "send_group_msg", "args": nested_args},
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
+        self.assertFalse(results[0].is_error)
+
+    def test_qqtool_current_group_id_can_be_omitted_for_current_conversation(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            json.dumps(
+                {"funname": "send_group_msg", "args": {"message": "hi"}},
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
+        self.assertFalse(results[0].is_error)
+
+    def test_qqtool_message_segment_blocks_arbitrary_local_file_for_non_root(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            json.dumps(
+                {
+                    "funname": "send_group_msg",
+                    "args": {
+                        "group_id": "10001",
+                        "message": [{"type": "image", "data": {"file": "run_agent.py"}}],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("消息段可能外发任意本地文件", payload["error"])
+
+    def test_qqtool_message_segment_allows_temp_artifact_for_non_root(self):
+        temp_output = Path(tempfile.gettempdir()) / "cb-agent-outputs" / "image.png"
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            json.dumps(
+                {
+                    "funname": "send_group_msg",
+                    "args": {
+                        "group_id": "10001",
+                        "message": [{"type": "image", "data": {"file": str(temp_output)}}],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
+        self.assertFalse(results[0].is_error)
+
+    def test_qqtool_cq_message_string_resource_policy_matches_segments(self):
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            json.dumps(
+                {
+                    "funname": "send_group_msg",
+                    "args": {
+                        "group_id": "10001",
+                        "message": "[CQ:image,file=run_agent.py]",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+
+        self.assertEqual(calls, [])
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["permission_denied"])
+        self.assertIn("消息段可能外发任意本地文件", payload["error"])
+
+        temp_output = Path(tempfile.gettempdir()) / "cb-agent-outputs" / "image.png"
+        calls, results = self._run_as_sender(
+            "200",
+            "qqtool",
+            json.dumps(
+                {
+                    "funname": "send_group_msg",
+                    "args": {
+                        "group_id": "10001",
+                        "message": f"[CQ:image,file={temp_output}]",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            env={"QQ_ROOT_USERS": "100"},
+        )
+
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
+        self.assertFalse(results[0].is_error)
+
     def test_temp_symlink_to_project_is_not_treated_as_safe_artifact(self):
         with tempfile.TemporaryDirectory() as td:
             link = Path(td) / "project-link"
@@ -660,10 +774,8 @@ class TestPlatformToolPermission(unittest.TestCase):
             '{"funname":"send_poke","args":{"user_id":"200"}}',
             env={"QQ_ROOT_USERS": "100"},
         )
-        self.assertEqual(calls, [])
-        payload = json.loads(results[0].result)
-        self.assertTrue(payload["permission_denied"])
-        self.assertIn("非当前群聊", payload["error"])
+        self.assertEqual([name for name, _ in calls], ["qqtool"])
+        self.assertFalse(results[0].is_error)
 
         calls, results = self._run_as_sender(
             "200",
