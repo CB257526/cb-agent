@@ -42,8 +42,8 @@ def system_prompt_section(name: str, compute: ComputeFn) -> SystemPromptSection:
     """创建一个可缓存的 Section。
 
     Section 在 SystemPromptSectionCache 里按 name 存,/clear 与 /compact 失效。
-    适合 CLAUDE.md 加载、env_info 计算、token_budget 读取等"同一进程内多次
-    调用结果稳定"的场景。
+    适合 env_info、token_budget 等"同一进程内多次调用结果稳定"的场景。
+    CLAUDE.md 记忆会在运行中被工具更新,必须走 uncached section 实时重读。
     """
     return SystemPromptSection(name=name, compute=compute, cache_break=False)
 

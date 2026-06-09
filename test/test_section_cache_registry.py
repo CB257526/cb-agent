@@ -15,7 +15,9 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -183,3 +185,69 @@ class TestCurrentTimeSection(unittest.TestCase):
         self.assertIn("Current local date: 2026-06-07", out1[0])
         self.assertNotEqual(out1, out2)
         self.assertIs(cache.get("current_time"), _MISSING)
+
+
+class TestMemorySectionRealtimeReload(unittest.TestCase):
+    def test_memory_section_reloads_loader_each_resolve(self):
+        """CLAUDE.md 记忆段必须每次 prompt 组装都重新读取。"""
+        from context.memory.types import MemoryFileInfo
+
+        class FakeMemoryLoader:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.reset_reasons: list[str] = []
+
+            def reset_cache(self, reason: str = "") -> None:
+                self.reset_reasons.append(reason)
+
+            async def get_memory_files(self):
+                self.calls += 1
+                return [
+                    MemoryFileInfo(
+                        path=Path(f"CLAUDE-{self.calls}.md").resolve(strict=False),
+                        type="Project",
+                        content=f"memory-v{self.calls}",
+                    )
+                ]
+
+        loader = FakeMemoryLoader()
+        cache = SystemPromptSectionCache(max_entries=10)
+        section = dynamic_sections.memory_section(loader)
+
+        out1 = asyncio.run(resolve_system_prompt_sections([section], cache))
+        out2 = asyncio.run(resolve_system_prompt_sections([section], cache))
+
+        self.assertEqual(loader.calls, 2)
+        self.assertEqual(
+            loader.reset_reasons,
+            ["memory_section_realtime_reload", "memory_section_realtime_reload"],
+        )
+        self.assertIn("memory-v1", out1[0])
+        self.assertIn("memory-v2", out2[0])
+        self.assertNotEqual(out1, out2)
+        self.assertIs(cache.get("memory"), _MISSING)
+
+    def test_memory_section_reads_updated_claude_md_without_restart(self):
+        """真实 CLAUDE.md 在运行中修改后,下一次 prompt 组装应看到新内容。"""
+        from context.memory.loader import MemoryLoader
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            claude_md = root / "CLAUDE.md"
+            claude_md.write_text("memory-from-v1", encoding="utf-8")
+            loader = MemoryLoader(
+                cwd=root,
+                include_managed=False,
+                include_user=False,
+            )
+            cache = SystemPromptSectionCache(max_entries=10)
+            section = dynamic_sections.memory_section(loader)
+
+            out1 = asyncio.run(resolve_system_prompt_sections([section], cache))
+            claude_md.write_text("memory-from-v2", encoding="utf-8")
+            out2 = asyncio.run(resolve_system_prompt_sections([section], cache))
+
+        self.assertIn("memory-from-v1", out1[0])
+        self.assertIn("memory-from-v2", out2[0])
+        self.assertNotIn("memory-from-v1", out2[0])
+        self.assertIs(cache.get("memory"), _MISSING)

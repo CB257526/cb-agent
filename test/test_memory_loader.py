@@ -20,8 +20,6 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import pytest
-
 from context.memory.formatter import MEMORY_INSTRUCTION_PROMPT, format_memory_files
 from context.memory.frontmatter import parse_frontmatter, strip_block_html_comments
 from context.memory.include_resolver import extract_include_paths

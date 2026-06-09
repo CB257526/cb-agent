@@ -262,6 +262,8 @@ class ConstantSystemPrompt:
 
 也兼容 `USER_COSERPLAY_PROMPT` 这个拼写。为空时不会注入。这里建议只写长期稳定的风格偏好；当前时间、cwd、工具列表、MCP instructions、Buddy 状态、CLAUDE.md/记忆内容、通讯平台会话信息等运行时动态内容仍由上下文系统自动拼接，避免后续做高缓存命中优化时把动态内容混进静态前缀。
 
+`CLAUDE.md` 及其 include/rules 记忆段会在每次 prompt 组装时重新读取；如果 agent 运行过程中通过工具写入了新的记忆，下一轮会话会直接看到最新内容，不需要重启进程或手动 `/clear`。
+
 ### 5. 启动 CLI
 
 默认启动，使用轻量 Markdown 记忆：

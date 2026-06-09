@@ -8,7 +8,7 @@ cb-agent 默认走 OpenAICompatibleAdapter:把 block 列表 join 成单 string,
 预留接口,本次不实现具体 cache_control 注入。
 
 收益(即使在 OpenAI 兼容路径下):
-- Section LRU 缓存依旧避免重读 CLAUDE.md / 重算 env_info
+- Section LRU 缓存依旧避免重算 env_info 等稳定段；CLAUDE.md 记忆段会实时重读
 - 调试 dump 仍可按 scope 着色
 - 切回 Anthropic 直连时,session 端代码无需改动
 """

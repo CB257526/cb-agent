@@ -7,9 +7,9 @@
 - 每个 section 函数返回 SystemPromptSection,而不是直接返回字符串。
   resolve_system_prompt_sections 会把它们并发 resolve。
 - compute 函数都是闭包,捕获了构造时的依赖(loader / model / settings)。
-- mcp_instructions 用 DANGEROUS_uncached_*,因为 MCP 服务的 instructions
-  字段在 connect/disconnect 之间会变,无稳定缓存键。
-- 其余 section 用普通 system_prompt_section,缓存键即 section name。
+- memory 与 mcp_instructions 用 DANGEROUS_uncached_*。memory 需要实时重读
+  CLAUDE.md,而 MCP instructions 会随 connect/disconnect 变化。
+- 其余稳定 section 用普通 system_prompt_section,缓存键即 section name。
 """
 
 from __future__ import annotations
@@ -29,17 +29,28 @@ def memory_section(memory_loader: Any) -> SystemPromptSection:
     """CLAUDE.md 多级合并段。
 
     memory_loader 是 MemoryLoader 实例(用 Any 类型避免循环 import)。
-    compute 是 async,直接 await loader.get_memory_files() -> format_memory_files()。
+    compute 是 async,每轮先清理 MemoryLoader memoize,再读取 CLAUDE.md。
+
+    这里不能使用普通 ``system_prompt_section`` 缓存。用户可能在 agent 运行途中
+    通过 memory/file_edit 等工具更新 CLAUDE.md,下一次会话/下一轮消息就应立刻看到
+    新记忆。为此这一段显式标记为 uncached,并同步清理 MemoryLoader 内部 memo。
     """
     async def compute() -> Optional[str]:
         from .. import memory as _memory_pkg
 
+        reset = getattr(memory_loader, "reset_cache", None)
+        if callable(reset):
+            reset(reason="memory_section_realtime_reload")
         files = await memory_loader.get_memory_files()
         if not files:
             return None
         return _memory_pkg.format_memory_files(files)
 
-    return system_prompt_section("memory", compute)
+    return DANGEROUS_uncached_system_prompt_section(
+        "memory",
+        compute,
+        reason="CLAUDE.md can be edited while the agent is running; memory must be reloaded for every prompt.",
+    )
 
 
 def env_info_section(
