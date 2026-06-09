@@ -30,6 +30,11 @@
     "fetch": {
       "command": "python",
       "args": ["-m", "mcp_server_fetch"]
+    },
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp"]
     }
   }
 }

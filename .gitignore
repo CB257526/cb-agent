@@ -6,6 +6,7 @@ __pycache__/
 # cb-agent 运行时产物
 .cbagent/
 .playwright-mcp/
+.codegraph/
 
 # C extensions
 *.so
