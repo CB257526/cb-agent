@@ -51,7 +51,9 @@ class ConstantSystemPrompt:
         "limit. After compaction you'll see a `compact_boundary` user message containing "
         "a summary; treat the summary as authoritative for facts before that point.\n"
         "- If a tool fails twice in a row, stop retrying with minor variations and "
-        "diagnose the root cause instead."
+        "diagnose the root cause instead.\n"
+        "当你发现任务中断或是其他异常情况，导致发现在这轮对话中缺少某个工具调用所提供的上下文时，请务必重新调用工具来获取"
+        "缺失的上下文。拒绝没有相关上下文就开始执行任务。\n"
     )
 
     DOING_TASKS_SECTION: str = (
