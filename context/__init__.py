@@ -41,6 +41,8 @@ from .compact import (
     messages_after_last_boundary,
 )
 from .memory import (
+    KnowledgeBase,
+    KnowledgeCaptureResult,
     MemoryFileInfo,
     MemoryLoader,
     MemoryType,
@@ -90,6 +92,8 @@ __all__ = [
     "maybe_microcompact_tool_results",
     "messages_after_last_boundary",
     # memory
+    "KnowledgeBase",
+    "KnowledgeCaptureResult",
     "MemoryFileInfo",
     "MemoryLoader",
     "MemoryType",

@@ -54,6 +54,7 @@ async def get_system_prompt(
     language: Optional[str] = None,
     output_style: Optional[str] = None,
     budget_directive: Optional[str] = None,
+    memory_query: str = "",
 ) -> list[str]:
     """组装当前会话的 system prompt(已 resolve、过滤空段)。
 
@@ -84,7 +85,7 @@ async def get_system_prompt(
     if sg is not None:
         dynamic_section_objs.append(sg)
     if memory_loader is not None:
-        dynamic_section_objs.append(memory_section(memory_loader))
+        dynamic_section_objs.append(memory_section(memory_loader, query=memory_query))
     dynamic_section_objs.append(current_time_section())
     dynamic_section_objs.append(
         env_info_section(

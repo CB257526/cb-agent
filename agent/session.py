@@ -502,6 +502,7 @@ class AgentSession:
         *,
         user_content: Any,
         system_instructions: str,
+        memory_query: str = "",
     ) -> List[Dict[str, Any]]:
         """按当前 history/state 构造本轮初始 LLM messages。
 
@@ -535,6 +536,7 @@ class AgentSession:
                     mcp_clients=self.mcp_clients,
                     skill_commands=self._collect_skill_commands(),
                     language=self.language,
+                    memory_query=memory_query,
                 )
             )
         except RuntimeError:
@@ -550,6 +552,7 @@ class AgentSession:
                         mcp_clients=self.mcp_clients,
                         skill_commands=self._collect_skill_commands(),
                         language=self.language,
+                        memory_query=memory_query,
                     )
                 )
             finally:
@@ -643,6 +646,7 @@ class AgentSession:
         messages = self._build_chat_messages(
             user_content=request_content,
             system_instructions=system_instructions,
+            memory_query=history_user_text,
         )
 
         tools_schema = (
@@ -681,6 +685,7 @@ class AgentSession:
             messages = self._build_chat_messages(
                 user_content=request_content,
                 system_instructions=system_instructions,
+                memory_query=history_user_text,
             )
 
         # 记录本轮初始消息（含 system/user/history）
@@ -715,6 +720,11 @@ class AgentSession:
         )
         if work_record is not None and work_record.text:
             self.history.append(make_work_record_message(work_record))
+        self._auto_update_memory_and_knowledge(
+            user_query=history_user_text,
+            final_answer=final_answer,
+            work_record_text=(work_record.text if work_record is not None else ""),
+        )
         self._persist_turn(history_user_text, final_answer, work_record)
 
         # 本轮结束后再看一次跨轮 state/history。工具轨迹落盘和 state 合并可能让
@@ -1461,6 +1471,35 @@ class AgentSession:
             )
         except Exception:
             logger.exception("本地会话落盘失败")
+
+    def _auto_update_memory_and_knowledge(
+        self,
+        *,
+        user_query: str,
+        final_answer: str,
+        work_record_text: str = "",
+    ) -> None:
+        """Best-effort long-term memory and structured knowledge update."""
+        if self.memory_loader is None or not self.ctx_enabled:
+            return
+        record_turn = getattr(self.memory_loader, "record_turn", None)
+        if not callable(record_turn):
+            return
+        try:
+            result = record_turn(
+                user_text=user_query,
+                assistant_text=final_answer or "",
+                work_record_text=work_record_text or "",
+            )
+            if result is not None:
+                logger.debug(
+                    "memory/knowledge auto-update: memory=%s pages=%s errors=%s",
+                    getattr(result, "memory_updated", False),
+                    len(getattr(result, "pages", []) or []),
+                    getattr(result, "errors", []) or [],
+                )
+        except Exception:
+            logger.exception("memory/knowledge auto-update failed")
 
     def _prepend_background_notifications(self, user_query: str) -> str:
         """每轮 chat 前 drain 后台任务通知，挂到 user_query 前作为 system reminder。

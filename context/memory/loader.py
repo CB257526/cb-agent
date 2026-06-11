@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, List, Optional
@@ -24,11 +25,15 @@ from typing import Awaitable, Callable, Iterable, List, Optional
 from .frontmatter import parse_frontmatter, strip_block_html_comments
 from .include_resolver import extract_include_paths
 from .paths import (
+    get_knowledge_root,
     get_local_memory_path,
     get_managed_memory_path,
     get_managed_rules_dir,
+    get_short_term_memory_path,
+    get_user_core_memory_path,
     get_user_memory_path,
     get_user_rules_dir,
+    iter_user_core_memory_paths,
     iter_project_memory_candidates,
     iter_rules_dir,
 )
@@ -174,15 +179,81 @@ class MemoryLoader:
         *,
         include_managed: bool = True,
         include_user: bool = True,
+        include_knowledge: bool = True,
     ) -> None:
         self.cwd = cwd.resolve()
         self.include_managed = include_managed
         self.include_user = include_user
+        self.include_knowledge = include_knowledge
+        self.knowledge_root = get_knowledge_root(self.cwd)
+        namespace_digest = hashlib.sha1(
+            str(self.knowledge_root).lower().encode("utf-8", errors="ignore")
+        ).hexdigest()[:12]
+        self.knowledge_namespace = "workspace:" + namespace_digest
+        self._knowledge_base = None
         self._memo = _AsyncMemoize(self._compute_memory_files)
 
     async def get_memory_files(self) -> List[MemoryFileInfo]:
         """返回当前会话的 memory 文件列表(已合并、去重、深度受限)。"""
         return await self._memo()
+
+    def get_knowledge_base(self):
+        """Return the lazily-created structured knowledge base."""
+        if self._knowledge_base is None:
+            from .knowledge import KnowledgeBase
+
+            self._knowledge_base = KnowledgeBase(
+                self.knowledge_root,
+                namespace=self.knowledge_namespace,
+            )
+        return self._knowledge_base
+
+    async def get_knowledge_context(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        max_chars: int = 3500,
+    ) -> str:
+        """Retrieve related structured knowledge for the current prompt."""
+        if not self.include_knowledge or not query or not str(query).strip():
+            return ""
+        try:
+            kb = self.get_knowledge_base()
+            return await asyncio.to_thread(
+                kb.render_related_context,
+                str(query),
+                limit=limit,
+                max_chars=max_chars,
+            )
+        except Exception:
+            logger.exception("knowledge context retrieval failed")
+            return ""
+
+    def record_turn(
+        self,
+        *,
+        user_text: str,
+        assistant_text: str,
+        work_record_text: str = "",
+    ):
+        """Best-effort memory and knowledge update after a completed turn."""
+        if not self.include_knowledge:
+            return None
+        try:
+            kb = self.get_knowledge_base()
+            result = kb.capture_turn(
+                user_text=user_text,
+                assistant_text=assistant_text,
+                work_record_text=work_record_text,
+                long_term_memory_path=get_user_core_memory_path("MEMORY.md"),
+            )
+            if getattr(result, "memory_updated", False):
+                self.reset_cache(reason="record_turn_memory_update")
+            return result
+        except Exception:
+            logger.exception("turn memory/knowledge capture failed")
+            return None
 
     def reset_cache(self, reason: str = "session_start") -> None:
         """清空 memoize 缓存。
@@ -214,12 +285,15 @@ class MemoryLoader:
             await _add_file(get_managed_memory_path(), "Managed")
             await _add_dir(get_managed_rules_dir(), "Managed")
         if self.include_user:
-            await _add_file(get_user_memory_path(), "User")
+            await _add_file(get_user_memory_path(), "Global")
+            for core_path in iter_user_core_memory_paths():
+                await _add_file(core_path, "Global")
             await _add_dir(get_user_rules_dir(), "User")
         # Project 层: 根 -> cwd 逐层
         for path, _label in iter_project_memory_candidates(self.cwd):
             await _process_then_extend(out, path, "Project", processed)
         # Local 层
+        await _add_file(get_short_term_memory_path(self.cwd), "ShortTerm")
         await _add_file(get_local_memory_path(self.cwd), "Local")
 
         # 总字符数上限保护(对齐 claude-code MAX_MEMORY_CHARACTER_COUNT)

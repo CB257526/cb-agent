@@ -4,10 +4,13 @@
 """
 
 from .formatter import MEMORY_INSTRUCTION_PROMPT, format_memory_files
+from .knowledge import KnowledgeBase, KnowledgeCaptureResult
 from .loader import MemoryLoader
 from .types import MemoryFileInfo, MemoryType
 
 __all__ = [
+    "KnowledgeBase",
+    "KnowledgeCaptureResult",
     "MEMORY_INSTRUCTION_PROMPT",
     "MemoryFileInfo",
     "MemoryLoader",

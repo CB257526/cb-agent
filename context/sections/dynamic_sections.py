@@ -25,7 +25,7 @@ from .registry import (
 )
 
 
-def memory_section(memory_loader: Any) -> SystemPromptSection:
+def memory_section(memory_loader: Any, query: str = "") -> SystemPromptSection:
     """CLAUDE.md 多级合并段。
 
     memory_loader 是 MemoryLoader 实例(用 Any 类型避免循环 import)。
@@ -42,9 +42,16 @@ def memory_section(memory_loader: Any) -> SystemPromptSection:
         if callable(reset):
             reset(reason="memory_section_realtime_reload")
         files = await memory_loader.get_memory_files()
-        if not files:
+        knowledge_context = ""
+        get_knowledge_context = getattr(memory_loader, "get_knowledge_context", None)
+        if callable(get_knowledge_context):
+            knowledge_context = await get_knowledge_context(query or "")
+        if not files and not knowledge_context:
             return None
-        return _memory_pkg.format_memory_files(files)
+        return _memory_pkg.format_memory_files(
+            files,
+            knowledge_context=knowledge_context,
+        )
 
     return DANGEROUS_uncached_system_prompt_section(
         "memory",

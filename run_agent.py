@@ -77,6 +77,14 @@ from agent.session import AgentSession
 from agent.work_context import LocalSessionStore, TraceSummarizer
 from constant.llm.constant_llm import ConstantLLM
 from context import MemoryLoader, OpenAICompatibleAdapter
+from context.memory.paths import (
+    CORE_MEMORY_FILENAMES,
+    SHORT_TERM_MEMORY_NAME,
+    get_knowledge_root,
+    get_short_term_memory_path,
+    get_user_core_memory_path,
+    get_workspace_memory_dir,
+)
 from skills.skill_manager import SkillManager
 from skills.skill_executor import SkillExecutor
 from tools.toolRegistry import ToolRegistry
@@ -403,8 +411,8 @@ class AgentRunner:
         """重构后保留为兼容 stub —— Markdown 记忆改由 MemoryLoader 统一加载。
 
         旧的 MarkdownMemoryProvider 已删除,记忆加载现在走 context.memory.MemoryLoader
-        的多级 CLAUDE.md 路径优先级链。这里仍然在 light 模式下保证全局/项目级
-        memory 目录存在并写入模板 CLAUDE.md,以便用户首次打开 TUI 就能编辑。
+        的 Global / Project / ShortTerm 三层路径链。这里仍然在 light 模式下保证
+        根工作区记忆文件、项目短期记忆文件和知识库目录存在。
 
         返回 None: bash_prompt_provider 调用方拿到 None 时会跳过 memory 提示段
         (memory 内容已经被 MemoryLoader 注入 system prompt 的 dynamic memory section)。
@@ -412,18 +420,31 @@ class AgentRunner:
         if self.memory_system != "light":
             return None
         try:
-            global_dir = Path.home() / ".cbagent"
-            project_dir = Path(_HERE) / ".cbagent" / "memory"
-            for d in (global_dir, project_dir):
-                d.mkdir(parents=True, exist_ok=True)
-            user_memory = global_dir / "CLAUDE.md"
-            if not user_memory.exists():
-                user_memory.write_text(
-                    "# cb-agent 用户全局记忆\n\n"
-                    "这是 cb-agent 跨项目共享的全局指令。把对所有项目都适用的偏好、"
-                    "规则、工具使用约定写在这里。具体项目的指令请放在项目根目录的 CLAUDE.md。\n",
+            workspace_dir = get_workspace_memory_dir()
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            templates = {
+                "AGENT.md": "# AGENT\n\nAgent persona and long-lived behavior settings.\n",
+                "USER.md": "# USER\n\nUser identity, preferences, and stable working style.\n",
+                "RULE.md": "# RULE\n\nCustom rules and constraints that should apply globally.\n",
+                "MEMORY.md": "# MEMORY\n\n## Captured memories\n",
+            }
+            for name in CORE_MEMORY_FILENAMES:
+                path = get_user_core_memory_path(name)
+                if not path.exists():
+                    path.write_text(templates[name], encoding="utf-8")
+
+            short_term = get_short_term_memory_path(Path(_HERE))
+            short_term.parent.mkdir(parents=True, exist_ok=True)
+            if not short_term.exists():
+                short_term.write_text(
+                    "# SHORT_TERM\n\n"
+                    "Project-local short-term memory for active tasks, recent decisions, "
+                    "and temporary context.\n",
                     encoding="utf-8",
                 )
+
+            knowledge_root = get_knowledge_root(Path(_HERE))
+            (knowledge_root / "pages").mkdir(parents=True, exist_ok=True)
         except Exception as e:
             _err(f"轻量记忆目录初始化失败(继续启动): {e}")
         return None
@@ -494,6 +515,22 @@ class AgentRunner:
         else:
             base = self._md_memory_provider.memory_instructions()
         parts = [base] if base else []
+        if self.memory_system == "light":
+            parts.append(
+                "[Markdown memory architecture]\n"
+                "- Global memory files are loaded from the workspace root: "
+                "`~/AGENT.md`, `~/USER.md`, `~/RULE.md`, and `~/MEMORY.md`.\n"
+                "- Project memory files are loaded from the current project chain: "
+                "`AGENT.md`, `USER.md`, `RULE.md`, `MEMORY.md`, `.cbagent/*.md`, "
+                "and legacy `CLAUDE.md` files.\n"
+                f"- Short-term project memory is loaded from `.cbagent/{SHORT_TERM_MEMORY_NAME}`.\n"
+                "- Structured knowledge pages live under `~/knowledge/pages/`; "
+                "`~/knowledge/index.json` and `~/knowledge/graph.json` are stable "
+                "interfaces for future web browsing and graph views.\n"
+                "- Important user facts may be appended to `~/MEMORY.md`; reusable "
+                "structured knowledge should become a Markdown page in the knowledge base. "
+                "The agent also performs best-effort automatic capture after each turn."
+            )
         if self.dangerously_skip_permissions:
             parts.append(
                 "[危险权限模式]\n"

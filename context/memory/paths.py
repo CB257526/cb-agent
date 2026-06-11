@@ -23,8 +23,18 @@ from typing import Iterator
 
 PROJECT_CLAUDE_NAME = "CLAUDE.md"
 LOCAL_CLAUDE_NAME = "CLAUDE.local.md"
+CORE_MEMORY_FILENAMES = ("AGENT.md", "USER.md", "RULE.md", "MEMORY.md")
+SHORT_TERM_MEMORY_NAME = "SHORT_TERM.md"
 PROJECT_RULES_DIRS = (".claude/rules", ".cbagent/rules")
 PROJECT_CLAUDE_SUBPATHS = (
+    "AGENT.md",
+    "USER.md",
+    "RULE.md",
+    "MEMORY.md",
+    ".cbagent/AGENT.md",
+    ".cbagent/USER.md",
+    ".cbagent/RULE.md",
+    ".cbagent/MEMORY.md",
     "CLAUDE.md",
     ".claude/CLAUDE.md",
     ".cbagent/CLAUDE.md",
@@ -52,9 +62,65 @@ def get_user_memory_path() -> Path:
     return Path.home() / ".cbagent" / "CLAUDE.md"
 
 
+def get_user_memory_dir() -> Path:
+    """Return the user-global memory directory."""
+    return Path.home() / ".cbagent"
+
+
+def get_workspace_memory_dir() -> Path:
+    """Return the memory workspace root.
+
+    The user-facing default is ``~/``. Set ``CBAGENT_WORKSPACE_DIR`` to move
+    the global memory files and knowledge directory together.
+    """
+    override = os.environ.get("CBAGENT_WORKSPACE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home().resolve()
+
+
+def iter_user_core_memory_paths() -> Iterator[Path]:
+    """Yield global memory files in stable load order.
+
+    ``~/.cbagent/*.md`` is kept as a legacy location. ``~/AGENT.md`` /
+    ``~/USER.md`` / ``~/RULE.md`` / ``~/MEMORY.md`` are loaded afterwards so
+    the documented workspace-root files take precedence.
+    """
+    legacy_base = get_user_memory_dir()
+    for name in CORE_MEMORY_FILENAMES:
+        yield legacy_base / name
+    base = get_workspace_memory_dir()
+    for name in CORE_MEMORY_FILENAMES:
+        yield base / name
+
+
+def get_user_core_memory_path(name: str) -> Path:
+    """Return the documented workspace-root core memory file path."""
+    if name not in CORE_MEMORY_FILENAMES:
+        raise ValueError(f"unsupported core memory file: {name}")
+    return get_workspace_memory_dir() / name
+
+
 def get_user_rules_dir() -> Path:
     """用户级 rules 目录。"""
     return Path.home() / ".cbagent" / "rules"
+
+
+def get_short_term_memory_path(cwd: Path) -> Path:
+    """Project-local short-term memory loaded after project memory."""
+    return cwd.resolve() / ".cbagent" / SHORT_TERM_MEMORY_NAME
+
+
+def get_knowledge_root(cwd: Path | None = None) -> Path:
+    """Return the workspace knowledge root.
+
+    Defaults to ``~/knowledge``. ``CBAGENT_KNOWLEDGE_DIR`` can point the agent
+    at another workspace root without changing code.
+    """
+    override = os.environ.get("CBAGENT_KNOWLEDGE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (get_workspace_memory_dir() / "knowledge").resolve()
 
 
 def iter_project_memory_candidates(cwd: Path) -> Iterator[tuple[Path, str]]:
@@ -104,11 +170,19 @@ def get_local_memory_path(cwd: Path) -> Path:
 __all__ = [
     "get_managed_memory_path",
     "get_managed_rules_dir",
+    "get_user_memory_dir",
+    "get_workspace_memory_dir",
     "get_user_memory_path",
+    "get_user_core_memory_path",
+    "iter_user_core_memory_paths",
     "get_user_rules_dir",
+    "get_short_term_memory_path",
+    "get_knowledge_root",
     "get_local_memory_path",
     "iter_project_memory_candidates",
     "iter_rules_dir",
+    "CORE_MEMORY_FILENAMES",
     "PROJECT_CLAUDE_NAME",
     "LOCAL_CLAUDE_NAME",
+    "SHORT_TERM_MEMORY_NAME",
 ]

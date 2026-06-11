@@ -36,23 +36,35 @@ MEMORY_INSTRUCTION_PROMPT = (
 _TYPE_LABEL: dict[MemoryType, str] = {
     "Managed": "managed instructions",
     "User": "user instructions",
+    "Global": "global memory and user profile",
     "Project": "project instructions, checked into the codebase",
+    "ShortTerm": "short-term project memory",
     "Local": "local user instructions, NOT checked in",
+    "Knowledge": "retrieved structured knowledge",
 }
 
 
-def format_memory_files(files: Sequence[MemoryFileInfo]) -> str:
+def format_memory_files(
+    files: Sequence[MemoryFileInfo],
+    *,
+    knowledge_context: str = "",
+) -> str:
     """把多个 MemoryFileInfo 拼成 memory section 注入文本。
 
     files 为空返回空串(memory section 会被过滤掉)。
     """
-    if not files:
+    if not files and not knowledge_context.strip():
         return ""
     chunks: list[str] = [MEMORY_INSTRUCTION_PROMPT]
     for f in files:
         label = _TYPE_LABEL.get(f.type, "instructions")
         chunks.append(
             f"\nContents of {f.path} ({label}):\n\n{f.content}"
+        )
+    if knowledge_context.strip():
+        chunks.append(
+            "\nRetrieved knowledge context (structured knowledge base / RAG):\n\n"
+            + knowledge_context.strip()
         )
     return "\n".join(chunks)
 

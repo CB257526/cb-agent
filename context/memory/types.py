@@ -10,7 +10,15 @@ from pathlib import Path
 from typing import Literal, Optional
 
 
-MemoryType = Literal["Managed", "User", "Project", "Local"]
+MemoryType = Literal[
+    "Managed",
+    "User",
+    "Global",
+    "Project",
+    "ShortTerm",
+    "Local",
+    "Knowledge",
+]
 
 
 @dataclass

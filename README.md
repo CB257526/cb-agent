@@ -5,8 +5,8 @@
 
 ```
 用户输入
-  └─> ContextBuilder(GSSC)
-        ├─ system / session state / Markdown memory / history
+  └─> ContextBuilder(Section / Boundary)
+        ├─ system / session state / 三层 Markdown memory / knowledge / history
         ├─ full memory + RAG（可选）
         └─ tools + MCP + skills
   └─> LLM stream think
@@ -19,8 +19,8 @@
 | 能力 | 说明 |
 |---|---|
 | 多轮 Function Calling | 支持流式内容、reasoning delta、tool_calls 分片累积与 tool result 回灌 |
-| ContextBuilder | GSSC：Gather → Select → Structure → Compress，按优先级和 token 预算组织上下文 |
-| 轻量 Markdown 记忆 | 默认启用，使用 `~/.cbagent/memory/` 与项目 `.cbagent/memory/`，不依赖 embedding / 向量库 |
+| ContextBuilder | Section / Boundary 架构：静态段可缓存，动态段每轮刷新，按 token 预算组织上下文 |
+| 轻量 Markdown 记忆 | 默认启用，按全局、项目、短期三层加载 `AGENT.md` / `USER.md` / `RULE.md` / `MEMORY.md`，并接入 `~/knowledge/` 知识库 |
 | full 记忆/RAG | 旧 `MemoryTool` / `RAGTool` 完整保留，通过 `--memory-system full` 启用 |
 | 跨轮工作上下文 | 每轮工具轨迹压成 `【工作记录】`，写入 `.cbagent/sessions/`，重启后可恢复 |
 | 多会话隔离 | 本地 session 可创建、切换、清理；不同会话 history/state/transcript 隔离 |
@@ -905,10 +905,12 @@ light 模式不会 import / register 旧 `MemoryTool`、`RAGTool`，因此不需
 
 | 级别 | 路径 | 用途 |
 |---|---|---|
-| 用户全局 | `~/.cbagent/memory/` | 长期偏好、跨项目事实 |
-| 当前项目 | `.cbagent/memory/` | 当前仓库的约定、进展、参考 |
+| 全局 | `~/AGENT.md`、`~/USER.md`、`~/RULE.md`、`~/MEMORY.md` | Agent 人格、用户身份、全局规则、长期记忆 |
+| 项目 | 当前项目链上的 `AGENT.md`、`USER.md`、`RULE.md`、`MEMORY.md`、`.cbagent/*.md`、旧 `CLAUDE.md` | 当前仓库的约定、进展、参考 |
+| 短期 | `.cbagent/SHORT_TERM.md` | 当前任务进展、临时决策、近期上下文 |
+| 知识库 | `~/knowledge/pages/*.md`、`~/knowledge/index.json`、`~/knowledge/graph.json` | 结构化知识页面、交叉引用、未来 Web/图谱接口 |
 
-每个目录都有 `MEMORY.md` 索引，具体记忆写在同目录其它 `.md` 文件。记忆文件建议：
+light 模式首次启动会创建全局核心文件、项目短期记忆文件和知识库目录。`~/.cbagent/*.md` 与旧 `CLAUDE.md` 路径仍兼容加载，但新记忆建议写入上表路径。记忆文件建议：
 
 ```markdown
 ---
@@ -921,7 +923,12 @@ scope: global
 用户偏好：回答使用中文，必要时说明验证命令。
 ```
 
-light 模式不新增记忆工具。用户要求“记住/保存偏好/保存项目事实”时，agent 会通过现有 `file_read` / `file_write` 修改 Markdown 记忆文件。
+每次向模型发起请求时，memory section 会加载三层 Markdown 记忆，并按当前用户问题从知识库检索相关页面片段。每轮完成后，agent 会 best-effort 把重要用户事实追加到 `~/MEMORY.md`，把可复用结构化知识沉淀为 `~/knowledge/pages/*.md`，同时刷新 `index.json` 和 `graph.json`。
+
+详细设计：
+
+- [note/cbagent上下文构建与跨会话持久记忆构建.md](note/cbagent上下文构建与跨会话持久记忆构建.md)
+- [note/cbagent知识库设计.md](note/cbagent知识库设计.md)
 
 ### full：旧向量记忆与 RAG
 
@@ -1205,7 +1212,7 @@ cb-agent/
 │   ├── platforms/         通讯平台通用消息结构与事件渲染器
 │   ├── qq/                NapCat / OneBot V11 适配器
 │   └── wechat/            个人微信 OC HTTP 长轮询适配器
-├── context/               ContextBuilder 与 Markdown memory provider
+├── context/               system prompt sections、三层 Markdown 记忆、知识库检索、compact
 ├── core/                  Message 等核心结构
 ├── memory/                full 模式旧记忆/RAG/存储
 ├── tools/                 原生工具、MCP 工具包装、ToolRegistry
@@ -1223,19 +1230,19 @@ cb-agent/
 
 ## 设计要点
 
-### ContextBuilder：GSSC
+### ContextBuilder：Section / Boundary
 
-Gather 顺序：
+动态上下文顺序：
 
 1. system instructions
 2. 本地 session state
-3. Markdown memory state / related
-4. full memory state / related
-5. full RAG
+3. global/project/short-term Markdown memory
+4. structured knowledge snippets from `~/knowledge/`
+5. optional full memory/RAG
 6. history
 7. additional packets
 
-之后按相关性、新近性、MMR、多级优先级和 token 预算筛选。结构化 prompt 固定为：
+system prompt 由静态 sections、`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 和动态 sections 组成。动态 memory 段内部会先加载 Markdown 记忆，再按当前 query 检索知识库。结构化 prompt 固定为：
 
 - `[Role & Policies]`
 - `[Task]`
@@ -1244,7 +1251,7 @@ Gather 顺序：
 - `[Context]`
 - `[Output]`
 
-详细见 [context/README.md](context/README.md)。
+详细见 [note/上下文工程架构技术报告.md](note/上下文工程架构技术报告.md) 和 [note/cbagent上下文构建与跨会话持久记忆构建.md](note/cbagent上下文构建与跨会话持久记忆构建.md)。
 
 ### 单轮 messages 与跨轮 history 分离
 
@@ -1276,7 +1283,7 @@ QQ/NapCat 与微信 OC 都通过 `agent.platforms` 的平台无关消息层适�
 Python：
 
 ```bash
-python -m py_compile agent_run_basic.py run_agent.py context/builder.py context/markdown_memory.py
+python -m compileall run_agent.py context/memory context/sections context/prompts agent/session.py
 python test/test_context_builder.py
 python test/test_session_renderer.py
 python test/test_transport.py
