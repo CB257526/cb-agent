@@ -7,7 +7,6 @@ import { AskQuestionPanel } from "./AskQuestionPanel.js";
 import { TodoPanel } from "./TodoPanel.js";
 import { Markdown } from "./Markdown.js";
 import { theme } from "../theme.js";
-import { BuddyCard, parseBuddyCardText } from "../buddy/BuddyCard.js";
 
 /** 最多渲染的消息条数。超出时旧消息折叠，避免 React 全量调和导致终端抖动。 */
 const MAX_VISIBLE = 50;
@@ -168,9 +167,6 @@ function renderItem(
 }
 
 function SystemMessage({ text }: { text: string }) {
-  const buddy = parseBuddyCardText(text);
-  if (buddy) return <BuddyCard card={buddy} />;
-
   const mcp = parseMcpStatus(text);
   if (mcp) return <MCPStatusCard data={mcp} />;
 

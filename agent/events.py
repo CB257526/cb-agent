@@ -242,17 +242,16 @@ class MCPStatus:
 
 
 @dataclass
-class BuddyUpdated:
-    """Buddy 状态更新事件。
+class PetUpdated:
+    """Desktop pet state update.
 
-    Buddy 不进入会话 history，也不参与工具轨迹；它是 UI 附属状态。后端在
-    /buddy 命令、pet 动画、每轮本地模板反应发生时广播完整快照，前端直接整片
-    替换即可，避免在 UI 端猜测配置文件是否写入成功。
+    Pet state is UI/runtime state. It does not enter conversation history and it
+    does not participate in tool traces. Frontends replace the whole snapshot.
     """
     state: Dict[str, Any]
-    reason: str = "update"  # command / reaction / startup 等
+    reason: str = "update"
     timestamp: float = field(default_factory=_now)
-    type: str = field(default="buddy_updated", init=False)
+    type: str = field(default="pet_updated", init=False)
 
 
 # ========== Union 类型（订阅者用 isinstance 区分）==========
@@ -275,7 +274,7 @@ Event = Union[
     AskUserQuestionAnswered,
     TodoListUpdated,
     MCPStatus,
-    BuddyUpdated,
+    PetUpdated,
 ]
 
 
@@ -296,5 +295,5 @@ __all__ = [
     "AskUserQuestion",
     "AskUserQuestionAnswered",
     "MCPStatus",
-    "BuddyUpdated",
+    "PetUpdated",
 ]

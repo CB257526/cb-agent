@@ -20,7 +20,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
-import { AgentEvent, BuddyState, ChatItem, ContextWindow, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, ChatItem, ContextWindow, PetState, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
@@ -29,7 +29,6 @@ import { ActivityPanel } from "./components/ActivityPanel.js";
 import { Banner } from "./components/Banner.js";
 import { SlashCommandPicker } from "./components/SlashCommandPicker.js";
 import { SessionSwitcher } from "./components/SessionSwitcher.js";
-import { BuddySprite } from "./buddy/BuddySprite.js";
 import { HistoryStore } from "./historyStore.js";
 import { findCommand, SlashCommand, CommandCtx, formatMCPStatus } from "./commands.js";
 import { readClipboardImageAttachment } from "./clipboardImage.js";
@@ -122,7 +121,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [showSessionSwitcher, setShowSessionSwitcher] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
-  const [buddyState, setBuddyState] = useState<BuddyState | null>(null);
+  const [, setPetState] = useState<PetState | null>(null);
   const [attachments, setAttachments] = useState<QueuedAttachment[]>([]);
   // 当前等待用户作答的问题 id：决定 EventStream 把输入路由给哪个 panel；
   // 同时 PromptInput 在问答期 disabled，避免误打字提交 prompt
@@ -352,8 +351,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           break;
         }
 
-        case "buddy_updated": {
-          setBuddyState((ev as any).state ?? null);
+        case "pet_updated": {
+          setPetState((ev as any).state ?? null);
           break;
         }
 
@@ -560,12 +559,12 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
   useEffect(() => {
     let disposed = false;
-    transport.getBuddyState()
+    transport.getPetState()
       .then((state) => {
-        if (!disposed) setBuddyState(state ?? null);
+        if (!disposed) setPetState(state ?? null);
       })
       .catch(() => {
-        if (!disposed) setBuddyState(null);
+        if (!disposed) setPetState(null);
       });
     return () => {
       disposed = true;
@@ -617,7 +616,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       resetContextWindow,
       openSessionSwitcher,
       toggleActivity: () => setShowActivity((v) => !v),
-      setBuddyState,
+      setPetState,
       attachments,
       setAttachments,
     };
@@ -732,7 +731,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
               delegateNavKeys={slashActive || activeQuestionId !== null || showSessionSwitcher}
             />
           </Box>
-          <BuddySprite state={buddyState} />
         </Box>
         <Box marginTop={1}>
           <StatusBar

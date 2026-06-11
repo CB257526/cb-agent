@@ -1,6 +1,6 @@
 """QQ/NapCat 配置读取。
 
-配置统一来自 .env / 环境变量，便于和现有日志、MCP、Buddy 开关保持一致。
+配置统一来自 .env / 环境变量，便于和现有日志、MCP 开关保持一致。
 """
 
 from __future__ import annotations

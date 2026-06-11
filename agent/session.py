@@ -35,7 +35,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from agent.cancel import (
     CancelToken,
@@ -45,7 +45,7 @@ from agent.cancel import (
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import (
-    BackgroundNotification, BuddyUpdated, Cancelled, Done, Error, RoundEnd, RoundStart,
+    BackgroundNotification, Cancelled, Done, Error, RoundEnd, RoundStart,
 )
 from agent.executor import ToolExecutor
 from agent.message_logger import MessageLogger
@@ -57,6 +57,7 @@ from context import (
     OpenAICompatibleAdapter,
     build_system_prompt_blocks,
     clear_system_prompt_sections,
+    compact_now,
     count_tokens,
     get_system_prompt,
     should_use_global_cache_scope,
@@ -74,7 +75,7 @@ from agent.work_context import (
     make_compact_record_message,
     make_work_record_message,
 )
-from agent.buddy import BuddyManager
+from agent.pet import PetManager
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,26 @@ def _message_kind(message: Message) -> str:
     return str(metadata.get("kind") or "")
 
 
+class _SessionCompactSummarizer:
+    """Adapter used by context.compact.compact_now for AgentSession history."""
+
+    def __init__(self, session: "AgentSession", *, state_text: str) -> None:
+        self.session = session
+        self.state_text = state_text
+
+    async def summarize(
+        self,
+        messages: Sequence[Message],
+        *,
+        focus: Optional[str] = None,
+    ) -> Optional[str]:
+        return self.session._make_compact_summary(
+            messages=messages,
+            state_text=self.state_text,
+            focus=focus,
+        )
+
+
 def _context_message_line(message: Message) -> str:
     """把一条跨轮 history 渲染成上下文估算用的单行文本。
 
@@ -203,7 +224,7 @@ class AgentSession:
         message_logger: Optional[MessageLogger] = None,
         language: Optional[str] = "Chinese",
         mcp_clients=None,
-        buddy_manager: Optional[BuddyManager] = None,
+        pet_manager: Optional[PetManager] = None,
     ) -> None:
         """
         Args:
@@ -233,7 +254,7 @@ class AgentSession:
         self.message_logger = message_logger
         self.language = language
         self.mcp_clients = mcp_clients
-        self.buddy_manager = buddy_manager
+        self.pet_manager = pet_manager
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
         if self.session_store is not None:
@@ -356,28 +377,50 @@ class AgentSession:
                 "no_op": True,
             }
 
-        summary = self._make_compact_summary(state_text=state_text)
-        compact_message = make_compact_record_message(summary)
         retained_turn = self._latest_plain_turn_messages()
+        compact_source = list(self.history)
+        if not compact_source and state_text:
+            compact_source = [
+                Message.create_user_message("[本地滚动状态]\n" + state_text)
+            ]
+
+        compact_result = asyncio.run(compact_now(
+            compact_source,
+            model=getattr(self.llm, "model", "") or "",
+            summarizer=_SessionCompactSummarizer(self, state_text=state_text),
+            session_state=None,
+            memory_loader=self.memory_loader,
+            keep_recent_messages=0,
+        ))
+        summary = compact_result.summary or self._rule_compact_summary(
+            messages=compact_source,
+            state_text=state_text,
+        )
+        compact_message = make_compact_record_message(summary)
+        new_history = [compact_message] + retained_turn
+        after_messages = len(new_history)
 
         # 压缩后的内存 history 是唯一会进入下一轮 ContextBuilder 的近轮历史。
         # compact_message 承担旧上下文摘要职责；retained_turn 保留用户刚刚说过的
         # 话和助手最终回答，避免 compact 后立刻丢掉最贴近当前任务的语气/细节。
-        self.history = [compact_message] + retained_turn
-        after_messages = len(self.history)
-
         persisted = False
         if self.session_store is not None:
             try:
                 self.session_store.save_compaction(
                     summary=str(compact_message.content or ""),
-                    history_payload=self.export_history(),
+                    history_payload=[
+                        _history_message_to_payload(message)
+                        for message in new_history
+                    ],
                     before_messages=before_messages,
                     after_messages=after_messages,
                 )
                 persisted = True
             except Exception:
                 logger.exception("本地会话 compact 快照落盘失败")
+                raise
+
+        self.history = new_history
 
         return {
             "session": self.current_session_payload().get("session"),
@@ -464,7 +507,7 @@ class AgentSession:
 
         重构后流程(对齐 Claude Code):
         1. system_instructions 是 _build_system_instructions 返回的"运行时补充"段
-           (Bash 权限/通讯平台、Skill 概览、Buddy 状态),作为 user-appended
+           (Bash 权限/通讯平台、Skill 概览、运行时 UI 状态),作为 user-appended
            段加在新 system prompt 末尾。长期稳定的身份和行为规则已经集中在
            constant.system_prompt.ConstantSystemPrompt,并由 context static sections
            放在动态边界之前。
@@ -684,19 +727,6 @@ class AgentSession:
         if post_turn_compaction is not None:
             auto_compactions.append(post_turn_compaction)
             logger.info("auto compact after turn: %s", post_turn_compaction)
-
-        # Buddy 是 UI 附属状态，不写 history。每轮结束后基于本轮用户输入和最终
-        # 回答生成轻量本地模板反应；如果触发了反应，就用事件流通知 TUI 刷新气泡。
-        if self.buddy_manager is not None:
-            try:
-                buddy_state = self.buddy_manager.maybe_react(
-                    user_query=user_query,
-                    assistant_answer=final_answer,
-                )
-                if buddy_state is not None:
-                    self.event_bus.emit(BuddyUpdated(state=buddy_state, reason="reaction"))
-            except Exception:
-                logger.exception("Buddy 本地反应生成失败")
 
         # Done 事件：让前端知道整轮结束
         elapsed = time.perf_counter() - chat_started
@@ -1249,7 +1279,10 @@ class AgentSession:
                 break
         return list(reversed(retained))
 
-    def _history_text_for_compact(self) -> str:
+    def _history_text_for_compact(
+        self,
+        messages: Optional[Sequence[Message]] = None,
+    ) -> str:
         """把当前内存 history 渲染成 compact summarizer 的输入文本。
 
         这里读取的是普通跨轮 history，而不是本轮 tool loop 的 messages，因此不会
@@ -1257,7 +1290,8 @@ class AgentSession:
         防止用户/助手长文回答让静默 summarizer 的输入过大。
         """
         lines: List[str] = []
-        for message in self.history:
+        source = self.history if messages is None else messages
+        for message in source:
             role = _message_role_name(message)
             kind = _message_kind(message)
             content = _clip_compact_text(_message_content_to_text(message.content), 500)
@@ -1291,7 +1325,13 @@ class AgentSession:
             parts.append("待办/阻塞：" + "；".join(_clip_compact_text(x, 120) for x in pending[-8:]))
         return _clip_compact_text("\n".join(parts), 6000)
 
-    def _make_compact_summary(self, *, state_text: str) -> str:
+    def _make_compact_summary(
+        self,
+        *,
+        messages: Optional[Sequence[Message]] = None,
+        state_text: str,
+        focus: Optional[str] = None,
+    ) -> str:
         """生成 /compact 摘要文本。
 
         优先走 OpenAI-compatible client 的非流式静默调用；它不会经过 llm.think，
@@ -1299,11 +1339,16 @@ class AgentSession:
         一条助手回答。任何失败都会回退到规则摘要，保证 /compact 是可靠的管理
         操作，而不是依赖网络/模型可用性的脆弱路径。
         """
-        fallback = self._rule_compact_summary(state_text=state_text)
+        fallback = self._rule_compact_summary(
+            messages=messages,
+            state_text=state_text,
+            focus=focus,
+        )
         client = getattr(self.llm, "client", None)
         model = getattr(self.llm, "model", None)
         if client is None or not model:
             return fallback
+        focus_text = f"\n摘要关注主题：{focus}" if focus else ""
 
         try:
             response = client.chat.completions.create(
@@ -1324,9 +1369,10 @@ class AgentSession:
                         "role": "user",
                         "content": (
                             "[当前会话历史]\n"
-                            f"{self._history_text_for_compact()}\n\n"
+                            f"{self._history_text_for_compact(messages)}\n\n"
                             "[本地滚动状态]\n"
                             f"{self._state_snapshot_for_compact(state_text)}"
+                            f"{focus_text}"
                         ),
                     },
                 ],
@@ -1343,7 +1389,13 @@ class AgentSession:
             content = "【上下文压缩】" + content
         return _clip_compact_text(content, COMPACT_RECORD_LIMIT)
 
-    def _rule_compact_summary(self, *, state_text: str) -> str:
+    def _rule_compact_summary(
+        self,
+        *,
+        messages: Optional[Sequence[Message]] = None,
+        state_text: str,
+        focus: Optional[str] = None,
+    ) -> str:
         """无 LLM 或 LLM 失败时的规则 compact 摘要。
 
         规则摘要不尝试推断新事实，只把已经存在于 history/state 里的内容重新组织
@@ -1351,8 +1403,10 @@ class AgentSession:
         近轮对话窗口。
         """
         state_snapshot = self._state_snapshot_for_compact(state_text)
-        history_text = self._history_text_for_compact()
+        history_text = self._history_text_for_compact(messages)
         parts = ["【上下文压缩】"]
+        if focus:
+            parts.append("关注主题：" + _clip_compact_text(focus, 120))
         if state_snapshot:
             parts.append("状态摘要：" + _clip_compact_text(state_snapshot, 700))
         if history_text:
@@ -1443,12 +1497,12 @@ class AgentSession:
         return "\n".join(lines) + "\n\n" + user_query
 
     def _build_system_instructions(self) -> str:
-        """组装运行时 system prompt 补充段：Bash / Skill / Buddy。
+        """组装运行时 system prompt 补充段：Bash / Skill。
 
         固定身份、行为规则和用户 cosplay 风格已经放在
         ``constant.system_prompt.ConstantSystemPrompt``。这里刻意只拼运行态内容，
         这样未来启用 provider prompt cache 时，稳定前缀不会被 Bash 权限模式、
-        Skill 列表或 Buddy 状态这些易变信息破坏命中率。
+        Skill 列表或运行时 UI 状态这些易变信息破坏命中率。
         """
         parts: list[str] = []
 
@@ -1469,15 +1523,6 @@ class AgentSession:
                     parts.append(overview)
             except Exception:
                 logger.exception("skill overview 构建失败")
-
-        if self.buddy_manager is not None:
-            try:
-                buddy_prompt = self.buddy_manager.prompt_section()
-                if buddy_prompt:
-                    parts.append("")
-                    parts.append(buddy_prompt)
-            except Exception:
-                logger.exception("Buddy prompt 段构建失败")
 
         return "\n".join(parts)
 

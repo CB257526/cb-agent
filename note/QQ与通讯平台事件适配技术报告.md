@@ -87,7 +87,7 @@ TUI 可以渲染结构化卡片，但 QQ 只能接收普通消息和文件。`Pl
 | `BackgroundNotification` | 发送后台任务完成提示 |
 | `ToolStart` | 默认发送短提示：普通工具为 `（调用工具:工具名 参数）`，bash 为 `（执行命令:命令）`；参数会脱敏和截断 |
 | `ToolComplete` | 默认静默，`IM_EVENT_VERBOSITY=full` 时发送耗时等调试摘要；`send_message_asset` 完成时仍会触发资源发送 |
-| `MCPStatus` / `BuddyUpdated` | 默认静默，避免运行状态污染聊天 |
+| `MCPStatus` / `PetUpdated` | 默认静默，避免运行状态污染聊天 |
 
 当 QQ 会话有待回答问题时，下一条消息会优先尝试解释为选项回复。群聊中此路径不要求再次 @ 机器人，避免用户回复 `1` 后工具仍卡住。支持：
 

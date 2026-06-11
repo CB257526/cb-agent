@@ -18,12 +18,12 @@ from agent.events import (
     AskUserQuestion,
     AskUserQuestionAnswered,
     BackgroundNotification,
-    BuddyUpdated,
     Cancelled,
     Done,
     Error,
     Event,
     MCPStatus,
+    PetUpdated,
     ReasoningDelta,
     RoundEnd,
     RoundStart,
@@ -625,9 +625,9 @@ def _format_full_event(event: Event) -> str:
         return f"Token 用量：prompt={event.prompt_tokens}, completion={event.completion_tokens}"
     if isinstance(event, MCPStatus):
         return f"MCP 状态：{event.status}，connected={event.connected}/{event.total}"
-    if isinstance(event, BuddyUpdated):
+    if isinstance(event, PetUpdated):
         state = event.state if isinstance(event.state, dict) else {}
-        return f"Buddy 状态更新：{state.get('status', 'unknown')}"
+        return f"Pet status update: {state.get('status', 'unknown')}"
     return ""
 
 

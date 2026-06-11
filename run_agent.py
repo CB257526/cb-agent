@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import Done, MCPStatus
-from agent.buddy import BuddyManager
+from agent.pet import PetEventBridge, PetManager
 from agent.executor import ToolExecutor
 from agent.platforms.messages import ConversationKey
 from agent.renderers.cli import CLIRenderer
@@ -190,7 +190,8 @@ class AgentRunner:
         self.dump_messages = bool(attach_cli_renderer)
         self._attach_cli_renderer = attach_cli_renderer
         self._md_memory_provider = self._create_markdown_memory_provider()
-        self.buddy_manager = BuddyManager()
+        self.pet_manager = PetManager()
+        self.pet_event_bridge: PetEventBridge | None = None
         # CLI 模式下的待发送附件队列。TUI 走 JSON-RPC attachments 字段；CLI 没有
         # 前端状态容器，所以在 Runner 内保留一份轻量队列，发送成功后清空。
         self.pending_attachments: List[Dict[str, Any]] = []
@@ -209,6 +210,8 @@ class AgentRunner:
 
         # 2. 事件总线（要在工具注册前建好，TodoTool 等工具构造期就要拿到）
         self.event_bus = EventBus()
+        self.pet_event_bridge = PetEventBridge(self.pet_manager)
+        self.pet_event_bridge.attach(self.event_bus)
 
         # 3. 工具注册表
         self.registry = ToolRegistry()
@@ -334,7 +337,7 @@ class AgentRunner:
             session_store=session_store,
             trace_summarizer=self._trace_summarizer,
             message_logger=self._create_message_logger(message_logger_scope),
-            buddy_manager=self.buddy_manager,
+            pet_manager=self.pet_manager,
         )
         # Gateway/平台适配器只拿到 AgentSession，不直接知道 AgentRunner。这里把 MCP
         # 运行态以回调形式挂到每个 session 上；状态只服务展示，不写入 history。
@@ -959,7 +962,7 @@ class AgentRunner:
                 "  /help        打印帮助\n"
                 "  /tools       列出所有已注册工具\n"
                 "  /mcp         查看 MCP 后台连接状态\n"
-                "  /buddy       查看/孵化/互动 Buddy 宠物\n"
+                "  /pet         管理轻量桌宠 runtime 与宠物包\n"
                 "  /attach PATH 添加图片或音频附件到下一轮\n"
                 "  /attachments 查看待发送附件队列\n"
                 "  /detach N|all 移除待发送附件\n"
@@ -1010,10 +1013,8 @@ class AgentRunner:
                     tail += f", error={error}"
                 print(f"  - {name}: {state}{tail}")
             print()
-        elif cmd == "/buddy":
-            # Buddy 是独立 UI 附属状态，不进入当前会话 history。CLI 下没有输入框旁
-            # sprite，但仍可以查看、孵化、摸摸、静音，TUI 会共享同一个配置文件。
-            result = self.buddy_manager.handle_command(raw_arg)
+        elif cmd == "/pet":
+            result = self.pet_manager.handle_command(raw_arg)
             text = result.get("text") if isinstance(result, dict) else ""
             if text:
                 print("\n" + str(text) + "\n")

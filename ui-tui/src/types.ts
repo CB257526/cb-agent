@@ -26,7 +26,7 @@ export type EventType =
   | "ask_user_question_answered"
   | "todo_list_updated"
   | "mcp_status"
-  | "buddy_updated"
+  | "pet_updated"
   | "gateway_ready";  // gateway 自定义，不在 events.py 里
 
 export interface BaseEvent {
@@ -173,38 +173,38 @@ export interface MCPStatusEvent extends BaseEvent, MCPStatusPayload {
   type: "mcp_status";
 }
 
-export interface BuddyCompanion {
-  name: string;
-  personality: string;
-  seed: string;
-  hatched_at: number;
-  rarity: "common" | "uncommon" | "rare" | "epic" | "legendary" | string;
-  species: string;
-  eye: string;
-  hat: string;
-  shiny: boolean;
-  stats: Record<string, number>;
-  sprite: string[];
-  frames: string[][];
-  face: string;
-  rarity_stars: string;
+export interface PetPackageSummary {
+  id: string;
+  displayName: string;
+  description?: string;
+  renderer: "live2d" | "spritesheet" | string;
+  path?: string;
+  ok?: boolean;
+  issues?: string[];
 }
 
-export interface BuddyState {
+export interface PetRuntimeState {
+  kind: string;
+  running: boolean;
+  path?: string | null;
+}
+
+export interface PetState {
   enabled: boolean;
-  status: "disabled" | "empty" | "ready" | string;
-  muted: boolean;
-  companion?: BuddyCompanion | null;
-  last_reaction?: string | null;
-  reaction_at?: number | null;
-  pet_at?: number | null;
+  status: string;
+  visible: boolean;
+  activity: string;
+  current_pet_id?: string | null;
+  current_pet?: PetPackageSummary | null;
+  pets: PetPackageSummary[];
+  runtime: PetRuntimeState;
   message?: string | null;
 }
 
-export interface BuddyCommandResult {
+export interface PetCommandResult {
   text: string;
   changed: boolean;
-  state: BuddyState;
+  state: PetState;
 }
 
 /** prompt.submit 的附件输入。后端会重新校验路径、格式、大小和 OCR/ASR 能力。 */
@@ -221,9 +221,9 @@ export interface QueuedAttachment extends PromptAttachmentInput {
   size?: number | null;
 }
 
-export interface BuddyUpdated extends BaseEvent {
-  type: "buddy_updated";
-  state: BuddyState;
+export interface PetUpdated extends BaseEvent {
+  type: "pet_updated";
+  state: PetState;
   reason?: string;
 }
 
@@ -243,7 +243,7 @@ export type AgentEvent =
   | AskUserQuestionAnswered
   | TodoListUpdated
   | MCPStatusEvent
-  | BuddyUpdated
+  | PetUpdated
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========

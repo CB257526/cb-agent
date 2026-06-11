@@ -20,7 +20,7 @@ import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AgentEvent, BuddyCommandResult, BuddyState, CompactPayload, MCPStatusPayload, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, CompactPayload, MCPStatusPayload, PetCommandResult, PetState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
@@ -229,14 +229,14 @@ export class Transport extends EventEmitter {
     return this.requestRpc("session.mcp_status");
   }
 
-  /** 读取 Buddy 当前状态；只服务 UI 附属展示，不影响会话 history。 */
-  getBuddyState(): Promise<BuddyState> {
-    return this.requestRpc("buddy.get_state");
+  /** 读取桌宠当前状态；只服务 UI 附属展示，不影响会话 history。 */
+  getPetState(): Promise<PetState> {
+    return this.requestRpc("pet.get_state");
   }
 
-  /** 执行 /buddy 子命令，后端负责持久化与状态广播。 */
-  runBuddyCommand(args = ""): Promise<BuddyCommandResult> {
-    return this.requestRpc("buddy.command", { args });
+  /** 执行 /pet 子命令，后端负责持久化与状态广播。 */
+  runPetCommand(args = ""): Promise<PetCommandResult> {
+    return this.requestRpc("pet.command", { args });
   }
 
   /** 用户回答 AskUserQuestionTool 的提问。selected_labels 单选给一个，多选给多个。

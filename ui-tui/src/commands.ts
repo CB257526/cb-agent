@@ -11,7 +11,7 @@ import type { Transport } from "./transport.js";
 import { basename } from "node:path";
 import { statSync } from "node:fs";
 import type { Dispatch, SetStateAction } from "react";
-import type { BuddyState, ChatItem, ContextWindow, MCPStatusPayload, QueuedAttachment, SessionPayload } from "./types.js";
+import type { ChatItem, ContextWindow, MCPStatusPayload, PetState, QueuedAttachment, SessionPayload } from "./types.js";
 import { readClipboardImageAttachment } from "./clipboardImage.js";
 
 export interface CommandCtx {
@@ -33,8 +33,8 @@ export interface CommandCtx {
   openSessionSwitcher: () => void;
   /** 切换后端日志面板 */
   toggleActivity: () => void;
-  /** 更新 Buddy 附属状态，供输入框旁 sprite 使用。 */
-  setBuddyState: (state: BuddyState | null) => void;
+  /** 更新桌宠附属状态，供 /pet 命令和事件同步使用。 */
+  setPetState: (state: PetState | null) => void;
   /** 当前待随下一条 prompt 一起提交的附件队列。 */
   attachments: QueuedAttachment[];
   /** 更新附件队列；命令只维护队列，不直接调用 OCR/ASR。 */
@@ -236,15 +236,15 @@ export const COMMANDS: readonly SlashCommand[] = [
     },
   },
   {
-    name: "/buddy",
-    description: "查看、孵化或互动 Buddy 宠物",
-    handler: async ({ transport, args, appendSystem, setBuddyState }) => {
+    name: "/pet",
+    description: "管理轻量桌宠 runtime 与宠物包",
+    handler: async ({ transport, args, appendSystem, setPetState }) => {
       try {
-        const result = await transport.runBuddyCommand(args);
-        setBuddyState(result.state ?? null);
+        const result = await transport.runPetCommand(args);
+        setPetState(result.state ?? null);
         if (result.text) appendSystem(result.text);
       } catch (e) {
-        appendSystem(`✗ /buddy 失败：${(e as Error).message}`);
+        appendSystem(`✗ /pet 失败：${(e as Error).message}`);
       }
     },
   },

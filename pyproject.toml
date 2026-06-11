@@ -26,6 +26,10 @@ dependencies = [
     "websockets>=13.0",       # QQ/NapCat OneBot 反向 WebSocket（使用 websockets.asyncio API）
     "pycryptodome>=3.20",     # 微信 OC 媒体 CDN AES-ECB 加解密
     "qrcode>=7.4",            # 微信 OC 扫码登录终端二维码
+    "Pillow>=10.0",           # 轻量桌宠 runtime 的 PNG / spritesheet 渲染
+    "pywebview>=6.2",         # 轻量桌宠 WebView Live2D 渲染窗口
+    "pynput>=1.8",            # 全局键盘 / 鼠标监听
+    "json5>=0.9",             # 兼容 BongoCat / Cubism JSON5 模型文件
 ]
 
 # full：完整能力，把所有可选模块的依赖一并装上
@@ -40,7 +44,6 @@ full = [
     "spacy>=3.7",
 
     # 多模态 RAG
-    "Pillow>=10.0",
     "librosa>=0.10",
     "markitdown>=0.0.1",
     "langdetect>=1.0.9",
@@ -60,3 +63,9 @@ full = [
 [tool.setuptools.packages.find]
 where = ["."]
 exclude = ["test*", "venv*", "外部代码*", "note*", "__pycache__*"]
+
+[tool.setuptools.package-data]
+agent = [
+    "pet_web/*",
+    "pet_web/js/*",
+]

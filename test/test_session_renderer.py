@@ -521,17 +521,73 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertTrue((store.active_dir / "compact.json").exists())
             self.assertTrue((store.active_dir / "compactions.jsonl").exists())
             self.assertTrue((store.active_dir / "transcript.jsonl").exists())
+            self.assertNotIn(payload["summary"], store.state_text())
 
             s.chat("继续")
             next_turn_messages = llm.calls[2]["messages"]
             context_text = "\n".join(str(m.get("content", "")) for m in next_turn_messages)
             self.assertIn("【上下文压缩】", context_text)
+            self.assertEqual(context_text.count("【上下文压缩】"), 1)
             self.assertIn("旧问题二", context_text)
             # compact 摘要本身可以保留“旧问题一”这类旧事实；真正要防止的是
             # 旧 user/assistant 消息继续作为独立 history 条目占用窗口。
             raw_contents = [m.get("content") for m in next_turn_messages]
             self.assertNotIn("旧问题一", raw_contents)
             self.assertNotIn("旧回答一", raw_contents)
+
+    def test_compact_context_does_not_mutate_history_when_persist_fails(self):
+        """compact 快照落盘失败时，内存 history 仍保持原样。"""
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            llm = FakeLLM([
+                {"answer": "旧回答一", "tool_calls": []},
+                {"answer": "旧回答二", "tool_calls": []},
+            ])
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s.chat("旧问题一")
+            s.chat("旧问题二")
+            before = s.export_history()
+
+            def fail_save_compaction(**kwargs):
+                raise OSError("disk full")
+
+            store.save_compaction = fail_save_compaction  # type: ignore[method-assign]
+
+            with self.assertRaises(OSError):
+                s.compact_context()
+
+            self.assertEqual(s.export_history(), before)
+
+    def test_compact_context_resets_memory_loader_cache(self):
+        """手动 compact 复用通用 compact_now，并清理 MemoryLoader cache。"""
+        class FakeMemoryLoader:
+            def __init__(self):
+                self.reasons: List[str] = []
+
+            def reset_cache(self, reason: str = "") -> None:
+                self.reasons.append(reason)
+
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            loader = FakeMemoryLoader()
+            llm = FakeLLM([
+                {"answer": "旧回答一", "tool_calls": []},
+                {"answer": "旧回答二", "tool_calls": []},
+            ])
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, memory_loader=loader, ctx_enabled=False,
+                session_store=store,
+            )
+            s.chat("旧问题一")
+            s.chat("旧问题二")
+
+            s.compact_context()
+
+            self.assertIn("user_compact", loader.reasons)
 
     def test_chat_history_appended_correctly(self):
         llm = FakeLLM([{"answer": "好的", "tool_calls": []}])

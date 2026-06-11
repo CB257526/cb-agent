@@ -32,7 +32,7 @@
 | MCP | 读取 `mcp.json`，通过 stdio 启动 MCP server，并展开成可调用工具 |
 | Skills | Markdown + YAML frontmatter 描述能力，按需加载指令和脚本 |
 | Bash 权限 | Bash 工具支持权限语义，TUI 模式下权限确认走 UI 通道 |
-| Buddy 宠物 | 可选虚拟宠物系统，支持孵化、摸摸、静音、TUI 输入框旁展示和本地气泡反应 |
+| 桌宠 | 可选轻量桌面宠物系统，使用 Python 原生 sidecar，兼容 BongoCat 素材目录和 spritesheet 包 |
 
 ## Quickstart
 
@@ -178,13 +178,7 @@ CBAGENT_LOG_DIR=.cbagent/logs
 
 运行日志默认写到 `.cbagent/logs/cb-agent-<timestamp>.log`；TUI 仍会把 Python stderr 镜像到 `~/.cb-agent/logs/gateway-<timestamp>.log`。
 
-Buddy 宠物默认关闭。需要使用时在 `.env` 里开启：
-
-```env
-FEATURE_BUDDY=1
-```
-
-开启后重启 CLI 或 TUI，再使用 `/buddy hatch` 孵化。Buddy 状态会持久化到 `~/.cbagent/buddy.json`，同一台机器上的 CLI 和 TUI 会共享同一只 Buddy。
+桌宠由 cb-agent 内置 Python runtime 负责透明置顶浮窗，不需要 Rust、Node、Tauri 或额外构建。运行时使用 Qt WebEngine 承载透明 Live2D WebGL 页面；按 `requirements.txt` 安装依赖即可。使用 `/pet install <folder>` 安装 BongoCat 风格素材目录或 spritesheet 宠物包。
 
 注意：`LLM_MODEL_ID` 必须在 [constant/llm/constant_llm.py](constant/llm/constant_llm.py) 的 `ConstantLLM.llm_dict` 里登记。新增模型时要补：
 
@@ -201,7 +195,6 @@ FEATURE_BUDDY=1
 | `AMAP_MAPS_API_KEY` | `mcp.json` 里的高德 MCP server |
 | `TAVILY_API_KEY` | `my_advanced_search` 的 Tavily 搜索源 |
 | `SERPAPI_API_KEY` | `my_advanced_search` 的 SerpApi 搜索源 |
-| `FEATURE_BUDDY` | 设为 `1` / `true` / `on` 后启用 Buddy 宠物系统 |
 | `CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS` | 设为 `1` 后等价于 `--dangerously-skip-permissions`，BashTool 将跳过权限确认和高危命令拦截 |
 | `CBAGENT_ATTACHMENT_MAX_MB` | 单个多模态附件大小上限，默认 `20` MB |
 | `OCR_API_KEY` / `OCR_BASE_URL` / `OCR_MODEL_NAME` | 纯文本基模处理图片附件时使用的 OCR/视觉描述模型 |
@@ -261,7 +254,7 @@ class ConstantSystemPrompt:
     USER_COSPLAY_PROMPT = "你是一位耐心、严格、偏工程审查风格的资深架构师。"
 ```
 
-也兼容 `USER_COSERPLAY_PROMPT` 这个拼写。为空时不会注入。这里建议只写长期稳定的风格偏好；当前时间、cwd、工具列表、MCP instructions、Buddy 状态、CLAUDE.md/记忆内容、通讯平台会话信息等运行时动态内容仍由上下文系统自动拼接，避免后续做高缓存命中优化时把动态内容混进静态前缀。
+也兼容 `USER_COSERPLAY_PROMPT` 这个拼写。为空时不会注入。这里建议只写长期稳定的风格偏好；当前时间、cwd、工具列表、MCP instructions、运行时 UI 状态、CLAUDE.md/记忆内容、通讯平台会话信息等运行时动态内容仍由上下文系统自动拼接，避免后续做高缓存命中优化时把动态内容混进静态前缀。
 
 `CLAUDE.md` 及其 include/rules 记忆段会在每次 prompt 组装时重新读取；如果 agent 运行过程中通过工具写入了新的记忆，下一轮会话会直接看到最新内容，不需要重启进程或手动 `/clear`。
 
@@ -365,7 +358,7 @@ TUI 快捷键：
 | `/new` | 新建并切换到空白会话 |
 | `/switch <id>` | 切换到指定 session |
 | `/compact` | 手动压缩当前会话上下文 |
-| `/buddy` | 查看、孵化或互动 Buddy 宠物 |
+| `/pet` | 管理轻量桌宠 runtime 与宠物包 |
 | `/attach <path>` | 添加本地图片或音频附件到下一轮消息 |
 | `/paste-image` | 从系统剪贴板读取图片并加入附件队列，终端不传 `Ctrl-V` 时优先用它 |
 | `/attachments` | 查看待发送附件队列 |
@@ -434,7 +427,7 @@ QQ_GROUP_CONTEXT_MAX_CHARS=8000
 # 通讯软件事件输出等级:
 # normal = 发送最终回答、编号问题、todo、错误、后台提示、文件资源和工具开始提示；
 #          工具开始提示格式为“（调用工具:工具名 参数）”，bash 为“（执行命令:命令）”。
-# full   = 额外发送工具完成、round、token、MCP/Buddy 状态等调试摘要。
+# full   = 额外发送工具完成、round、token、MCP/桌宠状态等调试摘要。
 IM_EVENT_VERBOSITY=normal
 
 # 群聊是否显示工具过程消息。0 表示群聊不发“调用工具/执行命令/工具完成”等过程提示；
@@ -992,40 +985,116 @@ CLI 支持：
 
 TUI 支持 `/sessions` 面板、`/new`、`/switch <id>`。
 
-## Buddy 宠物
+## 桌宠
 
-Buddy 是一个可选的本地虚拟宠物功能。它不会写入会话 history，也不会参与工具轨迹；它只作为 CLI/TUI 的附属状态存在。TUI 模式下，Buddy 会显示在输入框旁边，`pet` 时出现短暂爱心动画，有本地模板反应时会显示气泡。
+桌宠功能由 cb-agent 内置的轻量 Python runtime 提供桌面浮窗、透明置顶、拖动、显示/隐藏和 agent 状态联动。它不再嵌入完整 BongoCat/Tauri 项目，因此不需要 Rust、Node、pnpm、Tauri 构建链；为了让 Windows 上的 Live2D WebGL 真透明，runtime 使用 `pywebview` 的 Qt WebEngine 后端，需要 `qtpy` 和 `PySide6`。
 
-### 开启
+cb-agent 保留 BongoCat 的素材包思路：可以导入社区常见的 BongoCat Live2D 目录，也可以导入 AI 生成友好的 spritesheet 包。Live2D 目录会通过内置 WebView 里的 `pixi.js` + `easy-live2d` + Live2D Cubism Core 真实加载 `.model3.json`、`.moc3`、textures、physics、display info、motions 和 expressions；Python sidecar 使用 `pynput` 监听全局键盘/鼠标，并驱动 BongoCat 同款参数：`ParamMouseX/Y`、`ParamMouseLeftDown`、`ParamMouseRightDown`、`CatParamLeftHandDown`、`CatParamRightHandDown`。spritesheet 包继续支持帧动画和 agent 状态切换。
 
-在 `.env` 中设置：
+支持两类宠物包：
 
-```env
-FEATURE_BUDDY=1
-```
-
-然后重启 CLI 或 TUI。未开启时执行 `/buddy` 会提示设置 `FEATURE_BUDDY=1`。
-
-### 常用命令
+| 类型 | 说明 |
+|---|---|
+| BongoCat Live2D 目录 | 社区常见 BongoCat/Cubism 包；轻量 runtime 真实渲染 `.moc3`，默认保持透明背景，并读取 `resources/left-keys` / `resources/right-keys` 按键叠图 |
+| spritesheet | AI 生成友好的动画包，目录内包含 `pet.json` 和 atlas 图片 |
 
 CLI 和 TUI 都支持：
 
 | 命令 | 说明 |
 |---|---|
-| `/buddy` 或 `/buddy status` | 查看当前 Buddy；还没孵化时提示先 hatch |
-| `/buddy hatch` | 第一次孵化 Buddy；已有 Buddy 时不会覆盖 |
-| `/buddy rehatch` | 重新孵化，替换当前 Buddy |
-| `/buddy pet` | 摸摸 Buddy，触发爱心动画和一条本地反应 |
-| `/buddy mute` 或 `/buddy off` | 静音并隐藏 Buddy |
-| `/buddy unmute` 或 `/buddy on` | 取消静音，重新显示 Buddy |
+| `/pet` 或 `/pet status` | 查看 runtime、可见性、当前宠物和活动状态 |
+| `/pet install <folder>` | 安装宠物包根目录；Live2D 包根目录含 `*.model3.json`，spritesheet 包根目录含 `pet.json` |
+| `/pet list` | 列出已安装宠物、当前选择、显示名和本地库路径 |
+| `/pet select <id>` | 选择并加载宠物 |
+| `/pet uninstall <id>` | 卸载已安装宠物；`remove` / `delete` 也可用 |
+| `/pet launch` | 启动轻量 Python runtime |
+| `/pet show` / `/pet hide` | 显示或隐藏桌宠窗口 |
+| `/pet quit` | 关闭 runtime |
 
-状态文件默认在：
+也可以不进 CLI/TUI 安装：把宠物包目录直接放进项目级 `.cbagent\pet\` 或用户级 `~\.cbagent\pet\`，下一次执行 `/pet list`、`/pet status` 或 `/pet launch` 时会自动扫描并复制到 `~\.cbagent\pets\`。`/pet launch` 会自动选中新发现的包，方便直接看它是否能成功显示。
 
-```text
-~/.cbagent/buddy.json
+### 首次配置桌宠 runtime
+
+无需 Rust、Tauri 或 pnpm，也不需要手动从 BongoCat 复制运行时文件；Live2D Cubism Core 脚本已经随 `agent/pet_web/` 内置。第一次拿到仓库后，只要安装 Python 依赖。注意 `requirements.txt` 已包含桌宠透明窗口所需的 `qtpy` / `PySide6`：
+
+```powershell
+cd C:\path\to\cb-agent
+pip install -r requirements.txt
 ```
 
-如果要重新开始，可以用 `/buddy rehatch`。一般不建议手动编辑 `buddy.json`，除非是在调试持久化格式。
+然后在 CLI/TUI 里直接使用：
+
+```text
+/pet launch
+```
+
+runtime 日志写入：
+
+```text
+~\.cbagent\pet\runtime.log
+```
+
+默认会保留模型比例并把窗口最大边限制在 420px，避免某些 BongoCat 社区模型以 `1400x1400` 等原始尺寸置顶挡住桌面。需要调整大小时，在启动 CLI/TUI 前设置环境变量：
+
+```powershell
+$env:CBAGENT_PET_MAX_SIZE="520"  # 自动缩放时的最大边
+$env:CBAGENT_PET_SCALE="1"       # 按 Live2D 原始尺寸显示；设置后会覆盖 MAX_SIZE
+$env:CBAGENT_PET_X="80"          # 桌宠窗口左上角 X 坐标
+$env:CBAGENT_PET_Y="80"          # 桌宠窗口左上角 Y 坐标
+```
+
+桌宠运行后也可以直接把鼠标放在桌宠窗口上滚动滚轮调整大小；大小会写入 `~\.cbagent\pet\state.json`，下次 `/pet launch` 会继续使用。
+
+### 导入外部桌宠素材
+
+BongoCat Live2D 素材可以直接导入。`/pet install <folder>` 里的 `<folder>` 指“宠物包根目录”，不是父目录，也不是单个图片文件。这个目录根部应包含 `*.model3.json`，并且 `.model3.json` 引用的 `.moc3`、textures、可选 physics/display info/motions/expressions 文件都存在；轻量 runtime 会像 BongoCat 一样真实加载模型，并读取 `resources/cover.png` 作为列表封面。默认不会铺满显示 `resources/background.png`，这样桌面背景保持透明；如果确实需要显示底板，可在包根目录放 `pet.json` 并设置 `"showBackground": true`。
+
+导入前可先校验：
+
+```powershell
+python .\skills\hatch-bongocat-pet\scripts\validate_bongocat_pet.py "C:\path\to\pet-folder"
+```
+
+命令导入并启动：
+
+```text
+/pet install "C:\path\to\pet-folder"
+/pet list
+/pet launch
+/pet show
+```
+
+安装成功后会显示 `Installed and selected pet <id> (...)`、原始来源路径和复制后的本地库路径。若目录名是中文或其他非 ASCII，`<id>` 可能会变成类似 `pet-xxxxxxxxxx` 的安全 ID；用 `/pet list` 查看真实 ID，再用 `/pet select <id>` 切换。runtime 已经运行时，`install` 和 `select` 会立即把新宠物加载进窗口；未运行时用 `/pet launch` 显示。
+
+免命令导入也可以这样放目录：
+
+```text
+cb-agent\.cbagent\pet\你的Live2D包\
+cb-agent\.cbagent\pet\你的Spritesheet包\
+~\.cbagent\pet\你的Live2D包\
+~\.cbagent\pet\你的Spritesheet包\
+```
+
+每个“你的包”都必须是包根目录，不能只是父目录。例如 Live2D 包根目录里应直接看见 `cat.model3.json`；spritesheet 包根目录里应直接看见 `pet.json`。
+
+spritesheet 素材需要先打成 BongoCat-compatible 包。默认 atlas 为 `1536x1872`、`8x9` 网格、`192x208` cell：
+
+```powershell
+python .\skills\hatch-bongocat-pet\scripts\package_spritesheet_pet.py --pet-id my-pet --display-name "My Pet" --spritesheet "C:\path\to\atlas.png" --output-dir "C:\path\to\bongocat-pets"
+```
+
+然后安装生成的包：
+
+```text
+/pet install "C:\path\to\bongocat-pets\my-pet"
+/pet launch
+```
+
+安装后的宠物会复制到当前用户的 `~\.cbagent\pets\`。卸载时先 `/pet list` 找 ID，再执行：
+
+```text
+/pet uninstall <id>
+```
 
 ### 手动 compact
 
@@ -1055,7 +1124,7 @@ CONTEXT_USAGE_RATIO = 0.8
 |---|---|
 | `/help` | 打印帮助 |
 | `/tools` | 列出所有已注册工具 |
-| `/buddy` | 查看、孵化或互动 Buddy 宠物 |
+| `/pet` | 管理轻量桌宠 runtime 与宠物包 |
 | `/attach PATH` | 添加本地图片或音频附件到下一轮消息 |
 | `/attachments` | 查看待发送附件队列 |
 | `/detach N\|all` | 移除一个或全部待发送附件 |
@@ -1211,7 +1280,7 @@ python -m py_compile agent_run_basic.py run_agent.py context/builder.py context/
 python test/test_context_builder.py
 python test/test_session_renderer.py
 python test/test_transport.py
-python -m unittest discover -s test -p "test_buddy*.py"
+python -m unittest discover -s test -p "test_pet.py"
 python -m unittest discover -s test -p "test_multimodal_input.py"
 python -m unittest discover -s test -p "test_platform*.py"
 python -m unittest discover -s test -p "test_qq*.py"
@@ -1223,7 +1292,7 @@ TUI：
 ```bash
 cd ui-tui
 npm test
-npm test -- commands.test.ts transport.test.ts buddySprite.test.ts buddyCard.test.ts
+npm test -- commands.test.ts transport.test.ts
 npm run build
 ```
 
