@@ -202,6 +202,12 @@ def sensitive_tool_reason(tool_name: str, arguments: Dict[str, Any]) -> str:
             return f"rag(action={action or '<空>'}) 会修改知识库"
         return ""
 
+    if name == "knowledge_write":
+        return "knowledge_write 会修改结构化知识库"
+
+    if name == "knowledge_search":
+        return ""
+
     if _looks_like_mcp_tool(name):
         return _sensitive_mcp_reason(name, args)
 

@@ -102,6 +102,7 @@ from tools.tools.file_write_tool import FileWriteTool
 from tools.tools.file_edit_tool import FileEditTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
 from tools.tools.list_tools_tool import ListToolsTool
+from tools.tools.knowledge_tool import KnowledgeSearchTool, KnowledgeWriteTool
 from tools.tools.qqtool import QQTool
 from tools.tools.wechattool import WeChatTool
 
@@ -496,6 +497,8 @@ class AgentRunner:
             FileReadTool(),
             FileEditTool(),
             FileWriteTool(),
+            KnowledgeSearchTool(),
+            KnowledgeWriteTool(),
         ])
         if self.communication_platform == "qq":
             # 平台专用工具只在对应 transport 注入。普通 CLI/TUI 不注册 QQTool，
@@ -536,7 +539,10 @@ class AgentRunner:
                 "interfaces for future web browsing and graph views.\n"
                 "- Important user facts may be appended to `~/MEMORY.md`; reusable "
                 "structured knowledge should become a Markdown page in the knowledge base. "
-                "The agent also performs best-effort automatic capture after each turn."
+                "Use `knowledge_write` when the user confirms durable reusable knowledge, "
+                "and use `knowledge_search` before answering questions that depend on "
+                "stored project/user knowledge. The agent also performs best-effort "
+                "automatic capture after each turn."
             )
         if self.dangerously_skip_permissions:
             parts.append(

@@ -926,6 +926,8 @@ scope: global
 
 每次向模型发起请求时，memory section 会加载三层 Markdown 记忆，并按当前用户问题从知识库检索相关页面片段。每轮完成后，agent 会 best-effort 把重要用户事实追加到 `~/MEMORY.md`，把可复用结构化知识沉淀为 `~/knowledge/pages/*.md`，同时刷新 `index.json` 和 `graph.json`。
 
+模型也可以显式调用 `knowledge_write` / `knowledge_search`。默认情况下这两个工具读写 Markdown 知识库；设置 `CBAGENT_ENABLE_FULL_MEMORY=1` 后，同一工具会额外尝试 RAG / 向量索引与检索。
+
 详细设计：
 
 - [note/cbagent上下文构建与跨会话持久记忆构建.md](note/cbagent上下文构建与跨会话持久记忆构建.md)
