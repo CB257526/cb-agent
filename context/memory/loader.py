@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, List, Optional
 
@@ -191,6 +193,7 @@ class MemoryLoader:
         ).hexdigest()[:12]
         self.knowledge_namespace = "workspace:" + namespace_digest
         self._knowledge_base = None
+        self._knowledge_context_disabled_reason = ""
         self._memo = _AsyncMemoize(self._compute_memory_files)
 
     async def get_memory_files(self) -> List[MemoryFileInfo]:
@@ -218,14 +221,49 @@ class MemoryLoader:
         """Retrieve related structured knowledge for the current prompt."""
         if not self.include_knowledge or not query or not str(query).strip():
             return ""
+        if self._knowledge_context_disabled_reason:
+            logger.debug(
+                "knowledge context skipped: %s",
+                self._knowledge_context_disabled_reason,
+            )
+            return ""
         try:
+            started = time.perf_counter()
             kb = self.get_knowledge_base()
-            return await asyncio.to_thread(
+            timeout_raw = os.getenv("CBAGENT_KNOWLEDGE_CONTEXT_TIMEOUT", "3")
+            try:
+                timeout = float(timeout_raw)
+            except ValueError:
+                timeout = 3.0
+            task = asyncio.to_thread(
                 kb.render_related_context,
                 str(query),
                 limit=limit,
                 max_chars=max_chars,
             )
+            if timeout > 0:
+                result = await asyncio.wait_for(task, timeout=timeout)
+            else:
+                result = await task
+            elapsed = time.perf_counter() - started
+            logger.info(
+                "knowledge context built: chars=%s elapsed=%.2fs rag=%s root=%s",
+                len(result or ""),
+                elapsed,
+                getattr(kb, "enable_rag", None),
+                self.knowledge_root,
+            )
+            return result
+        except asyncio.TimeoutError:
+            self._knowledge_context_disabled_reason = (
+                "retrieval timed out; restart or raise "
+                "CBAGENT_KNOWLEDGE_CONTEXT_TIMEOUT to retry"
+            )
+            logger.warning(
+                "knowledge context retrieval timed out after %ss; disabled for this session",
+                os.getenv("CBAGENT_KNOWLEDGE_CONTEXT_TIMEOUT", "3"),
+            )
+            return ""
         except Exception:
             logger.exception("knowledge context retrieval failed")
             return ""

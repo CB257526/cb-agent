@@ -1,9 +1,11 @@
 """嵌入模型性能基准测试"""
+import os
 import time
 from memory.embedding import get_text_embedder_model
 
 
 def benchmark():
+    os.environ.setdefault("CBAGENT_ENABLE_FULL_MEMORY", "1")
     model = get_text_embedder_model()
     print(f"模型: {model.model_name}")
     print(f"维度: {model.dimension}")

@@ -1,7 +1,7 @@
 # cb-agent
 
 > 一个可拆解、可审计、带工具循环的 LLM Agent 框架。
-> 默认走轻量 Markdown 记忆；需要旧向量记忆/RAG 时再显式启用 full 模式。
+> 默认走轻量 Markdown 记忆和知识库关键词检索；旧向量记忆/RAG/embedding 只有设置 `CBAGENT_ENABLE_FULL_MEMORY=1` 后才会启用。
 
 ```
 用户输入
@@ -21,7 +21,7 @@
 | 多轮 Function Calling | 支持流式内容、reasoning delta、tool_calls 分片累积与 tool result 回灌 |
 | ContextBuilder | Section / Boundary 架构：静态段可缓存，动态段每轮刷新，按 token 预算组织上下文 |
 | 轻量 Markdown 记忆 | 默认启用，按全局、项目、短期三层加载 `AGENT.md` / `USER.md` / `RULE.md` / `MEMORY.md`，并接入 `~/knowledge/` 知识库 |
-| full 记忆/RAG | 旧 `MemoryTool` / `RAGTool` 完整保留，通过 `--memory-system full` 启用 |
+| full 记忆/RAG | 旧 `MemoryTool` / `RAGTool` 完整保留，通过 `CBAGENT_ENABLE_FULL_MEMORY=1` + `--memory-system full` 启用 |
 | 跨轮工作上下文 | 每轮工具轨迹压成 `【工作记录】`，写入 `.cbagent/sessions/`，重启后可恢复 |
 | 多会话隔离 | 本地 session 可创建、切换、清理；不同会话 history/state/transcript 隔离 |
 | 上下文压缩 | TUI 支持 `/compact`；后端也会在上下文接近模型窗口 80% 时自动 compact |
@@ -137,7 +137,7 @@ pip install -r requirements-full.txt
 | 模式 | 安装命令 | 默认记忆 | 是否注册 `memory` / `rag` | 适合场景 |
 |---|---|---|---|---|
 | light | `pip install -e .` | Markdown 文件 | 否 | 先跑起来、低依赖、无需向量库 |
-| full | `pip install -e ".[full]"` | 旧向量记忆/RAG | 是 | 需要 embedding、RAG、多模态、向量/图存储 |
+| full | `pip install -e ".[full]"` + `CBAGENT_ENABLE_FULL_MEMORY=1` | 旧向量记忆/RAG | 是 | 需要 embedding、RAG、多模态、向量/图存储 |
 
 ### 4. 配置 `.env`
 
@@ -237,9 +237,10 @@ CBAGENT_LOG_DIR=.cbagent/logs
 | `WECHAT_STATE_FILE` | 微信 token、account_id、sync_buf 和 context token 的本地状态文件，默认 `.cbagent/wechat/state.json` |
 | `CBAGENT_PLATFORM_ATTACHMENT_DIR_WECHAT` | 微信图片/文件/语音入站媒体下载目录，默认 `.cbagent/platform_attachments/wechat` |
 | `WECHAT_ACTION_TIMEOUT_SECONDS` | `wechattool` 调用微信 adapter action 的超时时间 |
-| `VECTOR_STORE_TYPE` / `QDRANT_URL` / `QDRANT_API_KEY` | full RAG/Memory 的向量存储 |
+| `CBAGENT_ENABLE_FULL_MEMORY` | 设为 `1` 才启用 full 旧向量记忆、RAG、embedding 和相关向量/图存储；默认关闭 |
+| `VECTOR_STORE_TYPE` / `QDRANT_URL` / `QDRANT_API_KEY` | full RAG/Memory 的向量存储，仅在 `CBAGENT_ENABLE_FULL_MEMORY=1` 时使用 |
 | `GRAPH_STORE_TYPE` / `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` | full 语义记忆图存储 |
-| `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` / `EMBED_API_KEY` | full embedding 配置 |
+| `EMBED_MODEL_TYPE` / `EMBED_MODEL_NAME` / `EMBED_API_KEY` | full embedding 配置，仅在 `CBAGENT_ENABLE_FULL_MEMORY=1` 时使用 |
 
 `.env` 已被 `.gitignore` 忽略，不会进仓库。
 
@@ -935,6 +936,7 @@ scope: global
 完整安装后可启用：
 
 ```bash
+set CBAGENT_ENABLE_FULL_MEMORY=1
 python run_agent.py --memory-system full
 ```
 
@@ -1357,6 +1359,7 @@ CB_AGENT_PYTHON=/path/to/python npm start
 
 ```bash
 pip install -e ".[full]"
+set CBAGENT_ENABLE_FULL_MEMORY=1
 python run_agent.py --memory-system full
 ```
 

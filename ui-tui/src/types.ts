@@ -207,10 +207,10 @@ export interface PetCommandResult {
   state: PetState;
 }
 
-/** prompt.submit 的附件输入。后端会重新校验路径、格式、大小和 OCR/ASR 能力。 */
+/** prompt.submit 的附件输入。后端会重新校验路径、格式、大小和 OCR/ASR/文档转换能力。 */
 export interface PromptAttachmentInput {
   path: string;
-  modality?: "image" | "audio";
+  modality?: "image" | "audio" | "text" | "document";
   source?: "direct" | "clipboard" | "ocr" | "asr";
 }
 

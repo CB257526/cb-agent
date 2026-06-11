@@ -632,6 +632,11 @@ class AgentSession:
         )
         request_content = multimodal_prompt.request_content
         history_user_text = multimodal_prompt.history_text
+        logger.info(
+            "chat prepare: multimodal processed attachments=%s elapsed=%.2fs",
+            len(multimodal_prompt.attachments),
+            time.perf_counter() - chat_started,
+        )
         if self.session_store is not None:
             try:
                 # 通讯平台私聊会按“每条消息新建 AgentSession 对象”从磁盘恢复。
@@ -641,18 +646,38 @@ class AgentSession:
             except Exception:
                 logger.exception("保存 pending 用户消息失败")
 
+        stage_started = time.perf_counter()
         system_instructions = self._build_system_instructions()
+        logger.info(
+            "chat prepare: runtime instructions built chars=%s elapsed=%.2fs total=%.2fs",
+            len(system_instructions or ""),
+            time.perf_counter() - stage_started,
+            time.perf_counter() - chat_started,
+        )
         auto_compactions: List[Dict[str, Any]] = [] #收集自动压缩（auto compaction）事件
         messages = self._build_chat_messages(
             user_content=request_content,
             system_instructions=system_instructions,
             memory_query=history_user_text,
         )
+        logger.info(
+            "chat prepare: context messages built messages=%s elapsed=%.2fs total=%.2fs",
+            len(messages),
+            time.perf_counter() - stage_started,
+            time.perf_counter() - chat_started,
+        )
 
+        stage_started = time.perf_counter()
         tools_schema = (
             self.registry.get_tools_description_openai_schema()
             if self.llm.is_Function_Calling
             else None
+        )
+        logger.info(
+            "chat prepare: tools schema built tools=%s elapsed=%.2fs total=%.2fs",
+            len(tools_schema or []),
+            time.perf_counter() - stage_started,
+            time.perf_counter() - chat_started,
         )
         logger.info(
             "chat start: query_chars=%s attachments=%s history=%s messages=%s tools=%s function_calling=%s",

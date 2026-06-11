@@ -21,6 +21,7 @@ export interface PromptInputProps {
   value: string;
   onChange: (v: string) => void;
   onSubmit: (v: string) => void;
+  onPasteRequest?: (insertText: (text: string) => void) => void;
   disabled: boolean;
   /** 历史读取器：null 表示无更多 / 边界。idx 0=最新一条，递增=更老 */
   getHistoryAt?: (idx: number) => string | null;
@@ -29,9 +30,11 @@ export interface PromptInputProps {
   delegateNavKeys?: boolean;
 }
 
-export function PromptInput({ value, onChange, onSubmit, disabled, getHistoryAt, delegateNavKeys }: PromptInputProps) {
+export function PromptInput({ value, onChange, onSubmit, onPasteRequest, disabled, getHistoryAt, delegateNavKeys }: PromptInputProps) {
   const [cursor, setCursor] = useState(value.length);
   const [historyIdx, setHistoryIdx] = useState<number | null>(null);
+  const valueRef = useRef(value);
+  const cursorRef = useRef(cursor);
 
   // 父组件外部改 value 时（比如选了命令后清空），把光标拉回末尾
   const lastValue = useRef(value);
@@ -40,7 +43,11 @@ export function PromptInput({ value, onChange, onSubmit, disabled, getHistoryAt,
       setCursor(value.length);
       lastValue.current = value;
     }
+    valueRef.current = value;
   }, [value]);
+  useEffect(() => {
+    cursorRef.current = cursor;
+  }, [cursor]);
 
   useInput((input, key) => {
     if (disabled) return;
@@ -83,6 +90,21 @@ export function PromptInput({ value, onChange, onSubmit, disabled, getHistoryAt,
     if (historyIdx !== null) setHistoryIdx(null);
 
     // ── 编辑动作 ──
+    if (key.ctrl && (input === "v" || input === "\u0016")) {
+      onPasteRequest?.((text) => {
+        if (!text) return;
+        const current = valueRef.current;
+        const currentCursor = cursorRef.current;
+        const next = current.slice(0, currentCursor) + text + current.slice(currentCursor);
+        const nextCursor = currentCursor + text.length;
+        lastValue.current = next;
+        valueRef.current = next;
+        cursorRef.current = nextCursor;
+        onChange(next);
+        setCursor(nextCursor);
+      });
+      return;
+    }
     if (key.return) {
       onSubmit(value);
       setCursor(0);

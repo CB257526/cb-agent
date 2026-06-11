@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from memory.feature_flags import is_full_memory_enabled
+
 from .paths import get_knowledge_root
 
 
@@ -183,8 +185,7 @@ class KnowledgeBase:
         self.graph_path = self.root / "graph.json"
         self.namespace = namespace
         if enable_rag is None:
-            raw = os.getenv("CBAGENT_MEMORY_RAG", "1").strip().lower()
-            enable_rag = raw not in {"0", "false", "no", "off"}
+            enable_rag = is_full_memory_enabled()
         self.enable_rag = enable_rag
         self._rag_pipeline: Optional[dict[str, Any]] = None
         self._rag_failed = False

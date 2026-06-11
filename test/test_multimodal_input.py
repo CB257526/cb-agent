@@ -125,6 +125,52 @@ class TestMultimodalInput(unittest.TestCase):
         self.assertIn("音频 ASR 文本", prompt.history_text)
         self.assertEqual(prompt.attachments[0].routed_as, "asr")
 
+    def test_text_attachment_uses_markdown_route(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "note.txt"
+            path.write_text("hello", encoding="utf-8")
+
+            with patch(
+                "agent.multimodal_input._convert_attachment_to_markdown",
+                return_value="# Note\n\nhello",
+            ) as convert:
+                prompt = process_multimodal_prompt(
+                    text="总结附件",
+                    attachments=[{"path": str(path), "source": "direct"}],
+                    model="text-test",
+                    cwd=Path(td),
+                    processor=FakeProcessor(),
+                )
+
+        convert.assert_called_once()
+        self.assertIn("# Note", str(prompt.request_content))
+        self.assertIn("# Note", prompt.history_text)
+        self.assertEqual(prompt.attachments[0].modality, "text")
+        self.assertEqual(prompt.attachments[0].routed_as, "markdown")
+
+    def test_document_attachment_uses_markdown_route(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "paper.pdf"
+            path.write_bytes(b"%PDF fake")
+
+            with patch(
+                "agent.multimodal_input._convert_attachment_to_markdown",
+                return_value="# Paper\n\nconverted markdown",
+            ) as convert:
+                prompt = process_multimodal_prompt(
+                    text="",
+                    attachments=[{"path": str(path), "source": "direct"}],
+                    model="text-test",
+                    cwd=Path(td),
+                    processor=FakeProcessor(),
+                )
+
+        convert.assert_called_once()
+        self.assertIn("# Paper", str(prompt.request_content))
+        self.assertIn("# Paper", prompt.history_text)
+        self.assertEqual(prompt.attachments[0].modality, "document")
+        self.assertEqual(prompt.attachments[0].routed_as, "markdown")
+
     def test_sanitize_replaces_data_uri_without_mutating_original(self) -> None:
         original = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abcdef"}}]
         sanitized = sanitize_multimodal_payload(original)
@@ -136,15 +182,15 @@ class TestMultimodalInput(unittest.TestCase):
     def test_invalid_inputs_raise_clear_errors(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             missing = Path(td) / "missing.png"
-            txt = Path(td) / "note.txt"
-            txt.write_text("hello", encoding="utf-8")
+            unsupported = Path(td) / "blob.bin"
+            unsupported.write_bytes(b"hello")
             big = Path(td) / "big.png"
             big.write_bytes(b"xx")
 
             with self.assertRaisesRegex(MultimodalInputError, "不存在"):
                 process_multimodal_prompt(text="x", attachments=[{"path": str(missing)}], cwd=Path(td))
             with self.assertRaisesRegex(MultimodalInputError, "不支持"):
-                process_multimodal_prompt(text="x", attachments=[{"path": str(txt)}], cwd=Path(td))
+                process_multimodal_prompt(text="x", attachments=[{"path": str(unsupported)}], cwd=Path(td))
             with patch.dict(os.environ, {"CBAGENT_ATTACHMENT_MAX_MB": "0.000001"}):
                 with self.assertRaisesRegex(MultimodalInputError, "超过限制"):
                     process_multimodal_prompt(text="x", attachments=[{"path": str(big)}], cwd=Path(td))

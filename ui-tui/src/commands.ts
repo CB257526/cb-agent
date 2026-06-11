@@ -100,7 +100,7 @@ export function makeQueuedAttachment(path: string, source: QueuedAttachment["sou
 }
 
 function formatQueuedAttachments(attachments: QueuedAttachment[]): string {
-  if (!attachments.length) return "当前没有待发送附件。使用 /attach <path> 添加图片或音频。";
+  if (!attachments.length) return "当前没有待发送附件。使用 /attach <path> 添加图片、音频或文档。";
   const lines = attachments.map((item, index) => {
     const size = typeof item.size === "number" ? ` ${formatBytes(item.size)}` : "";
     return `  ${index + 1}. ${item.fileName}${size} (${item.source ?? "direct"})`;
@@ -250,7 +250,7 @@ export const COMMANDS: readonly SlashCommand[] = [
   },
   {
     name: "/attach",
-    description: "添加图片或音频附件：/attach <path>",
+    description: "添加附件：/attach <path>",
     handler: ({ args, appendSystem, setAttachments }) => {
       const path = args.trim();
       if (!path) {

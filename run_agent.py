@@ -85,6 +85,7 @@ from context.memory.paths import (
     get_user_core_memory_path,
     get_workspace_memory_dir,
 )
+from memory.feature_flags import FULL_MEMORY_ENV, is_full_memory_enabled
 from skills.skill_manager import SkillManager
 from skills.skill_executor import SkillExecutor
 from tools.toolRegistry import ToolRegistry
@@ -456,6 +457,12 @@ class AgentRunner:
         skill_executor = SkillExecutor()
 
         tools = []
+        if self.memory_system == "full" and not is_full_memory_enabled():
+            _info(
+                f"full 记忆/RAG 已请求但未启用；设置 {FULL_MEMORY_ENV}=1 后才会加载 "
+                "memory/rag、向量库和 embedding。当前回退到轻量 Markdown 记忆。"
+            )
+            self.memory_system = "light"
         if self.memory_system == "full":
             # 旧 RAG/向量记忆只在 full 模式懒加载。这样 light/off 的默认启动路径
             # 不会 import memory_tool/rag_tool，也就不需要 embedding、Qdrant 等依赖。
@@ -1000,7 +1007,7 @@ class AgentRunner:
                 "  /tools       列出所有已注册工具\n"
                 "  /mcp         查看 MCP 后台连接状态\n"
                 "  /pet         管理轻量桌宠 runtime 与宠物包\n"
-                "  /attach PATH 添加图片或音频附件到下一轮\n"
+                "  /attach PATH 添加图片、音频或文档附件到下一轮\n"
                 "  /attachments 查看待发送附件队列\n"
                 "  /detach N|all 移除待发送附件\n"
                 "  /skills      列出所有 Skill\n"
@@ -1173,7 +1180,7 @@ class AgentRunner:
     def _print_pending_attachments(self) -> None:
         """展示 CLI 下一轮会随 prompt 一起发送的附件。"""
         if not self.pending_attachments:
-            _info("当前没有待发送附件。使用 /attach <path> 添加图片或音频。")
+            _info("当前没有待发送附件。使用 /attach <path> 添加图片、音频或文档。")
             return
         print("\n待发送附件：")
         for index, item in enumerate(self.pending_attachments, start=1):

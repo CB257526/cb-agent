@@ -6,8 +6,11 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from memory.embedding import refresh_embedder
 from context.memory.knowledge import KnowledgeBase
 from context.memory.loader import MemoryLoader
 from context.sections.dynamic_sections import memory_section
@@ -94,6 +97,21 @@ def test_knowledge_base_pages_index_and_graph(tmp_path: Path):
     context = kb.render_related_context("How does Memory Architecture work?", max_chars=1200)
     assert "Memory Architecture" in context
     assert "Layered memory" in context
+
+
+def test_knowledge_rag_is_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CBAGENT_ENABLE_FULL_MEMORY", raising=False)
+    assert not KnowledgeBase(tmp_path / "default").enable_rag
+
+    monkeypatch.setenv("CBAGENT_ENABLE_FULL_MEMORY", "1")
+    assert KnowledgeBase(tmp_path / "enabled").enable_rag
+
+
+def test_embedding_model_is_full_memory_opt_in(monkeypatch):
+    monkeypatch.delenv("CBAGENT_ENABLE_FULL_MEMORY", raising=False)
+
+    with pytest.raises(RuntimeError, match="Full memory is disabled"):
+        refresh_embedder()
 
 
 def test_capture_turn_updates_memory_and_knowledge(tmp_path: Path):

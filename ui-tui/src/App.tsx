@@ -30,8 +30,8 @@ import { Banner } from "./components/Banner.js";
 import { SlashCommandPicker } from "./components/SlashCommandPicker.js";
 import { SessionSwitcher } from "./components/SessionSwitcher.js";
 import { HistoryStore } from "./historyStore.js";
-import { findCommand, SlashCommand, CommandCtx, formatMCPStatus } from "./commands.js";
-import { readClipboardImageAttachment } from "./clipboardImage.js";
+import { findCommand, SlashCommand, CommandCtx, formatMCPStatus, makeQueuedAttachment } from "./commands.js";
+import { readClipboardForPaste } from "./clipboardImage.js";
 import type { PromptAttachmentInput, QueuedAttachment } from "./types.js";
 
 const STDERR_RING_MAX = 200;  // 内存里最多留 200 行，超出从头丢
@@ -591,14 +591,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       // 想保留前端可视历史的话以后可以拆成 Ctrl+L=只清屏 / /clear=连后端一起清
       setItems([]);
       clearScreen?.();
-    } else if (key.ctrl && (inputChar === "v" || inputChar === "\u0016")) {
-      if (busy || activeQuestionId !== null || showSessionSwitcher) return;
-      readClipboardImageAttachment()
-        .then((item) => {
-          setAttachments((prev) => [...prev, item]);
-          appendSystem(`已从剪贴板添加图片：${item.fileName}`);
-        })
-        .catch((e) => appendSystem(`剪贴板图片读取失败：${(e as Error).message}`));
     }
   });
 
@@ -663,6 +655,26 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     _pendingSubmitId.current = transport.sendPrompt(text, submitAttachments);
   }, [attachments, busy, transport, appendSystem, runCommand]);
 
+  const handlePasteRequest = useCallback((insertText: (text: string) => void) => {
+    if (busy || activeQuestionId !== null || showSessionSwitcher) return;
+    readClipboardForPaste()
+      .then((item) => {
+        if (item.kind === "text") {
+          insertText(item.text);
+          return;
+        }
+        if (item.kind === "files") {
+          const queued = item.paths.map((path) => makeQueuedAttachment(path, "clipboard"));
+          setAttachments((prev) => [...prev, ...queued]);
+          appendSystem(`已从剪贴板添加 ${queued.length} 个文件。发送下一条消息时会一起提交。`);
+          return;
+        }
+        setAttachments((prev) => [...prev, item.attachment]);
+        appendSystem(`已从剪贴板添加图片：${item.attachment.fileName}`);
+      })
+      .catch((e) => appendSystem(`剪贴板读取失败：${(e as Error).message}`));
+  }, [busy, activeQuestionId, showSessionSwitcher, appendSystem]);
+
   /** ↑/↓ 翻历史的回调：idx 0 = 最新一条，递增 = 更老。null 表示越界 */
   const getHistoryAt = useCallback((idx: number): string | null => {
     const all = historyStore.all();
@@ -726,6 +738,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
               value={input}
               onChange={setInput}
               onSubmit={handleSubmit}
+              onPasteRequest={handlePasteRequest}
               disabled={busy || activeQuestionId !== null || showSessionSwitcher}
               getHistoryAt={getHistoryAt}
               delegateNavKeys={slashActive || activeQuestionId !== null || showSessionSwitcher}

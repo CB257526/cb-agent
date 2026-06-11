@@ -30,6 +30,7 @@ os.chdir(_PROJECT_ROOT)
 
 from dotenv import load_dotenv
 load_dotenv()
+os.environ.setdefault("CBAGENT_ENABLE_FULL_MEMORY", "1")
 
 # 测试资源目录（项目目录外部）
 _SOURCE_DIR = os.path.join(_PARENT, "source")

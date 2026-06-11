@@ -127,7 +127,7 @@ AgentSession._auto_update_memory_and_knowledge()
 - 用户明确表达“记住、偏好、以后、重要、必须、不要忘”等长期信号时，追加一条去重后的 bullet 到 `~/MEMORY.md`。
 - 对架构、设计、实现、接口、方案、决策、规则、流程等可复用知识，生成或追加 Markdown 页面。
 - 页面写入后立即重建 `index.json` 和 `graph.json`。
-- 如果 `CBAGENT_MEMORY_RAG` 未关闭且 RAG pipeline 可用，页面会 best-effort 进入向量索引。
+- 默认只使用 Markdown 页面与关键词检索；只有设置 `CBAGENT_ENABLE_FULL_MEMORY=1` 时，RAG pipeline / 向量库 / embedding 才会 best-effort 启用。
 
 ## 6. Web UI 与知识图谱预留
 

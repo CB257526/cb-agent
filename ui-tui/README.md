@@ -100,9 +100,11 @@ CB_AGENT_PYTHON=/path/to/cbAgent/venv/bin/python npm start
 
 Linux 服务器上建议显式设置 `CB_AGENT_PYTHON`，因为很多发行版只有 `python3` 命令，没有 `python` 命令。TUI 现在会在找不到虚拟环境时自动兜底 `python3`，但显式路径更容易排查部署问题。
 
-### Linux 剪贴板图片
+### 剪贴板与附件
 
-TUI 的 `/paste-image` 和 `Ctrl-V` 图片粘贴依赖桌面剪贴板工具：
+TUI 的 `Ctrl-V` 会优先识别剪贴板文件、文本和图片：文件会加入附件队列，文本会插入输入框，图片会保存为临时 PNG 附件。`/paste-image` 仍只用于显式读取图片。
+
+Linux 下图片粘贴依赖桌面剪贴板工具：
 
 | 环境 | 依赖 | 不满足时 |
 |---|---|---|
@@ -110,7 +112,7 @@ TUI 的 `/paste-image` 和 `Ctrl-V` 图片粘贴依赖桌面剪贴板工具：
 | X11 | `xclip` | 使用 `/attach <path>` |
 | SSH/headless | 通常没有系统剪贴板 | 使用 `/attach <path>` |
 
-如果只是服务器部署，不需要桌面环境；把图片上传到后端可读目录后，用 `/attach <path>` 是最稳定的入口。
+如果只是服务器部署，不需要桌面环境；把文件上传到后端可读目录后，用 `/attach <path>` 是最稳定的入口。PDF、Word、txt 等文档附件会在后端用 MarkItDown 转为 Markdown 后进入本轮消息；图片和音频继续走原有 OCR/ASR 或视觉输入逻辑。
 
 ### 危险权限模式
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import mimetypes
 import os
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -21,6 +23,54 @@ from utils.multimodal import MultimodalProcessor
 IMAGE_MIME_MAP = MultimodalProcessor.IMAGE_MIME_MAP
 AUDIO_MIME_MAP = MultimodalProcessor.AUDIO_MIME_MAP
 DEFAULT_ATTACHMENT_MAX_MB = 20
+DEFAULT_ATTACHMENT_TEXT_MAX_CHARS = 120_000
+TEXT_ATTACHMENT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".html",
+    ".htm",
+    ".css",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".py",
+    ".java",
+    ".c",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".rs",
+    ".php",
+    ".rb",
+    ".sh",
+    ".bat",
+    ".ps1",
+    ".sql",
+    ".log",
+}
+DOCUMENT_ATTACHMENT_EXTENSIONS = {
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".rtf",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".epub",
+}
 
 
 class MultimodalInputError(ValueError):
@@ -202,15 +252,25 @@ def _process_one_attachment(
         base.routed_as = "ocr"
         return base
 
-    result = processor.process_audio(str(path))
-    text = str((result or {}).get("text") or "").strip()
-    if not text:
-        raise MultimodalInputError(
-            f"音频附件 {path.name} ASR 转录失败，请检查 ASR_API_KEY/ASR_BASE_URL 配置。"
-        )
-    request_parts.append({"type": "text", "text": f"[附件 #{index}: audio {path.name}]\n{text}"})
-    base.text = text
-    base.routed_as = "asr"
+    if modality == "audio":
+        result = processor.process_audio(str(path))
+        text = str((result or {}).get("text") or "").strip()
+        if not text:
+            raise MultimodalInputError(
+                f"音频附件 {path.name} ASR 转录失败，请检查 ASR_API_KEY/ASR_BASE_URL 配置。"
+            )
+        request_parts.append({"type": "text", "text": f"[附件 #{index}: audio {path.name}]\n{text}"})
+        base.text = text
+        base.routed_as = "asr"
+        return base
+
+    markdown = _convert_attachment_to_markdown(path, modality=modality)
+    markdown = _limit_attachment_text(markdown, path.name)
+    if not markdown.strip():
+        raise MultimodalInputError(f"附件 {path.name} 转换为 Markdown 后没有可用文本。")
+    request_parts.append({"type": "text", "text": f"[附件 #{index}: {modality} {path.name}]\n{markdown}"})
+    base.text = markdown
+    base.routed_as = "markdown"
     return base
 
 
@@ -248,9 +308,15 @@ def _detect_modality(path: Path, requested: Any) -> tuple[str, str]:
         inferred, mime = "image", IMAGE_MIME_MAP[ext]
     elif ext in AUDIO_MIME_MAP:
         inferred, mime = "audio", AUDIO_MIME_MAP[ext]
+    elif ext in TEXT_ATTACHMENT_EXTENSIONS:
+        inferred = "text"
+        mime = mimetypes.guess_type(path.name)[0] or "text/plain"
+    elif ext in DOCUMENT_ATTACHMENT_EXTENSIONS:
+        inferred = "document"
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
     wanted = str(requested or inferred or "").strip().lower()
-    if wanted not in {"image", "audio"} or inferred is None:
+    if wanted not in {"image", "audio", "text", "document"} or inferred is None:
         raise MultimodalInputError(f"不支持的附件格式：{path.suffix or path.name}")
     if wanted != inferred:
         raise MultimodalInputError(f"附件 {path.name} 的 modality={wanted} 与扩展名不匹配。")
@@ -270,6 +336,64 @@ def _read_limited_bytes(path: Path) -> bytes:
             f"附件 {path.name} 大小 {size} 字节，超过限制 {limit} 字节。"
         )
     return path.read_bytes()
+
+
+def _convert_attachment_to_markdown(path: Path, *, modality: str) -> str:
+    """Convert text/document attachments into Markdown using MarkItDown.
+
+    The Python backend is launched from the project environment, so importing
+    MarkItDown here uses the same runtime as the agent. Plain text files fall
+    back to direct decoding if MarkItDown is unavailable or cannot parse them.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            from markitdown import MarkItDown
+
+            result = MarkItDown().convert(str(path))
+        text = (
+            getattr(result, "text_content", None)
+            or getattr(result, "markdown", None)
+            or str(result)
+        )
+        return str(text or "").strip()
+    except ImportError as exc:
+        if modality == "text":
+            return _read_text_attachment(path)
+        raise MultimodalInputError(
+            "MarkItDown 未安装，无法转换文档附件。请在启动 cb-agent 的 Python 环境中安装 markitdown。"
+        ) from exc
+    except Exception as exc:
+        if modality == "text":
+            fallback = _read_text_attachment(path)
+            if fallback.strip():
+                return fallback
+        raise MultimodalInputError(f"附件 {path.name} 转换 Markdown 失败：{exc}") from exc
+
+
+def _read_text_attachment(path: Path) -> str:
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
+        try:
+            return data.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def _limit_attachment_text(text: str, file_name: str) -> str:
+    raw = os.getenv("CBAGENT_ATTACHMENT_TEXT_MAX_CHARS")
+    try:
+        limit = int(raw) if raw else DEFAULT_ATTACHMENT_TEXT_MAX_CHARS
+    except ValueError:
+        limit = DEFAULT_ATTACHMENT_TEXT_MAX_CHARS
+    limit = max(1000, limit)
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit].rstrip()
+        + f"\n\n[附件 {file_name} 的 Markdown 文本超过 {limit} 字符，已截断。]"
+    )
 
 
 def _normal_source(value: Any) -> str:

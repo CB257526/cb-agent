@@ -6,6 +6,7 @@ import time
 import json
 from pathlib import Path
 from memory.embedding import get_text_embedder_model, get_dimension
+from memory.feature_flags import full_memory_disabled_message, is_full_memory_enabled
 from ..storage.vector_store_manager import VectorStoreManager
 from ..storage.graph_store_manager import GraphStoreManager
 from utils.multimodal import MultimodalProcessor
@@ -1581,6 +1582,8 @@ def create_rag_pipeline(
     rag_namespace: str = "default"
 ) -> Dict[str, Any]:
     """通过 VectorStoreManager 创建 RAG 管线，自动适配 Zvec/Qdrant 等后端。"""
+    if not is_full_memory_enabled():
+        raise RuntimeError(full_memory_disabled_message())
     dimension = get_dimension(384)
 
     store = VectorStoreManager.get_instance(

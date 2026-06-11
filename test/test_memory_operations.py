@@ -27,6 +27,7 @@ os.chdir(_PROJECT_ROOT)
 
 from dotenv import load_dotenv
 load_dotenv()
+os.environ.setdefault("CBAGENT_ENABLE_FULL_MEMORY", "1")
 
 from memory.base import MemoryConfig
 from memory.manager import MemoryManager

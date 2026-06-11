@@ -6,6 +6,7 @@
 - 通过环境变量优先级：dashscope > local > tfidf。
 
 环境变量：
+- CBAGENT_ENABLE_FULL_MEMORY: 设为 "1" 才允许创建 embedding 模型（默认关闭）
 - EMBED_MODEL_TYPE: "dashscope" | "local" | "tfidf"（默认 dashscope）
 - EMBED_MODEL_NAME: 模型名称（dashscope默认 text-embedding-v3；local默认 sentence-transformers/all-MiniLM-L6-v2）
 - EMBED_API_KEY: Embedding API Key（统一命名）
@@ -18,6 +19,7 @@ import os
 import numpy as np
 import requests
 from dotenv import load_dotenv
+from memory.feature_flags import full_memory_disabled_message, is_full_memory_enabled
 
 load_dotenv()
 # ==============
@@ -264,6 +266,8 @@ _embedder: Optional[EmbeddingModel] = None
 
 
 def _build_embedder() -> EmbeddingModel:
+    if not is_full_memory_enabled():
+        raise RuntimeError(full_memory_disabled_message())
     # 从环境变量获取首选模型类型,为空时默认 local
     preferred = os.getenv("EMBED_MODEL_TYPE", "local").strip()
     # 根据提供商选择默认模型
