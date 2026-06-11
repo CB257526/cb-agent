@@ -282,6 +282,42 @@ class TestWorkContext(unittest.TestCase):
             self.assertIn("compact 后的新问题", restored_text)
             self.assertNotIn("旧问题一", restored_text)
 
+    def test_compaction_snapshot_rolls_back_when_state_save_fails(self):
+        """compact 落盘中途失败时，不留下半套 compact 快照。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.append_turn(
+                user_query="旧问题",
+                final_answer="旧回答",
+                work_record=None,
+            )
+            state_path = store.active_dir / "state.json"
+            state_before = state_path.read_text(encoding="utf-8")
+
+            def fail_save_state(state):
+                raise OSError("state write failed")
+
+            store.save_state = fail_save_state  # type: ignore[method-assign]
+
+            with self.assertRaises(OSError):
+                store.save_compaction(
+                    summary="【上下文压缩】旧上下文已经压缩",
+                    history_payload=[
+                        {
+                            "role": "assistant",
+                            "content": "【上下文压缩】旧上下文已经压缩",
+                            "kind": "compact_record",
+                        },
+                    ],
+                    before_messages=2,
+                    after_messages=1,
+                )
+
+            self.assertFalse((store.active_dir / "compact.json").exists())
+            self.assertFalse((store.active_dir / "compactions.jsonl").exists())
+            self.assertEqual(state_before, state_path.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

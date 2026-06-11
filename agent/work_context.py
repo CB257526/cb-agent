@@ -22,6 +22,7 @@ import logging
 import re
 import shutil
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -994,6 +995,17 @@ class LocalSessionStore:
         self.ensure_active()
         self.active_dir.mkdir(parents=True, exist_ok=True)
 
+        compact_path = self.active_dir / "compact.json"
+        compactions_path = self.active_dir / "compactions.jsonl"
+        state_path = self.active_dir / "state.json"
+        index_path = self.index_path
+        paths_to_restore = [compact_path, compactions_path, state_path, index_path]
+        file_snapshots = {
+            path: path.read_text(encoding="utf-8") if path.exists() else None
+            for path in paths_to_restore
+        }
+        state_snapshot = deepcopy(self.state)
+
         ts = _now_iso()
         compact = {
             "ts": ts,
@@ -1004,28 +1016,46 @@ class LocalSessionStore:
             "before_messages": before_messages,
             "after_messages": after_messages,
         }
-        self._write_json(self.active_dir / "compact.json", compact)
+        try:
+            self._write_json(compact_path, compact)
 
-        # compactions.jsonl 是审计流：保留每次 compact 的时间、数量变化和摘要。
-        # 它不像 compact.json 那样只保存最新快照；这样将来排查“什么时候压缩过”
-        # 时，不需要翻 Git 或猜测 state 的 updated_at。
-        with (self.active_dir / "compactions.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(compact, ensure_ascii=False, default=str) + "\n")
+            # compactions.jsonl 是审计流：保留每次 compact 的时间、数量变化和摘要。
+            # 它不像 compact.json 那样只保存最新快照；这样将来排查“什么时候压缩过”
+            # 时，不需要翻 Git 或猜测 state 的 updated_at。
+            with compactions_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(compact, ensure_ascii=False, default=str) + "\n")
 
-        state = self.state if isinstance(self.state, dict) else self._new_state()
-        state["updated_at"] = ts
-        state["rolling_summary"] = _clip(summary, ROLLING_SUMMARY_LIMIT)
-        state["compacted_at"] = ts
-        state["compact_count"] = int(state.get("compact_count") or 0) + 1
-        state["compact_transcript_offset"] = compact["transcript_offset"]
-        state["files_seen"] = _tail_mapping(state.get("files_seen"), FILES_SEEN_LIMIT)
-        state["files_modified"] = _tail_mapping(state.get("files_modified"), FILES_MODIFIED_LIMIT)
-        state["recent_commands"] = _tail_list(state.get("recent_commands"), RECENT_COMMANDS_LIMIT)
-        state["decisions"] = _tail_list(state.get("decisions"), DECISIONS_LIMIT)
-        state["pending"] = _tail_list(state.get("pending"), PENDING_LIMIT)
-        self.save_state(state)
-        self._write_index()
-        return compact
+            state = self.state if isinstance(self.state, dict) else self._new_state()
+            state["updated_at"] = ts
+            # The compact summary is restored through compact.json/history as the
+            # compact_record anchor. Keeping the same text in rolling_summary would
+            # inject it again through SessionState on the next turn.
+            state["last_compact_summary"] = _clip(summary, ROLLING_SUMMARY_LIMIT)
+            state["rolling_summary"] = ""
+            state["compacted_at"] = ts
+            state["compact_count"] = int(state.get("compact_count") or 0) + 1
+            state["compact_transcript_offset"] = compact["transcript_offset"]
+            state["files_seen"] = _tail_mapping(state.get("files_seen"), FILES_SEEN_LIMIT)
+            state["files_modified"] = _tail_mapping(state.get("files_modified"), FILES_MODIFIED_LIMIT)
+            state["recent_commands"] = _tail_list(state.get("recent_commands"), RECENT_COMMANDS_LIMIT)
+            state["decisions"] = _tail_list(state.get("decisions"), DECISIONS_LIMIT)
+            state["pending"] = _tail_list(state.get("pending"), PENDING_LIMIT)
+            self.save_state(state)
+            self._write_index()
+            return compact
+        except Exception:
+            self.state = state_snapshot if isinstance(state_snapshot, dict) else {}
+            for path, text in file_snapshots.items():
+                try:
+                    if text is None:
+                        if path.exists():
+                            path.unlink()
+                    else:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(text, encoding="utf-8")
+                except Exception:
+                    logger.exception("failed to roll back compact snapshot file %s", path)
+            raise
 
     def _read_transcript_items(self, session_dir: Path) -> List[Dict[str, Any]]:
         """读取 transcript.jsonl 为结构化行列表。
@@ -1228,7 +1258,10 @@ class LocalSessionStore:
             "updated_at": updated_at,
             "turn_count": int(state.get("turn_count") or self._count_transcript_turns(session_dir)),
             "active_task": _clip(state.get("active_task"), 120),
-            "rolling_summary": _clip(state.get("rolling_summary"), 180),
+            "rolling_summary": _clip(
+                state.get("rolling_summary") or state.get("last_compact_summary"),
+                180,
+            ),
             "is_active": session_id == self.active_session_id,
         }
 
