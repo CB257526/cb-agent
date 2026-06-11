@@ -800,7 +800,7 @@ class PetRuntime:
                 if renderer == "live2d" and status.get("live2dReady"):
                     self._log(f"renderer ready: {json.dumps(status, ensure_ascii=False)}")
                     return status
-                if renderer == "spritesheet" and status.get("renderer") == "spritesheet":
+                if renderer == "spritesheet" and status.get("renderer") == "spritesheet" and status.get("spriteReady"):
                     self._log(f"renderer ready: {json.dumps(status, ensure_ascii=False)}")
                     return status
             time.sleep(0.1)
@@ -809,8 +809,8 @@ class PetRuntime:
         return last_status
 
     def _resize_window_to_status(self, status: Dict[str, Any]) -> None:
-        width_value = status.get("modelNaturalWidth") or status.get("modelWidth")
-        height_value = status.get("modelNaturalHeight") or status.get("modelHeight")
+        width_value = status.get("modelNaturalWidth") or status.get("modelWidth") or status.get("spriteCellWidth")
+        height_value = status.get("modelNaturalHeight") or status.get("modelHeight") or status.get("spriteCellHeight")
         try:
             width = float(width_value)
             height = float(height_value)
@@ -819,9 +819,9 @@ class PetRuntime:
         if width <= 0 or height <= 0:
             return
         self.model_size = (width, height)
-        self._resize_to_model_size(width, height)
+        self._resize_to_model_size(width, height, allow_upscale=status.get("renderer") == "spritesheet")
 
-    def _resize_to_model_size(self, width: float, height: float) -> None:
+    def _resize_to_model_size(self, width: float, height: float, *, allow_upscale: bool = False) -> None:
         scale_text = os.environ.get("CBAGENT_PET_SCALE")
         if scale_text:
             try:
@@ -830,7 +830,9 @@ class PetRuntime:
                 scale = 1.0
         else:
             max_edge = float(self.max_size)
-            scale = min(1.0, max_edge / max(width, height))
+            scale = max_edge / max(width, height)
+            if not allow_upscale:
+                scale = min(1.0, scale)
 
         target_width = max(80, int(round(width * scale)))
         target_height = max(80, int(round(height * scale)))
@@ -853,7 +855,7 @@ class PetRuntime:
     def set_size(self, params: Dict[str, Any]) -> None:
         self._apply_max_size_param(params)
         if self.model_size is not None:
-            self._resize_to_model_size(*self.model_size)
+            self._resize_to_model_size(*self.model_size, allow_upscale=True)
         else:
             try:
                 self.window.resize(self.max_size, self.max_size)

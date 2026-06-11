@@ -33,6 +33,7 @@ interface SpriteState {
   frameCount?: number
   durationMs?: number
   frameDurationMs?: number
+  frameDurations?: number[]
 }
 
 interface SpritesheetLoadPayload {
@@ -65,8 +66,10 @@ let spriteImage: HTMLImageElement | null = null
 let spriteAtlas: SpritesheetLoadPayload['atlas'] | null = null
 let spriteStates: Record<string, SpriteState> = {}
 let spriteState = 'idle'
+let spriteBaseState = 'idle'
 let spriteFrame = 0
 let spriteTimer: number | undefined
+let spriteReady = false
 let latestMouse: { x: number; y: number } | null = null
 let smoothedMouse: { x: number; y: number } | null = null
 let mouseTickerStarted = false
@@ -155,6 +158,9 @@ function clearSpritesheet() {
   spriteImage = null
   spriteAtlas = null
   spriteStates = {}
+  spriteReady = false
+  spriteBaseState = 'idle'
+  spriteState = 'idle'
   spritesheetContext.clearRect(0, 0, spritesheetCanvas.width, spritesheetCanvas.height)
 }
 
@@ -273,47 +279,79 @@ function resizeLive2D() {
 }
 
 function loadSpritesheet(payload: SpritesheetLoadPayload) {
+  setLoading(true)
   setRenderer('spritesheet')
   lastError = null
   destroyLive2D()
   currentKeys = {}
   clearKeyOverlays()
   setBackground(null)
+  clearSpritesheet()
   spriteAtlas = payload.atlas
   spriteStates = payload.states
-  spriteState = 'idle'
+  spriteBaseState = spriteStates.idle ? 'idle' : Object.keys(spriteStates)[0] ?? 'idle'
+  spriteState = spriteBaseState
   spriteFrame = 0
+  spriteReady = false
   spriteImage = new Image()
-  spriteImage.onload = () => drawSpriteFrame()
+  spriteImage.onload = () => {
+    spriteReady = true
+    drawSpriteFrame()
+    setLoading(false)
+  }
+  spriteImage.onerror = () => {
+    lastError = `failed to load spritesheet: ${payload.image}`
+    spriteReady = false
+    setLoading(false)
+  }
   spriteImage.src = payload.image
 }
 
 function drawSpriteFrame() {
-  if (!spriteImage || !spriteAtlas) return
+  if (!spriteImage || !spriteAtlas || !spriteReady) return
   const state = spriteStates[spriteState] ?? spriteStates.idle ?? Object.values(spriteStates)[0]
   if (!state) return
   const frames = Math.max(1, state.frames ?? state.frameCount ?? 1)
   const row = state.row ?? 0
   const column = state.column ?? 0
-  const sx = (column + (spriteFrame % frames)) * spriteAtlas.cellWidth
+  const frameIndex = spriteFrame % frames
+  const sx = (column + frameIndex) * spriteAtlas.cellWidth
   const sy = row * spriteAtlas.cellHeight
   spritesheetCanvas.width = window.innerWidth
   spritesheetCanvas.height = window.innerHeight
   spritesheetContext.clearRect(0, 0, spritesheetCanvas.width, spritesheetCanvas.height)
+  const scale = Math.min(window.innerWidth / spriteAtlas.cellWidth, window.innerHeight / spriteAtlas.cellHeight)
+  const dw = Math.max(1, Math.round(spriteAtlas.cellWidth * scale))
+  const dh = Math.max(1, Math.round(spriteAtlas.cellHeight * scale))
+  const dx = Math.round((window.innerWidth - dw) / 2)
+  const dy = Math.round((window.innerHeight - dh) / 2)
   spritesheetContext.drawImage(
     spriteImage,
     sx,
     sy,
     spriteAtlas.cellWidth,
     spriteAtlas.cellHeight,
-    0,
-    0,
-    window.innerWidth,
-    window.innerHeight,
+    dx,
+    dy,
+    dw,
+    dh,
   )
   spriteFrame += 1
-  const duration = Math.max(30, state.durationMs ?? state.frameDurationMs ?? 120)
+  const duration = Math.max(30, state.frameDurations?.[frameIndex] ?? state.durationMs ?? state.frameDurationMs ?? 120)
+  if (spriteTimer) {
+    window.clearTimeout(spriteTimer)
+    spriteTimer = undefined
+  }
   spriteTimer = window.setTimeout(drawSpriteFrame, duration)
+}
+
+function selectSpriteState(state: string) {
+  const next = spriteStates[state] ? state : (spriteStates.idle ? 'idle' : Object.keys(spriteStates)[0] ?? 'idle')
+  if (spriteState !== next) {
+    spriteFrame = 0
+  }
+  spriteState = next
+  if (spriteReady) drawSpriteFrame()
 }
 
 function setParameter(id: string, value: number | boolean) {
@@ -440,6 +478,11 @@ function releaseKey(key: string) {
 }
 
 function pressKey(key: string, pressed: boolean, autoReleaseMs = 0) {
+  if (activeRenderer === 'spritesheet') {
+    selectSpriteState(pressed ? (spriteStates.running ? 'running' : spriteBaseState) : spriteBaseState)
+    return
+  }
+
   const normalized = supportedKey(key)
   if (!normalized) return
 
@@ -473,6 +516,19 @@ function pressKey(key: string, pressed: boolean, autoReleaseMs = 0) {
 }
 
 function mouseButton(button: string, pressed: boolean) {
+  if (activeRenderer === 'spritesheet') {
+    if (!pressed) {
+      selectSpriteState(spriteBaseState)
+    } else if (button === 'right' && spriteStates.waving) {
+      selectSpriteState('waving')
+    } else if (spriteStates.jumping) {
+      selectSpriteState('jumping')
+    } else {
+      selectSpriteState(spriteBaseState)
+    }
+    return
+  }
+
   if (button === 'left') setParameter('ParamMouseLeftDown', pressed)
   if (button === 'right') setParameter('ParamMouseRightDown', pressed)
 }
@@ -532,9 +588,8 @@ function mouseMove(xRatio: number, yRatio: number) {
 }
 
 function setState(state: string) {
-  spriteState = state || 'idle'
-  spriteFrame = 0
-  if (spriteImage) drawSpriteFrame()
+  spriteBaseState = state || 'idle'
+  selectSpriteState(spriteBaseState)
 }
 
 function handleWheel(event: WheelEvent) {
@@ -581,6 +636,11 @@ window.cbPet = {
     return {
       renderer: activeRenderer,
       live2dReady,
+      spriteReady,
+      spriteCellWidth: spriteAtlas?.cellWidth ?? null,
+      spriteCellHeight: spriteAtlas?.cellHeight ?? null,
+      spriteState,
+      spriteFrame,
       modelWidth: model?.width ?? null,
       modelHeight: model?.height ?? null,
       modelNaturalWidth: live2dModelSize?.width ?? null,

@@ -75,7 +75,14 @@ def make_spritesheet_package(root: Path) -> Path:
             "displayName": "Sprite Cat",
             "renderer": "spritesheet",
             "spritesheetPath": "atlas.png",
-            "atlas": {"width": 1536, "height": 1872, "columns": 8, "rows": 9},
+            "atlas": {
+                "width": 1536,
+                "height": 1872,
+                "columns": 8,
+                "rows": 9,
+                "cellWidth": 192,
+                "cellHeight": 208,
+            },
             "states": {"idle": {"row": 0, "frames": 8, "durationMs": 120}},
         }),
         encoding="utf-8",
@@ -308,6 +315,54 @@ class TestPetRuntimePayload(unittest.TestCase):
                 self.assertEqual(auto_payload["hiddenPartIds"], ["Part28"])
             finally:
                 runtime.shutdown()
+
+    def test_spritesheet_payload_uses_manifest_and_asset_server(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            source = make_spritesheet_package(Path(td))
+            runtime = pet_runtime.PetRuntime()
+            try:
+                manifest = json.loads((source / "pet.json").read_text(encoding="utf-8"))
+                payload = runtime._build_spritesheet_payload(source, manifest)
+                self.assertIsNotNone(payload)
+                assert payload is not None
+                self.assertEqual(payload["renderer"], "spritesheet")
+                self.assertEqual(payload["atlas"]["cellWidth"], 192)
+                self.assertEqual(payload["atlas"]["cellHeight"], 208)
+                self.assertTrue(str(payload["image"]).startswith("http://127.0.0.1:"))
+
+                with urllib.request.urlopen(payload["image"], timeout=2) as response:
+                    self.assertEqual(response.read(), b"png")
+            finally:
+                runtime.shutdown()
+
+    def test_spritesheet_status_resizes_window_to_cell_aspect(self) -> None:
+        class FakeWindow:
+            x = 80
+            y = 80
+            width = 420
+            height = 420
+
+            def resize(self, width: int, height: int) -> None:
+                self.width = width
+                self.height = height
+
+            def move(self, x: int, y: int) -> None:
+                self.x = x
+                self.y = y
+
+        runtime = pet_runtime.PetRuntime()
+        runtime.window = FakeWindow()
+        runtime.max_size = 420
+
+        runtime._resize_window_to_status({
+            "renderer": "spritesheet",
+            "spriteReady": True,
+            "spriteCellWidth": 192,
+            "spriteCellHeight": 208,
+        })
+
+        self.assertEqual(runtime.window.width, 388)
+        self.assertEqual(runtime.window.height, 420)
 
     def test_key_names_match_bongocat_assets(self) -> None:
         self.assertEqual(pet_runtime._key_name(pet_runtime.keyboard.Key.space), "Space")
