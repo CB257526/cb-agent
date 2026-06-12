@@ -89116,10 +89116,11 @@ ${e}`);
           background.style.display = "none";
         }
       }
+      const PIXI_INIT_TIMEOUT_MS = 12000;
       async function ensureApp() {
         if (app) return app;
         app = new import_pixi11.Application();
-        await app.init({
+        const initPromise = app.init({
           view: live2dCanvas,
           resizeTo: window,
           background: "rgba(0,0,0,0)",
@@ -89136,6 +89137,12 @@ ${e}`);
             preserveDrawingBuffer: true
           }
         });
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`PIXI Application.init() timed out after ${PIXI_INIT_TIMEOUT_MS}ms`));
+          }, PIXI_INIT_TIMEOUT_MS);
+        });
+        await Promise.race([initPromise, timeoutPromise]);
         app.start();
         return app;
       }
@@ -89531,7 +89538,11 @@ ${e}`);
           if (payload.renderer === "spritesheet") {
             loadSpritesheet(payload);
           } else {
-            void loadLive2D(payload);
+            loadLive2D(payload).catch((err) => {
+              lastError = err instanceof Error ? err.message : String(err);
+              console.error("loadLive2D failed:", err);
+              setLoading(false);
+            });
           }
         },
         pressKey,

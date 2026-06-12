@@ -28,6 +28,8 @@ dependencies = [
     "qrcode>=7.4",            # 微信 OC 扫码登录终端二维码
     "Pillow>=10.0",           # 轻量桌宠 runtime 的 PNG / spritesheet 渲染
     "pywebview>=6.2",         # 轻量桌宠 WebView Live2D 渲染窗口
+    "qtpy>=2.4",              # Qt 后端抽象层
+    "PySide6>=6.7",           # Qt WebEngine（Chromium 90+）
     "pynput>=1.8",            # 全局键盘 / 鼠标监听
     "json5>=0.9",             # 兼容 BongoCat / Cubism JSON5 模型文件
 ]
