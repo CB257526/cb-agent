@@ -44,14 +44,12 @@ class TestMultimodalInput(unittest.TestCase):
         ConstantLLM.llm_dict["mm-test"] = {
             "is_tool": True,
             "is_reasoning": False,
-            "json_output": True,
             "max_tokens": 100000,
             "image_ability": True,
         }
         ConstantLLM.llm_dict["text-test"] = {
             "is_tool": True,
             "is_reasoning": False,
-            "json_output": True,
             "max_tokens": 100000,
             "image_ability": False,
         }

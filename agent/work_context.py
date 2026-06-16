@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from core.message import Message
+from agent.message_protocol import drop_orphan_tool_message_objects
 from utils.common import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -145,77 +146,147 @@ def _message_kind(message: Message) -> str:
     return str(meta.get("kind") or "")
 
 
-def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
-    """把 compact.json 里的轻量 history payload 还原为 Message。
+def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
+    """把 Message 序列化成可落盘且可往返还原的 dict。
 
-    compact 快照保存的是 TUI/RPC 也能理解的 `{role, content, kind}`，而不是
-    OpenAI 原始 message。这里故意只恢复 user/assistant/system 三类普通文本：
-    tool message、tool_call_id、assistant.tool_calls 都不允许跨轮恢复。
+    与旧的 _history_message_to_payload（仅返回 role/content/kind 的轻量 UI 视图）
+    不同，这个 helper 用于 transcript.jsonl 与 compact.json 的持久化：
+    - 保留 assistant.tool_calls（含 OpenAI function 字段）
+    - 保留 tool 消息的 tool_call_id 与 name
+    - 保留 metadata.kind 用于识别 compact_boundary
+    这样跨轮恢复时可以原样把 tool_use + tool_result 块塞回 messages，让模型
+    看到上一轮真实工具调用细节（CC 同款累积模式）。
+    """
+    role = message.role.value if hasattr(message.role, "value") else str(message.role)
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    payload: Dict[str, Any] = {"role": role}
+    # content 可能是字符串或多模态数组（仅 user 角色）。tool 消息的 content
+    # 必须保留为字符串。assistant 没有 content 但有 tool_calls 时 content=None。
+    payload["content"] = message.content
+    if message.tool_calls:
+        payload["tool_calls"] = message.tool_calls
+    if message.tool_call_id:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.tool_name:
+        payload["tool_name"] = message.tool_name
+    kind = metadata.get("kind")
+    if kind:
+        payload["kind"] = str(kind)
+    return payload
+
+
+def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
+    """把持久化 payload 还原为 Message。
+
+    支持的 role：user / system / assistant（可带 tool_calls）/ tool。
+    旧 compact.json 里的轻量结构（仅 role/content/kind）也仍能恢复成普通文本
+    消息——这条路径主要服务破坏性更新前可能残留的旧快照。
     """
     if not isinstance(payload, dict):
         return None
     role = str(payload.get("role") or "")
-    content = str(payload.get("content") or "")
+    content = payload.get("content")
     kind = payload.get("kind")
-    if not content:
-        return None
+    tool_calls = payload.get("tool_calls")
+    tool_call_id = payload.get("tool_call_id") or ""
+    tool_name = payload.get("tool_name") or payload.get("name") or ""
+
     if role == "user":
-        msg = Message.create_user_message(content)
+        # user 消息可能是多模态 list，也可能是字符串。空内容跳过。
+        if isinstance(content, list):
+            if not content:
+                return None
+            msg = Message(role="user", content=content)
+        else:
+            text = str(content or "")
+            if not text:
+                return None
+            msg = Message.create_user_message(text)
     elif role == "system":
-        msg = Message.create_system_message(content)
+        text = str(content or "")
+        if not text:
+            return None
+        msg = Message.create_system_message(text)
+    elif role == "tool":
+        # tool 消息必须有 tool_call_id 才能跟 assistant.tool_calls 配对。
+        # 缺失时无法回灌（OpenAI 协议会 400），直接丢弃。
+        if not tool_call_id:
+            return None
+        msg = Message.create_tool_message(
+            tool_call_id=str(tool_call_id),
+            tool_name=str(tool_name),
+            tool_output=str(content or ""),
+        )
+    elif role == "assistant":
+        # assistant 至少要有 content 或 tool_calls 之一才有意义。
+        text = content if isinstance(content, str) else (str(content) if content else None)
+        if not text and not tool_calls:
+            return None
+        msg = Message.create_assistant_message(
+            input_text=text,
+            tool_calls=tool_calls if isinstance(tool_calls, list) else None,
+        )
     else:
-        msg = Message.create_assistant_message(content)
+        return None
+
     if kind:
         msg.metadata = {"kind": str(kind)}
     return msg
 
 
 def _messages_from_transcript_item(item: Dict[str, Any]) -> List[Message]:
-    """把 transcript.jsonl 的单轮记录还原成普通 history 消息。
+    """把 transcript.jsonl 的单轮记录还原成 history 消息序列。
 
-    transcript 仍然是审计源：每行是一轮 user/final/work_record。compact 恢复时
-    只会读取 compact 之后新增的行；未 compact 的旧会话则读取全部行。无论哪种
-    情况，都不还原 trace_entries 里的工具协议细节。
+    新格式：item["messages"] 是本轮提交到 history 的完整消息列表（含 user、
+    assistant 含 tool_calls、role=tool、final assistant）。直接逐条还原即可。
+
+    旧格式（破坏性更新前）会有 user_query/final_answer/work_record 字段——
+    这条路径不再支持，旧 session 启动时会被破坏性清理。
     """
-    messages: List[Message] = []
-    user_query = item.get("user_query")
-    final_answer = item.get("final_answer")
-    work_record = item.get("work_record")
-    if user_query:
-        messages.append(Message.create_user_message(str(user_query)))
-    if final_answer:
-        messages.append(Message.create_assistant_message(str(final_answer)))
-    if work_record:
-        messages.append(_create_work_record_message(str(work_record)))
-    return messages
+    raw_messages = item.get("messages")
+    if not isinstance(raw_messages, list):
+        return []
+    out: List[Message] = []
+    for payload in raw_messages:
+        msg = _message_payload_to_message(payload)
+        if msg is not None:
+            out.append(msg)
+    return out
 
 
 def _trim_restored_history(messages: List[Message], max_messages: int) -> List[Message]:
-    """按恢复窗口裁剪 history，并尽量保留最近一次 compact 锚点。
+    """按恢复窗口裁剪 history，并尽量保留最近一次 compact_boundary。
 
     普通恢复直接取尾部 max_messages 即可；但 compact 后的第一条消息是
-    `【上下文压缩】`，它承担旧上下文摘要的职责。如果后续新消息很多，简单尾裁剪
-    会把 compact 锚点挤掉，导致旧任务状态丢失。因此这里优先保留最近一条
-    compact_record，再用剩余窗口装 compact 之后的最新消息。
+    `【上下文压缩】` boundary，它承担早期上下文摘要的职责。如果后续新消息
+    很多，简单尾裁剪会把 boundary 挤掉，导致早期任务状态丢失。因此这里
+    优先保留最近一个 compact_boundary，再用剩余窗口装其后的最新消息。
+
+    CC 模式下 history 累积的是原始协议消息(assistant.tool_calls / role=tool),
+    任何尾裁剪/anchor+tail 都可能把 assistant.tool_calls 切掉而留下它的 tool
+    响应,形成"孤儿 tool"。跨进程恢复后第一轮就把它发给 LLM 会触发 OpenAI
+    兼容协议 400。因此截断后统一过一遍孤儿清理——这是 _build_chat_messages
+    切片清理之外的第二道保险(防止恢复进内存的 history 本身就不合法)。
     """
     if max_messages <= 0:
         return []
     if len(messages) <= max_messages:
-        return messages
+        return drop_orphan_tool_message_objects(messages)
 
-    compact_idx = None
+    boundary_idx = None
     for idx, message in enumerate(messages):
-        if _message_kind(message) == "compact_record":
-            compact_idx = idx
+        if _message_kind(message) == "compact_boundary":
+            boundary_idx = idx
 
-    if compact_idx is None:
-        return messages[-max_messages:]
+    if boundary_idx is None:
+        return drop_orphan_tool_message_objects(messages[-max_messages:])
 
-    anchor = messages[compact_idx]
+    anchor = messages[boundary_idx]
     tail_capacity = max_messages - 1
     if tail_capacity <= 0:
         return [anchor]
-    return [anchor] + messages[compact_idx + 1:][-tail_capacity:]
+    trimmed = [anchor] + messages[boundary_idx + 1:][-tail_capacity:]
+    return drop_orphan_tool_message_objects(trimmed)
 
 
 def _extract_tool_call_name(call: Dict[str, Any]) -> str:
@@ -329,13 +400,17 @@ class TraceEntry:
 
 @dataclass
 class WorkRecord:
-    """一轮对话结束后生成的工作记录。
+    """一轮对话结束后提取的结构化工作记录。
 
-    ``text`` 会作为普通 assistant 消息追加到 ``AgentSession.history``；
-    其他字段用于更新 state.json。这样即时上下文和长期恢复使用同一份事实，
-    但注入位置不同：text 进入 [Context]，state_text 进入更高优先级的 [State]。
+    Claude Code 对齐重构后，``text`` 字段保留但不再被注入 history。原始
+    assistant.tool_calls / role=tool 消息会按累积模式直接进入下一轮 prompt，
+    上一轮工具细节不再依赖文本摘要。
+
+    其他字段（files_seen / files_modified / recent_commands / decisions / pending）
+    继续用于更新 state.json，state.json 仍作为独立 user message 注入。这层
+    结构化提取与原始消息累积互补，不冲突。
     """
-    text: str
+    text: str = ""
     trace_entries: List[TraceEntry] = field(default_factory=list)
     files_seen: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     files_modified: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -356,14 +431,15 @@ class WorkRecord:
 
 
 class RuleTraceSummarizer:
-    """纯规则工作记录生成器。
+    """纯规则结构化提取器。
 
-    它有两个用途：
-    1. trace 较小时直接生成 ``【工作记录】``，避免额外 LLM 调用；
-    2. trace 较大但静默 LLM 总结失败时作为兜底。
+    Claude Code 对齐重构后，这个类不再生成 `【工作记录】` 文本注入 history。
+    它只从工具轨迹里抽取结构化字段（files_seen / files_modified /
+    recent_commands），用于更新 state.json。state.json 通过独立 user message
+    注入下一轮 prompt，与原始消息累积模式互补。
 
-    规则总结只做字段提取和短句拼接，不尝试推理新结论，因此稳定、便宜、
-    不会把 summarizer 的失败传染给主对话流程。
+    text 字段保留但置空，是为了保持 WorkRecord 接口稳定（trace_entries 仍可
+    被 LocalSessionStore 选择性落盘做审计）。
     """
 
     def summarize(
@@ -373,21 +449,14 @@ class RuleTraceSummarizer:
         final_answer: str,
         trace_entries: Sequence[TraceEntry],
     ) -> WorkRecord:
-        del final_answer
+        del user_query, final_answer
         files_seen: Dict[str, Dict[str, Any]] = {}
         files_modified: Dict[str, Dict[str, Any]] = {}
         recent_commands: List[Dict[str, Any]] = []
-        lines: List[str] = []
-
-        if user_query:
-            lines.append(f"用户任务：{_clip(user_query, 120)}")
 
         for entry in trace_entries:
             meta = entry.metadata
             if entry.name == "file_read":
-                # file_read 是代码任务里最重要的上下文来源。这里保存路径、
-                # 读取模式和行数信息，以及最多 100 字符的正文预览；完整正文
-                # 只存在于本轮 messages，不进入 history/transcript/state。
                 path = str(meta.get("path") or entry.arguments.get("path") or "")
                 if path:
                     files_seen[path] = {
@@ -398,18 +467,9 @@ class RuleTraceSummarizer:
                         "summary": _clip(meta.get("content_preview") or entry.result_summary, FILE_SUMMARY_LIMIT),
                         "last_seen_at": entry.timestamp,
                     }
-                    lines.append(
-                        "读取文件："
-                        f"{path} ({meta.get('mode') or 'unknown'}, "
-                        f"returned={meta.get('returned_lines')}) "
-                        f"{_clip(meta.get('content_preview') or entry.result_summary, 120)}"
-                    )
                 continue
 
             if entry.name == "file_write":
-                # file_write 的入参 content 已在 _summarize_arguments 中丢弃。
-                # 这里仅记录写入结果和粗粒度行数变化，方便下一轮知道哪些文件
-                # 已经被 agent 改过。
                 path = str(meta.get("path") or entry.arguments.get("path") or "")
                 if path:
                     files_modified[path] = {
@@ -418,16 +478,9 @@ class RuleTraceSummarizer:
                         "summary": _clip(entry.result_summary or meta.get("message"), FILE_SUMMARY_LIMIT),
                         "last_modified_at": entry.timestamp,
                     }
-                    lines.append(
-                        f"修改文件：{path} "
-                        f"(+{meta.get('lines_added')}/-{meta.get('lines_removed')})"
-                    )
                 continue
 
             if entry.name in {"bash", "bash_task"}:
-                # bash 输出通常很大，而且可能已经由 BashTool 单独落到
-                # .cbagent/bash_outputs。跨轮上下文只需要命令、cwd、退出码、
-                # 简短输出摘要和 output_file 引用。
                 command = str(meta.get("command") or entry.arguments.get("command") or "")
                 if not command and entry.name == "bash_task":
                     command = f"bash_task {entry.arguments.get('action', '')}".strip()
@@ -441,27 +494,13 @@ class RuleTraceSummarizer:
                 if meta.get("output_file"):
                     item["output_file"] = meta.get("output_file")
                 recent_commands.append(item)
-                lines.append(
-                    f"执行命令：{_clip(command, 120)} "
-                    f"(exit={meta.get('exit_code')}, cwd={meta.get('cwd')}) "
-                    f"{_clip(entry.result_summary, 100)}"
-                )
                 continue
-
-            lines.append(
-                f"调用工具：{entry.name} "
-                f"{_clip(entry.result_summary, 120)}"
-            )
 
         if not trace_entries:
             return WorkRecord(text="", trace_entries=[])
 
-        text = "【工作记录】" + "\n".join(lines)
-        if len(text) > WORK_RECORD_LIMIT:
-            text = _clip(text, WORK_RECORD_LIMIT)
-
         return WorkRecord(
-            text=text,
+            text="",
             trace_entries=list(trace_entries),
             files_seen=files_seen,
             files_modified=files_modified,
@@ -470,14 +509,14 @@ class RuleTraceSummarizer:
 
 
 class TraceSummarizer:
-    """静默 LLM 工作记录压缩器。
+    """LLM 静默工作记录压缩器（已退役）。
 
-    它直接调用 OpenAI-compatible client，且强制 ``stream=False``。这里绝对
-    不走 ``llm.think()``，原因是 think() 是主回答路径，会向 EventBus 发
-    TextDelta/ReasoningDelta，前端会把 summarizer 的内容误当成助手回答。
+    Claude Code 对齐重构后，跨轮 history 直接累积原始 tool_use + tool_result
+    消息，不再注入【工作记录】文本。这个类只剩下"返回结构化字段"的语义，
+    实现上等同 RuleTraceSummarizer。
 
-    如果没有传入 llm、llm 没有 client/model，或静默调用失败，就直接返回
-    RuleTraceSummarizer 的结果。总结能力是增强项，不能影响主对话完成。
+    保留类名是为了兼容 run_agent.py 的现有装配代码——外部依赖注入还是会
+    传 llm 进来，构造器忽略它即可，未来可彻底删除这个类。
     """
 
     def __init__(
@@ -485,7 +524,7 @@ class TraceSummarizer:
         llm: Optional[Any] = None,
         fallback: Optional[RuleTraceSummarizer] = None,
     ) -> None:
-        self.llm = llm
+        del llm  # 不再使用 LLM 静默调用
         self.fallback = fallback or RuleTraceSummarizer()
 
     def summarize(
@@ -495,60 +534,11 @@ class TraceSummarizer:
         final_answer: str,
         trace_entries: Sequence[TraceEntry],
     ) -> WorkRecord:
-        # 先生成规则版记录。即使后面的 LLM 调用成功，也复用它里面提取好的
-        # files_seen/files_modified/recent_commands 等结构化状态，只替换 text。
-        fallback_record = self.fallback.summarize(
+        return self.fallback.summarize(
             user_query=user_query,
             final_answer=final_answer,
             trace_entries=trace_entries,
         )
-        client = getattr(self.llm, "client", None)
-        model = getattr(self.llm, "model", None)
-        if client is None or not model:
-            return fallback_record
-
-        # 给 LLM 的输入只包含 trace 的单行摘要，不包含原始文件正文或完整 stdout。
-        # 因此即便 trace_entries 来自 file_read/bash，也不会把大输出二次送入
-        # summarizer。
-        trace_text = "\n".join(e.to_line() for e in trace_entries)
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=0,
-                stream=False,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是会话工作记录压缩器。把工具轨迹压缩成一条中文工作记录，"
-                            "只保留对下一轮继续任务有帮助的事实：看过/改过的文件、命令、"
-                            "关键结论、待办。不要编造。输出不超过600字，并以【工作记录】开头。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"用户任务：{user_query}\n\n"
-                            f"最终回答：{_clip(final_answer, 500)}\n\n"
-                            f"工具轨迹：\n{trace_text}"
-                        ),
-                    },
-                ],
-            )
-            content = response.choices[0].message.content or ""
-        except Exception:
-            logger.exception("silent trace summary failed")
-            return fallback_record
-
-        # LLM 只负责把文字表达得更紧凑；结构化状态仍以规则提取为准。
-        # 这样可以降低幻觉对 state.json 的影响。
-        content = _clip(content, WORK_RECORD_LIMIT)
-        if not content:
-            return fallback_record
-        if not content.startswith("【工作记录】"):
-            content = "【工作记录】" + content
-        fallback_record.text = _clip(content, WORK_RECORD_LIMIT)
-        return fallback_record
 
 
 class TraceCollector:
@@ -901,21 +891,19 @@ class LocalSessionStore:
         }
 
     def load_latest_history(self, max_messages: int = 12) -> List[Message]:
-        """从 transcript 恢复最近 history。
+        """从 transcript 恢复最近 history（CC 模式：raw messages 累积）。
 
-        未执行过 /compact 的会话，会从 transcript 恢复最近 history。transcript
-        每轮最多恢复三条普通对话消息：
-        1. user_query -> user message；
-        2. final_answer -> assistant message；
-        3. work_record -> assistant message，content 以【工作记录】开头。
+        新格式：每条 transcript 记录的 ``messages`` 字段是本轮 commit 到 history
+        的完整消息列表，含 user / assistant(可带 tool_calls) / role=tool / final
+        assistant。恢复时按顺序还原即可，模型在新一轮就能看到上一轮真实工具
+        调用细节。
 
-        执行过 /compact 的会话，会优先读取 compact.json：
-        1. 先恢复 compact 快照中的 `【上下文压缩】` 锚点和压缩后保留的最近消息；
-        2. 再从 transcript 的 compact_offset 之后补上新轮次；
-        3. 旧 transcript 保留在磁盘用于审计，但不会重新灌进 prompt。
+        执行过 /compact 的会话仍然优先读 compact.json：里面的 ``history``
+        字段保存了 compact 时刻的 boundary 之后消息（含 boundary system 消息
+        本身）。transcript_offset 之后的新轮再追加。
 
-        不恢复 role=tool，也不恢复 assistant.tool_calls。跨轮恢复的是对话和工作
-        摘要，而不是上一轮工具协议状态。
+        旧格式（user_query/final_answer/work_record 三段式）已不再支持；
+        破坏性更新已确认，旧目录在启动期清空。
         """
         if not self.active_session_id:
             return []
@@ -1125,13 +1113,19 @@ class LocalSessionStore:
         *,
         user_query: str,
         final_answer: str,
-        work_record: Optional[WorkRecord],
+        committed_messages: List[Message],
+        work_record: Optional[WorkRecord] = None,
     ) -> None:
         """追加一轮 transcript，并同步更新 state.json。
 
-        transcript 是审计/恢复用的逐轮记录；state 是给模型下一轮快速使用的
-        滚动摘要。两者都只保存压缩后的 work_record/trace_entries，不保存完整
-        工具输出。
+        新格式（CC 对齐）：transcript 行包含本轮提交进 history 的完整 messages
+        序列（user / assistant 含 tool_calls / role=tool / final assistant），
+        恢复时直接逐条还原即可。这意味着 transcript 行的体积会比旧格式大，但
+        换来的是跨进程恢复时模型仍能看到原始 tool_use + tool_result 配对。
+
+        work_record 仅用于驱动 state.json 的结构化字段更新（files_seen /
+        recent_commands / decisions / pending）；它的 text 字段已废弃，不再
+        参与 history 注入或 transcript 持久化。
         """
         self.ensure_active()
         self.active_dir.mkdir(parents=True, exist_ok=True)
@@ -1139,7 +1133,7 @@ class LocalSessionStore:
             "ts": _now_iso(),
             "user_query": user_query,
             "final_answer": final_answer,
-            "work_record": work_record.text if work_record else "",
+            "messages": [_message_to_persist_payload(m) for m in committed_messages],
             "trace_entries": (
                 [e.to_dict() for e in work_record.trace_entries]
                 if work_record and self.persist_trace_entries else []
@@ -1161,17 +1155,17 @@ class LocalSessionStore:
         合并策略是"新事实覆盖旧事实"：
         - 同一路径的 files_seen/files_modified 用最新摘要覆盖；
         - recent_commands 只保留最近 N 条；
-        - rolling_summary 采用追加后截断，避免无限增长。
+        - decisions/pending 追加后截尾。
+
+        重构后 record.text 不再参与（它已经废弃，CC 模式下原始 tool_use +
+        tool_result 直接存进 transcript），rolling_summary 只由 /compact 路径
+        通过 last_compact_summary 维护。
         """
         state = self.state or self._new_state()
         state["updated_at"] = _now_iso()
         state["turn_count"] = int(state.get("turn_count") or 0) + 1
         if user_query:
             state["active_task"] = _clip(user_query, 200)
-        if record.text:
-            current = str(state.get("rolling_summary") or "")
-            merged = (current + "\n" + record.text).strip() if current else record.text
-            state["rolling_summary"] = _clip(merged, ROLLING_SUMMARY_LIMIT)
 
         files_seen = state.setdefault("files_seen", {})
         if isinstance(files_seen, dict):
@@ -1324,40 +1318,6 @@ class LocalSessionStore:
         tmp.replace(path)
 
 
-def _create_work_record_message(text: str) -> Message:
-    """把工作记录包装成普通 assistant message。
-
-    这里故意不用 role=tool：tool message 必须有对应的 tool_call_id，且只在
-    同一轮 OpenAI tool calling 协议中合法。跨轮工作记录是普通文本背景。
-    """
-    msg = Message.create_assistant_message(text)
-    msg.metadata = {"kind": "work_record"}
-    return msg
-
-
-def _create_compact_record_message(text: str) -> Message:
-    """把 /compact 摘要包装成普通 assistant message。
-
-    compact record 和 work record 一样，都是给下一轮模型看的普通背景文本，
-    不是工具协议消息。它的 metadata.kind 只服务本地恢复和 TUI 渲染；即使某些
-    旧路径丢了 metadata，content 里的 `【上下文压缩】` 前缀也足够让人类识别。
-    """
-    content = _clip(text, COMPACT_RECORD_LIMIT)
-    if not content.startswith("【上下文压缩】"):
-        content = "【上下文压缩】" + content
-    msg = Message.create_assistant_message(content)
-    msg.metadata = {"kind": "compact_record"}
-    return msg
-
-
-def make_work_record_message(record: WorkRecord) -> Message:
-    return _create_work_record_message(record.text)
-
-
-def make_compact_record_message(text: str) -> Message:
-    return _create_compact_record_message(text)
-
-
 __all__ = [
     "COMPACT_RECORD_LIMIT",
     "LocalSessionStore",
@@ -1366,6 +1326,4 @@ __all__ = [
     "TraceEntry",
     "TraceSummarizer",
     "WorkRecord",
-    "make_compact_record_message",
-    "make_work_record_message",
 ]

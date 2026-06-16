@@ -184,7 +184,6 @@ CBAGENT_LOG_DIR=.cbagent/logs
 
 - `is_tool`
 - `is_reasoning`
-- `json_output`
 - `max_tokens`
 - `image_ability`
 

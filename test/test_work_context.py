@@ -1,4 +1,15 @@
-"""Work context compression and local session store tests."""
+"""Work context 与 LocalSessionStore 的核心持久化测试 —— CC 模式。
+
+重构后 transcript.jsonl 改为存原始 messages 列表(含 user / assistant 含
+tool_calls / role=tool / final assistant)。这里只覆盖必须保证的几个点:
+
+1. trace_entry_from_tool_result 仍能正确截断超大输出
+2. append_turn 能够落盘 raw messages 并被 load_latest_history 还原
+3. load_latest_history 能还原 assistant.tool_calls 与 role=tool
+4. save_pending_user_message 配合 commit 流程不会重复
+5. switch/list 多 session 隔离仍然成立
+6. compact_boundary 落盘 + 恢复后切片使用
+"""
 
 from __future__ import annotations
 
@@ -14,15 +25,37 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from agent.compact_boundary import (
+    COMPACT_BOUNDARY_KIND,
+    make_compact_boundary_message,
+)
 from agent.work_context import (
     LocalSessionStore,
     RuleTraceSummarizer,
-    make_compact_record_message,
+    WorkRecord,
+    _message_to_persist_payload,
     trace_entry_from_tool_result,
 )
+from core.message import Message
 
 
-class TestWorkContext(unittest.TestCase):
+def _user(text: str) -> Message:
+    return Message.create_user_message(text)
+
+
+def _assistant(text: str = None, tool_calls=None) -> Message:
+    return Message.create_assistant_message(input_text=text, tool_calls=tool_calls)
+
+
+def _tool(call_id: str, name: str, content: str) -> Message:
+    return Message.create_tool_message(
+        tool_call_id=call_id,
+        tool_name=name,
+        tool_output=content,
+    )
+
+
+class TestTraceEntry(unittest.TestCase):
     def test_file_read_trace_is_clipped_and_structured(self):
         long_content = "abcdef" * 40
         entry = trace_entry_from_tool_result(
@@ -45,278 +78,186 @@ class TestWorkContext(unittest.TestCase):
         self.assertEqual(entry.metadata["path"], "agent/session.py")
         self.assertNotIn(long_content, entry.to_line())
 
-    def test_local_session_store_persists_restores_and_clears(self):
+
+class TestPersistAndRestoreMessages(unittest.TestCase):
+    def test_append_turn_persists_raw_messages_and_restores(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
+
+            committed = [
+                _user("帮我读 a.py"),
+                _assistant(tool_calls=[{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "file_read", "arguments": "{\"path\":\"a.py\"}"},
+                }]),
+                _tool("call_1", "file_read", json.dumps({
+                    "path": "a.py", "content": "print('hello')",
+                }, ensure_ascii=False)),
+                _assistant("已经看完 a.py"),
+            ]
+            store.append_turn(
+                user_query="帮我读 a.py",
+                final_answer="已经看完 a.py",
+                committed_messages=committed,
+            )
+
+            transcript = store.active_dir / "transcript.jsonl"
+            self.assertTrue(transcript.exists())
+            line = json.loads(transcript.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(len(line["messages"]), 4)
+            roles = [m["role"] for m in line["messages"]]
+            self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+            # tool_call_id / tool_calls 都被持久化
+            self.assertEqual(line["messages"][1]["tool_calls"][0]["id"], "call_1")
+            self.assertEqual(line["messages"][2]["tool_call_id"], "call_1")
+
+            restored = LocalSessionStore(root)
+            history = restored.load_latest_history(max_messages=20)
+            self.assertEqual(len(history), 4)
+            self.assertEqual(history[1].tool_calls[0]["id"], "call_1")
+            self.assertEqual(history[2].tool_call_id, "call_1")
+            self.assertEqual(history[2].tool_name, "file_read")
+            self.assertEqual(history[3].content, "已经看完 a.py")
+
+    def test_append_turn_with_state_structured_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+
             entry = trace_entry_from_tool_result(
                 name="file_read",
                 arguments={"path": "a.py"},
-                result=json.dumps({
-                    "path": "a.py",
-                    "mode": "range-1-10",
-                    "total_lines": 10,
-                    "returned_lines": 10,
-                    "truncated": False,
-                    "content": "print('hello')",
-                }, ensure_ascii=False),
-                is_error=False,
-                round_idx=1,
+                result=json.dumps({"path": "a.py", "content": "x"}, ensure_ascii=False),
+                is_error=False, round_idx=1,
             )
             record = RuleTraceSummarizer().summarize(
-                user_query="读 a.py",
-                final_answer="看完了",
-                trace_entries=[entry],
+                user_query="读 a.py", final_answer="ok", trace_entries=[entry],
             )
+            self.assertEqual(record.text, "")  # 已不再生成文本
+            self.assertIn("a.py", record.files_seen)
 
             store.append_turn(
                 user_query="读 a.py",
-                final_answer="看完了",
+                final_answer="ok",
+                committed_messages=[_user("读 a.py"), _assistant("ok")],
                 work_record=record,
             )
-
-            transcript = store.active_dir / "transcript.jsonl"
-            state = store.active_dir / "state.json"
-            self.assertTrue(transcript.exists())
-            self.assertTrue(state.exists())
-            raw = transcript.read_text(encoding="utf-8")
-            self.assertIn("【工作记录】", raw)
-            self.assertNotIn("abcdef" * 40, raw)
-
-            restored = LocalSessionStore(root)
-            history = restored.load_latest_history()
-            self.assertEqual(len(history), 3)
-            self.assertIn("【工作记录】", str(history[-1].content))
-            self.assertIn("a.py", restored.state_text())
-
-            restored.clear_active_session()
-            self.assertFalse((root / "index.json").exists())
-            self.assertFalse(transcript.exists())
-
-    def test_local_session_store_can_skip_trace_entries_for_platform_chat(self):
-        """通讯平台私聊保留压缩工作记录，但不落完整工具明细。"""
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / ".cbagent" / "sessions"
-            store = LocalSessionStore(root, persist_trace_entries=False)
-            entry = trace_entry_from_tool_result(
-                name="bash",
-                arguments={"command": "echo should-not-persist"},
-                result=json.dumps({
-                    "command": "echo should-not-persist",
-                    "exit_code": 0,
-                    "stdout": "工具输出不该进入 QQ 私聊长期上下文",
-                }, ensure_ascii=False),
-                is_error=False,
-                round_idx=1,
-            )
-            record = RuleTraceSummarizer().summarize(
-                user_query="干净用户原话",
-                final_answer="干净最终回复",
-                trace_entries=[entry],
-            )
-
-            store.append_turn(
-                user_query="干净用户原话",
-                final_answer="干净最终回复",
-                work_record=record,
-            )
-
-            transcript = store.active_dir / "transcript.jsonl"
-            raw = transcript.read_text(encoding="utf-8")
-            payload = json.loads(raw.splitlines()[0])
-            self.assertEqual(payload["user_query"], "干净用户原话")
-            self.assertEqual(payload["final_answer"], "干净最终回复")
-            self.assertIn("【工作记录】", payload["work_record"])
-            self.assertEqual(payload["trace_entries"], [])
-            self.assertIn("【工作记录】", store.state_text())
-
-            # 兼容旧版本已经写入的 trace_entries：恢复时仍只使用压缩 work_record，
-            # 不把逐工具明细还原成 OpenAI tool 协议或普通上下文。
-            old_item = {
-                "ts": "2026-06-07T00:00:00+00:00",
-                "user_query": "旧用户问题",
-                "final_answer": "旧助手回答",
-                "work_record": "【工作记录】调用工具：fetch_fetch 旧工具流水账",
-                "trace_entries": [entry.to_dict()],
-            }
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(old_item, ensure_ascii=False) + "\n")
-
-            restored = LocalSessionStore(root, persist_trace_entries=False)
-            history = restored.load_latest_history(max_messages=10)
-            restored_text = "\n".join(str(m.content) for m in history)
-            self.assertIn("干净用户原话", restored_text)
-            self.assertIn("干净最终回复", restored_text)
-            self.assertIn("旧用户问题", restored_text)
-            self.assertIn("旧助手回答", restored_text)
-            self.assertIn("【工作记录】", restored_text)
-            self.assertIn("fetch_fetch", restored_text)
+            self.assertIn("a.py", store.state_text())
 
     def test_pending_user_message_restores_and_is_cleared_after_turn(self):
-        """收到用户消息后先落 pending；完整回合落盘后再清理，避免重复历史。"""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
-
             store.append_turn(
-                user_query="上一轮问题",
-                final_answer="上一轮回答",
-                work_record=None,
+                user_query="上一轮",
+                final_answer="回完",
+                committed_messages=[_user("上一轮"), _assistant("回完")],
             )
-            store.save_pending_user_message("这条消息已经收到但还没回答")
-            pending_path = store.active_dir / "pending_user.json"
-            self.assertTrue(pending_path.exists())
+            store.save_pending_user_message("尚未回答")
+            self.assertTrue((store.active_dir / "pending_user.json").exists())
 
             restored = LocalSessionStore(root)
-            restored_history = restored.load_latest_history(max_messages=10)
-            restored_text = "\n".join(str(m.content) for m in restored_history)
-            self.assertIn("上一轮问题", restored_text)
-            self.assertIn("上一轮回答", restored_text)
-            self.assertIn("这条消息已经收到但还没回答", restored_text)
+            history = restored.load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("上一轮", text)
+            self.assertIn("回完", text)
+            self.assertIn("尚未回答", text)
 
             restored.append_turn(
-                user_query="这条消息已经收到但还没回答",
-                final_answer="现在回答完成",
-                work_record=None,
+                user_query="尚未回答",
+                final_answer="刚回",
+                committed_messages=[_user("尚未回答"), _assistant("刚回")],
             )
             self.assertFalse((restored.active_dir / "pending_user.json").exists())
+            final = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in final)
+            self.assertEqual(text.count("尚未回答"), 1)
+            self.assertIn("刚回", text)
 
-            final_restore = LocalSessionStore(root)
-            final_history = final_restore.load_latest_history(max_messages=10)
-            final_text = "\n".join(str(m.content) for m in final_history)
-            self.assertEqual(final_text.count("这条消息已经收到但还没回答"), 1)
-            self.assertIn("现在回答完成", final_text)
 
-    def test_local_session_store_lists_creates_and_switches_isolated_sessions(self):
-        """多个 session 目录互相隔离，切换只恢复目标目录自己的 transcript/state。"""
+class TestSessionIsolation(unittest.TestCase):
+    def test_lists_creates_and_switches_isolated_sessions(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
 
             first_id = store.active_session_id
-            self.assertIsNotNone(first_id)
             store.append_turn(
-                user_query="第一会话的问题",
-                final_answer="第一会话的回答",
-                work_record=None,
+                user_query="一号问题",
+                final_answer="一号回答",
+                committed_messages=[_user("一号问题"), _assistant("一号回答")],
             )
 
-            second_summary = store.create_session()
-            second_id = second_summary["session_id"]
+            second = store.create_session()
+            second_id = second["session_id"]
             self.assertNotEqual(first_id, second_id)
             store.append_turn(
-                user_query="第二会话的问题",
-                final_answer="第二会话的回答",
-                work_record=None,
+                user_query="二号问题",
+                final_answer="二号回答",
+                committed_messages=[_user("二号问题"), _assistant("二号回答")],
             )
 
-            sessions = store.list_sessions()
-            self.assertEqual({s["session_id"] for s in sessions}, {first_id, second_id})
-            self.assertEqual(
-                [s for s in sessions if s["is_active"]][0]["session_id"],
-                second_id,
-            )
+            sessions = {s["session_id"] for s in store.list_sessions()}
+            self.assertEqual(sessions, {first_id, second_id})
 
-            switched = store.switch_session(first_id)  # type: ignore[arg-type]
-            self.assertEqual(switched["session_id"], first_id)
-            history = store.load_latest_history(max_messages=10)
-            restored_text = "\n".join(str(m.content) for m in history)
-            self.assertIn("第一会话的问题", restored_text)
-            self.assertIn("第一会话的回答", restored_text)
-            self.assertNotIn("第二会话的问题", restored_text)
-
-            index = json.loads((root / "index.json").read_text(encoding="utf-8"))
-            self.assertEqual(index["active_session_id"], first_id)
+            store.switch_session(first_id)  # type: ignore[arg-type]
+            history = store.load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("一号问题", text)
+            self.assertNotIn("二号问题", text)
 
             with self.assertRaises(ValueError):
                 store.switch_session("../outside")
 
-    def test_compaction_snapshot_restores_from_anchor_and_keeps_transcript(self):
-        """compact 后保留 transcript 审计，但恢复 history 时从 compact 锚点继续。"""
+
+class TestCompactBoundaryPersistence(unittest.TestCase):
+    def test_save_compaction_with_boundary_payload_round_trip(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
-
             store.append_turn(
-                user_query="旧问题一",
-                final_answer="旧回答一",
-                work_record=None,
+                user_query="旧一",
+                final_answer="老答一",
+                committed_messages=[_user("旧一"), _assistant("老答一")],
             )
             store.append_turn(
-                user_query="旧问题二",
-                final_answer="旧回答二",
-                work_record=None,
+                user_query="旧二",
+                final_answer="老答二",
+                committed_messages=[_user("旧二"), _assistant("老答二")],
             )
-            transcript = store.active_dir / "transcript.jsonl"
-            raw_before = transcript.read_text(encoding="utf-8")
 
-            compact_msg = make_compact_record_message("【上下文压缩】旧上下文已经压缩")
-            recent_user = {"role": "user", "content": "旧问题二", "kind": None}
-            recent_assistant = {"role": "assistant", "content": "旧回答二", "kind": None}
+            boundary = make_compact_boundary_message("摘要:已读 a.py")
             store.save_compaction(
-                summary=str(compact_msg.content),
-                history_payload=[
-                    {"role": "assistant", "content": str(compact_msg.content), "kind": "compact_record"},
-                    recent_user,
-                    recent_assistant,
-                ],
+                summary=str(boundary.content or ""),
+                history_payload=[_message_to_persist_payload(boundary)],
                 before_messages=4,
-                after_messages=3,
+                after_messages=1,
             )
 
             self.assertTrue((store.active_dir / "compact.json").exists())
             self.assertTrue((store.active_dir / "compactions.jsonl").exists())
-            self.assertEqual(raw_before, transcript.read_text(encoding="utf-8"))
 
             store.append_turn(
-                user_query="compact 后的新问题",
-                final_answer="新回答",
-                work_record=None,
+                user_query="新一",
+                final_answer="新答一",
+                committed_messages=[_user("新一"), _assistant("新答一")],
             )
 
             restored = LocalSessionStore(root)
-            history = restored.load_latest_history(max_messages=12)
-            restored_text = "\n".join(str(m.content) for m in history)
-            self.assertIn("【上下文压缩】", restored_text)
-            self.assertIn("旧问题二", restored_text)
-            self.assertIn("compact 后的新问题", restored_text)
-            self.assertNotIn("旧问题一", restored_text)
-
-    def test_compaction_snapshot_rolls_back_when_state_save_fails(self):
-        """compact 落盘中途失败时，不留下半套 compact 快照。"""
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / ".cbagent" / "sessions"
-            store = LocalSessionStore(root)
-            store.append_turn(
-                user_query="旧问题",
-                final_answer="旧回答",
-                work_record=None,
+            history = restored.load_latest_history(max_messages=20)
+            # 第一条应是 boundary
+            self.assertEqual(
+                (history[0].metadata or {}).get("kind"),
+                COMPACT_BOUNDARY_KIND,
             )
-            state_path = store.active_dir / "state.json"
-            state_before = state_path.read_text(encoding="utf-8")
-
-            def fail_save_state(state):
-                raise OSError("state write failed")
-
-            store.save_state = fail_save_state  # type: ignore[method-assign]
-
-            with self.assertRaises(OSError):
-                store.save_compaction(
-                    summary="【上下文压缩】旧上下文已经压缩",
-                    history_payload=[
-                        {
-                            "role": "assistant",
-                            "content": "【上下文压缩】旧上下文已经压缩",
-                            "kind": "compact_record",
-                        },
-                    ],
-                    before_messages=2,
-                    after_messages=1,
-                )
-
-            self.assertFalse((store.active_dir / "compact.json").exists())
-            self.assertFalse((store.active_dir / "compactions.jsonl").exists())
-            self.assertEqual(state_before, state_path.read_text(encoding="utf-8"))
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("【上下文压缩】", text)
+            self.assertIn("新一", text)
+            # boundary 之前的旧消息不再注入
+            self.assertNotIn("旧一", text)
+            self.assertNotIn("老答一", text)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ from agent.transport import Gateway, StdioTransport, make_event_message, make_re
 from agent.work_context import LocalSessionStore
 from agent.pet import PetManager
 from constant.llm.constant_llm import ConstantLLM
+from core.message import Message
 from skills.skill_manager import SkillManager
 
 
@@ -379,7 +380,6 @@ class TestGatewayDispatch(unittest.TestCase):
             ConstantLLM.llm_dict["fake"] = {
                 "is_tool": True,
                 "is_reasoning": False,
-                "json_output": True,
                 "max_tokens": 100000,
                 "image_ability": True,
             }
@@ -452,12 +452,18 @@ class TestGatewayDispatch(unittest.TestCase):
             store.append_turn(
                 user_query="旧问题一",
                 final_answer="旧回答一",
-                work_record=None,
+                committed_messages=[
+                    Message.create_user_message("旧问题一"),
+                    Message.create_assistant_message("旧回答一"),
+                ],
             )
             store.append_turn(
                 user_query="旧问题二",
                 final_answer="旧回答二",
-                work_record=None,
+                committed_messages=[
+                    Message.create_user_message("旧问题二"),
+                    Message.create_assistant_message("旧回答二"),
+                ],
             )
 
             msgs = self._run_gateway_with_msgs(
@@ -471,7 +477,9 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertEqual(len(replies), 1)
             result = replies[0]["result"]
             self.assertIn("【上下文压缩】", result["summary"])
-            self.assertGreater(result["before_messages"], result["after_messages"])
+            # CC 模式: compact 在 history 末尾追加 boundary,after = before + 1。
+            # boundary 之前的旧消息保留用于审计,但下一轮发给 LLM 时会被切掉。
+            self.assertEqual(result["after_messages"], result["before_messages"] + 1)
             self.assertIn("context_window", result)
             self.assertGreater(result["context_window"]["used_tokens"], 0)
             self.assertTrue(result["persisted"])
@@ -644,14 +652,20 @@ class TestGatewayDispatch(unittest.TestCase):
             store.append_turn(
                 user_query="第一会话问题",
                 final_answer="第一轮回答",
-                work_record=None,
+                committed_messages=[
+                    Message.create_user_message("第一会话问题"),
+                    Message.create_assistant_message("第一轮回答"),
+                ],
             )
             second = store.create_session()
             second_id = second["session_id"]
             store.append_turn(
                 user_query="第二会话问题",
                 final_answer="第二轮回答",
-                work_record=None,
+                committed_messages=[
+                    Message.create_user_message("第二会话问题"),
+                    Message.create_assistant_message("第二轮回答"),
+                ],
             )
 
             msgs = self._run_gateway_with_msgs(

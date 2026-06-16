@@ -143,7 +143,6 @@ class TestAgentSessionBasic(unittest.TestCase):
         ConstantLLM.llm_dict["fake"] = {
             "is_tool": True,
             "is_reasoning": False,
-            "json_output": True,
             "max_tokens": 1000,
             "image_ability": False,
         }
@@ -167,7 +166,6 @@ class TestAgentSessionBasic(unittest.TestCase):
         ConstantLLM.llm_dict["fake"] = {
             "is_tool": True,
             "is_reasoning": False,
-            "json_output": True,
             "max_tokens": 100000,
             "image_ability": True,
         }
@@ -212,7 +210,6 @@ class TestAgentSessionBasic(unittest.TestCase):
         ConstantLLM.llm_dict["fake"] = {
             "is_tool": True,
             "is_reasoning": False,
-            "json_output": True,
             "max_tokens": 100000,
             "image_ability": False,
         }
@@ -318,23 +315,23 @@ class TestAgentSessionBasic(unittest.TestCase):
         self.assertTrue(dones)
         self.assertTrue(dones[-1].cancelled)
 
-    def test_tool_loop_auto_compresses_large_tool_result_without_breaking_protocol(self):
-        """工具循环接近窗口时只压缩 tool.content，不破坏 role/tool_call_id 协议配对。"""
+    def test_tool_loop_keeps_raw_tool_result_for_next_round(self):
+        """CC 模式:工具结果原样回灌进下一轮 messages,result_cap 持久化超大输出,
+        但 tool_call_id 配对必须仍然合法。"""
+        call_id = "call_loop_compress"
         original = ConstantLLM.llm_dict.get("fake")
-        ConstantLLM.llm_dict["fake"] = {
-            "is_tool": True,
-            "is_reasoning": False,
-            "json_output": True,
-            "max_tokens": 700,
-            "image_ability": False,
-        }
-        huge_content = "large-tool-output-" * 300
-        call_id = "call_big_read"
         try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "is_image_ability": False, "max_tokens": 5000,
+            }
             llm = FakeLLM([
-                {"answer": "", "tool_calls": [_tc("file_read", '{"path":"big.txt"}', call_id=call_id)]},
-                {"answer": "已基于压缩结果继续", "tool_calls": []},
+                {"answer": "", "tool_calls": [_tc(
+                    "file_read", '{"path":"big.txt"}', call_id=call_id,
+                )]},
+                {"answer": "已基于工具结果继续", "tool_calls": []},
             ])
+            huge_content = "X" * 200
             self.registry.execute_tool = MagicMock(return_value=json.dumps({
                 "path": "big.txt",
                 "mode": "all",
@@ -351,32 +348,184 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             answer = s.chat("读 big.txt")
 
-            self.assertEqual(answer, "已基于压缩结果继续")
+            self.assertEqual(answer, "已基于工具结果继续")
             self.assertEqual(len(llm.calls), 2)
             round2_msgs = llm.calls[1]["messages"]
             tool_msgs = [m for m in round2_msgs if m.get("role") == "tool"]
             self.assertEqual(len(tool_msgs), 1)
             self.assertEqual(tool_msgs[0].get("tool_call_id"), call_id)
-            self.assertIn("【自动工具结果压缩】", tool_msgs[0].get("content", ""))
-            self.assertNotIn(huge_content, tool_msgs[0].get("content", ""))
-
-            dones = [e for e in self.events if isinstance(e, Done)]
-            self.assertTrue(dones)
-            auto_compact = dones[-1].auto_compact
-            self.assertIsInstance(auto_compact, dict)
-            self.assertTrue(auto_compact["compacted"])
-            self.assertTrue(any(
-                event.get("reason") == "tool_loop"
-                and event.get("compressed_tool_messages", 0) >= 1
-                for event in auto_compact["events"]
-            ))
+            # 结果原样回灌(result_cap 不会触发，因为 < 50k)
+            self.assertIn(huge_content, tool_msgs[0].get("content", ""))
         finally:
             if original is None:
                 ConstantLLM.llm_dict.pop("fake", None)
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_tool_trace_appended_as_work_record_and_seen_next_turn(self):
+    def test_history_window_cut_drops_orphan_tool_message(self):
+        """P0 回归:history_window 截断落在 assistant(tool_calls) 与 tool 之间时,
+        发给 LLM 的请求体不能出现孤儿 tool 消息(否则 OpenAI 兼容协议 400)。
+
+        构造:第一轮一个 file_read 工具调用 -> 第二轮收尾。然后手动把
+        history_window 调到 2,使下一轮切片尾部正好从 tool 结果开始(它的
+        assistant.tool_calls 父消息被挤出窗口)。再发一句,检查请求体合法。
+        """
+        call_id = "call_orphan_cut"
+        original = ConstantLLM.llm_dict.get("fake")
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "is_image_ability": False, "max_tokens": 100000,
+            }
+            llm = FakeLLM([
+                {"answer": "", "tool_calls": [_tc(
+                    "file_read", '{"path":"a.txt"}', call_id=call_id,
+                )]},
+                {"answer": "第一轮完成", "tool_calls": []},
+                {"answer": "第二轮完成", "tool_calls": []},
+            ])
+            self.registry.execute_tool = MagicMock(return_value=json.dumps({
+                "path": "a.txt", "content": "hello",
+            }, ensure_ascii=False))
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+
+            s.chat("读 a.txt")
+            # 第一轮后 history:user, assistant(tool_calls), tool, assistant(final)
+            # 把窗口压到 2,下一轮切片尾部 = [tool, assistant(final)] —— tool 成孤儿
+            s.history_window = 2
+
+            s.chat("继续")
+
+            # 第二轮(第 3 次 think)的请求体里不应有任何孤儿 tool
+            round_msgs = llm.calls[2]["messages"]
+            seen_ids = set()
+            for m in round_msgs:
+                if m.get("role") == "assistant":
+                    for tc in (m.get("tool_calls") or []):
+                        seen_ids.add(tc.get("id"))
+            for m in round_msgs:
+                if m.get("role") == "tool":
+                    self.assertIn(
+                        m.get("tool_call_id"), seen_ids,
+                        msg="发给 LLM 的 tool 消息必须能在前文找到声明它的 assistant.tool_calls",
+                    )
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_dynamic_context_counts_tool_call_arguments(self):
+        """P1 回归:Context% 估算必须把纯 tool_calls 的 arguments 计入。
+
+        重构后 history 里 assistant(tool_calls, content=None) 是大头(file_write
+        的完整内容就藏在 arguments 里)。旧逻辑按"有正文才计入"会把它整段漏算,
+        导致 Context% 系统性偏低。这里断言带大 arguments 的工具调用被计入估算。"""
+        call_id = "call_ctx_count"
+        original = ConstantLLM.llm_dict.get("fake")
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "is_image_ability": False, "max_tokens": 100000,
+            }
+            big_args = json.dumps({"path": "x.py", "content": "Z" * 2000})
+            llm = FakeLLM([
+                {"answer": "", "tool_calls": [_tc(
+                    "file_write", big_args, call_id=call_id,
+                )]},
+                {"answer": "写好了", "tool_calls": []},
+            ])
+            self.registry.execute_tool = MagicMock(return_value=json.dumps({
+                "ok": True,
+            }, ensure_ascii=False))
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+
+            s.chat("写 x.py")
+            text = s._dynamic_context_text()
+            # arguments 里那 2000 个 Z 必须体现在估算文本里(不被漏算)
+            self.assertIn("Z" * 100, text)
+            usage = s.context_window_usage()
+            self.assertGreater(usage["used_tokens"], 400)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_dynamic_context_follows_compact_boundary_slice(self):
+        """P1 回归:Context% 估算与请求口径一致,走 boundary 切片。
+
+        /compact 后 boundary 之前的原始消息不再进入下一轮 prompt,Context% 也应
+        只统计 boundary(含)之后的部分,而不是物理尾部 self.history[-window:]。
+        """
+        original = ConstantLLM.llm_dict.get("fake")
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "is_image_ability": False, "max_tokens": 100000,
+            }
+            llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+            from core.message import Message
+            from agent.compact_boundary import make_compact_boundary_message
+            # 灌一段很长的早期 history(会被 compact 切掉)
+            s.history.append(Message.create_user_message("早期问题 " + "A" * 3000))
+            s.history.append(Message.create_assistant_message("早期回答 " + "B" * 3000))
+            text_before = s._dynamic_context_text()
+            self.assertIn("A" * 100, text_before)
+
+            # 追加 boundary(模拟 /compact);boundary 之后只有一句短消息
+            s.history.append(make_compact_boundary_message("摘要"))
+            s.history.append(Message.create_user_message("新问题"))
+
+            text_after = s._dynamic_context_text()
+            # 早期长消息已被切片排除,不再出现在估算文本里
+            self.assertNotIn("A" * 100, text_after)
+            self.assertIn("摘要", text_after)
+            self.assertIn("新问题", text_after)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_tool_call_blocks_when_full_window_overflows(self):
+        """模型完整窗口被即将超过时,preflight blocking 阈值会拒绝继续。"""
+        original = ConstantLLM.llm_dict.get("fake")
+        ConstantLLM.llm_dict["fake"] = {
+            "is_tool": True, "is_reasoning": False,
+            "is_image_ability": False, "max_tokens": 700,
+        }
+        try:
+            llm = FakeLLM([])  # 不应该被调用,blocking 早返回
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+            answer = s.chat("X" * 5000)  # 超出 700 max_tokens
+            self.assertIn("[上下文窗口已满]", answer)
+            self.assertEqual(len(llm.calls), 0)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_tool_trace_persists_state_and_round2_sees_raw_tool_result(self):
+        """CC 模式下 history 累积原始 tool_calls + tool_result; state.json
+        提取结构化字段(files_seen 等)供下一轮使用。"""
         long_content = "abcdef" * 40
         llm = FakeLLM([
             {"answer": "", "tool_calls": [_tc("file_read", '{"path":"a.txt"}')]},
@@ -401,28 +550,34 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             s.chat("读 a.txt")
 
-            self.assertEqual(len(s.history), 3)
-            work_content = s.history[-1].content
-            self.assertIsInstance(work_content, str)
-            self.assertIn("【工作记录】", work_content)
-            self.assertIn("a.txt", work_content)
-            self.assertNotIn(long_content, work_content)
+            # CC 模式 history: user + assistant(tool_calls) + tool + final = 4
+            self.assertEqual(len(s.history), 4)
+            roles = [m.role.value if hasattr(m.role, "value") else str(m.role)
+                     for m in s.history]
+            self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+            self.assertTrue(s.history[1].tool_calls)
+            self.assertEqual(s.history[2].tool_call_id, s.history[1].tool_calls[0]["id"])
 
+            # 第 2 轮请求里 tool_result 原文仍在
             round2_tool_msgs = llm.calls[1]["messages"]
             self.assertTrue(any(
                 m.get("role") == "tool" and long_content in m.get("content", "")
                 for m in round2_tool_msgs
             ))
 
+            # state.json 已通过结构化字段提取记录 a.txt
+            self.assertIn("a.txt", store.state_text())
+
+            # transcript 落盘的是原始 messages
             transcript = store.active_dir / "transcript.jsonl"
             raw_transcript = transcript.read_text(encoding="utf-8")
-            self.assertIn("【工作记录】", raw_transcript)
-            self.assertNotIn(long_content, raw_transcript)
+            self.assertIn("file_read", raw_transcript)
 
+            # 第 3 轮再问,模型仍然能在 history 里看到上一轮原始 tool_calls / tool_result
             s.chat("继续分析")
             next_turn_messages = llm.calls[2]["messages"]
             self.assertTrue(any(
-                "【工作记录】" in str(m.get("content", ""))
+                m.get("role") == "tool" and long_content in str(m.get("content", ""))
                 for m in next_turn_messages
             ))
 
@@ -454,8 +609,12 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
                 session_store=LocalSessionStore(root),
             )
-            self.assertEqual(len(restored.history), 3)
-            self.assertIn("【工作记录】", str(restored.history[-1].content))
+            # CC 模式 history: user + assistant(tool_calls) + tool + final = 4
+            self.assertEqual(len(restored.history), 4)
+            roles = [m.role.value if hasattr(m.role, "value") else str(m.role)
+                     for m in restored.history]
+            self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+            self.assertEqual(str(restored.history[-1].content), "done")
 
             restored.clear_history()
             self.assertEqual(restored.history, [])
@@ -492,8 +651,10 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertNotIn("第二会话问题", restored)
             self.assertEqual(store.active_session_id, first_id)
 
-    def test_compact_context_reduces_history_and_is_seen_next_turn(self):
-        """AgentSession.compact_context 会压缩内存 history，并让下一轮看到 compact 锚点。"""
+    def test_compact_context_appends_boundary_and_slices_next_turn(self):
+        """compact_context 在 history 末尾追加 compact_boundary;下一轮发给 LLM
+        的请求只包含 boundary 之后(含 boundary)的消息,boundary 之前的旧消息
+        留在 history 用于审计但不再注入 prompt。"""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -511,29 +672,32 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(len(s.history), 4)
 
             payload = s.compact_context()
+            # boundary 追加后 history 长度 +1
             self.assertEqual(payload["before_messages"], 4)
-            self.assertEqual(payload["after_messages"], 3)
+            self.assertEqual(payload["after_messages"], 5)
             self.assertTrue(payload["persisted"])
-            self.assertIn("context_window", payload)
-            self.assertGreater(payload["context_window"]["used_tokens"], 0)
             self.assertIn("【上下文压缩】", payload["summary"])
-            self.assertEqual(s.history[0].metadata, {"kind": "compact_record"})
+            # 末尾是新插入的 boundary
+            self.assertEqual(
+                (s.history[-1].metadata or {}).get("kind"),
+                "compact_boundary",
+            )
             self.assertTrue((store.active_dir / "compact.json").exists())
             self.assertTrue((store.active_dir / "compactions.jsonl").exists())
             self.assertTrue((store.active_dir / "transcript.jsonl").exists())
-            self.assertNotIn(payload["summary"], store.state_text())
 
             s.chat("继续")
             next_turn_messages = llm.calls[2]["messages"]
             context_text = "\n".join(str(m.get("content", "")) for m in next_turn_messages)
             self.assertIn("【上下文压缩】", context_text)
-            self.assertEqual(context_text.count("【上下文压缩】"), 1)
-            self.assertIn("旧问题二", context_text)
-            # compact 摘要本身可以保留“旧问题一”这类旧事实；真正要防止的是
-            # 旧 user/assistant 消息继续作为独立 history 条目占用窗口。
-            raw_contents = [m.get("content") for m in next_turn_messages]
-            self.assertNotIn("旧问题一", raw_contents)
-            self.assertNotIn("旧回答一", raw_contents)
+            # boundary 之前的旧 user/assistant 不再作为独立条目出现在请求里
+            raw_user_assistant = [
+                m for m in next_turn_messages
+                if m.get("role") in {"user", "assistant"}
+            ]
+            joined = "\n".join(str(m.get("content")) for m in raw_user_assistant)
+            self.assertNotIn("旧回答一", joined)
+            self.assertNotIn("旧回答二", joined)
 
     def test_compact_context_does_not_mutate_history_when_persist_fails(self):
         """compact 快照落盘失败时，内存 history 仍保持原样。"""
