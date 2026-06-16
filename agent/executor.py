@@ -23,10 +23,12 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from agent.cancel import CancelToken
@@ -36,6 +38,7 @@ from agent.platforms.permissions import (
     check_platform_tool_permission,
     permission_denied_payload,
 )
+from agent.result_cap import cap_batch_results, cap_single_result
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +143,7 @@ class ToolExecutor:
         runner: ToolRunner,
         event_bus: Optional[EventBus] = None,
         max_workers: int = 4,
+        persist_dir: Optional[Path] = None,
     ) -> None:
         """
         Args:
@@ -147,10 +151,12 @@ class ToolExecutor:
                     通常是 ToolRegistry.execute_tool。
             event_bus: 可选事件总线，发 ToolStart / ToolComplete
             max_workers: 并发线程池大小上限。一批超过这个数仍并发，但被池内排队。
+            persist_dir: 工具结果超限时的持久化目录。默认 .cbagent/tool_results/
         """
         self._runner = runner
         self._bus = event_bus
         self._max_workers = max_workers
+        self._persist_dir = persist_dir or Path(os.getcwd()) / ".cbagent" / "tool_results"
 
     def execute(
         self,
@@ -196,9 +202,14 @@ class ToolExecutor:
 
         if should_parallelize(tool_calls):
             logger.info("executor mode: parallel round=%s calls=%s", round_idx, len(tool_calls))
-            return self._execute_parallel(tool_calls, round_idx, cancel_token)
-        logger.info("executor mode: serial round=%s calls=%s", round_idx, len(tool_calls))
-        return self._execute_serial(tool_calls, round_idx, cancel_token)
+            results = self._execute_parallel(tool_calls, round_idx, cancel_token)
+        else:
+            logger.info("executor mode: serial round=%s calls=%s", round_idx, len(tool_calls))
+            results = self._execute_serial(tool_calls, round_idx, cancel_token)
+
+        # 批量总量上限检查：单轮所有 tool results 总字符超限时从最长的开始持久化
+        cap_batch_results(results, self._persist_dir)
+        return results
 
     # ---------- 串行 ----------
 
@@ -329,6 +340,18 @@ class ToolExecutor:
             duration,
             len(result) if isinstance(result, str) else len(str(result)),
         )
+
+        # 统一结果上限：超过 MAX_SINGLE_RESULT_CHARS 时持久化到磁盘
+        if not is_error:
+            result, persisted = cap_single_result(
+                result, call_id, name, self._persist_dir,
+            )
+            if persisted:
+                logger.info(
+                    "tool result persisted: name=%s call_id=%s dir=%s",
+                    name, call_id, self._persist_dir,
+                )
+
         return ToolCallResult(
             call_id=call_id, name=name, arguments=args,
             result=result, duration_seconds=duration, is_error=is_error,

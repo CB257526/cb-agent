@@ -159,7 +159,7 @@ def _message_kind(message: Message) -> str:
 
 
 class _SessionCompactSummarizer:
-    """Adapter used by context.compact.compact_now for AgentSession history."""
+    """`context.compact.compact_now` 用于压缩 AgentSession 历史记录的适配器。"""
 
     def __init__(self, session: "AgentSession", *, state_text: str) -> None:
         self.session = session
@@ -171,6 +171,7 @@ class _SessionCompactSummarizer:
         *,
         focus: Optional[str] = None,
     ) -> Optional[str]:
+        """压缩历史记录，返回摘要。"""
         return self.session._make_compact_summary(
             messages=messages,
             state_text=self.state_text,
@@ -199,7 +200,7 @@ class AgentSession:
     """
 
     # 工具调用循环最大轮数，防死循环
-    MAX_TOOL_ROUNDS = 50
+    MAX_TOOL_ROUNDS = 200
     # 当前工具循环的完整 tool result 被压缩进 messages 时，每条 tool message
     # 最多保留的字符数。它比跨轮 TraceCollector 的 100 字符略宽，是因为本轮
     # 模型还需要靠这条摘要继续推理；但仍然要有硬边界，防止 file_read/stdout
@@ -217,7 +218,7 @@ class AgentSession:
         skill_manager: Optional[SkillManager] = None,
         bash_prompt_provider=None,
         ctx_enabled: bool = True,
-        history_window: int = 12,
+        history_window: int = 12,  # 最多保留 12 轮历史记录
         messages_snapshot_hook=None,
         session_store: Optional[LocalSessionStore] = None,
         trace_summarizer: Optional[TraceSummarizer] = None,
@@ -592,6 +593,7 @@ class AgentSession:
             })
 
         # 截尾历史
+        # TODO：历史消息截尾逻辑需要优化，考虑是否需要根据安全窗口动态调整
         for m in self.history[-self.history_window:]:
             messages.append(m.to_dict())
         messages.append({"role": "user", "content": user_content})
@@ -623,13 +625,13 @@ class AgentSession:
             str(persistent_user_text).strip()
             if persistent_user_text is not None
             else user_query
-        )
+        ) # 从持久化用户文本或用户查询中获取历史文本
         multimodal_prompt = process_multimodal_prompt(
             text=user_query,
             attachments=attachments,
             model=getattr(self.llm, "model", None),
             history_text=history_source_text,
-        )
+        ) # 处理多模态输入，生成请求内容和历史文本
         request_content = multimodal_prompt.request_content
         history_user_text = multimodal_prompt.history_text
         logger.info(
@@ -646,8 +648,8 @@ class AgentSession:
             except Exception:
                 logger.exception("保存 pending 用户消息失败")
 
-        stage_started = time.perf_counter()
-        system_instructions = self._build_system_instructions()
+        stage_started = time.perf_counter() # 记录当前阶段开始时间
+        system_instructions = self._build_system_instructions() # 构建运行时指令
         logger.info(
             "chat prepare: runtime instructions built chars=%s elapsed=%.2fs total=%.2fs",
             len(system_instructions or ""),
@@ -1083,11 +1085,11 @@ class AgentSession:
         trace_collector = TraceCollector()
         # 当前轮 messages 的自动压缩事件会在 chat 结束时放进 Done.auto_compact，
         # 方便 TUI 或日志侧知道“这轮为了保护上下文窗口做过压缩”。
-        loop_compactions: List[Dict[str, Any]] = []
+        loop_compactions: List[Dict[str, Any]] = []  # 当前轮自动压缩事件
         # tool message content 只有在当前请求体达到或超过 80% 安全窗口时才会被替换。
         # key 是 messages 里的下标，value 是预先从 TraceEntry 生成的安全摘要。
-        tool_message_summaries: Dict[int, str] = {}
-        compressed_tool_message_indices: set[int] = set()
+        tool_message_summaries: Dict[int, str] = {}  
+        compressed_tool_message_indices: set[int] = set()  # 已压缩的 tool message 下标，用于去重
         for round_idx in range(1, self.MAX_TOOL_ROUNDS + 1):
             # 进入新一轮前先看 token
             if token.is_cancelled():
@@ -1149,6 +1151,7 @@ class AgentSession:
                 return round_idx, final, trace_collector, loop_compactions
 
             if not isinstance(result, dict):
+                #TODO：错误信息不明确
                 logger.error("LLM returned unexpected result: round=%s type=%s", round_idx, type(result).__name__)
                 self.event_bus.emit(Error(
                     where="llm",
@@ -1295,6 +1298,9 @@ class AgentSession:
         /compact 后只保留真正的最近一轮用户/助手对话，工作记录和 compact 锚点
         已经被折进新的摘要里，继续保留它们会浪费上下文窗口。
         """
+        # TODO: 改为按 token 预算保留多轮对话，而非固定只保留最近 1 轮。
+        #   方案：从最近往前按完整轮次填充，直到 context_window * RETAIN_RATIO(~0.18) 用完。
+        #   以轮次为单位不切断，第一轮无条件保留，只保留 user/assistant 纯对话。
         retained: List[Message] = []
         last_plain_role = ""
         for message in reversed(self.history):
