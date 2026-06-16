@@ -38,7 +38,25 @@ class FakeProcessor:
 
 
 class TestMultimodalInput(unittest.TestCase):
+    # 能力覆盖类 env(ConstantLLM 会优先读它们覆盖 llm_dict)。cb_agents.py 顶部的
+    # load_dotenv() 在 import 时把用户本地 .env 的 IMAGE_ABILITY/MAX_TOKENS 等灌进
+    # os.environ,而其他测试也可能残留这些 env。本类依赖 mm-test/text-test 的
+    # llm_dict.image_ability monkeypatch,必须先清掉这些 env,否则图片路由会被
+    # env 的 IMAGE_ABILITY 覆盖,导致原生视觉用例错走 OCR。
+    _CAPABILITY_ENV_KEYS = ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "IMAGE_ABILITY")
+
     def setUp(self) -> None:
+        saved = {k: os.environ.pop(k, None) for k in self._CAPABILITY_ENV_KEYS}
+
+        def _restore() -> None:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(_restore)
+
         self._old_mm = ConstantLLM.llm_dict.get("mm-test")
         self._old_text = ConstantLLM.llm_dict.get("text-test")
         ConstantLLM.llm_dict["mm-test"] = {

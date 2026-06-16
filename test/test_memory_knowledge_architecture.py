@@ -124,11 +124,12 @@ def test_capture_turn_updates_memory_and_knowledge(tmp_path: Path):
         long_term_memory_path=memory_path,
     )
 
+    # capture_turn 现在只负责 MEMORY.md 长期记忆(显式"请记住"类触发)。
+    # 结构化知识页自动捕获已移除，改由模型显式调用 knowledge_write 工具，
+    # 因此这里不应再产生 pages。
     assert result.memory_updated
-    assert result.pages
+    assert not result.pages
     assert "三层结构" in memory_path.read_text(encoding="utf-8")
-    index = json.loads((tmp_path / "knowledge" / "index.json").read_text(encoding="utf-8"))
-    assert index["pages"]
 
 
 def test_memory_section_includes_structured_knowledge_context(tmp_path: Path):

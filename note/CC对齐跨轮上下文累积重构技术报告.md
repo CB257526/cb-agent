@@ -403,6 +403,101 @@ Review 过程中发现 `ConstantLLM.llm_dict` 的 `json_output` 字段是死的�
 用前者。收敛成"`model_max_tokens` 委托 `window.py`"是更彻底的去重,但会动到
 context/budget 链路,留待单独重构,不混入本次。
 
+## 记忆系统 Review 修复（自动知识捕获退化 + 会话切换缓存）
+
+重构后对"上下文加载与记忆系统"做了一轮系统性 review（规则加载 / 工作记忆 /
+长期记忆 / 会话持久化）。结论:大部分链路健康——CLAUDE.md 四层加载每轮强制
+重读、memory_query 真实驱动知识检索、消息序列化往返无损、会话目录隔离可靠、
+compact 的 transcript_offset 锚点 + 文件快照回滚都正确。发现并修复两个问题。
+
+### P1:自动知识页捕获退化且与 knowledge_write 工具重复（已移除）
+
+`KnowledgeBase.capture_turn` 历史上做两件事:
+1. MEMORY.md 长期记忆更新（`_looks_like_memory` 触发，只看 user_text）
+2. 结构化知识页自动捕获（`_looks_like_knowledge` 触发 → `upsert_page`）
+
+问题出在第 2 件:它的触发启发式 `if work_record_text and len(combined) > 600`
+依赖 work_record 文本，而 CC 对齐重构后 `WorkRecord.text` 恒为空，这条分支
+永久失效；`_body_from_turn` 的 `## Work trace` 章节也永远为空。更关键的是，
+项目已有 `knowledge_write` 工具——由模型基于语义主动判断"这值得记"并整理成
+结构化正文，写入同一个 KnowledgeBase，比字符长度启发式可靠得多。自动捕获
+既退化又冗余。
+
+处理:移除知识页自动捕获路径，保留 MEMORY.md 自动更新。
+- `knowledge.py`:`capture_turn` 删掉 `_looks_like_knowledge` 触发的 `upsert_page`
+  块，只留 MEMORY.md 更新;`work_record_text` 形参保留（`del` 标注）仅为兼容签名。
+- 删除随之死掉的 `_looks_like_knowledge` / `_title_from_turn` / `_body_from_turn`
+  / `_tags_from_text` 四个私有方法，以及 `KNOWLEDGE_TRIGGERS` 常量。
+- `session.py`:`_auto_update_memory_and_knowledge` 调用不再传 `work_record_text`。
+- 保留:`upsert_page`（knowledge_write 工具在用）、`_looks_like_memory`、
+  `MEMORY_TRIGGERS`、`append_long_term_memory`。
+- 澄清一个 review 误报:episodic/semantic memory 并非被本次重构"搞空转"——
+  `record_turn` 从来只调 `capture_turn`，那两层一直靠 LLM 主动调 memory 工具
+  写入，重构前后行为一致。
+
+### P2:switch_session 切换后未清 system prompt section 缓存（已修）
+
+`clear_history`（/clear）会调 `clear_system_prompt_sections()` + MemoryLoader
+`reset_cache`，但 `switch_session` 漏了。env_info section 缓存键含 cwd，换会话
+（尤其换项目目录）后可能注入上一会话的环境快照。`session.py:switch_session`
+补上与 clear_history 一致的缓存清理。
+
+### 验证
+
+- 手动驱动（venv 无 pytest）验证:capture_turn 只更新 MEMORY.md、不再产生
+  知识页;长 assistant 文本也不再触发自动捕获;`upsert_page`/knowledge_write
+  显式写入仍正常;死方法与 `KNOWLEDGE_TRIGGERS` 确认删除。
+- `test_knowledge_tools` 3 用例、`test_memory_knowledge_architecture` 的
+  capture_turn 用例（改断言为 `not result.pages`）。
+- P2 回归:`test_session_renderer` 46/46、`test_transport` 24/24、
+  `test_work_context` 6/6 全过。
+
+## 模型能力支持环境变量覆盖（换服务商兜底）
+
+### 背景
+
+`llm_dict` 用模型名作键登记能力（is_tool / image_ability / max_tokens）。换
+API 服务商后——尤其用中转站——`LLM_MODEL_ID` 常和表里的键对不上，例如硅基流动
+的 `deepseek-ai/DeepSeek-V4-Flash` vs 表里的 `deepseek-v4-flash`。lookup 落空
+就退回默认值：function calling 误判、Context% 失准、多模态模型被当纯文本强制
+走 OCR。
+
+### 改动
+
+在 `ConstantLLM` 加一个统一的能力解析层，所有消费点改走它，优先级
+**env > llm_dict > 默认**：
+
+- 新增 env 键 `IS_TOOL` / `IS_REASONING` / `MAX_TOKENS` / `IMAGE_ABILITY`。
+- `_parse_bool_env`：识别 true/false/1/0/yes/no/on/off。
+- `_parse_token_count_env`：支持 `1024K` / `1M` / `200000` 写法（中转站常用 K/M
+  表述窗口）。
+- `resolve_is_tool` / `resolve_is_reasoning` / `resolve_image_ability` /
+  改造后的 `model_max_tokens`：统一三级取值。
+- 消费点接线：
+  - `cb_agents._is_able_Function_Calling` → `resolve_is_tool`
+  - `multimodal_input.model_supports_image` → `resolve_image_ability`
+  - `window.get_context_window_for_model` 新增 `MAX_TOKENS` 为最高优先级，
+    与 session 主链路的 `model_max_tokens` 共用同一个 env 键——顺带收敛了之前
+    "两条窗口路径各读各的" 的遗留重叠。
+- `.env.example` 补充这 4 个键的注释与用法。
+
+### 测试隔离副作用（重要）
+
+`cb_agents.py` 顶部 `load_dotenv()` 在 import 时就把用户本地 `.env` 的这些值
+灌进 `os.environ`。由于 env 现在优先级最高，依赖 `llm_dict` monkeypatch 的测试
+会被真实 env 覆盖而失败（开发者本地设了 `MAX_TOKENS=1024K` 就触发）。因此给
+`test_session_renderer` / `test_transport` / `test_multimodal_input` 的相关测试类
+加了能力 env 隔离（setUp 清 4 键 + addCleanup 恢复）。这也暴露了一条经验：凡
+依赖 llm_dict monkeypatch 的用例都必须隔离这组 env。
+
+### 验证
+
+- 新增 `test_constant_llm_env.py` 16 用例：K/M 解析、布尔解析、三级优先级、
+  换服务商兜底、window 复用 `MAX_TOKENS`。
+- 端到端模拟真实场景（`deepseek-ai/DeepSeek-V4-Flash` 对不上 llm_dict +
+  `.env` 配 4 键）：能力全部从 env 正确解析，两条窗口路径结果一致。
+- 全量 `unittest discover`：476 测试，仅 2 个 pytest 缺失的预存失败无关。
+
 ## 引用
 
 - 现有 `_tool_loop`：[cb-agent/agent/session.py](cb-agent/agent/session.py)

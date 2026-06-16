@@ -52,25 +52,6 @@ MEMORY_TRIGGERS = (
     "必须",
     "不要忘",
 )
-KNOWLEDGE_TRIGGERS = (
-    "architecture",
-    "design",
-    "implementation",
-    "api",
-    "interface",
-    "knowledge",
-    "decision",
-    "架构",
-    "设计",
-    "实现",
-    "接口",
-    "知识",
-    "方案",
-    "决策",
-    "规则",
-    "流程",
-    "重构",
-)
 
 
 @dataclass
@@ -223,15 +204,27 @@ class KnowledgeBase:
         work_record_text: str = "",
         long_term_memory_path: Optional[Path] = None,
     ) -> KnowledgeCaptureResult:
-        """Capture valuable facts/pages from one completed conversation turn."""
+        """Capture valuable long-term memory from one completed conversation turn.
+
+        历史上这里还做过"知识页自动捕获"(靠 _looks_like_knowledge 启发式判断
+        是否值得记，再 upsert_page)。该路径已移除，原因有二：
+        1. 它依赖 work_record_text 文本，而 CC 对齐重构后该字段恒为空，启发式
+           触发条件已失效，捕获质量退化；
+        2. 它与 knowledge_write 工具职责重复——后者由模型基于语义主动判断"这值得
+           记"，并整理成结构化正文，比字符长度启发式可靠得多，写入同一个
+           KnowledgeBase。
+
+        因此自动捕获只保留 MEMORY.md 长期记忆这一条(只依赖 user_text 的显式
+        "请记住"类触发)，结构化知识页改由模型显式调用 knowledge_write 写入。
+        ``work_record_text`` 参数保留仅为兼容调用方签名，现已不参与任何逻辑。
+        """
+        del work_record_text  # 不再参与捕获逻辑，保留形参仅为兼容签名
         result = KnowledgeCaptureResult()
         try:
             self.ensure_structure()
         except Exception as exc:
             result.errors.append(f"knowledge init failed: {exc}")
             return result
-
-        combined = "\n".join(x for x in [user_text, assistant_text, work_record_text] if x)
 
         if long_term_memory_path and self._looks_like_memory(user_text):
             try:
@@ -240,27 +233,6 @@ class KnowledgeBase:
             except Exception as exc:
                 logger.exception("failed to append long-term memory")
                 result.errors.append(f"long-term memory update failed: {exc}")
-
-        if self._looks_like_knowledge(user_text, assistant_text, work_record_text):
-            try:
-                page = self.upsert_page(
-                    title=self._title_from_turn(user_text),
-                    body=self._body_from_turn(
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                        work_record_text=work_record_text,
-                    ),
-                    tags=self._tags_from_text(combined),
-                    source="conversation",
-                    metadata={
-                        "captured_at": _now_iso(),
-                        "capture": "auto",
-                    },
-                )
-                result.pages.append(page)
-            except Exception as exc:
-                logger.exception("failed to capture knowledge page")
-                result.errors.append(f"knowledge page update failed: {exc}")
 
         return result
 
@@ -547,58 +519,6 @@ class KnowledgeBase:
     def _looks_like_memory(self, text: str) -> bool:
         lower = (text or "").lower()
         return any(trigger in lower or trigger in text for trigger in MEMORY_TRIGGERS)
-
-    def _looks_like_knowledge(self, user_text: str, assistant_text: str, work_record_text: str) -> bool:
-        combined = "\n".join([user_text or "", assistant_text or "", work_record_text or ""])
-        lower = combined.lower()
-        if any(trigger in lower or trigger in combined for trigger in KNOWLEDGE_TRIGGERS):
-            return True
-        if work_record_text and len(combined) > 600:
-            return True
-        return len(assistant_text or "") > 1200 and len(user_text or "") > 40
-
-    def _title_from_turn(self, user_text: str) -> str:
-        first = " ".join((user_text or "").split())
-        first = re.sub(r"^[#>\-\s]+", "", first)
-        return _clip_text(first or "Conversation knowledge", 72)
-
-    def _body_from_turn(
-        self,
-        *,
-        user_text: str,
-        assistant_text: str,
-        work_record_text: str,
-    ) -> str:
-        parts = [
-            "## Source question\n\n" + _clip_text(user_text, 1200),
-            "## Consolidated answer\n\n" + _clip_text(assistant_text, 2600),
-        ]
-        if work_record_text:
-            parts.append("## Work trace\n\n" + _clip_text(work_record_text, 1200))
-        return "\n\n".join(parts)
-
-    def _tags_from_text(self, text: str) -> list[str]:
-        tags: set[str] = set()
-        lower = text.lower()
-        for tag in (
-            "memory",
-            "rag",
-            "architecture",
-            "tooling",
-            "api",
-            "agent",
-            "knowledge",
-            "project",
-            "架构",
-            "记忆",
-            "知识库",
-            "工具",
-            "接口",
-            "项目",
-        ):
-            if tag in lower or tag in text:
-                tags.add(tag)
-        return sorted(tags)[:8]
 
     def _first_paragraph(self, body: str) -> str:
         for part in body.split("\n\n"):

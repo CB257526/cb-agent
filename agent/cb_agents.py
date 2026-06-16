@@ -461,11 +461,12 @@ class CbAgentsLLM:
                 thread.join(timeout=self._stream_join_seconds)
 
     def _is_able_Function_Calling(self) -> bool:
-        """根据模型提供商判断是否支持函数调用"""
-        #实现根据模型提供商判断是否支持函数调用的逻辑
-        if self.model in ConstantLLM.llm_dict:
-            return ConstantLLM.llm_dict[self.model].get("is_tool", True)
-        return True
+        """根据模型能力判断是否支持函数调用。
+
+        取值优先级:环境变量 IS_TOOL > llm_dict[model]["is_tool"] > 默认 True。
+        换服务商导致模型名和 llm_dict 对不上时,用 .env 的 IS_TOOL 兜底。
+        """
+        return ConstantLLM.resolve_is_tool(self.model, default=True)
 
     def think(
         self,

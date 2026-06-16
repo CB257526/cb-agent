@@ -101,8 +101,13 @@ class ProcessedMultimodalPrompt:
 
 
 def model_supports_image(model: Optional[str]) -> bool:
-    config = ConstantLLM.llm_dict.get(str(model or ""))
-    return bool(config.get("image_ability")) if isinstance(config, dict) else False
+    """模型是否支持原生视觉输入。
+
+    取值优先级:环境变量 IMAGE_ABILITY > llm_dict[model]["image_ability"] >
+    默认 False。换服务商导致模型名对不上 llm_dict 时,用 .env 的 IMAGE_ABILITY
+    兜底,避免多模态模型被误判为纯文本而强制走 OCR。
+    """
+    return ConstantLLM.resolve_image_ability(model, default=False)
 
 
 def sanitize_multimodal_payload(value: Any) -> Any:

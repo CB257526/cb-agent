@@ -333,6 +333,16 @@ class AgentSession:
         self.history = self.session_store.load_latest_history(
             max_messages=self.history_window,
         )
+        # 切换会话与 /clear 一样要清掉 system prompt section 缓存和 MemoryLoader
+        # memoize：env_info 的缓存键含 cwd，CLAUDE.md memory 段也按上一会话状态
+        # 缓存过。换会话(尤其换项目目录)后若不清，下一轮可能注入上一会话的
+        # 环境快照或记忆。clear_history 已经这样做，这里保持一致。
+        clear_system_prompt_sections()
+        if self.memory_loader is not None:
+            try:
+                self.memory_loader.reset_cache(reason="switch_session")
+            except Exception:
+                logger.exception("MemoryLoader 缓存清理失败")
         return {
             "session": summary,
             "history": self.export_history(),
@@ -796,10 +806,14 @@ class AgentSession:
             final_answer=final_answer,
             trace_collector=trace_collector,
         )
+        # 自动记忆更新:现在只驱动 MEMORY.md 长期记忆(KnowledgeBase.capture_turn
+        # 内按用户显式"请记住"类触发写入)。结构化知识页改由模型显式调用
+        # knowledge_write 工具写入——原先依赖 work_record 文本的自动知识页捕获
+        # 已移除(work_record 文本在 CC 对齐重构后恒为空,且与 knowledge_write
+        # 职责重复)。因此这里不再传 work_record_text。
         self._auto_update_memory_and_knowledge(
             user_query=history_user_text,
             final_answer=final_answer,
-            work_record_text="",
         )
         self._persist_turn(
             history_user_text,

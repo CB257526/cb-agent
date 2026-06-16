@@ -95,8 +95,32 @@ def _tc(name: str, args: str = "{}", call_id: str = "") -> dict:
 # ========== AgentSession ==========
 
 
+# 能力覆盖类 env 键：ConstantLLM 会优先读这 4 个 env 覆盖 llm_dict。
+# cb_agents.py 顶部的 load_dotenv() 在 import 时就把用户本地 .env 里的
+# 这些值（如 MAX_TOKENS=1024K、IMAGE_ABILITY=False）灌进了 os.environ，
+# 会盖掉测试用 llm_dict monkeypatch 的窗口/视觉能力。测试期间清掉它们，
+# 让用例只受 llm_dict monkeypatch 控制。
+_CAPABILITY_ENV_KEYS = ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "IMAGE_ABILITY")
+
+
+def _isolate_capability_env(test_case: unittest.TestCase) -> None:
+    """删除能力覆盖类 env 变量，并在测试结束后恢复原值。"""
+    saved = {k: os.environ.pop(k, None) for k in _CAPABILITY_ENV_KEYS}
+
+    def _restore() -> None:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    test_case.addCleanup(_restore)
+
+
 class TestAgentSessionBasic(unittest.TestCase):
     def setUp(self):
+        # 先做 env 隔离，避免用户 .env 的能力覆盖值干扰 llm_dict monkeypatch。
+        _isolate_capability_env(self)
         self.bus = EventBus()
         self.events = collect_all(self.bus)
         self.registry = MagicMock()

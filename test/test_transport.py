@@ -235,6 +235,24 @@ class _PipeStdin:
 
 class TestGatewayDispatch(unittest.TestCase):
 
+    def setUp(self):
+        # 能力覆盖类 env 键：ConstantLLM 会优先读这 4 个 env 覆盖 llm_dict。
+        # cb_agents.py 顶部的 load_dotenv() 在 import 时就把用户本地 .env 里的
+        # 这些值（如 IMAGE_ABILITY=False）灌进了 os.environ，会盖掉测试用 llm_dict
+        # monkeypatch 的视觉能力，导致附件路由走 OCR 而非原生 image_url。
+        # 测试期间清掉它们，结束后恢复，让用例只受 llm_dict monkeypatch 控制。
+        _capability_keys = ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "IMAGE_ABILITY")
+        _saved = {k: os.environ.pop(k, None) for k in _capability_keys}
+
+        def _restore() -> None:
+            for k, v in _saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(_restore)
+
     def _run_gateway_with_msgs(self, llm: FakeLLM, msgs: List[str], wait_for: int = 0,
                                 wait_done: bool = False, session_store=None,
                                 mcp_status_provider=None,
