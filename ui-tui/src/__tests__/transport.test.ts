@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { buildRunAgentArgs, RUN_AGENT_ARGS, STDERR_UI_LINE_MAX, Transport } from "../transport.js";
+import { buildRunAgentArgs, defaultGatewayLogPath, RUN_AGENT_ARGS, STDERR_UI_LINE_MAX, Transport } from "../transport.js";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -38,6 +38,12 @@ describe("Transport launch args", () => {
 
   it("does not pass dangerous permission skip flag by default", () => {
     expect(buildRunAgentArgs({})).toEqual(RUN_AGENT_ARGS);
+  });
+
+  it("uses project-level .cbagent system logs for gateway stderr", () => {
+    const normalized = defaultGatewayLogPath("/repo/cb-agent", 123).replace(/\\/g, "/");
+    expect(normalized).toContain("/repo/cb-agent/.cbagent/logs/system/");
+    expect(normalized.endsWith("/gateway-123.log")).toBe(true);
   });
 });
 

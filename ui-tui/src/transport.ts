@@ -18,12 +18,15 @@
 import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { AgentEvent, CompactPayload, MCPStatusPayload, PetCommandResult, PetState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
+
+export function defaultGatewayLogPath(cwd: string, now = Date.now()): string {
+  return join(cwd, ".cbagent", "logs", "system", `gateway-${now}.log`);
+}
 
 function isTruthyEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
@@ -50,7 +53,7 @@ export interface TransportOptions {
   cwd?: string;
   /** 额外环境变量 */
   env?: NodeJS.ProcessEnv;
-  /** stderr 日志路径。默认 ~/.cb-agent/logs/gateway-<ts>.log */
+  /** stderr 日志路径。默认 .cbagent/logs/system/gateway-<ts>.log */
   stderrLog?: string;
 }
 
@@ -82,9 +85,9 @@ export class Transport extends EventEmitter {
     const cwd = opts.cwd ?? join(process.cwd(), "..");
 
     // 解析 stderr 日志路径
-    const logsDir = join(homedir(), ".cb-agent", "logs");
+    const logsDir = join(cwd, ".cbagent", "logs", "system");
     mkdirSync(logsDir, { recursive: true });
-    this.stderrLogPath = opts.stderrLog ?? join(logsDir, `gateway-${Date.now()}.log`);
+    this.stderrLogPath = opts.stderrLog ?? defaultGatewayLogPath(cwd);
     const childEnv = { ...process.env, ...opts.env, PYTHONIOENCODING: "utf-8" };
 
     this.proc = spawn(python, buildRunAgentArgs(childEnv), {

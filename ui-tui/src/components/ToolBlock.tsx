@@ -204,7 +204,7 @@ function formatArgsFull(args?: Record<string, unknown>): string {
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
-  return s.slice(0, max) + `\n... [+${s.length - max} chars truncated, see ~/.cb-agent/logs]`;
+  return s.slice(0, max) + `\n... [+${s.length - max} chars truncated, see .cbagent/logs]`;
 }
 
 /**

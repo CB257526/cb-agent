@@ -60,7 +60,7 @@ ui-tui/
 [Stage 5a 报告](../note/Stage5a%20stdio%20JSON-RPC%20网关技术报告.md)。简要：
 
 - **stdout**：NDJSON，一行一条 JSON-RPC 消息
-- **stderr**：Python 端诊断输出，UI 把它写到 `~/.cb-agent/logs/gateway-<ts>.log`，**不**显示在屏幕上
+- **stderr**：Python 端诊断输出，UI 把它写到 `.cbagent/logs/system/gateway-<ts>.log`，**不**显示在屏幕上
 - **stdin**：UI → 后端的 RPC 请求
 
 UI 收到的两类消息：
@@ -126,7 +126,7 @@ CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS=1 npm start
 
 ### 后端日志位置
 
-`~/.cb-agent/logs/gateway-<timestamp>.log`。UI 启动时新建一个文件，把 Python stderr 全写过去。
+`.cbagent/logs/system/gateway-<timestamp>.log`。UI 启动时新建一个文件，把 Python stderr 全写过去。
 协议解析失败时 UI 会给出文件路径让用户去看。
 
 ### 桌宠
@@ -186,7 +186,7 @@ UI 在 busy 时会禁用输入框（显示 "（agent 正在工作，等待结束
 ### 2. 工具结果只显示前 600 字
 
 cb-agent 工具结果（尤其是 file_read、search、bash）可能很长。屏幕上截前 600，剩下的用一行
-"... [+N chars truncated, see ~/.cb-agent/logs]" 提示。完整内容**不在** stderr 日志里——agent 那边
+"... [+N chars truncated, see .cbagent/logs]" 提示。完整内容**不在** stderr 日志里——agent 那边
 没把工具结果写出来。如果要看完整结果，需要改 agent 加日志，或者扩展 ToolBlock 支持滚动查看（
 TODO，Stage 5c 候选）。
 

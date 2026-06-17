@@ -14,7 +14,7 @@
  *
  * 故障 hint：
  *   - Python 端启动失败 → exit code 非 0 → App 显示 "进程退出"，stderr 全在
- *     ~/.cb-agent/logs/gateway-<ts>.log，让用户去看
+ *     .cbagent/logs/system/gateway-<ts>.log，让用户去看
  *   - 协议解析失败 → 通常是 Python 端漏了 stdout 重定向（比如调试时加了 print 没走 _info）
  *     UI 显示一行警告 + 日志路径
  */

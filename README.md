@@ -174,9 +174,9 @@ CBAGENT_LOG_DIR=.cbagent/logs
 
 - `basic`: 记录启动、会话、工具、网关、错误等关键生命周期日志。
 - `detail`: 增加每轮 think、工具调度、RPC 分发和 messages 摘要日志。
-- `full`: 开启 DEBUG，并把发送给 LLM 的完整 messages 写入 `messages-*.log`。
+- `full`: 开启 DEBUG；对话 messages 日志始终完整写入 `conversation-*.jsonl`。
 
-运行日志默认写到 `.cbagent/logs/cb-agent-<timestamp>.log`；TUI 仍会把 Python stderr 镜像到 `~/.cb-agent/logs/gateway-<timestamp>.log`。
+系统运行日志默认写到 `.cbagent/logs/system/cb-agent-<timestamp>.log`；TUI 会把 Python stderr 镜像到 `.cbagent/logs/system/gateway-<timestamp>.log`。完整对话日志写到 `.cbagent/logs/conversations/conversation-*.jsonl`。
 
 桌宠由 cb-agent 内置 Python runtime 负责透明置顶浮窗，不需要 Rust、Node、Tauri 或额外构建。运行时使用 Qt WebEngine 承载透明 Live2D WebGL 页面；按 `requirements.txt` 安装依赖即可。使用 `/pet install <folder>` 安装 BongoCat 风格素材目录或 spritesheet 宠物包。
 
@@ -376,6 +376,22 @@ TUI 底部状态栏会显示：
 - `Context used/max percent`，也就是 state + history 对上下文窗口的占用
 - OpenAI usage 累计
 - 工具循环 round
+
+### 6b. 启动 OTUI（OpenTUI 重构版，推荐）
+
+`ui-otui/` 是基于 **OpenTUI + Solid.js（运行在 Bun 上）** 重写的新 TUI，外观对齐 opencode，并根治了旧 Ink 版的两个顽疾：流式输出时滚轮跳顶、长按 delete 失灵。后端契约与旧版完全一致（复用同一套 `transport.ts` + `run_agent.py --transport jsonrpc`），Python 端无需改动。
+
+前置：安装 [Bun](https://bun.sh) ≥ 1.3.14（与 Node 共存，互不干扰）。
+
+```bash
+cd ui-otui
+bun install
+bun start
+```
+
+Python 路径解析、`CB_AGENT_PYTHON` 覆盖、`CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS` 透传逻辑都与旧 TUI 相同。快捷键：`Enter` 发送、`/` 命令面板、`↑/↓` 历史/选项、`Ctrl-O` 日志面板、`Ctrl-C` busy 时取消/空闲退出。三栏布局：左侧消息流 + 输入框，右侧 Sidebar（会话/模型/MCP），底部 Footer 状态栏。
+
+> 旧的 `ui-tui/`（Ink 版）暂时保留作为回退参照，后续确认稳定后会移除。
 
 ### 7. 启动 QQ / NapCat
 
@@ -1041,7 +1057,7 @@ pip install -r requirements.txt
 runtime 日志写入：
 
 ```text
-~\.cbagent\pet\runtime.log
+.cbagent\logs\system\pet-runtime.log
 ```
 
 默认会保留模型比例并把窗口最大边限制在 420px，避免某些 BongoCat 社区模型以 `1400x1400` 等原始尺寸置顶挡住桌面。需要调整大小时，在启动 CLI/TUI 前设置环境变量：
@@ -1273,7 +1289,7 @@ TUI 通过 stdio JSON-RPC 与 Python 后端通信：
 
 - stdout：NDJSON 事件/响应
 - stdin：RPC 请求
-- stderr：后端日志，写到 `~/.cb-agent/logs/gateway-<timestamp>.log`
+- stderr：后端日志，写到 `.cbagent/logs/system/gateway-<timestamp>.log`
 
 详细见 [note/Stage5a stdio JSON-RPC 网关技术报告.md](<note/Stage5a stdio JSON-RPC 网关技术报告.md>)。
 
@@ -1345,7 +1361,7 @@ python test/test_rag_operations.py
 查看日志：
 
 ```text
-~/.cb-agent/logs/gateway-<timestamp>.log
+.cbagent/logs/system/gateway-<timestamp>.log
 ```
 
 也可以指定 Python：
