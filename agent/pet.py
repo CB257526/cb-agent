@@ -119,9 +119,11 @@ class PetRuntimeController:
 
     def __init__(self, runtime_path: Optional[Path] = None) -> None:
         self.runtime_path = runtime_path
+        self.project_root = Path(__file__).resolve().parent.parent
         self._proc: Optional[subprocess.Popen[str]] = None
         self._log_file: Any = None
         self._lock = threading.RLock()
+        self.log_path = self.project_root / ".cbagent" / "logs" / "system" / "pet-runtime.log"
 
     def _close_log_locked(self) -> None:
         if self._log_file:
@@ -218,9 +220,8 @@ class PetRuntimeController:
             dep_error = self._dependency_error()
             if dep_error:
                 return {"ok": False, "status": "missing-dependency", "message": dep_error}
-            log_dir = Path.home() / ".cbagent" / "pet"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = log_dir / "runtime.log"
+            log_path = self.log_path
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = log_path.open("a", encoding="utf-8", buffering=1)
             self._log_file.write(f"\n--- pet runtime launch {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
             self._log_file.flush()
@@ -234,7 +235,7 @@ class PetRuntimeController:
                     stderr=self._log_file,
                     text=True,
                     encoding="utf-8",
-                    cwd=str(Path(__file__).resolve().parent.parent),
+                    cwd=str(self.project_root),
                     creationflags=creationflags,
                 )
             except OSError as exc:
@@ -623,7 +624,7 @@ class PetManager:
             self.runtime.send("pet.set_visible", {"visible": cfg.get("visible", True)})
         text = "Pet runtime launched." if result.get("ok") else str(result.get("message") or "Pet runtime launch failed.")
         if result.get("ok") and current and not loaded:
-            text += "\nSelected pet could not be sent to the runtime. Check ~/.cbagent/pet/runtime.log."
+            text += f"\nSelected pet could not be sent to the runtime. Check {self.runtime.log_path}."
         if synced:
             names = ", ".join(f"{item.get('id')} ({item.get('displayName')})" for item in synced)
             text += f"\nAuto-imported from drop-in folder: {names}."

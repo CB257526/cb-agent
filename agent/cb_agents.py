@@ -31,7 +31,7 @@ def _console_io_mode() -> str:
     一旦混入普通文本会让前端解析失败。
     """
 
-    raw = (os.getenv(LLM_CONSOLE_IO_ENV) or "summary").strip().lower()
+    raw = (os.getenv(LLM_CONSOLE_IO_ENV) or "off").strip().lower()
     if raw in {"0", "false", "no", "off", "none"}:
         return "off"
     if raw in {"full", "all", "verbose"}:

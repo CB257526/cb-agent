@@ -216,6 +216,14 @@ class TestPetRuntimeController(unittest.TestCase):
         self.assertIsNotNone(runtime)
         self.assertEqual(runtime.name, "pet_runtime.py")
 
+    def test_runtime_log_path_is_project_scoped(self) -> None:
+        controller = PetRuntimeController()
+
+        self.assertEqual(
+            controller.log_path,
+            Path(__file__).resolve().parents[1] / ".cbagent" / "logs" / "system" / "pet-runtime.log",
+        )
+
     def test_launch_uses_python_module_runtime(self) -> None:
         class FakeProc:
             pid = 123

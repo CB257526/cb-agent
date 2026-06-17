@@ -32,6 +32,8 @@ _LEVEL_ALIASES = {
 class LoggingSettings:
     verbosity: str
     log_dir: Path
+    system_log_dir: Path
+    conversation_log_dir: Path
     runtime_log_path: Path
     message_log_mode: str
     file_level: int
@@ -67,13 +69,18 @@ def resolve_logging_settings(
     if not log_dir.is_absolute():
         log_dir = project_root / log_dir
 
+    system_log_dir = log_dir / "system"
+    conversation_log_dir = log_dir / "conversations"
+
     ts = int(time.time() if timestamp is None else timestamp)
-    runtime_log_path = log_dir / f"cb-agent-{ts}.log"
+    runtime_log_path = system_log_dir / f"cb-agent-{ts}.log"
 
     if verbosity == "full":
         return LoggingSettings(
             verbosity=verbosity,
             log_dir=log_dir,
+            system_log_dir=system_log_dir,
+            conversation_log_dir=conversation_log_dir,
             runtime_log_path=runtime_log_path,
             message_log_mode="full",
             file_level=logging.DEBUG,
@@ -86,8 +93,10 @@ def resolve_logging_settings(
         return LoggingSettings(
             verbosity=verbosity,
             log_dir=log_dir,
+            system_log_dir=system_log_dir,
+            conversation_log_dir=conversation_log_dir,
             runtime_log_path=runtime_log_path,
-            message_log_mode="summary",
+            message_log_mode="full",
             file_level=logging.DEBUG,
             console_level=logging.INFO,
             project_level=logging.DEBUG,
@@ -97,8 +106,10 @@ def resolve_logging_settings(
     return LoggingSettings(
         verbosity="basic",
         log_dir=log_dir,
+        system_log_dir=system_log_dir,
+        conversation_log_dir=conversation_log_dir,
         runtime_log_path=runtime_log_path,
-        message_log_mode="off",
+        message_log_mode="full",
         file_level=logging.INFO,
         console_level=logging.WARNING,
         project_level=logging.INFO,
@@ -110,7 +121,8 @@ def resolve_logging_settings(
 def configure_logging(project_root: Path) -> LoggingSettings:
     load_dotenv(project_root / ".env")
     settings = resolve_logging_settings(project_root=project_root)
-    settings.log_dir.mkdir(parents=True, exist_ok=True)
+    settings.system_log_dir.mkdir(parents=True, exist_ok=True)
+    settings.conversation_log_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"

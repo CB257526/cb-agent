@@ -312,11 +312,8 @@ class AgentRunner:
         在一整份全局日志里翻找。
         """
 
-        if self.logging_settings.message_log_mode == "off":
-            logger.info("message logger disabled at log level=%s", self.logging_settings.verbosity)
-            return None
         safe_scope = _safe_runtime_name(scope or "main")
-        path = self.logging_settings.log_dir / f"messages-{int(time.time())}-{safe_scope}.log"
+        path = self.logging_settings.conversation_log_dir / f"conversation-{int(time.time())}-{safe_scope}.jsonl"
         message_logger = MessageLogger(
             path,
             mode=self.logging_settings.message_log_mode,

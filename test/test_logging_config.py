@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sys
 import tempfile
@@ -32,8 +33,13 @@ class TestLoggingConfig(unittest.TestCase):
             timestamp=123,
         )
         self.assertEqual(basic.verbosity, "basic")
-        self.assertEqual(basic.message_log_mode, "off")
+        self.assertEqual(basic.message_log_mode, "full")
         self.assertEqual(basic.console_level, logging.WARNING)
+        self.assertEqual(basic.system_log_dir, root / ".cbagent" / "logs" / "system")
+        self.assertEqual(
+            basic.conversation_log_dir,
+            root / ".cbagent" / "logs" / "conversations",
+        )
 
         detail = resolve_logging_settings(
             project_root=root,
@@ -41,7 +47,7 @@ class TestLoggingConfig(unittest.TestCase):
             timestamp=123,
         )
         self.assertEqual(detail.verbosity, "detail")
-        self.assertEqual(detail.message_log_mode, "summary")
+        self.assertEqual(detail.message_log_mode, "full")
         self.assertEqual(detail.project_level, logging.DEBUG)
 
         full = resolve_logging_settings(
@@ -65,27 +71,11 @@ class TestLoggingConfig(unittest.TestCase):
         )
 
         self.assertEqual(settings.log_dir, root / "logs" / "custom")
-        self.assertEqual(settings.runtime_log_path.name, "cb-agent-456.log")
+        self.assertEqual(settings.system_log_dir, root / "logs" / "custom" / "system")
+        self.assertEqual(settings.runtime_log_path, settings.system_log_dir / "cb-agent-456.log")
 
 
 class TestMessageLogger(unittest.TestCase):
-    def test_summary_mode_clips_content(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "messages.log"
-            logger = MessageLogger(path, mode="summary")
-            try:
-                logger.log([
-                    {"role": "user", "content": "secret-" + ("x" * 400)},
-                ], label="test")
-            finally:
-                logger.close()
-
-            text = path.read_text(encoding="utf-8")
-
-        self.assertIn("mode: summary", text)
-        self.assertIn("preview: secret-", text)
-        self.assertNotIn("x" * 350, text)
-
     def test_full_mode_keeps_content(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "messages.log"
@@ -99,8 +89,42 @@ class TestMessageLogger(unittest.TestCase):
 
             text = path.read_text(encoding="utf-8")
 
-        self.assertIn("mode: full", text)
+        self.assertIn('"mode": "full"', text)
         self.assertIn("full-content-body", text)
+
+    def test_full_mode_records_structured_messages_without_clipping(self) -> None:
+        long_text = "prompt-" + ("x" * 5000)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "messages.log"
+            logger = MessageLogger(path, mode="full")
+            try:
+                logger.log(
+                    [
+                        {"role": "user", "content": long_text},
+                        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+                        {"role": "tool", "tool_call_id": "c1", "name": "bash", "content": long_text},
+                    ],
+                    label="round",
+                    tools=[{"type": "function", "function": {"name": "bash"}}],
+                    response={"answer": "ok"},
+                )
+            finally:
+                logger.close()
+
+            records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        event = records[1]
+        self.assertEqual(event["event"], "messages")
+        self.assertEqual(event["message_count"], 3)
+        self.assertEqual(event["messages"][0]["content"], long_text)
+        self.assertEqual(event["messages"][2]["content"], long_text)
+        self.assertEqual(event["tools"][0]["function"]["name"], "bash")
+        self.assertEqual(event["response"]["answer"], "ok")
+
+    def test_non_full_mode_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError):
+                MessageLogger(Path(td) / "messages.log", mode="summary")
 
 
 if __name__ == "__main__":

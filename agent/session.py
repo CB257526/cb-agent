@@ -163,6 +163,26 @@ def _message_kind(message: Message) -> str:
     return str(metadata.get("kind") or "")
 
 
+def _llm_result_to_assistant_payload(result: Any) -> Optional[Dict[str, Any]]:
+    """Convert an LLM result into an assistant-role log payload."""
+    if isinstance(result, list):
+        return {"role": "assistant", "content": result[0] if result else ""}
+    if not isinstance(result, dict):
+        return None
+    answer = result.get("answer") or ""
+    tool_calls = result.get("tool_calls") or []
+    reasoning = result.get("reasoning_content")
+    payload: Dict[str, Any] = {
+        "role": "assistant",
+        "content": answer or None,
+    }
+    if tool_calls:
+        payload["tool_calls"] = tool_calls
+    if reasoning:
+        payload["reasoning_content"] = reasoning
+    return payload
+
+
 class _SessionCompactSummarizer:
     """`context.compact.compact_now` 用于压缩 AgentSession 历史记录的适配器。"""
 
@@ -810,7 +830,8 @@ class AgentSession:
         if self.message_logger is not None:
             try:
                 self.message_logger.log(
-                    sanitize_multimodal_payload(messages),
+                    messages,
+                    tools=tools_schema,
                     label=f"会话开始 | query=\"{history_user_text[:100]}\"",
                 )
             except Exception:
@@ -1288,7 +1309,8 @@ class AgentSession:
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        sanitize_multimodal_payload(messages),
+                        messages,
+                        tools=tools_schema,
                         label=f"第 {round_idx} 轮 think 前",
                     )
                 except Exception:
@@ -1301,6 +1323,20 @@ class AgentSession:
                 cancel_event=token.event,
                 round_idx=round_idx,
             )
+            if self.message_logger is not None:
+                try:
+                    logged_messages = list(messages)
+                    assistant_payload = _llm_result_to_assistant_payload(result)
+                    if assistant_payload is not None:
+                        logged_messages.append(assistant_payload)
+                    self.message_logger.log(
+                        logged_messages,
+                        tools=tools_schema,
+                        response=result,
+                        label=f"round {round_idx} after think",
+                    )
+                except Exception:
+                    logger.exception("message_logger write failed")
 
             # 不支持 FC 的模型返回 [text, None]
             if isinstance(result, list):
@@ -1399,6 +1435,16 @@ class AgentSession:
                     is_error=exec_result.is_error,
                     round_idx=round_idx,
                 )
+
+            if self.message_logger is not None:
+                try:
+                    self.message_logger.log(
+                        messages,
+                        tools=tools_schema,
+                        label=f"round {round_idx} after tool results",
+                    )
+                except Exception:
+                    logger.exception("message_logger write failed")
 
             self.event_bus.emit(RoundEnd(
                 round_idx=round_idx, has_tool_calls=True, final=False,
