@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import Done, MCPStatus
+from agent.hooks import HookManager, load_hooks_config
 from agent.pet import PetEventBridge, PetManager
 from agent.executor import ToolExecutor
 from agent.platforms.messages import ConversationKey
@@ -231,11 +232,23 @@ class AgentRunner:
         self._register_native_tools()
         self._prepare_mcp_loading()
 
+        # 3b. Hook 管理器（读 .cbagent/hooks.json，可选；无配置时 enabled=False）。
+        # 必须在 ToolExecutor 之前建好，作为 PreToolUse/PostToolUse 的拦截层透传进去。
+        hooks_cfg = load_hooks_config(Path(_HERE) / ".cbagent" / "hooks.json")
+        self.hook_manager = HookManager(
+            hooks_cfg,
+            event_bus=self.event_bus,
+            cwd=Path(_HERE),
+        )
+        if self.hook_manager.enabled:
+            _info("已加载 hooks 配置")
+
         # 4. 工具调度器（依赖 event_bus）
         self.executor = ToolExecutor(
             runner=self.registry.execute_tool,
             event_bus=self.event_bus,
             max_workers=4,
+            hook_manager=self.hook_manager,
         )
 
         # trace_summarizer 只在工具轨迹超过阈值时静默调用;小 trace 走规则压缩。
@@ -348,6 +361,7 @@ class AgentRunner:
             trace_summarizer=self._trace_summarizer,
             message_logger=self._create_message_logger(message_logger_scope),
             pet_manager=self.pet_manager,
+            hook_manager=self.hook_manager,
         )
         # Gateway/平台适配器只拿到 AgentSession，不直接知道 AgentRunner。这里把 MCP
         # 运行态以回调形式挂到每个 session 上；状态只服务展示，不写入 history。

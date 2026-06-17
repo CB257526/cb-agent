@@ -132,6 +132,42 @@ def _parse_arguments(raw: str) -> Dict[str, Any]:
         return {}
 
 
+def _hook_blocked_payload(tool_name: str, arguments: Dict[str, Any], reason: str) -> str:
+    """PreToolUse hook 阻止工具时回灌给模型的结构化结果。
+
+    沿用 permission_denied_payload 的思路：工具没真正执行，但仍按 tool calling
+    协议回灌一条 tool 消息；结构化 JSON 让模型稳定识别这是 hook 拦截而非异常。
+    """
+    payload = {
+        "hook_blocked": True,
+        "error": reason or "PreToolUse hook 阻止了该工具调用",
+        "tool": tool_name,
+        "hint": "该操作被本地 hooks 配置拦截。如需放行，请调整 .cbagent/hooks.json。",
+    }
+    if tool_name == "bash":
+        payload["command"] = str((arguments or {}).get("command") or "")[:500]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _append_hook_context(result: str, context: str) -> str:
+    """把 PostToolUse hook 注入的额外上下文追加进工具结果。
+
+    优先把 context 合进 result 的 JSON 结构（加 _hook_context 字段）；result 不是
+    JSON 对象时退化成纯文本拼接。两种方式都让模型在 tool 消息里看到 hook 提示，
+    AgentSession 回灌逻辑零改动。
+    """
+    text = (result or "").strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                obj["_hook_context"] = context
+                return json.dumps(obj, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
+    return f"{result}\n\n[hook 注入上下文]\n{context}"
+
+
 # ========== 调度器 ==========
 
 
@@ -144,6 +180,7 @@ class ToolExecutor:
         event_bus: Optional[EventBus] = None,
         max_workers: int = 4,
         persist_dir: Optional[Path] = None,
+        hook_manager: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -152,11 +189,14 @@ class ToolExecutor:
             event_bus: 可选事件总线，发 ToolStart / ToolComplete
             max_workers: 并发线程池大小上限。一批超过这个数仍并发，但被池内排队。
             persist_dir: 工具结果超限时的持久化目录。默认 .cbagent/tool_results/
+            hook_manager: 可选 HookManager，在工具执行前后触发 PreToolUse /
+                          PostToolUse hook。None 表示不启用 hooks（零回归）。
         """
         self._runner = runner
         self._bus = event_bus
         self._max_workers = max_workers
         self._persist_dir = persist_dir or Path(os.getcwd()) / ".cbagent" / "tool_results"
+        self._hook_manager = hook_manager
 
     def execute(
         self,
@@ -306,6 +346,38 @@ class ToolExecutor:
                 result=result, duration_seconds=0.0, is_error=True,
             )
 
+        # PreToolUse hook：平台权限通过后、工具真正执行前的可配置拦截层。
+        # 复用与平台权限同款的"拒绝即回灌结构化消息"模式；也可改写工具输入。
+        if self._hook_manager is not None and self._hook_manager.has_event("PreToolUse"):
+            outcome = self._hook_manager.fire(
+                "PreToolUse",
+                {"tool_name": name, "tool_input": args},
+                matcher_value=name,
+                round_idx=round_idx,
+            )
+            if outcome.blocked:
+                result = _hook_blocked_payload(name, args, outcome.block_reason)
+                logger.warning(
+                    "tool blocked by PreToolUse hook: round=%s name=%s call_id=%s reason=%s",
+                    round_idx, name, call_id, outcome.block_reason,
+                )
+                if self._bus is not None:
+                    self._bus.emit(ToolComplete(
+                        call_id=call_id, name=name, result=result,
+                        duration_seconds=0.0, is_error=True,
+                        round_idx=round_idx,
+                    ))
+                return ToolCallResult(
+                    call_id=call_id, name=name, arguments=args,
+                    result=result, duration_seconds=0.0, is_error=True,
+                )
+            if outcome.updated_input is not None:
+                logger.info(
+                    "tool input rewritten by PreToolUse hook: round=%s name=%s call_id=%s",
+                    round_idx, name, call_id,
+                )
+                args = outcome.updated_input
+
         if self._bus is not None:
             self._bus.emit(ToolStart(
                 call_id=call_id, name=name, arguments=args, round_idx=round_idx,
@@ -330,6 +402,23 @@ class ToolExecutor:
                 duration_seconds=duration, is_error=is_error,
                 round_idx=round_idx,
             ))
+
+        # PostToolUse hook：工具成功执行后触发，可注入额外上下文给模型。
+        # additional_context 追加进 result JSON 的约定字段 _hook_context，零协议改动：
+        # 模型读到的 tool 消息里多一段 hook 注入的提示，AgentSession 无需特殊处理。
+        if (
+            not is_error
+            and self._hook_manager is not None
+            and self._hook_manager.has_event("PostToolUse")
+        ):
+            outcome = self._hook_manager.fire(
+                "PostToolUse",
+                {"tool_name": name, "tool_input": args, "tool_response": result},
+                matcher_value=name,
+                round_idx=round_idx,
+            )
+            if outcome.additional_context:
+                result = _append_hook_context(result, outcome.additional_context)
 
         logger.info(
             "tool complete: round=%s name=%s call_id=%s is_error=%s duration=%.2fs result_chars=%s",

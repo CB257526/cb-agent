@@ -31,8 +31,9 @@ from typing import Any, Dict, List, Optional
 
 from agent.event_bus import EventBus
 from agent.events import (
-    BackgroundNotification, Cancelled, Done, Error, ReasoningDelta,
-    RoundEnd, RoundStart, TextDelta, TokenUsage, ToolComplete, ToolStart,
+    BackgroundNotification, Cancelled, Done, Error, HookCompleted, HookStarted,
+    ReasoningDelta, RoundEnd, RoundStart, TextDelta, TokenUsage, ToolComplete,
+    ToolStart,
 )
 
 logger = logging.getLogger(__name__)
@@ -263,6 +264,8 @@ class CLIRenderer:
             (self._on_background, BackgroundNotification),
             (self._on_error, Error),
             (self._on_cancelled, Cancelled),
+            (self._on_hook_started, HookStarted),
+            (self._on_hook_completed, HookCompleted),
         ]
         for cb, evt in bindings:
             self.bus.subscribe(cb, evt)
@@ -344,6 +347,21 @@ class CLIRenderer:
                 suffix = "..." if e.result and len(e.result) > 200 else ""
                 duration_tag = f" {DIM}({e.duration_seconds:.2f}s){RESET}" if e.duration_seconds >= 0.5 else ""
                 print(f"     {DIM}← 结果:{RESET} {preview}{suffix}{duration_tag}")
+
+    def _on_hook_started(self, e: HookStarted) -> None:
+        with self._lock:
+            label = e.event_name + (f"({e.matcher})" if e.matcher and e.matcher != "*" else "")
+            print(f"  {DIM}{CYAN}hook {label} 运行中 ...{RESET}")
+
+    def _on_hook_completed(self, e: HookCompleted) -> None:
+        with self._lock:
+            if e.blocked:
+                print(f"     {RED}hook {e.event_name} 拦截了该操作{RESET}")
+            elif e.has_context:
+                print(f"     {DIM}{CYAN}hook {e.event_name} 注入了上下文{RESET}")
+            else:
+                duration_tag = f" ({e.duration_seconds:.2f}s)" if e.duration_seconds >= 0.5 else ""
+                print(f"     {DIM}hook {e.event_name} 完成{duration_tag}{RESET}")
 
     def _on_token_usage(self, e: TokenUsage) -> None:
         if not self.show_token_usage:

@@ -212,6 +212,7 @@ class AgentSession:
         language: Optional[str] = "Chinese",
         mcp_clients=None,
         pet_manager: Optional[PetManager] = None,
+        hook_manager: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -242,6 +243,11 @@ class AgentSession:
         self.language = language
         self.mcp_clients = mcp_clients
         self.pet_manager = pet_manager
+        # 可选 HookManager：在用户提交、会话开始、上下文压缩、收尾等生命周期点
+        # 触发用户可配置的 hook。None 表示不启用 hooks（零回归）。
+        self.hook_manager = hook_manager
+        # SessionStart 只在「本会话首个 Prompt」触发一次，这个标志做去重。
+        self._session_start_fired = False
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
         if self.session_store is not None:
@@ -646,6 +652,39 @@ class AgentSession:
         chat_started = time.perf_counter()
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
         user_query = self._prepend_background_notifications(user_query)
+
+        # 生命周期 hook：SessionStart（本会话首个 Prompt，仅一次）+ UserPromptSubmit。
+        # 两者的 additional_context 收集起来，稍后追加进 system_instructions 注入模型；
+        # UserPromptSubmit blocked 则直接返回拒绝原因，不进 LLM。
+        hook_extra_context = ""
+        if self.hook_manager is not None:
+            if not self._session_start_fired:
+                self._session_start_fired = True
+                if self.hook_manager.has_event("SessionStart"):
+                    ss = self.hook_manager.fire(
+                        "SessionStart",
+                        {"source": "startup"},
+                        matcher_value="startup",
+                    )
+                    if ss.additional_context:
+                        hook_extra_context += ss.additional_context
+            if self.hook_manager.has_event("UserPromptSubmit"):
+                ups = self.hook_manager.fire(
+                    "UserPromptSubmit",
+                    {"prompt": user_query},
+                )
+                if ups.blocked or ups.stop:
+                    reason = ups.block_reason or "本次输入被 hooks 配置拦截。"
+                    logger.info("UserPromptSubmit hook 拦截本次输入: reason=%s", reason)
+                    self.event_bus.emit(Done(
+                        final_answer=reason,
+                        rounds_used=0,
+                        cancelled=False,
+                    ))
+                    return reason
+                if ups.additional_context:
+                    hook_extra_context += ("\n" if hook_extra_context else "") + ups.additional_context
+
         history_source_text = (
             str(persistent_user_text).strip()
             if persistent_user_text is not None
@@ -675,6 +714,14 @@ class AgentSession:
 
         stage_started = time.perf_counter() # 记录当前阶段开始时间
         system_instructions = self._build_system_instructions() # 构建运行时指令
+        # 把 SessionStart / UserPromptSubmit hook 注入的上下文追加到运行时指令末尾，
+        # 让模型在本轮 system 补充段看到 hook 提供的额外信息。
+        if hook_extra_context:
+            system_instructions = (
+                f"{system_instructions}\n\n[hooks 注入上下文]\n{hook_extra_context}"
+                if system_instructions else
+                f"[hooks 注入上下文]\n{hook_extra_context}"
+            )
         logger.info(
             "chat prepare: runtime instructions built chars=%s elapsed=%.2fs total=%.2fs",
             len(system_instructions or ""),
@@ -832,6 +879,15 @@ class AgentSession:
         if post_turn_compaction is not None:
             auto_compactions.append(post_turn_compaction)
             logger.info("auto compact after turn: %s", post_turn_compaction)
+
+        # Stop hook：整轮回答就绪、Done 收尾前触发（通知类用途，如生成报告/清理）。
+        # 第一版不实现 Stop 阻止收尾（防循环逻辑留作后续），只注入可选上下文做记录。
+        if self.hook_manager is not None and self.hook_manager.has_event("Stop"):
+            self.hook_manager.fire(
+                "Stop",
+                {"last_assistant_message": final_answer or ""},
+                round_idx=rounds_used,
+            )
 
         # Done 事件：让前端知道整轮结束
         elapsed = time.perf_counter() - chat_started
@@ -1041,6 +1097,19 @@ class AgentSession:
         state_text = self._session_state_text()
         if before_messages == 0 and not state_text:
             return None
+
+        # PreCompact hook：在真正执行压缩前触发（已过滤掉 no-op 的早返回路径）。
+        # matcher 值归一化：内部各 reason（preflight_*/post_turn）统一暴露为 "auto"，
+        # 手动 /compact 暴露为 "manual"，对齐 Claude Code 的 trigger 语义。
+        # 第一版仅通知用途（导出/保存上下文），不支持阻止压缩。
+        if self.hook_manager is not None and self.hook_manager.has_event("PreCompact"):
+            trigger = "manual" if reason == "manual" else "auto"
+            self.hook_manager.fire(
+                "PreCompact",
+                {"trigger": trigger, "reason": reason},
+                matcher_value=trigger,
+                round_idx=round_idx,
+            )
 
         try:
             payload = self.compact_context()

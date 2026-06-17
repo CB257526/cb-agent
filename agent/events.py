@@ -254,6 +254,36 @@ class PetUpdated:
     type: str = field(default="pet_updated", init=False)
 
 
+# ========== Hook 事件（HookManager 触发 hook 时的可见性广播）==========
+
+
+@dataclass
+class HookStarted:
+    """某个 hook handler 开始执行。
+
+    HookManager 的控制流是双向的（要收集决策影响主流程），但仍通过 EventBus
+    emit 这个只读事件，让前端能看到"某个 hook 正在跑"。
+    """
+    event_name: str              # "PreToolUse" / "PostToolUse" / ...
+    handler_type: str            # 目前只有 "command"
+    matcher: str                 # 命中的 matcher 字段值
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="hook_started", init=False)
+
+
+@dataclass
+class HookCompleted:
+    """某个 hook handler 执行完毕。"""
+    event_name: str
+    blocked: bool                # 是否阻止了主操作
+    has_context: bool            # 是否注入了 additional_context
+    duration_seconds: float
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="hook_completed", init=False)
+
+
 # ========== Union 类型（订阅者用 isinstance 区分）==========
 
 
@@ -275,6 +305,8 @@ Event = Union[
     TodoListUpdated,
     MCPStatus,
     PetUpdated,
+    HookStarted,
+    HookCompleted,
 ]
 
 
@@ -296,4 +328,6 @@ __all__ = [
     "AskUserQuestionAnswered",
     "MCPStatus",
     "PetUpdated",
+    "HookStarted",
+    "HookCompleted",
 ]
