@@ -1,0 +1,4 @@
+# OpenTUI + Solid 需要用 babel-preset-solid 编译 JSX（把 JSX 编译成 DOM template 调用），
+# 而不是 Bun 默认的 React 风格 jsx()/jsxDEV() 转换。
+# @opentui/solid/preload 注册了这个 Bun 插件，必须在进程启动前 preload。
+preload = ["@opentui/solid/preload"]
