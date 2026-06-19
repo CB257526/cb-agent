@@ -153,6 +153,11 @@ export function SessionProvider(props: ParentProps) {
   // 附件队列等这个 ack 后再清空，避免 submit 被拒时用户得重挑文件。
   let pendingSubmitId: string | null = null;
 
+  // 本次 chat 是否产生过任何可见输出（文本/思考/工具调用）。submit 时复位，
+  // 收到 text_delta/reasoning_delta/tool_start 置 true；done 时若仍为 false，
+  // 说明模型返回了空响应（completion_tokens=0），给用户一条提示而非静默无反应。
+  let sawOutput = false;
+
   const appendItem = (item: ChatItem) =>
     setState("items", (prev) => [...prev, item]);
 
@@ -205,14 +210,17 @@ export function SessionProvider(props: ParentProps) {
         break;
 
       case "text_delta":
+        sawOutput = true;
         appendAssistantText(e.delta as string);
         break;
 
       case "reasoning_delta":
+        sawOutput = true;
         appendThoughtText(e.delta as string);
         break;
 
       case "tool_start":
+        sawOutput = true;
         // 按 call_id 配对（修掉旧实现"按 name + 最近未完成"匹配的隐患）
         appendItem({
           id: nextId(),
@@ -308,6 +316,15 @@ export function SessionProvider(props: ParentProps) {
 
       case "done":
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
+        // 整轮没有任何文本/思考/工具输出 = 模型空响应。提示可能原因，避免用户以为 UI 卡了。
+        // 被取消的轮次不算空响应（用户主动中断），跳过提示。
+        if (!sawOutput && !e.cancelled) {
+          appendSystem(
+            "模型返回了空响应（completion_tokens=0，无文本/工具调用）。" +
+              "常见原因：注册的工具过多导致请求过大、某个 MCP 工具 schema 不合法，或上游接口异常。" +
+              "可尝试 /compact 压缩上下文，或关闭部分 MCP 后重试。",
+          );
+        }
         setState("busy", false);
         setState("round", 0);
         break;
@@ -447,6 +464,7 @@ export function SessionProvider(props: ParentProps) {
 
     appendItem({ id: nextId(), role: "user", text: displayText });
     setState("busy", true);
+    sawOutput = false; // 新一轮：复位"是否产生过输出"，done 时据此判定空响应
     // 记录这次 submit 的 RPC id：ack 回来后再清空附件队列（见 onResponse）
     pendingSubmitId = transport.sendPrompt(text, submitAttachments);
   };
