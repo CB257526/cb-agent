@@ -5,36 +5,42 @@
       "args": ["-y", "@amap/amap-maps-mcp-server"],
       "env": {
         "AMAP_MAPS_API_KEY": "${AMAP_MAPS_API_KEY}"
-      }
+      },
+      "disable": false
     },
     "playwright": {
       "command": "npx",
       "args": [
         "@playwright/mcp@latest"
-      ]
+      ],
+      "disable": false
     },
     "tavily": {
       "command": "npx",
       "args": ["-y", "tavily-mcp@latest"],
       "env": {
         "TAVILY_API_KEY": "${TAVILY_API_KEY}"
-      }
+      },
+      "disable": false
     },
     "github": {
       "type": "http",
       "url": "https://api.githubcopilot.com/mcp/",
       "headers": {
         "Authorization": "Bearer ${GITHUB_PAT}"
-      }
+      },
+      "disable": false
     },
     "fetch": {
       "command": "python",
-      "args": ["-m", "mcp_server_fetch"]
+      "args": ["-m", "mcp_server_fetch"],
+      "disable": false
     },
     "codegraph": {
       "type": "stdio",
       "command": "codegraph",
-      "args": ["serve", "--mcp"]
+      "args": ["serve", "--mcp"],
+      "disable": false
     }
   }
 }

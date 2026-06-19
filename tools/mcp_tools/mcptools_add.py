@@ -197,6 +197,12 @@ def load_mcp_server_configs(
             if not isinstance(server_config, dict):
                 raise ValueError(f"MCP server {server_name} 的配置必须是对象")
 
+            # disable 字段：显式设为 true 时跳过该 MCP server，不启动也不注册
+            # 没有该字段或值为 false 时默认启用
+            if server_config.get("disable") is True:
+                logger.info("MCP server %s 已被 disable，跳过加载", server_name)
+                continue
+
             transport = _normalize_transport(server_config)
             _raise_if_unresolved_env(server_name, server_config)
             if transport == "stdio":
