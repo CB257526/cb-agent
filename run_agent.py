@@ -99,6 +99,7 @@ from tools.tools.bash_tool import BashTool
 from tools.tools.bash_task_tool import BashTaskTool
 from tools.tools.bash_permission_tool import BashPermissionTool
 from tools.tools.file_read_tool import FileReadTool
+from tools.tools.load_image_tool import LoadImageTool
 from tools.tools.file_write_tool import FileWriteTool
 from tools.tools.file_edit_tool import FileEditTool
 from tools.tools.ask_user_question_tool import AskUserQuestionTool
@@ -506,6 +507,7 @@ class AgentRunner:
             BashTaskTool(),
             BashPermissionTool(),
             FileReadTool(),
+            LoadImageTool(),
             FileEditTool(),
             FileWriteTool(),
             KnowledgeSearchTool(),

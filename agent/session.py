@@ -1436,6 +1436,13 @@ class AgentSession:
                     round_idx=round_idx,
                 )
 
+            # load_image 多模态分支：图片不能塞进 role=tool（中转站多不接受），
+            # 工具把 image_url 块排进 pending_images 缓冲，这里在全部 tool 消息回灌
+            # 之后追加一条 role=user 消息把图片送给模型。base64 只活在当轮 messages：
+            # _extract_protocol_messages 只 commit assistant / role=tool，user 消息
+            # 不进 history，与用户附件图片同一条安全边界（base64 绝不落 history）。
+            self._inject_pending_images(messages)
+
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
@@ -1465,6 +1472,41 @@ class AgentSession:
         )
 
     # ---------- 辅助 ----------
+
+    def _inject_pending_images(self, messages: List[Dict[str, Any]]) -> None:
+        """把 load_image 排队的图片作为一条 role=user 消息注入当轮 messages。
+
+        load_image 工具在视觉模型下不能用返回值带图（role=tool 不接受 image_url），
+        而是把 image_url 内容块排进 pending_images 缓冲。这里在本轮全部 tool 消息
+        回灌之后 drain 缓冲，拼成 [{type:text, "图片加载成功："}, {type:image_url}, ...]
+        的 user 消息，下一轮 think 时模型即可看到原图。
+
+        base64 只存在于当轮 messages：_extract_protocol_messages 只把 assistant /
+        role=tool commit 进 history，user 消息不进 history，因此 data URI 不会落盘，
+        与用户附件图片的安全边界一致。
+        """
+        try:
+            from tools.tools.pending_images import drain_images
+            pending = drain_images()
+        except Exception:
+            logger.exception("drain pending images 失败，已忽略")
+            return
+        if not pending:
+            return
+
+        content: List[Dict[str, Any]] = []
+        for item in pending:
+            image_part = item.get("image_part")
+            if not isinstance(image_part, dict):
+                continue
+            file_name = item.get("file_name") or "image"
+            content.append({"type": "text", "text": f"图片加载成功：{file_name}"})
+            content.append(image_part)
+        if not content:
+            return
+
+        messages.append({"role": "user", "content": content})
+        logger.info("injected %s pending image(s) as user message", len(pending))
 
     def _extract_protocol_messages(
         self,
