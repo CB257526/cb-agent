@@ -127,6 +127,7 @@ class TestAgentSessionBasic(unittest.TestCase):
         self.registry.execute_tool = MagicMock(return_value="{}")
         self.registry.get_tools_description_openai_schema = MagicMock(return_value=[])
         self.registry.get_tools_description = MagicMock(return_value="")
+        self.registry.list_tools = MagicMock(return_value=["bash", "file_read"])
         self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
 
     def _make_session(self, llm: FakeLLM, **kwargs) -> AgentSession:
@@ -575,12 +576,13 @@ class TestAgentSessionBasic(unittest.TestCase):
             s.chat("读 a.txt")
 
             # CC 模式 history: user + assistant(tool_calls) + tool + final = 4
-            self.assertEqual(len(s.history), 4)
+            self.assertEqual(len(s.history), 5)
             roles = [m.role.value if hasattr(m.role, "value") else str(m.role)
                      for m in s.history]
-            self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
-            self.assertTrue(s.history[1].tool_calls)
-            self.assertEqual(s.history[2].tool_call_id, s.history[1].tool_calls[0]["id"])
+            self.assertEqual(roles, ["user", "user", "assistant", "tool", "assistant"])
+            self.assertEqual((s.history[0].metadata or {}).get("kind"), "context_update")
+            self.assertTrue(s.history[2].tool_calls)
+            self.assertEqual(s.history[3].tool_call_id, s.history[2].tool_calls[0]["id"])
 
             # 第 2 轮请求里 tool_result 原文仍在
             round2_tool_msgs = llm.calls[1]["messages"]
@@ -634,10 +636,11 @@ class TestAgentSessionBasic(unittest.TestCase):
                 session_store=LocalSessionStore(root),
             )
             # CC 模式 history: user + assistant(tool_calls) + tool + final = 4
-            self.assertEqual(len(restored.history), 4)
+            self.assertEqual(len(restored.history), 5)
             roles = [m.role.value if hasattr(m.role, "value") else str(m.role)
                      for m in restored.history]
-            self.assertEqual(roles, ["user", "assistant", "tool", "assistant"])
+            self.assertEqual(roles, ["user", "user", "assistant", "tool", "assistant"])
+            self.assertEqual((restored.history[0].metadata or {}).get("kind"), "context_update")
             self.assertEqual(str(restored.history[-1].content), "done")
 
             restored.clear_history()
@@ -659,7 +662,8 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False, session_store=store,
             )
             s.chat("第一会话问题")
-            self.assertEqual(len(s.history), 2)
+            self.assertEqual(len(s.history), 3)
+            self.assertEqual(len(s.export_history()), 2)
 
             created = s.create_session()
             second_id = created["session"]["session_id"]
@@ -693,12 +697,13 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             s.chat("旧问题一")
             s.chat("旧问题二")
-            self.assertEqual(len(s.history), 4)
+            self.assertEqual(len(s.history), 6)
+            self.assertEqual(len(s.export_history()), 4)
 
             payload = s.compact_context()
             # boundary 追加后 history 长度 +1
-            self.assertEqual(payload["before_messages"], 4)
-            self.assertEqual(payload["after_messages"], 5)
+            self.assertEqual(payload["before_messages"], 6)
+            self.assertEqual(payload["after_messages"], 7)
             self.assertTrue(payload["persisted"])
             self.assertIn("【上下文压缩】", payload["summary"])
             # 末尾是新插入的 boundary
@@ -777,11 +782,57 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             self.assertIn("user_compact", loader.reasons)
 
+    def test_chat_prompt_keeps_runtime_context_out_of_first_system_message(self):
+        llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+        s = self._make_session(llm)
+
+        s.chat("hello")
+
+        messages = llm.calls[0]["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertNotIn("# Current time", messages[0]["content"])
+        self.assertNotIn("# Environment", messages[0]["content"])
+        self.assertNotIn("Available tools:", messages[0]["content"])
+
+        context_messages = [
+            m for m in messages
+            if m.get("role") == "user" and "<context-update>" in str(m.get("content", ""))
+        ]
+        self.assertEqual(len(context_messages), 1)
+        self.assertIn("# Current time", context_messages[0]["content"])
+        self.assertIn("# Environment", context_messages[0]["content"])
+        self.assertIn("Available tools: bash, file_read.", context_messages[0]["content"])
+
+        exported = s.export_history()
+        self.assertFalse(any(item.get("kind") == "context_update" for item in exported))
+
+    def test_second_turn_reuses_prior_context_update_as_committed_history_prefix(self):
+        llm = FakeLLM([
+            {"answer": "first answer", "tool_calls": []},
+            {"answer": "second answer", "tool_calls": []},
+        ])
+        s = self._make_session(llm)
+
+        s.chat("first question")
+        first_request = llm.calls[0]["messages"]
+        s.chat("second question")
+        second_request = llm.calls[1]["messages"]
+
+        self.assertEqual(second_request[0], first_request[0])
+        self.assertEqual(second_request[1], first_request[1])
+        self.assertEqual(second_request[2], first_request[2])
+        self.assertEqual(second_request[3]["role"], "assistant")
+        self.assertEqual(second_request[3]["content"], "first answer")
+        self.assertIn("<context-update>", second_request[-2]["content"])
+        self.assertEqual(second_request[-1]["role"], "user")
+        self.assertEqual(second_request[-1]["content"], "second question")
+
     def test_chat_history_appended_correctly(self):
         llm = FakeLLM([{"answer": "好的", "tool_calls": []}])
         s = self._make_session(llm)
         s.chat("hello")
-        self.assertEqual(len(s.history), 2)
+        self.assertEqual(len(s.history), 3)
+        self.assertEqual(len(s.export_history()), 2)
         # user + assistant
         roles = [m.role.value if hasattr(m.role, "value") else str(m.role) for m in s.history]
         self.assertIn("user", roles)
@@ -794,13 +845,14 @@ class TestAgentSessionBasic(unittest.TestCase):
         ans = s.chat("test")
         self.assertEqual(ans, "")
         # user 入了，assistant 因为空字符串没入
-        self.assertEqual(len(s.history), 1)
+        self.assertEqual(len(s.history), 2)
+        self.assertEqual(len(s.export_history()), 1)
 
     def test_clear_history(self):
         llm = FakeLLM([{"answer": "a", "tool_calls": []}])
         s = self._make_session(llm)
         s.chat("q")
-        self.assertEqual(len(s.history), 2)
+        self.assertEqual(len(s.history), 3)
         s.clear_history()
         self.assertEqual(len(s.history), 0)
 

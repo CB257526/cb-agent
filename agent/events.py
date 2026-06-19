@@ -46,10 +46,32 @@ class ReasoningDelta:
 
 @dataclass
 class TokenUsage:
-    """流式响应结束时的 token 用量（最后一个非空 chunk.usage）。"""
+    """流式响应结束时的 token 用量与 prompt cache 遥测。
+
+    基础字段(所有 provider 保证返回):
+        prompt_tokens:   输入 token 数(含 system + history + user)
+        completion_tokens: 输出 token 数(含 reasoning_content)
+        total_tokens:    prompt + completion
+
+    Prompt cache 遥测字段(按 provider 能力可选,None = 不支持):
+        cached_prompt_tokens:  被 provider 端缓存命中而免计算的 prompt token 数。
+                               跨 provider 归一后的统一字段——OpenAI 路径来自
+                               usage.prompt_tokens_details.cached_tokens,
+                               Anthropic 路径等价于 prompt_cache_hit_tokens。
+        prompt_cache_hit_tokens: 缓存命中的 token 数(Anthropic 原生字段;部分
+                                 OpenAI 兼容厂商也直接返回顶层 hit/miss 拆分)。
+        prompt_cache_miss_tokens: 缓存未命中,需重新计算的部分。
+        cache_hit_rate:          缓存命中率(0.0~1.0),hit/(hit+miss) 或
+                                 cached/prompt_tokens 的近似值。
+
+    这些字段均为 Optional,下游渲染/日志应做好 None 检查。"""
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cached_prompt_tokens: Optional[int] = None
+    prompt_cache_hit_tokens: Optional[int] = None
+    prompt_cache_miss_tokens: Optional[int] = None
+    cache_hit_rate: Optional[float] = None
     round_idx: int = 0
     timestamp: float = field(default_factory=_now)
     type: str = field(default="token_usage", init=False)

@@ -29,8 +29,7 @@ prefix cache 站在一起,且短任务零摘要损耗。
 1. `work_record` 文本注入彻底移除,`state.json` 结构化层(files_seen / recent_commands /
    decisions / pending)保留。
 2. 旧 session 数据破坏性更新,不做兼容。
-3. microcompact 用 LRU 替换 `tool_result` content(OpenAI 兼容协议没有 Anthropic 的
-   `cache_edits`)。
+3. microcompact 用 LRU 替换 `tool_result` content,仅作为本地兼容策略。
 
 ## 目标架构
 
@@ -75,7 +74,7 @@ prefix cache 站在一起,且短任务零摘要损耗。
 
 ### `agent/microcompact.py`
 
-CC 的 `cached_microcompact` 依赖 Anthropic API 的 `cache_edits`,本地消息原封不动让
+CC 的 server-side microcompact 是 provider-specific 能力,本地消息原封不动让
 server 端忽略旧 tool_result。OpenAI 兼容协议(DeepSeek 等)没有这个能力,因此用
 本地等同语义替代。
 
@@ -235,7 +234,7 @@ OpenAI/DeepSeek 兼容 API 的 prefix cache 命中率会显著提升,尤其在�
 
 - `result_cap.py` 单条 50k / 批量 200k 持久化(已对齐 CC,不动)
 - `state.json` 结构化字段提取(files_seen / recent_commands 等)
-- ContextBuilder + memory_loader + provider_adapter 的 system prompt 组装链路
+- Chat prompt builder + memory_loader 的 system/context update 组装链路
 - `/clear` 语义(彻底删除当前 session)
 - 多 session 隔离 / 切换 / pending_user 崩溃恢复
 - 多模态输入处理(image_url/base64 仍不进 history)

@@ -1,7 +1,7 @@
 """Microcompact —— 用 LRU 替换最旧的 tool_result content。
 
 背景：
-- Claude Code 的 cached_microcompact 依赖 Anthropic API 的 cache_edits 字段，
+- Claude Code 的 server-side microcompact 是 provider-specific 能力，
   本地消息原封不动，让 server 端忽略旧 tool_result。
 - cb-agent 走 OpenAI 兼容协议（DeepSeek 等），没有这个能力。这里用同等语义的
   本地策略替代：在传给 LLM 前，原地替换最旧的若干条 tool 消息的 content 为

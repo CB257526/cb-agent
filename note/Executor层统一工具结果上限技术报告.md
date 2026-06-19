@@ -126,7 +126,7 @@ PERSIST_DIR_NAME = "tool_results"      # 持久化目录名
 |------|----------|----------|------|
 | executor result_cap | 工具返回时立即 | 单条/单批 | 最先生效 |
 | `_maybe_compress_tool_loop_messages` | 每轮结束，80% 窗口时 | 当前 messages 中所有 tool content | 在 cap 之后，做进一步摘要 |
-| `cached_microcompact` | 跨轮积累 | 旧 tool result 按条数淘汰 | 处理历史消息 |
+| local microcompact | 跨轮积累 | 旧 tool result 按条数淘汰 | 处理历史消息 |
 | auto_compact | 85% 窗口时 | 整个 history | 最后的兜底压缩 |
 
 四层各管各的生命周期阶段，互不冲突。

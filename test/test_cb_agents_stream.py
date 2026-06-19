@@ -119,6 +119,40 @@ class TestUsageToDict(unittest.TestCase):
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
         })
 
+    def test_openai_cached_tokens_shape(self):
+        usage = SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=5,
+            total_tokens=105,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=70),
+        )
+        self.assertEqual(_usage_to_dict(usage), {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "cached_prompt_tokens": 70,
+            "prompt_cache_hit_tokens": 70,
+            "cache_hit_rate": 0.7,
+        })
+
+    def test_siliconflow_cache_hit_miss_shape(self):
+        usage = {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_cache_hit_tokens": 80,
+            "prompt_cache_miss_tokens": 20,
+        }
+        self.assertEqual(_usage_to_dict(usage), {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "cached_prompt_tokens": 80,
+            "prompt_cache_hit_tokens": 80,
+            "prompt_cache_miss_tokens": 20,
+            "cache_hit_rate": 0.8,
+        })
+
 
 # ========== Function Calling 流式事件 ==========
 
@@ -208,7 +242,13 @@ class TestThinkWithFunctionCallingEvents(unittest.TestCase):
         self.assertEqual(planned[0].round_idx, 3)
 
     def test_token_usage_event_from_last_chunk(self):
-        usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+        usage = SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=20,
+            total_tokens=120,
+            prompt_cache_hit_tokens=64,
+            prompt_cache_miss_tokens=36,
+        )
         self._stream([
             _chunk(_delta(content="hi")),
             _chunk(delta=None, usage=usage),  # 末尾 usage chunk
@@ -221,9 +261,19 @@ class TestThinkWithFunctionCallingEvents(unittest.TestCase):
         self.assertEqual(usage_events[0].prompt_tokens, 100)
         self.assertEqual(usage_events[0].completion_tokens, 20)
         self.assertEqual(usage_events[0].total_tokens, 120)
+        self.assertEqual(usage_events[0].cached_prompt_tokens, 64)
+        self.assertEqual(usage_events[0].prompt_cache_hit_tokens, 64)
+        self.assertEqual(usage_events[0].prompt_cache_miss_tokens, 36)
+        self.assertEqual(usage_events[0].cache_hit_rate, 0.64)
         # 返回值里也带 usage
         self.assertEqual(result["usage"], {
-            "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "cached_prompt_tokens": 64,
+            "prompt_cache_hit_tokens": 64,
+            "prompt_cache_miss_tokens": 36,
+            "cache_hit_rate": 0.64,
         })
 
     def test_no_usage_event_when_no_usage(self):

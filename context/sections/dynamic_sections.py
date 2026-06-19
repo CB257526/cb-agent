@@ -1,7 +1,7 @@
 """动态系统提示段 —— 每个函数返回一个 SystemPromptSection。
 
-对应 claude-code/src/constants/prompts.ts 中放在 SYSTEM_PROMPT_DYNAMIC_BOUNDARY
-之后的几段(memory / env_info / language / mcp_instructions / token_budget)。
+这些运行时段(memory / env_info / language / mcp_instructions / token_budget)
+会作为低权限 context update 追加到 Chat Completions 请求尾部附近。
 
 设计要点:
 - 每个 section 函数返回 SystemPromptSection,而不是直接返回字符串。

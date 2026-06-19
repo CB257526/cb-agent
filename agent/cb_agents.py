@@ -180,15 +180,111 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _usage_to_dict(usage: Any) -> Optional[Dict[str, int]]:
-    """OpenAI usage 对象 → dict。None 透传 None。"""
+def _usage_value(obj: Any, key: str, default: Any = None) -> Any:
+    """从 usage 对象(dict 或 object)中安全提取字段值。
+
+    不同 provider 返回的 usage 格式不一致:
+    - OpenAI 原生返回 object(属性访问)
+    - DeepSeek 等兼容 API 可能返回 dict(键访问)
+    - 某些厂商把缓存遥测放在 usage.prompt_tokens_details 子对象中
+
+    本函数统一两种访问路径,避免调用方关心底层数据结构。
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _usage_int(obj: Any, key: str) -> Optional[int]:
+    """从 usage 对象中提取整数字段,带类型容错。
+
+    返回 None 表示该字段不存在或无法解析为合法整数(而非抛异常)。
+    负数被钳位为 0,因为 token 计数字段不应出现负值(某些 provider
+    的 bug 或 protocol mismatch 可能产生 -1 类占位值)。
+    """
+    value = _usage_value(obj, key)
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_to_dict(usage: Any) -> Optional[Dict[str, Any]]:
+    """OpenAI 兼容 usage 对象 → dict,含 prompt cache 遥测。
+
+    不同 provider 的缓存遥测字段命名不统一:
+    - Anthropic 原生: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
+    - OpenAI 兼容:   usage.prompt_tokens_details.cached_tokens
+    - DeepSeek:      部分模型返回 cached_tokens,不返回 hit/miss 拆分
+
+    本函数对上述三种情况做了兼容:
+    1. 优先从 prompt_tokens_details.cached_tokens 读取(OpenAI 路径)
+    2. 其次从 usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens 读取
+       (Anthropic 路径)
+    3. 如果只有一个字段有值,用它补全另一个(数据不完整时做互推)
+    4. 命中率 = hit/(hit+miss),仅在分母 > 0 时计算
+
+    返回的 dict 包含:
+    - prompt_tokens / completion_tokens / total_tokens: 基础用量
+    - cached_prompt_tokens: 被缓存的 prompt token 数(跨 provider 归一)
+    - prompt_cache_hit_tokens: 缓存命中的 prompt token 数
+    - prompt_cache_miss_tokens: 缓存未命中,需重新计算的部分
+    - cache_hit_rate: 缓存命中率(0~1 的 float,保留 4 位小数)
+    """
     if usage is None:
         return None
-    return {
-        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+    # 基础 token 计数 —— 三个字段是所有 provider 都保证返回的
+    prompt_tokens = _usage_int(usage, "prompt_tokens") or 0
+    completion_tokens = _usage_int(usage, "completion_tokens") or 0
+    total_tokens = _usage_int(usage, "total_tokens") or 0
+    out: Dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
     }
+
+    # 缓存遥测 —— 字段名和位置因 provider 而异,需要兼容读取
+    # prompt_tokens_details 是 OpenAI 风格的嵌套对象,含 cached_tokens
+    details = _usage_value(usage, "prompt_tokens_details")
+    cached = _usage_int(details, "cached_tokens")
+    # prompt_cache_hit_tokens / prompt_cache_miss_tokens 是 Anthropic 风格
+    # 的顶层字段;部分 OpenAI 兼容厂商也直接返回这两个字段
+    hit = _usage_int(usage, "prompt_cache_hit_tokens")
+    miss = _usage_int(usage, "prompt_cache_miss_tokens")
+
+    # 跨 provider 数据互推: provider 可能只返回 cached 或只返回 hit,
+    # 这里做对称补全,让下游消费者总能从两个维度查看缓存效果
+    if cached is None and hit is not None:
+        cached = hit
+    if hit is None and cached is not None:
+        hit = cached
+
+    # 写入 dict —— 只有非 None 的字段才出现,避免下游做 None 检查
+    if cached is not None:
+        out["cached_prompt_tokens"] = cached
+    if hit is not None:
+        out["prompt_cache_hit_tokens"] = hit
+    if miss is not None:
+        out["prompt_cache_miss_tokens"] = miss
+
+    # 缓存命中率计算
+    # 路径 A: hit + miss 都存在,直接算 hit/(hit+miss)
+    # 路径 B: 只有 cached,用 cached/prompt_tokens 近似(估算命中比例)
+    numerator: Optional[int] = None
+    denominator: Optional[int] = None
+    if hit is not None and miss is not None:
+        numerator = hit
+        denominator = hit + miss
+    elif cached is not None and prompt_tokens > 0:
+        numerator = cached
+        denominator = prompt_tokens
+    if numerator is not None and denominator and denominator > 0:
+        out["cache_hit_rate"] = round(numerator / denominator, 4)
+    return out
 
 class CbAgentsLLM:
     """
@@ -619,10 +715,15 @@ class CbAgentsLLM:
 
         # 推 token usage 事件
         if last_usage is not None and event_bus is not None:
+            usage_dict = _usage_to_dict(last_usage) or {}
             event_bus.emit(TokenUsage(
-                prompt_tokens=getattr(last_usage, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(last_usage, "completion_tokens", 0) or 0,
-                total_tokens=getattr(last_usage, "total_tokens", 0) or 0,
+                prompt_tokens=usage_dict.get("prompt_tokens", 0),
+                completion_tokens=usage_dict.get("completion_tokens", 0),
+                total_tokens=usage_dict.get("total_tokens", 0),
+                cached_prompt_tokens=usage_dict.get("cached_prompt_tokens"),
+                prompt_cache_hit_tokens=usage_dict.get("prompt_cache_hit_tokens"),
+                prompt_cache_miss_tokens=usage_dict.get("prompt_cache_miss_tokens"),
+                cache_hit_rate=usage_dict.get("cache_hit_rate"),
                 round_idx=round_idx,
             ))
 
@@ -787,10 +888,15 @@ class CbAgentsLLM:
 
         # token usage 事件
         if last_usage is not None and event_bus is not None:
+            usage_dict = _usage_to_dict(last_usage) or {}
             event_bus.emit(TokenUsage(
-                prompt_tokens=getattr(last_usage, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(last_usage, "completion_tokens", 0) or 0,
-                total_tokens=getattr(last_usage, "total_tokens", 0) or 0,
+                prompt_tokens=usage_dict.get("prompt_tokens", 0),
+                completion_tokens=usage_dict.get("completion_tokens", 0),
+                total_tokens=usage_dict.get("total_tokens", 0),
+                cached_prompt_tokens=usage_dict.get("cached_prompt_tokens"),
+                prompt_cache_hit_tokens=usage_dict.get("prompt_cache_hit_tokens"),
+                prompt_cache_miss_tokens=usage_dict.get("prompt_cache_miss_tokens"),
+                cache_hit_rate=usage_dict.get("cache_hit_rate"),
                 round_idx=round_idx,
             ))
 

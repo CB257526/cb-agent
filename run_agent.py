@@ -77,7 +77,7 @@ from agent.message_logger import MessageLogger
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore, TraceSummarizer
 from constant.llm.constant_llm import ConstantLLM
-from context import MemoryLoader, OpenAICompatibleAdapter
+from context import MemoryLoader
 from context.memory.paths import (
     CORE_MEMORY_FILENAMES,
     SHORT_TERM_MEMORY_NAME,
@@ -343,14 +343,12 @@ class AgentRunner:
         """
 
         memory_loader = MemoryLoader(cwd=Path(_HERE)) if self.ctx_enabled else None
-        provider_adapter = OpenAICompatibleAdapter()
         session = AgentSession(
             llm=self.llm,
             registry=self.registry,
             executor=self.executor,
             event_bus=self.event_bus,
             memory_loader=memory_loader,
-            provider_adapter=provider_adapter,
             skill_manager=self._skill_manager,
             bash_prompt_provider=self._memory_prompt_provider,
             ctx_enabled=self.ctx_enabled,

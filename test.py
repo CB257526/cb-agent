@@ -122,16 +122,14 @@ from agent.cb_agents import CbAgentsLLM
 # from tools.tools.rag_tool import RAGTool
 # from context import (
 #     MemoryLoader,
-#     OpenAICompatibleAdapter,
-#     build_system_prompt_blocks,
+#     get_static_system_prompt,
+#     get_dynamic_context_prompt,
 #     get_system_prompt,
 # )
 # from core.message import Message
 
 # # 重构后:不再有 ContextBuilder 流水线。直接组装 system prompt + 历史。
 # loader = MemoryLoader(cwd=Path.cwd())
-# adapter = OpenAICompatibleAdapter()
-
 # user_query = "数据库连接超时怎么办"
 
 # async def _build():
@@ -142,8 +140,14 @@ from agent.cb_agents import CbAgentsLLM
 #         language="Chinese",
 #     )
 #     parts.append("你是资深 DBA")
-#     blocks = build_system_prompt_blocks(parts, use_global_cache_scope=False)
-#     return adapter.emit_system(blocks)
+#     static_parts = get_static_system_prompt(enabled_tools=frozenset(["memory", "rag"]))
+#     dynamic_parts = await get_dynamic_context_prompt(
+#         enabled_tools=frozenset(["memory", "rag"]),
+#         model="deepseek-v4-flash",
+#         memory_loader=loader,
+#         memory_query=user_query,
+#     )
+#     return "\n\n".join(static_parts + dynamic_parts)
 
 # system_payload = asyncio.run(_build())
 

@@ -16,8 +16,9 @@ from tools.tools.list_tools_tool import ListToolsTool
 
 
 class DummyTool(Tool):
-    def __init__(self) -> None:
-        super().__init__(name="dummy_tool", description="dummy description")
+    def __init__(self, name: str = "dummy_tool") -> None:
+        description = "dummy description" if name == "dummy_tool" else f"{name} description"
+        super().__init__(name=name, description=description)
 
     def get_parameters(self) -> List[ToolParameter]:
         return []
@@ -38,6 +39,30 @@ class TestListToolsTool(unittest.TestCase):
 
         self.assertIn("- dummy_tool: dummy description", output)
         self.assertNotIn("当前没有已注册的工具", output)
+
+
+    def test_registry_outputs_are_sorted_by_name(self) -> None:
+        first = ToolRegistry()
+        first.register_tool(DummyTool("z_tool"))
+        first.register_function("a_func", "a function", lambda _args: "ok")
+        first.register_tool(DummyTool("m_tool"))
+
+        second = ToolRegistry()
+        second.register_tool(DummyTool("m_tool"))
+        second.register_tool(DummyTool("z_tool"))
+        second.register_function("a_func", "a function", lambda _args: "ok")
+
+        self.assertEqual(first.list_tools(), ["a_func", "m_tool", "z_tool"])
+        self.assertEqual([tool.name for tool in first.get_all_tools()], ["m_tool", "z_tool"])
+        self.assertEqual(
+            first.get_tools_description_openai_schema(),
+            second.get_tools_description_openai_schema(),
+        )
+        schema_names = [
+            item["function"]["name"]
+            for item in first.get_tools_description_openai_schema()
+        ]
+        self.assertEqual(schema_names, ["a_func", "m_tool", "z_tool"])
 
 
 if __name__ == "__main__":

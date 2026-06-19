@@ -1261,7 +1261,7 @@ cb-agent/
 6. history
 7. additional packets
 
-system prompt 由静态 sections、`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 和动态 sections 组成。动态 memory 段内部会先加载 Markdown 记忆，再按当前 query 检索知识库。结构化 prompt 固定为：
+Chat Completions prompt 由首条稳定静态 system message、append-only 历史、低权限 runtime context update 和当前 user message 组成。动态 memory 段会在 context update 内加载 Markdown 记忆，并按当前 query 检索知识库。结构化 prompt 固定为：
 
 - `[Role & Policies]`
 - `[Task]`

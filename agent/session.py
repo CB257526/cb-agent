@@ -18,10 +18,9 @@ AgentRunner 的会话主流程组合起来，但**不直接做任何输出**—�
 - 渲染逻辑（颜色 / 面板）：CLIRenderer 那边
 
 上下文工程模块对接 (Claude Code 对齐重构):
-- 旧 ContextBuilder/ContextPacket 已删除,改走 context.get_system_prompt
-  组装 list[str] -> build_system_prompt_blocks -> provider_adapter.emit_system
-  -> 单 string 进 messages[0]。
-- memory_loader / provider_adapter 在 run_agent.py 装配,这里只持依赖。
+- 旧 ContextBuilder/ContextPacket 已删除,改为 Chat Completions 专用构造:
+  首条稳定 system,随后追加历史、运行时 context update 和当前 user。
+- memory_loader 在 run_agent.py 装配; provider-specific system adapter 已删除。
 - _build_chat_messages 不再使用 GSSC 流水线;state/compact/work_record 链路
   保留(用户决策: work_context.py 完整保留)。
 
@@ -54,16 +53,13 @@ from agent.question_registry import QuestionRegistry
 from constant.llm.constant_llm import ConstantLLM
 from context import (
     MemoryLoader,
-    OpenAICompatibleAdapter,
-    build_system_prompt_blocks,
     clear_system_prompt_sections,
     compact_now,
     count_tokens,
-    get_system_prompt,
-    should_use_global_cache_scope,
+    get_dynamic_context_prompt,
+    get_static_system_prompt,
 )
-from context.cache.provider_adapter import CacheControlAdapter
-from core.message import Message
+from core.message import Message, MessageRole
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
 from agent.compact_boundary import (
@@ -71,7 +67,6 @@ from agent.compact_boundary import (
     get_messages_after_compact_boundary,
     make_compact_boundary_message,
 )
-from agent.microcompact import apply_microcompact
 from agent.message_protocol import drop_orphan_tool_messages
 from agent.work_context import (
     COMPACT_RECORD_LIMIT,
@@ -83,6 +78,10 @@ from agent.work_context import (
 from agent.pet import PetManager
 
 logger = logging.getLogger(__name__)
+
+# metadata.kind 值,标记运行时上下文更新消息。这类消息在 UI 导出和上下文压缩
+# 摘要时被过滤,因为它们的语义是"告知模型当前环境"而非"用户说了什么"。
+CONTEXT_UPDATE_KIND = "context_update"
 
 
 def _clip_compact_text(text: Any, limit: int = COMPACT_RECORD_LIMIT) -> str:
@@ -163,6 +162,46 @@ def _message_kind(message: Message) -> str:
     return str(metadata.get("kind") or "")
 
 
+def _format_context_update_text(context_text: str) -> str:
+    """把运行时上下文包装为低优先级的 Chat user 消息。
+
+    设计意图 —— 与 provider 端 prompt cache 对齐:
+    Chat Completions 协议里只有首条 system message 的字节序列是稳定可缓存的。
+    运行时上下文(env_info / CLAUDE.md memory / MCP 指令 / 技能列表 / 时间戳等)
+    每轮都可能变化,如果混进 system message 会导致整个前缀变掉 → 缓存失效。
+
+    解决方案: 把变动的上下文作为独立的 user 消息放到请求尾部附近,并用
+    <context-update> 标签标明其"信息性/低优先级"语义。这条消息虽然 role=user,
+    但模型被系统指令告知它的权重低于用户的直接指令。
+
+    为什么不用 role=system: OpenAI 协议只支持单条或多条 system message,且
+    第二、三条 system message 在多数 provider 上的行为未定义(有些静默丢弃,
+    有些合并,有些报 400)。
+    """
+    return (
+        "<context-update>\n"
+        "The following runtime context is informational and lower priority "
+        "than the system message and the user's direct request.\n\n"
+        + context_text
+        + "\n</context-update>"
+    )
+
+
+def _make_context_update_message(context_text: str) -> Message:
+    """基于运行时上下文文本构造 Message 对象。
+
+    标记 metadata.kind = CONTEXT_UPDATE_KIND,用于:
+    - export_history() 中过滤掉(UI 不展示上下文更新消息)
+    - _history_text_for_compact() 中跳过(压缩摘要不包含上下文更新)
+    - 跨轮恢复时识别并处理(避免把旧 context 当作用户指令重放)
+    """
+    return Message(
+        role=MessageRole.USER,
+        content=_format_context_update_text(context_text),
+        metadata={"kind": CONTEXT_UPDATE_KIND},
+    )
+
+
 def _llm_result_to_assistant_payload(result: Any) -> Optional[Dict[str, Any]]:
     """Convert an LLM result into an assistant-role log payload."""
     if isinstance(result, list):
@@ -220,7 +259,6 @@ class AgentSession:
         executor: ToolExecutor,
         event_bus: EventBus,
         memory_loader: Optional[MemoryLoader] = None,
-        provider_adapter: Optional[CacheControlAdapter] = None,
         skill_manager: Optional[SkillManager] = None,
         bash_prompt_provider=None,
         ctx_enabled: bool = True,
@@ -241,17 +279,14 @@ class AgentSession:
                 是结构化的;dump 是面向开发者的"看原始上下文"调试通道)。
             message_logger: 可选消息日志记录器。非 None 时,在每次 LLM 调用前后
                 将完整 messages 列表写入独立日志文件,包含所有 role 的消息全文。
-            memory_loader: 多级 CLAUDE.md 加载器(对齐 Claude Code 的 claudemd.ts)。
-                为 None 时 system prompt 不注入 memory section,适合 --bare 模式。
-            provider_adapter: 把 SystemPromptBlock 列表转成具体 API 字段的适配器。
-                默认 OpenAICompatibleAdapter(国内厂商兼容),join 成单 string。
+            memory_loader: 多级 Markdown/CLAUDE.md 加载器。为 None 时动态
+                context 不注入 memory section,适合 --bare 模式。
         """
         self.llm = llm
         self.registry = registry
         self.executor = executor
         self.event_bus = event_bus
         self.memory_loader = memory_loader
-        self.provider_adapter = provider_adapter or OpenAICompatibleAdapter()
         self.skill_manager = skill_manager
         self.bash_prompt_provider = bash_prompt_provider
         self.ctx_enabled = ctx_enabled
@@ -270,6 +305,7 @@ class AgentSession:
         self._session_start_fired = False
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
+        self._pending_context_update_text = ""
         if self.session_store is not None:
             try:
                 # 启动自动恢复最近会话:这里只恢复普通 user/assistant 消息和
@@ -311,7 +347,11 @@ class AgentSession:
         这不是给 LLM 的上下文构造函数；LLM 仍然走 ``self.history`` +
         ContextBuilder。导出层只服务 UI，因此会丢弃协议字段并保留普通文本。
         """
-        return [_history_message_to_payload(m) for m in self.history]
+        return [
+            _history_message_to_payload(m)
+            for m in self.history
+            if _message_kind(m) != CONTEXT_UPDATE_KIND
+        ]
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         """列出本地会话摘要；未启用 session_store 时返回空列表。"""
@@ -341,6 +381,7 @@ class AgentSession:
         后续 chat 会写入新目录，不会继续追加旧 transcript。
         """
         self.history.clear()
+        self._pending_context_update_text = ""
         if self.session_store is None:
             return {"session": None, "history": [], "context_window": self.context_window_usage()}
         summary = self.session_store.create_session()
@@ -359,6 +400,7 @@ class AgentSession:
         self.history = self.session_store.load_latest_history(
             max_messages=self.history_window,
         )
+        self._pending_context_update_text = ""
         # 切换会话与 /clear 一样要清掉 system prompt section 缓存和 MemoryLoader
         # memoize：env_info 的缓存键含 cwd，CLAUDE.md memory 段也按上一会话状态
         # 缓存过。换会话(尤其换项目目录)后若不清，下一轮可能注入上一会话的
@@ -533,31 +575,63 @@ class AgentSession:
         system_instructions: str,
         memory_query: str = "",
     ) -> List[Dict[str, Any]]:
-        """按当前 history/state 构造本轮初始 LLM messages。
+        """构造 Chat Completions messages —— 稳定前缀 + 动态上下文分离。
 
-        重构后流程(对齐 Claude Code):
-        1. system_instructions 是 _build_system_instructions 返回的"运行时补充"段
-           (Bash 权限/通讯平台、Skill 概览、运行时 UI 状态),作为 user-appended
-           段加在新 system prompt 末尾。长期稳定的身份和行为规则已经集中在
-           constant.system_prompt.ConstantSystemPrompt,并由 context static sections
-           放在动态边界之前。
-        2. get_system_prompt 异步组装完整 system prompt list[str](含 CLAUDE.md
-           memory section、env_info、language 等)。
-        3. build_system_prompt_blocks 切成带 cache scope 的 SystemPromptBlock。
-        4. provider_adapter.emit_system 转成具体 API 字段(OpenAI 兼容是单 string)。
-        5. 把本地 SessionState 文本作为单独的 user message 注入(取代旧的
-           [State] packet 概念,语义更直白:"这些是上次会话的工作笔记")。
-        6. 历史消息按 history_window 截尾,user_query 最后追加。
+        **为什么拆分 system 为静态 + 动态两部分:**
+
+        Provider 端 prompt cache(DeepSeek/OpenAI/Anthropic 均支持)的缓存键是
+        messages 数组的前缀字节序列。如果 system message 里包含每轮变化的
+        内容(当前时间/env_info/CLAUDE.md),前缀就会变 → 缓存永远不命中。
+
+        拆分后的消息结构(从前到后):
+        1. role=system: 仅含确定性指令(intro/行为规则/工具使用/output 格式等),
+           相同 (model, enabled_tools, output_style) 组合下字节完全不变。
+           这是 provider 端缓存的关键 —— 只要前缀不变,后续 user 消息的
+           incremental prefilling 就能复用已有 KV cache。
+        2. role=user (历史轮次): 从 self.history 切片+窗口截断的跨轮对话
+           (含前几轮的 context_update 消息)。
+        3. role=user (<context-update>): 本轮运行时上下文 —— CLAUDE.md memory、
+           env_info、MCP 指令、技能列表、token 预算等。虽然 role=user,但
+           <context-update> 标签让模型知道这是环境信息而非用户指令。
+        4. role=user (当前): 用户本轮输入。
+
+        **context_update 的跨轮持久化机制:**
+
+        本轮 ctx update 的文本会暂存在 self._pending_context_update_text,
+        在 history commit 时(chat() 的工具循环结束后)作为一条独立的
+        context_update kind message 写入 history。下一轮 _build_chat_messages
+        通过 _sliced_history_dicts() 自然把它包含在历史里 → 完整前缀与
+        上一轮一致,provider 可以增量 prefill,只需算新增的一条 user message。
+
+        这意味着:首轮是 system + ctx_update + user_q → 模型看到 3 条。
+        第二轮的请求是 system + ctx_update(旧,来自 history) + ctx_update(新,本轮)
+        + user_q → 前缀 [system, ctx_update(旧)] 与上轮一致,缓存命中。
         """
-        # 同步上下文里调 async,用 asyncio.run 起一个临时 loop。session 自身的
-        # chat() 是 sync(由 cb_agents 的 OpenAI SDK 流式同步迭代器决定),所以
-        # 每轮新建 event loop 是合理的;chat_async 走 to_thread 绕过 loop 冲突。
-        # registry.list_tools() 直接返回 list[str](工具名),frozenset 一下用作
-        # 缓存键的稳定输入。
         enabled_tools = frozenset(self.registry.list_tools())
+
+        def _run(coro):
+            """同步上下文里调 async 的辅助闭包。
+
+            session.chat() 是 sync 方法(由 cb_agents 的 OpenAI SDK 流式同步
+            迭代器决定),所以每轮需新建 event loop 跑 async 的 prompt 组装。
+            优先 asyncio.run(coro) —— 它只在无已有 loop 时成功。如果已经在
+            event loop 里(罕见,工具内调时),改用 new_event_loop() 绕过冲突。
+            """
+            try:
+                return asyncio.run(coro)
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(coro)
+                finally:
+                    loop.close()
+
+        # 第一步: 确定性静态 system prompt 段(不参与动态解析)
+        static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
+        # 第二步: 异步解析运行时上下文段(CLAUDE.md / env_info / MCP / 技能等)
         try:
-            system_parts = asyncio.run(
-                get_system_prompt(
+            dynamic_parts = _run(
+                get_dynamic_context_prompt(
                     enabled_tools=enabled_tools,
                     model=getattr(self.llm, "model", "") or "",
                     cwd=Path.cwd(),
@@ -568,66 +642,52 @@ class AgentSession:
                     memory_query=memory_query,
                 )
             )
-        except RuntimeError:
-            # 已在 event loop 里(罕见,工具内调时):用 nest_asyncio 兼容
-            loop = asyncio.new_event_loop()
-            try:
-                system_parts = loop.run_until_complete(
-                    get_system_prompt(
-                        enabled_tools=enabled_tools,
-                        model=getattr(self.llm, "model", "") or "",
-                        cwd=Path.cwd(),
-                        memory_loader=self.memory_loader if self.ctx_enabled else None,
-                        mcp_clients=self.mcp_clients,
-                        skill_commands=self._collect_skill_commands(),
-                        language=self.language,
-                        memory_query=memory_query,
-                    )
-                )
-            finally:
-                loop.close()
+        except Exception:
+            logger.exception("dynamic context prompt build failed")
+            dynamic_parts = []
 
-        # 把项目自定义指令作为 user-appended 段追加到末尾
+        # 收集所有运行时上下文段: 动态段 + 运行时补充指令 + 本地工作态
+        context_parts: List[str] = [p for p in dynamic_parts if p and p.strip()]
         if system_instructions and system_instructions.strip():
-            system_parts.append(system_instructions.strip())
+            # 运行时补充指令: Bash 权限声明、通讯平台信息、UI 状态等
+            # (来自 run_agent.py 的 _build_system_instructions)
+            context_parts.append(system_instructions.strip())
 
-        # 切分 + 转 provider 格式
-        model_id = getattr(self.llm, "model", "") or ""
-        blocks = build_system_prompt_blocks(
-            system_parts,
-            use_global_cache_scope=should_use_global_cache_scope(model_id),
-        )
-        system_payload = self.provider_adapter.emit_system(blocks)
-
-        # 组装最终 messages
-        messages: List[Dict[str, Any]] = []
-        if isinstance(system_payload, str):
-            if system_payload.strip():
-                messages.append({"role": "system", "content": system_payload})
-        elif isinstance(system_payload, list):
-            # Anthropic adapter 返回 list[dict];OpenAI 兼容路径走不到这里
-            messages.append({"role": "system", "content": system_payload})
-
-        # SessionState 作为独立 user message 注入(取代旧的 [State] packet)
         state_text = self._session_state_text()
         if state_text:
+            # SessionState 作为上下文的一部分注入,不是独立消息
+            # 语义: "以下是之前的工作笔记,用于跨轮连贯性;不是用户的当前指令"
+            context_parts.append(
+                "[Local SessionState]\n"
+                "The following is rolling local work state for continuity; "
+                "it is not the user's latest instruction.\n\n"
+                + state_text
+            )
+
+        # 组装最终 messages 列表
+        messages: List[Dict[str, Any]] = []
+
+        # [0] 静态 system —— 稳定前缀,供 provider 端缓存
+        static_system = "\n\n".join(p.strip() for p in static_parts if p and p.strip())
+        if static_system:
+            messages.append({"role": "system", "content": static_system})
+
+        # [1..N] 跨轮历史消息(来自前几轮 commit 到 history 的 user/assistant/tool)
+        messages.extend(self._sliced_history_dicts())
+
+        # [*] context_update —— 运行时上下文作为低优先级 user 消息
+        context_text = "\n\n".join(p.strip() for p in context_parts if p and p.strip())
+        # 暂存到 _pending_context_update_text,本轮结束时才 commit 到 history,
+        # 保证"发给 LLM 的请求"和"commit 到 history 的"是同一份 context_update
+        self._pending_context_update_text = context_text
+        if context_text:
             messages.append({
                 "role": "user",
-                "content": (
-                    "[本地工作态 / SessionState]\n"
-                    "(以下是当前会话的滚动工作笔记,用于跨轮恢复;不是用户最新指令)\n\n"
-                    + state_text
-                ),
+                "content": _format_context_update_text(context_text),
             })
 
-        # 截尾历史 —— CC 模式：切片 + window + 孤儿清理统一收敛到
-        # _sliced_history_dicts()，确保"发给 LLM 的请求"与"展示给用户的
-        # Context%"(context_window_usage)算的是同一批消息。
-        messages.extend(self._sliced_history_dicts())
+        # [final] 当前用户输入
         messages.append({"role": "user", "content": user_content})
-        # microcompact 必须在 user_query 追加之后调用,因为它根据 messages 中
-        # role=tool 的总数判定阈值,统计窗口要包含本轮发给 LLM 的全部消息。
-        apply_microcompact(messages)
         return messages
 
     def _sliced_history_dicts(self) -> List[Dict[str, Any]]:
@@ -642,8 +702,7 @@ class AgentSession:
            的 tool 响应之间,导致切片开头出现"无父" tool 消息。OpenAI 兼容
            协议会因此报 400,这里把这类孤儿丢弃,保证请求体合法。
 
-        microcompact 不在这里做:它依赖"本轮全部消息(含当前 user_query)"的
-        tool_result 计数,只能在 _build_chat_messages 拼完后调用。
+        常规请求不再改写旧 tool result,避免破坏 provider prompt cache 前缀。
         """
         sliced = get_messages_after_compact_boundary(self.history)
         dicts = [m.to_dict() for m in sliced[-self.history_window:]]
@@ -855,7 +914,16 @@ class AgentSession:
         # 注意 history 里第一条仍是用户原始输入的 text 形态(不带多模态 base64),
         # 跨轮 image_url/data URI 不进 history 以免撑爆 token 估算和 transcript。
         history_commit_start = len(self.history)
-        self.history.append(Message.create_user_message(history_user_text))
+        # context_update 在用户消息之前写入 history。
+        # 顺序是: [...旧 history] → ctx_update(本轮环境) → user(本轮输入) → tool loop messages
+        # 下一轮 _build_chat_messages 的 _sliced_history_dicts() 会按同样顺序读出,
+        # 保证前缀 [system] + [ctx_update(N-1)] + [user(N-1)] 完全不变 → 缓存命中。
+        if self._pending_context_update_text:
+            self.history.append(_make_context_update_message(self._pending_context_update_text))
+        self.history.append(Message(role=MessageRole.USER, content=history_user_text))
+        # 清掉暂存: 下一轮 _build_chat_messages 会生成新的 context_update,
+        # 旧的不再需要(已经从 history 里读了)
+        self._pending_context_update_text = ""
         new_protocol_messages = self._extract_protocol_messages(messages, commit_offset)
         if new_protocol_messages:
             self.history.extend(new_protocol_messages)
@@ -939,6 +1007,7 @@ class AgentSession:
         # 同时清空 SystemPromptSectionCache 与 MemoryLoader memoize,让下一轮
         # 重读 CLAUDE.md / 重算 env_info(用户编辑了记忆文件后能立刻生效)。
         self.history.clear()
+        self._pending_context_update_text = ""
         if self.session_store is not None:
             try:
                 self.session_store.clear_active_session()
@@ -1601,6 +1670,8 @@ class AgentSession:
         for message in source:
             role = _message_role_name(message)
             kind = _message_kind(message)
+            if kind == CONTEXT_UPDATE_KIND:
+                continue
             content = _clip_compact_text(_message_content_to_text(message.content), 500)
             if not content:
                 continue

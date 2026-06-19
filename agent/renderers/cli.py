@@ -367,10 +367,24 @@ class CLIRenderer:
         if not self.show_token_usage:
             return
         with self._lock:
+            # 拼接缓存遥测信息(仅在有值时显示):
+            # cached → 被缓存的 prompt token 数(OpenAI 路径)
+            # hit/miss → Anthropic 风格的命中/未命中拆分
+            # hit_rate → 缓存命中率百分比
+            cache_bits: List[str] = []
+            if e.cached_prompt_tokens is not None:
+                cache_bits.append(f"cached={e.cached_prompt_tokens}")
+            if e.prompt_cache_hit_tokens is not None:
+                cache_bits.append(f"hit={e.prompt_cache_hit_tokens}")
+            if e.prompt_cache_miss_tokens is not None:
+                cache_bits.append(f"miss={e.prompt_cache_miss_tokens}")
+            if e.cache_hit_rate is not None:
+                cache_bits.append(f"hit_rate={e.cache_hit_rate:.1%}")
+            cache_text = (" " + " ".join(cache_bits)) if cache_bits else ""
             print(
                 f"  {DIM}{GRAY}[round {e.round_idx}] tokens: "
                 f"prompt={e.prompt_tokens} completion={e.completion_tokens} "
-                f"total={e.total_tokens}{RESET}"
+                f"total={e.total_tokens}{cache_text}{RESET}"
             )
 
     def _on_background(self, e: BackgroundNotification) -> None:

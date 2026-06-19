@@ -52,6 +52,11 @@ export interface TokenUsage extends BaseEvent {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  // prompt cache 遥测(仅支持该能力的 provider 返回)
+  cached_prompt_tokens?: number;   // 被缓存的 prompt token 数
+  prompt_cache_hit_tokens?: number;   // 缓存命中数
+  prompt_cache_miss_tokens?: number;  // 缓存未命中数
+  cache_hit_rate?: number;            // 缓存命中率(0~1)
 }
 
 export interface ToolStart extends BaseEvent {

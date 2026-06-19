@@ -11,7 +11,7 @@
 - bash_output.py 工具级截断：保持不变，executor cap 是兜底
 - _maybe_compress_tool_loop_messages：在 80% 窗口时替换 tool content 为摘要，
   executor cap 在它之前生效（工具返回时就做），两者互不冲突
-- cached_microcompact：按条数替换旧 tool result 为占位，处理跨轮积累的旧消息
+- legacy local microcompact：按条数替换旧 tool result 为占位，处理跨轮积累的旧消息
 """
 
 from __future__ import annotations

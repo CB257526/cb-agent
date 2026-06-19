@@ -19,17 +19,15 @@
 ```text
 AgentSession.chat(user_query)
   -> _build_chat_messages(memory_query=user_query)
-    -> get_system_prompt(..., memory_query)
-      -> static sections
-      -> SYSTEM_PROMPT_DYNAMIC_BOUNDARY
-      -> dynamic sections
+    -> get_static_system_prompt(...)
+      -> first stable system message
+    -> append persisted history
+    -> get_dynamic_context_prompt(..., memory_query)
+      -> context_update user message
         -> memory_section(memory_loader, query=memory_query)
           -> MemoryLoader.get_memory_files()
           -> MemoryLoader.get_knowledge_context(query)
           -> format_memory_files(files, knowledge_context)
-    -> provider_adapter.emit_system(blocks)
-    -> append local session state
-    -> append history
     -> append current user query
 ```
 

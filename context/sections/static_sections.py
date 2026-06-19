@@ -3,8 +3,8 @@
 对应 claude-code/src/constants/prompts.ts 中的 simpleIntro / simpleSystem /
 simpleDoingTasks / actions / usingYourTools / outputEfficiency 几段。
 
-这些函数返回**确定性字符串**:相同入参永远产出相同输出,无需缓存即可放在
-SYSTEM_PROMPT_DYNAMIC_BOUNDARY 之前共享 cache_scope=GLOBAL。
+这些函数返回**确定性字符串**:相同入参永远产出相同输出,适合放在
+Chat Completions 请求的首条稳定 system message 中。
 
 稳定文本集中放在 ``constant.system_prompt.ConstantSystemPrompt``。这里保留函数
 是为了维持 prompts/builder.py 的分段语义，并给 output_style 这类少量包装逻辑

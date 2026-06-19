@@ -148,16 +148,21 @@ class ToolRegistry:
 
     def get_tools_description(self) -> str:
         """
-        获取所有可用工具的格式化描述字符串
+        获取所有可用工具的格式化描述字符串。
+
+        工具按名称字母序排序输出。这是为了:
+        - 确定性: 相同工具集合 → 相同排列顺序 → system message 字节不变
+        - 缓存友好: system message 是 messages[0],其字节序列必须稳定
+          provider 端才能命中 prompt cache。如果每次随机排列,缓存前缀就变了。
 
         Returns:
-            工具描述字符串，用于构建提示词
+            工具描述字符串,用于构建提示词
         """
         descriptions = []
 
         with self._lock:
-            tools = list(self._tools.values())
-            functions = list(self._functions.items())
+            tools = sorted(self._tools.values(), key=lambda t: t.name)
+            functions = sorted(self._functions.items(), key=lambda item: item[0])
 
         # Tool对象描述
         for tool in tools:
@@ -172,16 +177,21 @@ class ToolRegistry:
 
     def get_tools_description_openai_schema(self) -> Optional[List[Dict]]:
         """
-        获取所有可用工具的openai function calling格式列表
+        获取所有可用工具的 OpenAI function calling 格式列表。
+
+        工具按名称字母序排序,输出前再次按 function.name 排序:
+        - 内部 sorted() 保证 Tool 对象和函数工具各自的确定性顺序
+        - 外层 descriptions.sort() 保证合并后的最终列表也是确定性的
+        - 两层排序缺一不可: Tool.name 和 function.name 的字母序可能不一致
 
         Returns:
-            工具列表，用于模型调用Function Calling
+            工具列表,用于模型调用 Function Calling
         """
         descriptions = []
 
         with self._lock:
-            tools = list(self._tools.values())
-            functions = list(self._functions.items())
+            tools = sorted(self._tools.values(), key=lambda t: t.name)
+            functions = sorted(self._functions.items(), key=lambda item: item[0])
 
         # Tool对象描述
         for tool in tools:
@@ -202,18 +212,20 @@ class ToolRegistry:
                     },
                 }
             })
-        
+        descriptions.sort(
+            key=lambda item: str(((item.get("function") or {}).get("name")) or "")
+        )
         return descriptions if descriptions else []
 
     def list_tools(self) -> list[str]:
-        """列出所有工具名称"""
+        """列出所有工具名称,按字母序排列(保证确定性,支持 prompt cache)。"""
         with self._lock:
-            return list(self._tools.keys()) + list(self._functions.keys())
+            return sorted(list(self._tools.keys()) + list(self._functions.keys()))
 
     def get_all_tools(self) -> list[Tool]:
-        """获取所有Tool对象"""
+        """获取所有 Tool 对象,按名称字母序排列(保证确定性)。"""
         with self._lock:
-            return list(self._tools.values())
+            return sorted(self._tools.values(), key=lambda t: t.name)
 
     def clear(self):
         """清空所有工具"""
