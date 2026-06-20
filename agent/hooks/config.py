@@ -41,6 +41,8 @@ SUPPORTED_EVENTS = frozenset({
     "PostToolUse",
     "PreCompact",
     "Stop",
+    "SubagentStart",   # 子代理启动时触发，用于通知 hook 新子代理已创建
+    "SubagentStop",    # 子代理停止时触发，用于通知 hook 子代理已结束
 })
 
 # 第一版支持的 handler 类型。

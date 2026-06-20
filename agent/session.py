@@ -271,6 +271,11 @@ class AgentSession:
         mcp_clients=None,
         pet_manager: Optional[PetManager] = None,
         hook_manager: Optional[Any] = None,
+        system_prompt_addendum: Optional[str] = None,
+        max_tool_rounds: Optional[int] = None,
+        memory_writeback_enabled: bool = True,
+        is_subagent: bool = False,
+        subagent_task_registry: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -298,6 +303,11 @@ class AgentSession:
         self.language = language
         self.mcp_clients = mcp_clients
         self.pet_manager = pet_manager
+        self.system_prompt_addendum = system_prompt_addendum or ""
+        self.max_tool_rounds = int(max_tool_rounds or self.MAX_TOOL_ROUNDS)
+        self.memory_writeback_enabled = memory_writeback_enabled
+        self.is_subagent = is_subagent
+        self.subagent_task_registry = subagent_task_registry
         # 可选 HookManager：在用户提交、会话开始、上下文压缩、收尾等生命周期点
         # 触发用户可配置的 hook。None 表示不启用 hooks（零回归）。
         self.hook_manager = hook_manager
@@ -669,6 +679,11 @@ class AgentSession:
 
         # [0] 静态 system —— 稳定前缀,供 provider 端缓存
         static_system = "\n\n".join(p.strip() for p in static_parts if p and p.strip())
+        if self.system_prompt_addendum.strip():
+            static_system = (
+                f"{static_system}\n\n{self.system_prompt_addendum.strip()}"
+                if static_system else self.system_prompt_addendum.strip()
+            )
         if static_system:
             messages.append({"role": "system", "content": static_system})
 
@@ -730,7 +745,7 @@ class AgentSession:
     ) -> str:
         chat_started = time.perf_counter()
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
-        user_query = self._prepend_background_notifications(user_query)
+        user_query = self._prepend_runtime_notifications(user_query)
 
         # 生命周期 hook：SessionStart（本会话首个 Prompt，仅一次）+ UserPromptSubmit。
         # 两者的 additional_context 收集起来，稍后追加进 system_instructions 注入模型；
@@ -1341,7 +1356,8 @@ class AgentSession:
         # 三级阈值 + microcompact + autocompact;loop_compactions 保留为空列表
         # 是为了维持 _chat_impl 的解构调用兼容。
         loop_compactions: List[Dict[str, Any]] = []
-        for round_idx in range(1, self.MAX_TOOL_ROUNDS + 1):
+        max_rounds = self.max_tool_rounds
+        for round_idx in range(1, max_rounds + 1):
             # 进入新一轮前先看 token
             if token.is_cancelled():
                 self.event_bus.emit(Cancelled(
@@ -1360,7 +1376,7 @@ class AgentSession:
 
             self.event_bus.emit(RoundStart(
                 round_idx=round_idx,
-                max_rounds=self.MAX_TOOL_ROUNDS,
+                max_rounds=max_rounds,
             ))
             logger.info(
                 "round start: round=%s messages=%s request_tokens_est=%s",
@@ -1530,11 +1546,11 @@ class AgentSession:
         # 超出最大轮数
         self.event_bus.emit(Error(
             where="session",
-            message=f"工具调用超过 {self.MAX_TOOL_ROUNDS} 轮，强制终止",
-            round_idx=self.MAX_TOOL_ROUNDS,
+            message=f"工具调用超过 {max_rounds} 轮，强制终止",
+            round_idx=max_rounds,
         ))
         return (
-            self.MAX_TOOL_ROUNDS,
+            max_rounds,
             "（工具调用次数过多，已终止本轮）",
             trace_collector,
             loop_compactions,
@@ -1861,6 +1877,8 @@ class AgentSession:
         work_record_text: str = "",
     ) -> None:
         """Best-effort long-term memory and structured knowledge update."""
+        if not self.memory_writeback_enabled:
+            return
         if self.memory_loader is None or not self.ctx_enabled:
             return
         record_turn = getattr(self.memory_loader, "record_turn", None)
@@ -1881,6 +1899,34 @@ class AgentSession:
                 )
         except Exception:
             logger.exception("memory/knowledge auto-update failed")
+
+    def _prepend_runtime_notifications(self, user_query: str) -> str:
+        user_query = self._prepend_background_notifications(user_query)
+        return self._prepend_subagent_notifications(user_query)
+
+    def _prepend_subagent_notifications(self, user_query: str) -> str:
+        registry = self.subagent_task_registry
+        if registry is None:
+            return user_query
+        try:
+            done = registry.drain_notifications()
+        except Exception:
+            logger.exception("drain subagent notifications failed")
+            return user_query
+        if not done:
+            return user_query
+
+        lines = ["<system-reminder>", "[后台子 Agent 任务完成通知]"]
+        for task in done:
+            lines.append(
+                f"- task_id={task.id} subagent_type={task.subagent_type} "
+                f"status={task.status} output={task.output_path}"
+            )
+        lines.append(
+            "请在需要向用户汇报前使用 agent_task(action=output, task_id=...) 查看子任务摘要或完整输出。"
+        )
+        lines.append("</system-reminder>")
+        return "\n".join(lines) + "\n\n" + user_query
 
     def _prepend_background_notifications(self, user_query: str) -> str:
         """每轮 chat 前 drain 后台任务通知，挂到 user_query 前作为 system reminder。

@@ -51,8 +51,9 @@ cb-agent 已有 EventBus（`agent/event_bus.py`），但它是**单向广播**�
 | `PreCompact` | 上下文即将压缩前 | `trigger`（`auto` / `manual`） | 仅通知（导出/保存） |
 | `Stop` | 整轮回答收尾前 | 无 matcher（总触发） | 仅通知（生成报告/清理） |
 
-> `SubagentStart` / `SubagentStop` 暂未实现——本项目当前没有「Agent 调用子 Agent」
-> 的递归机制。待引入子 agent / Task 工具后再加。
+> `SubagentStart` / `SubagentStop` 已用于 `agent` / `agent_task` 子 Agent 流程。所有 hook stdin
+> 都会带上 `agent_scope`、`subagent_id`、`subagent_type`、`parent_session_id`、`task_id`
+> 和 `run_in_background`，子 Agent 内部生命周期与工具 hooks 使用 `agent_scope: "subagent"`。
 
 ## matcher 写法
 

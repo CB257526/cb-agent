@@ -33,7 +33,7 @@ from agent.event_bus import EventBus
 from agent.events import (
     BackgroundNotification, Cancelled, Done, Error, HookCompleted, HookStarted,
     ReasoningDelta, RoundEnd, RoundStart, TextDelta, TokenUsage, ToolComplete,
-    ToolStart,
+    ToolStart, SubagentCompleted, SubagentProgress, SubagentStarted,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,6 +262,9 @@ class CLIRenderer:
             (self._on_tool_complete, ToolComplete),
             (self._on_token_usage, TokenUsage),
             (self._on_background, BackgroundNotification),
+            (self._on_subagent_started, SubagentStarted),
+            (self._on_subagent_progress, SubagentProgress),
+            (self._on_subagent_completed, SubagentCompleted),
             (self._on_error, Error),
             (self._on_cancelled, Cancelled),
             (self._on_hook_started, HookStarted),
@@ -393,6 +396,33 @@ class CLIRenderer:
                 f"{BLUE}{BOLD}⟳ 后台任务完成{RESET} "
                 f"task={e.task_id} status={e.status} exit={e.exit_code} "
                 f"{DIM}→ {e.output_path}{RESET}"
+            )
+
+    def _on_subagent_started(self, e: SubagentStarted) -> None:
+        with self._lock:
+            bg = f" task={e.task_id}" if e.task_id else ""
+            print(
+                f"{BLUE}{BOLD}subagent started{RESET} "
+                f"type={e.subagent_type} id={e.subagent_id}{bg} "
+                f"{DIM}{e.description}{RESET}"
+            )
+
+    def _on_subagent_progress(self, e: SubagentProgress) -> None:
+        with self._lock:
+            task = f" task={e.task_id}" if e.task_id else ""
+            print(
+                f"  {DIM}{CYAN}subagent {e.subagent_id}{task}: {e.message}{RESET}"
+            )
+
+    def _on_subagent_completed(self, e: SubagentCompleted) -> None:
+        with self._lock:
+            color = RED if e.is_error else GREEN
+            task = f" task={e.task_id}" if e.task_id else ""
+            output = f" {DIM}->{e.output_path}{RESET}" if e.output_path else ""
+            print(
+                f"{color}{BOLD}subagent {e.status}{RESET} "
+                f"type={e.subagent_type} id={e.subagent_id}{task} "
+                f"rounds={e.rounds_used} {DIM}({e.duration_seconds:.2f}s){RESET}{output}"
             )
 
     def _on_error(self, e: Error) -> None:

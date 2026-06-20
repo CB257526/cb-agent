@@ -17,6 +17,7 @@ command 执行通过 mock subprocess.run 模拟，不真正起子进程，保证
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
 import unittest
@@ -29,6 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.hooks import HookManager, load_hooks_config, matches  # noqa: E402
 from agent.hooks import manager as hooks_manager  # noqa: E402
 from agent.hooks.config import HookGroup, HookHandler  # noqa: E402
+from agent.event_bus import EventBus, collect_all  # noqa: E402
+from agent.events import HookCompleted, HookStarted  # noqa: E402
 
 
 class _Proc:
@@ -120,6 +123,24 @@ class TestConfigLoad(unittest.TestCase):
         # 不支持的 handler 类型 → 该组无合法 handler → 整组丢弃
         self.assertNotIn("PostToolUse", cfg)
 
+    def test_subagent_events_are_supported(self):
+        cfg = load_hooks_config(self._write(
+            """
+            {
+              "hooks": {
+                "SubagentStart": [
+                  {"matcher": "*", "hooks": [{"type": "command", "command": "echo start"}]}
+                ],
+                "SubagentStop": [
+                  {"matcher": "*", "hooks": [{"type": "command", "command": "echo stop"}]}
+                ]
+              }
+            }
+            """
+        ))
+        self.assertIn("SubagentStart", cfg)
+        self.assertIn("SubagentStop", cfg)
+
 
 class TestFire(unittest.TestCase):
     def test_no_config_returns_empty(self):
@@ -207,6 +228,59 @@ class TestFire(unittest.TestCase):
         self.assertTrue(mgr.has_event("PreToolUse"))
         self.assertFalse(mgr.has_event("Stop"))
         self.assertFalse(HookManager({}, cwd=Path(".")).enabled)
+
+    def test_scope_fields_are_sent_to_stdin_and_events(self):
+        cfg = {
+            "PreToolUse": [
+                HookGroup(matcher="bash", handlers=[HookHandler(command="echo ok")])
+            ]
+        }
+        bus = EventBus()
+        events = collect_all(bus)
+        captured = {}
+
+        def fake_run(*_args, **kwargs):
+            captured["stdin"] = kwargs.get("input")
+            return _Proc(0, "", "")
+
+        mgr = HookManager(
+            cfg,
+            cwd=Path("."),
+            event_bus=bus,
+            session_id="root-session",
+        ).with_context(
+            agent_scope="subagent",
+            subagent_id="sub_1",
+            subagent_type="reviewer",
+            parent_session_id="root-session",
+            task_id="task_1",
+            run_in_background=True,
+        )
+
+        with mock.patch.object(hooks_manager.subprocess, "run", side_effect=fake_run):
+            mgr.fire(
+                "PreToolUse",
+                {"tool_name": "bash", "tool_input": {}, "tool_call_id": "call_1"},
+                matcher_value="bash",
+                round_idx=7,
+            )
+
+        stdin = json.loads(captured["stdin"])
+        self.assertEqual(stdin["agent_scope"], "subagent")
+        self.assertEqual(stdin["subagent_id"], "sub_1")
+        self.assertEqual(stdin["subagent_type"], "reviewer")
+        self.assertEqual(stdin["parent_session_id"], "root-session")
+        self.assertEqual(stdin["task_id"], "task_1")
+        self.assertTrue(stdin["run_in_background"])
+        self.assertEqual(stdin["round_idx"], 7)
+        self.assertEqual(stdin["tool_call_id"], "call_1")
+
+        started = next(e for e in events if isinstance(e, HookStarted))
+        completed = next(e for e in events if isinstance(e, HookCompleted))
+        self.assertEqual(started.agent_scope, "subagent")
+        self.assertEqual(started.subagent_id, "sub_1")
+        self.assertEqual(completed.hook_call_id, started.hook_call_id)
+        self.assertEqual(completed.task_id, "task_1")
 
 
 if __name__ == "__main__":

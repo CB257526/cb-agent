@@ -1,7 +1,7 @@
 """工具注册表 - HelloAgents原生工具系统"""
 
 import threading
-from typing import Optional, Any, Callable
+from typing import Optional, Any, Callable, Iterable
 from .tool import Tool
 from typing import List, Dict
 
@@ -226,6 +226,60 @@ class ToolRegistry:
         """获取所有 Tool 对象,按名称字母序排列(保证确定性)。"""
         with self._lock:
             return sorted(self._tools.values(), key=lambda t: t.name)
+
+    def clone_filtered(
+        self,
+        *,
+        allow_names: Optional[Iterable[str]] = None,
+        deny_names: Optional[Iterable[str]] = None,
+        event_bus: Any = None,
+    ) -> "ToolRegistry":
+        """创建一个只包含指定工具的快照注册表。
+
+        按 allow/deny 两组规则筛选工具，同时处理特殊工具（todo 需要 event_bus、
+        list_tools 需要引用自身）的依赖注入。返回的注册表不共享工具映射表；
+        除 todo/list_tools 等需要重新绑定的特殊工具外，普通工具实例会复用原实例。
+        """
+        allow = set(allow_names) if allow_names is not None else None
+        deny = set(deny_names or [])
+        cloned = ToolRegistry()
+
+        with self._lock:
+            tools = sorted(self._tools.values(), key=lambda t: t.name)
+            functions = sorted(self._functions.items(), key=lambda item: item[0])
+
+        selected_tool_names = []
+        for tool in tools:
+            if allow is not None and tool.name not in allow:
+                continue
+            if tool.name in deny:
+                continue
+            selected_tool_names.append(tool.name)
+            if tool.name == "list_tools":
+                continue
+            if tool.name == "todo":
+                try:
+                    from tools.tools.todo_tool import TodoTool
+                    cloned.register_tool(TodoTool(event_bus=event_bus))
+                    continue
+                except Exception:
+                    pass
+            cloned.register_tool(tool)
+
+        if "list_tools" in selected_tool_names:
+            try:
+                from tools.tools.list_tools_tool import ListToolsTool
+                cloned.register_tool(ListToolsTool(cloned))
+            except Exception:
+                pass
+
+        for name, info in functions:
+            if allow is not None and name not in allow:
+                continue
+            if name in deny:
+                continue
+            cloned.register_function(name, info["description"], info["func"])
+        return cloned
 
     def clear(self):
         """清空所有工具"""

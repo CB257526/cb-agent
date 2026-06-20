@@ -280,6 +280,63 @@ class PetUpdated:
 
 
 @dataclass
+class SubagentStarted:
+    """子代理（child agent）开始运行的事件。
+
+    当主代理（root agent）启动一个子代理任务时广播此事件，
+    用于 UI 展示"子代理启动"的状态变化。
+    """
+    subagent_id: str           # 子代理的唯一标识
+    subagent_type: str         # 子代理的类型（如 "agent_tool" / "agent_task"）
+    description: str           # 子代理的任务描述
+    task_id: Optional[str] = None       # 后台任务 ID（运行于后台时才有）
+    run_in_background: bool = False     # 是否以后台任务方式运行
+    parent_session_id: Optional[str] = None  # 父会话的 session_id
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="subagent_started", init=False)
+
+
+@dataclass
+class SubagentProgress:
+    """子代理运行过程中的进度更新事件。
+
+    子代理在执行中周期性地 emit 紧凑进度消息，
+    UI 端可以根据 status 展示"运行中"状态。
+    """
+    subagent_id: str           # 子代理的唯一标识
+    subagent_type: str         # 子代理的类型
+    message: str               # 进度描述文本
+    task_id: Optional[str] = None       # 绑定的后台任务 ID
+    status: str = "running"             # 当前状态（running / ...）
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="subagent_progress", init=False)
+
+
+@dataclass
+class SubagentCompleted:
+    """子代理运行结束的事件（成功、失败或取消）。
+
+    包含最终的输出内容、执行时长、使用轮数等汇总信息，
+    UI 端根据 is_error 切换成功/失败的颜色渲染。
+    """
+    subagent_id: str           # 子代理的唯一标识
+    subagent_type: str         # 子代理的类型
+    description: str           # 任务描述（与 started 事件一致，方便 UI 聚合）
+    status: str                # 结束状态：completed / failed / cancelled
+    content: str = ""          # 子代理的最终回答文本
+    task_id: Optional[str] = None       # 绑定的后台任务 ID
+    output_path: Optional[str] = None   # 输出文件路径（如有持久化）
+    duration_seconds: float = 0.0       # 子代理执行总耗时
+    rounds_used: int = 0                # 子代理使用的工具循环轮数
+    is_error: bool = False              # 是否以错误结束
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="subagent_completed", init=False)
+
+
+@dataclass
 class HookStarted:
     """某个 hook handler 开始执行。
 
@@ -290,6 +347,13 @@ class HookStarted:
     handler_type: str            # 目前只有 "command"
     matcher: str                 # 命中的 matcher 字段值
     round_idx: int = 0
+    hook_call_id: str = ""                    # 本次 hook 调用的唯一标识，用于关联 started/completed 配对
+    agent_scope: str = "root"                  # 代理作用域："root" 主代理 / "subagent" 子代理
+    subagent_id: Optional[str] = None          # 子代理 ID（仅子代理作用域时有值）
+    subagent_type: Optional[str] = None        # 子代理类型
+    parent_session_id: Optional[str] = None    # 父会话 ID
+    task_id: Optional[str] = None             # 后台任务 ID
+    run_in_background: bool = False           # 是否运行在后台
     timestamp: float = field(default_factory=_now)
     type: str = field(default="hook_started", init=False)
 
@@ -301,6 +365,13 @@ class HookCompleted:
     blocked: bool                # 是否阻止了主操作
     has_context: bool            # 是否注入了 additional_context
     duration_seconds: float
+    hook_call_id: str = ""                    # 本次 hook 调用的唯一标识，与 HookStarted 配对
+    agent_scope: str = "root"                  # 代理作用域："root" 主代理 / "subagent" 子代理
+    subagent_id: Optional[str] = None          # 子代理 ID（仅子代理作用域时有值）
+    subagent_type: Optional[str] = None        # 子代理类型
+    parent_session_id: Optional[str] = None    # 父会话 ID
+    task_id: Optional[str] = None             # 后台任务 ID
+    run_in_background: bool = False           # 是否运行在后台
     round_idx: int = 0
     timestamp: float = field(default_factory=_now)
     type: str = field(default="hook_completed", init=False)
@@ -327,6 +398,9 @@ Event = Union[
     TodoListUpdated,
     MCPStatus,
     PetUpdated,
+    SubagentStarted,
+    SubagentProgress,
+    SubagentCompleted,
     HookStarted,
     HookCompleted,
 ]
@@ -350,6 +424,9 @@ __all__ = [
     "AskUserQuestionAnswered",
     "MCPStatus",
     "PetUpdated",
+    "SubagentStarted",
+    "SubagentProgress",
+    "SubagentCompleted",
     "HookStarted",
     "HookCompleted",
 ]

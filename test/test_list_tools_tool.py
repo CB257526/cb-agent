@@ -1,3 +1,12 @@
+"""list_tools 工具的单元测试。
+
+覆盖 ListToolsTool 在注册表中查询工具列表的基本功能和边界情况。
+
+跑法：
+    ../venv/python.exe test/test_list_tools_tool.py
+    ../venv/python.exe -m unittest test.test_list_tools_tool -v
+"""
+
 from __future__ import annotations
 
 import os
@@ -63,6 +72,21 @@ class TestListToolsTool(unittest.TestCase):
             for item in first.get_tools_description_openai_schema()
         ]
         self.assertEqual(schema_names, ["a_func", "m_tool", "z_tool"])
+
+    def test_clone_filtered_rebinds_list_tools_to_child_registry(self) -> None:
+        registry = ToolRegistry()
+        registry.register_tool(DummyTool("safe_tool"))
+        registry.register_tool(DummyTool("blocked_tool"))
+        registry.register_tool(ListToolsTool(registry))
+
+        child = registry.clone_filtered(deny_names={"blocked_tool"})
+
+        self.assertIn("safe_tool", child.list_tools())
+        self.assertIn("list_tools", child.list_tools())
+        self.assertNotIn("blocked_tool", child.list_tools())
+        output = child.execute_tool("list_tools", {})
+        self.assertIn("safe_tool", output)
+        self.assertNotIn("blocked_tool", output)
 
 
 if __name__ == "__main__":

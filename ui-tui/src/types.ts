@@ -27,6 +27,11 @@ export type EventType =
   | "todo_list_updated"
   | "mcp_status"
   | "pet_updated"
+  | "subagent_started"
+  | "subagent_progress"
+  | "subagent_completed"
+  | "hook_started"
+  | "hook_completed"
   | "gateway_ready";  // gateway 自定义，不在 events.py 里
 
 export interface BaseEvent {
@@ -232,6 +237,64 @@ export interface PetUpdated extends BaseEvent {
   reason?: string;
 }
 
+export interface SubagentStarted extends BaseEvent {
+  type: "subagent_started";
+  subagent_id: string;
+  subagent_type: string;
+  description: string;
+  task_id?: string | null;
+  run_in_background: boolean;
+  parent_session_id?: string | null;
+}
+
+export interface SubagentProgress extends BaseEvent {
+  type: "subagent_progress";
+  subagent_id: string;
+  subagent_type: string;
+  message: string;
+  task_id?: string | null;
+  status: string;
+}
+
+export interface SubagentCompleted extends BaseEvent {
+  type: "subagent_completed";
+  subagent_id: string;
+  subagent_type: string;
+  description: string;
+  status: string;
+  content: string;
+  task_id?: string | null;
+  output_path?: string | null;
+  duration_seconds: number;
+  rounds_used: number;
+  is_error: boolean;
+}
+
+export interface HookScopeFields {
+  hook_call_id: string;
+  agent_scope: "root" | "subagent" | string;
+  subagent_id?: string | null;
+  subagent_type?: string | null;
+  parent_session_id?: string | null;
+  task_id?: string | null;
+  run_in_background?: boolean;
+}
+
+export interface HookStarted extends BaseEvent, HookScopeFields {
+  type: "hook_started";
+  event_name: string;
+  handler_type: string;
+  matcher: string;
+}
+
+export interface HookCompleted extends BaseEvent, HookScopeFields {
+  type: "hook_completed";
+  event_name: string;
+  blocked: boolean;
+  has_context: boolean;
+  duration_seconds: number;
+}
+
 export type AgentEvent =
   | TextDelta
   | ReasoningDelta
@@ -249,6 +312,11 @@ export type AgentEvent =
   | TodoListUpdated
   | MCPStatusEvent
   | PetUpdated
+  | SubagentStarted
+  | SubagentProgress
+  | SubagentCompleted
+  | HookStarted
+  | HookCompleted
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========

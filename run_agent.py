@@ -75,6 +75,7 @@ from agent.platforms.messages import ConversationKey
 from agent.renderers.cli import CLIRenderer
 from agent.message_logger import MessageLogger
 from agent.session import AgentSession
+from agent.subagents import SubagentRegistry, SubagentTaskRegistry
 from agent.work_context import LocalSessionStore, TraceSummarizer
 from constant.llm.constant_llm import ConstantLLM
 from context import MemoryLoader
@@ -107,6 +108,7 @@ from tools.tools.list_tools_tool import ListToolsTool
 from tools.tools.knowledge_tool import KnowledgeSearchTool, KnowledgeWriteTool
 from tools.tools.qqtool import QQTool
 from tools.tools.wechattool import WeChatTool
+from tools.tools.subagent_tool import AgentTaskTool, AgentTool, SubagentRunner
 
 try:
     from tools.mcp_tools.mcptools_add import load_mcp_server_configs
@@ -245,6 +247,9 @@ class AgentRunner:
             _info("已加载 hooks 配置")
 
         # 4. 工具调度器（依赖 event_bus）
+        self.subagent_registry = SubagentRegistry(Path(_HERE))
+        self.subagent_task_registry = SubagentTaskRegistry(Path(_HERE) / ".cbagent" / "subagents")
+
         self.executor = ToolExecutor(
             runner=self.registry.execute_tool,
             event_bus=self.event_bus,
@@ -272,6 +277,7 @@ class AgentRunner:
                 event_bus=self.event_bus,
             )
         )
+        self._register_subagent_tools()
 
         # 5c. 给全局 PermissionGate 装上 question_channel，让 bash 权限弹框
         # 也能走 UI 而不是 stdin（TUI 模式下 stdin 被前端接管）
@@ -326,6 +332,35 @@ class AgentRunner:
         )
         return message_logger
 
+    def _register_subagent_tools(self) -> None:
+        """Register root-only subagent entry points."""
+        runner = SubagentRunner(
+            llm=self.llm,
+            parent_registry=self.registry,
+            parent_event_bus=self.event_bus,
+            hook_manager=self.hook_manager,
+            cwd=Path(_HERE),
+            ctx_enabled=self.ctx_enabled,
+            skill_manager=self._skill_manager,
+            bash_prompt_provider=self._memory_prompt_provider,
+            trace_summarizer=self._trace_summarizer,
+            language="Chinese",
+            mcp_clients=None,
+            message_logger_factory=self._create_message_logger,
+            parent_session_id="main",
+        )
+        self.registry.register_tool(AgentTaskTool(
+            registry=self.subagent_registry,
+            task_registry=self.subagent_task_registry,
+        ))
+        self.registry.register_tool(AgentTool(
+            registry=self.subagent_registry,
+            task_registry=self.subagent_task_registry,
+            runner=runner,
+            hook_manager=self.hook_manager,
+            parent_session_id="main",
+        ))
+
     def _create_agent_session(
         self,
         *,
@@ -358,6 +393,7 @@ class AgentRunner:
             message_logger=self._create_message_logger(message_logger_scope),
             pet_manager=self.pet_manager,
             hook_manager=self.hook_manager,
+            subagent_task_registry=getattr(self, "subagent_task_registry", None),
         )
         # Gateway/平台适配器只拿到 AgentSession，不直接知道 AgentRunner。这里把 MCP
         # 运行态以回调形式挂到每个 session 上；状态只服务展示，不写入 history。

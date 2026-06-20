@@ -259,6 +259,11 @@ class ToolExecutor:
         round_idx: int,
         cancel_token: Optional[CancelToken],
     ) -> List[ToolCallResult]:
+        """串行执行一批 tool_calls。
+
+        每执行一个工具前检查 cancel_token；已取消的 tool_calls 填入占位结果，
+        保证 OpenAI 协议每个 tool_call_id 都有对应的 tool 消息回灌。
+        """
         results: List[ToolCallResult] = []
         cancel_emitted = False
         for tc in tool_calls:
@@ -351,7 +356,11 @@ class ToolExecutor:
         if self._hook_manager is not None and self._hook_manager.has_event("PreToolUse"):
             outcome = self._hook_manager.fire(
                 "PreToolUse",
-                {"tool_name": name, "tool_input": args},
+                {
+                    "tool_name": name,
+                    "tool_input": args,
+                    "tool_call_id": call_id,   # 传入 call_id，使 hook 能关联到具体的工具调用实例
+                },
                 matcher_value=name,
                 round_idx=round_idx,
             )
@@ -413,7 +422,12 @@ class ToolExecutor:
         ):
             outcome = self._hook_manager.fire(
                 "PostToolUse",
-                {"tool_name": name, "tool_input": args, "tool_response": result},
+                {
+                    "tool_name": name,        # 工具名称
+                    "tool_input": args,        # 工具输入参数
+                    "tool_response": result,   # 工具执行结果
+                    "tool_call_id": call_id,   # 传入 call_id，使 hook 能关联到具体的工具调用实例
+                },
                 matcher_value=name,
                 round_idx=round_idx,
             )

@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid                       # 为每次 hook 调用生成唯一标识，用于 HookStarted / HookCompleted 配对
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -99,6 +100,7 @@ class HookManager:
         event_bus: Any = None,
         cwd: Path,
         session_id: str = "",
+        context: Optional[Dict[str, Any]] = None,   # 运行时作用域上下文（agent_scope / subagent_id 等）
     ) -> None:
         """
         Args:
@@ -106,11 +108,24 @@ class HookManager:
             event_bus: 可选 EventBus，用于 emit HookStarted / HookCompleted
             cwd: hook 命令的工作目录（也写进 stdin JSON）
             session_id: 当前会话 id，写进 stdin JSON
+            context: 运行时作用域上下文，含 agent_scope / subagent_id 等，
+                    用于区分根代理和子代理发起的 hook 调用
         """
         self._config = config or {}
         self._bus = event_bus
         self._cwd = Path(cwd)
         self._session_id = session_id
+        # 运行时作用域上下文：区分 hook 调用属于 root 代理还是子代理
+        self._context: Dict[str, Any] = {
+            "agent_scope": "root",            # "root" 主代理 / "subagent" 子代理
+            "subagent_id": None,               # 子代理唯一 ID
+            "subagent_type": None,             # 子代理类型
+            "parent_session_id": None,          # 父会话 ID
+            "task_id": None,                    # 后台任务 ID
+            "run_in_background": False,         # 是否后台运行
+        }
+        if context:
+            self._context.update(context)       # 用外部传入的上下文覆盖默认值
 
     @property
     def enabled(self) -> bool:
@@ -120,6 +135,29 @@ class HookManager:
     def has_event(self, event_name: str) -> bool:
         """某事件是否配置了 hook。调用方用它避免无谓的 payload 构造。"""
         return bool(self._config.get(event_name))
+
+    def with_context(
+        self,
+        *,
+        event_bus: Any = None,
+        session_id: Optional[str] = None,
+        **context: Any,
+    ) -> "HookManager":
+        """创建一个共享配置但携带不同运行时作用域的新 HookManager 实例。
+
+        子代理启动时调用此方法生成自己的 HookManager 副本，
+        使得子代理内触发的 hook 事件携带正确的 agent_scope / subagent_id 等字段，
+        而不用修改原 HookManager 的共享配置。
+        """
+        merged = dict(self._context)
+        merged.update(context)
+        return HookManager(
+            self._config,
+            event_bus=self._bus if event_bus is None else event_bus,
+            cwd=self._cwd,
+            session_id=self._session_id if session_id is None else session_id,
+            context=merged,
+        )
 
     def fire(
         self,
@@ -149,17 +187,18 @@ class HookManager:
         if not handlers:
             return HookOutcome()
 
-        stdin_json = self._build_stdin_json(event_name, payload)
+        stdin_json = self._build_stdin_json(event_name, payload, round_idx)
         outcome = HookOutcome()
         context_parts: List[str] = []
 
         for handler in handlers:
-            self._emit_started(event_name, handler, matcher_value, round_idx)
+            hook_call_id = uuid.uuid4().hex[:12]  # 为本次 hook 调用生成唯一 ID，配对 started/completed 事件
+            self._emit_started(event_name, handler, matcher_value, round_idx, hook_call_id)
             start = time.perf_counter()
             raw = self._run_command(handler, stdin_json)
             duration = time.perf_counter() - start
             self._merge(raw, outcome, context_parts)
-            self._emit_completed(event_name, outcome, bool(context_parts), duration, round_idx)
+            self._emit_completed(event_name, outcome, bool(context_parts), duration, round_idx, hook_call_id)
             # 已被阻止/要求停止则不再跑后续 handler（语义上已经短路）
             if outcome.blocked or outcome.stop:
                 break
@@ -283,13 +322,19 @@ class HookManager:
 
     # ---------- stdin 构造 ----------
 
-    def _build_stdin_json(self, event_name: str, payload: Dict[str, Any]) -> str:
-        """拼装传给 hook 命令 stdin 的 JSON（对齐 Claude Code 字段名）。"""
+    def _build_stdin_json(self, event_name: str, payload: Dict[str, Any], round_idx: int = 0) -> str:
+        """拼装传给 hook 命令 stdin 的 JSON（对齐 Claude Code 字段名）。
+
+        包含作用域上下文（agent_scope / subagent_id 等），
+        使 hook 命令能感知当前是在根代理还是子代理中执行。
+        """
         data: Dict[str, Any] = {
             "session_id": self._session_id,
             "cwd": str(self._cwd),
             "hook_event_name": event_name,
+            "round_idx": round_idx,              # 当前工具循环轮次，供 hook 命令做轮次感知决策
         }
+        data.update(self._context)               # 注入运行时作用域（agent_scope 等）
         data.update(payload or {})
         return json.dumps(data, ensure_ascii=False)
 
@@ -297,6 +342,7 @@ class HookManager:
 
     def _emit_started(
         self, event_name: str, handler: HookHandler, matcher: str, round_idx: int,
+        hook_call_id: str,                                # 本次 hook 调用的唯一标识
     ) -> None:
         if self._bus is None:
             return
@@ -306,6 +352,13 @@ class HookManager:
                 event_name=event_name,
                 handler_type=handler.type,
                 matcher=matcher,
+                hook_call_id=hook_call_id,                     # 关联 started/completed 配对
+                agent_scope=str(self._context.get("agent_scope") or "root"),  # 代理作用域
+                subagent_id=self._context.get("subagent_id"),                  # 子代理 ID
+                subagent_type=self._context.get("subagent_type"),              # 子代理类型
+                parent_session_id=self._context.get("parent_session_id"),      # 父会话 ID
+                task_id=self._context.get("task_id"),                          # 后台任务 ID
+                run_in_background=bool(self._context.get("run_in_background")),# 是否后台运行
                 round_idx=round_idx,
             ))
         except Exception:  # noqa: BLE001
@@ -313,7 +366,7 @@ class HookManager:
 
     def _emit_completed(
         self, event_name: str, outcome: HookOutcome, has_context: bool,
-        duration: float, round_idx: int,
+        duration: float, round_idx: int, hook_call_id: str,   # 关联 started/completed 配对
     ) -> None:
         if self._bus is None:
             return
@@ -324,6 +377,13 @@ class HookManager:
                 blocked=outcome.blocked,
                 has_context=has_context,
                 duration_seconds=duration,
+                hook_call_id=hook_call_id,                     # 与 HookStarted 的 call_id 一致
+                agent_scope=str(self._context.get("agent_scope") or "root"),  # 代理作用域
+                subagent_id=self._context.get("subagent_id"),                  # 子代理 ID
+                subagent_type=self._context.get("subagent_type"),              # 子代理类型
+                parent_session_id=self._context.get("parent_session_id"),      # 父会话 ID
+                task_id=self._context.get("task_id"),                          # 后台任务 ID
+                run_in_background=bool(self._context.get("run_in_background")),# 是否后台运行
                 round_idx=round_idx,
             ))
         except Exception:  # noqa: BLE001
