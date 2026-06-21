@@ -11,7 +11,7 @@
 import type { Transport } from "./transport.js";
 import { basename } from "node:path";
 import { statSync } from "node:fs";
-import type { ChatItem, ContextWindow, MCPStatusPayload, PetState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
+import type { ChatItem, ContextWindow, MCPStatusPayload, PetState, PlanMode, PlanState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
 import { readClipboardImageAttachment } from "./clipboardImage.js";
 
 export interface CommandCtx {
@@ -35,6 +35,10 @@ export interface CommandCtx {
   setAttachments: (updater: (prev: QueuedAttachment[]) => QueuedAttachment[]) => void;
   /** 更新桌宠状态，供 /pet 命令同步 Sidebar。 */
   setPet: (state: PetState | null) => void;
+  /** Update Plan Mode state. */
+  setPlanState?: (state: PlanState | null) => void;
+  /** Switch Plan/Execute mode. */
+  setPlanMode?: (mode: PlanMode) => Promise<void>;
   /** 标记命令级长操作进行中（驱动 Footer 动效）；传 null 结束。runCommand 会兜底清。 */
   setPending: (label: string | null) => void;
   /** 打开浮层 Select 弹窗（方向键选 + 回车确认）。 */
@@ -295,6 +299,62 @@ export const COMMANDS: readonly SlashCommand[] = [
         });
       } catch (e) {
         appendSystem(`✗ /mcp 失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
+    name: "/plan",
+    description: "Plan Mode: status, mode <plan|execute>, approve, reject <feedback>",
+    handler: async ({ transport, args, appendSystem, setPlanState, setPlanMode }) => {
+      const trimmed = args.trim();
+      const [sub = "status", ...rest] = trimmed.split(/\s+/);
+      const command = sub.toLowerCase();
+      try {
+        if (command === "status") {
+          const result = await transport.getPlanState();
+          setPlanState?.(result.plan_state ?? null);
+          const state = result.plan_state;
+          appendSystem(
+            `Plan mode: ${state.mode}; status: ${state.status}; revision: ${state.revision ?? 0}` +
+              (state.current_path ? `\ncurrent: ${state.current_path}` : "") +
+              (state.approved_path ? `\napproved: ${state.approved_path}` : "") +
+              (state.last_feedback ? `\nlast feedback: ${state.last_feedback}` : ""),
+          );
+          return;
+        }
+        if (command === "mode") {
+          const mode = (rest[0] ?? "").toLowerCase();
+          if (mode !== "plan" && mode !== "execute") {
+            appendSystem("Usage: /plan mode <plan|execute>");
+            return;
+          }
+          if (setPlanMode) {
+            await setPlanMode(mode);
+          } else {
+            const result = await transport.setMode(mode);
+            setPlanState?.(result.plan_state ?? null);
+          }
+          appendSystem(`Plan mode set to ${mode.toUpperCase()}.`);
+          return;
+        }
+        if (command === "approve") {
+          const result = await transport.approvePlan();
+          setPlanState?.(result.plan_state ?? null);
+          return;
+        }
+        if (command === "reject") {
+          const feedback = rest.join(" ").trim();
+          if (!feedback) {
+            appendSystem("Usage: /plan reject <feedback>");
+            return;
+          }
+          const result = await transport.rejectPlan(feedback);
+          setPlanState?.(result.plan_state ?? null);
+          return;
+        }
+        appendSystem("Usage: /plan [status|mode <plan|execute>|approve|reject <feedback>]");
+      } catch (e) {
+        appendSystem(`/plan failed: ${(e as Error).message}`);
       }
     },
   },

@@ -20,7 +20,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
-import { AgentEvent, ChatItem, ContextWindow, PetState, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, ChatItem, ContextWindow, PetState, PlanMode, PlanState, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
@@ -101,6 +101,25 @@ function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
     });
 }
 
+function planStateToItem(state: PlanState | null | undefined): ChatItem | null {
+  if (!state) return null;
+  const status = state.status ?? "idle";
+  const text =
+    status === "approved"
+      ? (state.approved_plan || state.approved_plan_preview || "")
+      : (state.pending_plan || state.pending_plan_preview || "");
+  if (!text.trim()) return null;
+  return {
+    id: nextId(),
+    role: "plan",
+    text,
+    planStatus: status,
+    planRevision: status === "approved"
+      ? (state.approved_revision ?? state.revision ?? null)
+      : (state.pending_revision ?? state.revision ?? null),
+  };
+}
+
 export function App({ transport, clearScreen }: { transport: Transport; clearScreen?: () => void }) {
   const { exit } = useApp();
 
@@ -118,6 +137,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [stderrLines, setStderrLines] = useState<string[]>([]);
   const [showActivity, setShowActivity] = useState(false);
   const [currentSession, setCurrentSession] = useState<SessionSummary | null>(null);
+  const [planState, setPlanState] = useState<PlanState | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [showSessionSwitcher, setShowSessionSwitcher] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
@@ -170,6 +190,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   // prompt.submit 是 fire-and-forget RPC，但后端仍会立刻回一个 accepted/error。
   // 附件队列等这个 ack 后再清空，避免 submit 本身被拒绝时用户需要重新挑文件。
   const _pendingSubmitId = useRef<string | null>(null);
+  const _streamingPlanId = useRef<string | null>(null);
   // MCP 后台加载会按 server 状态变化发事件。这里只记录上一次展示文本，
   // 防止同一快照重复追加 system 行，保持对话流安静。
   const _lastMcpStatusText = useRef("");
@@ -270,8 +291,14 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     if (payload.context_window !== undefined) {
       setContextWindow(payload.context_window ?? null);
     }
+    if (payload.plan_state !== undefined) {
+      setPlanState(payload.plan_state ?? null);
+    }
+    _streamingPlanId.current = null;
     setItems(() => {
       const restored = restoredHistoryToItems(payload.history ?? []);
+      const planItem = planStateToItem(payload.plan_state);
+      if (planItem) restored.push(planItem);
       if (notice) restored.push({ id: nextId(), role: "system", text: notice });
       return restored;
     });
@@ -279,6 +306,20 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     setBusy(false);
     setActiveQuestionId(null);
   }, [flushNow, resetFlushRhythm, resetTokenUsage]);
+
+  const setMode = useCallback(async (mode: PlanMode) => {
+    try {
+      const payload = await transport.setMode(mode);
+      setPlanState(payload.plan_state ?? null);
+    } catch (e) {
+      appendSystem(`Plan mode switch failed: ${(e as Error).message}`);
+    }
+  }, [transport, appendSystem]);
+
+  const togglePlanMode = useCallback(() => {
+    const current = planState?.mode ?? "execute";
+    void setMode(current === "plan" ? "execute" : "plan");
+  }, [planState?.mode, setMode]);
 
   const refreshSessions = useCallback(async () => {
     setSessionsLoading(true);
@@ -345,10 +386,110 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           if ((ev as any).context_window !== undefined) {
             setContextWindow((ev as any).context_window ?? null);
           }
-          if (Array.isArray((ev as any).history) && (ev as any).history.length > 0) {
-            setItems(restoredHistoryToItems((ev as any).history));
+          if ((ev as any).plan_state !== undefined) {
+            setPlanState((ev as any).plan_state ?? null);
+          }
+          if (Array.isArray((ev as any).history)) {
+            const restored = restoredHistoryToItems((ev as any).history);
+            const planItem = planStateToItem((ev as any).plan_state);
+            if (planItem) restored.push(planItem);
+            if (restored.length > 0) setItems(restored);
           }
           break;
+
+        case "plan_mode_changed": {
+          const e = ev as any;
+          setPlanState(e.plan_state ?? null);
+          break;
+        }
+
+        case "plan_start": {
+          _streamingPlanId.current = null;
+          break;
+        }
+
+        case "plan_delta": {
+          flushNow();
+          const e = ev as any;
+          const delta = String(e.delta ?? "");
+          if (!delta) break;
+          setItems((prev) => {
+            const existingId = _streamingPlanId.current;
+            if (existingId) {
+              const idx = prev.findIndex((it) => it.id === existingId);
+              if (idx >= 0) {
+                const item = prev[idx];
+                const updated: ChatItem = { ...item, text: item.text + delta };
+                return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)];
+              }
+            }
+            const id = nextId();
+            _streamingPlanId.current = id;
+            return [...prev, {
+              id,
+              role: "plan",
+              text: delta,
+              planStatus: "idle",
+              planRevision: null,
+            }];
+          });
+          break;
+        }
+
+        case "plan_ready": {
+          flushNow();
+          const e = ev as any;
+          const state = e.plan_state as PlanState | undefined;
+          setPlanState(state ?? null);
+          setItems((prev) => {
+            const id = _streamingPlanId.current;
+            _streamingPlanId.current = null;
+            if (!id) {
+              return [...prev, {
+                id: nextId(),
+                role: "plan",
+                text: String(e.plan ?? ""),
+                planStatus: "pending",
+                planRevision: state?.pending_revision ?? state?.revision ?? null,
+              }];
+            }
+            const idx = prev.findIndex((it) => it.id === id);
+            if (idx < 0) return prev;
+            const item = prev[idx];
+            const updated: ChatItem = {
+              ...item,
+              text: item.text || String(e.plan ?? ""),
+              planStatus: "pending",
+              planRevision: state?.pending_revision ?? state?.revision ?? null,
+            };
+            return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)];
+          });
+          break;
+        }
+
+        case "plan_approved": {
+          const e = ev as any;
+          setPlanState(e.plan_state ?? null);
+          setItems((prev) => prev.map((it) => (
+            it.role === "plan" && it.planStatus === "pending"
+              ? { ...it, planStatus: "approved", planRevision: e.plan_state?.approved_revision ?? it.planRevision }
+              : it
+          )));
+          appendSystem("Plan approved. Switched back to EXEC mode.");
+          break;
+        }
+
+        case "plan_rejected": {
+          const e = ev as any;
+          setPlanState(e.plan_state ?? null);
+          setItems((prev) => prev.map((it) => (
+            it.role === "plan" && it.planStatus === "pending"
+              ? { ...it, planStatus: "rejected" }
+              : it
+          )));
+          appendSystem("Plan rejected. Feedback will be included in the next Plan Mode turn.");
+          break;
+        }
 
         case "mcp_status": {
           const text = formatMCPStatus(ev as any);
@@ -600,6 +741,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       // 想保留前端可视历史的话以后可以拆成 Ctrl+L=只清屏 / /clear=连后端一起清
       setItems([]);
       clearScreen?.();
+    } else if (key.tab && !busy && activeQuestionId === null && !showSessionSwitcher && !slashActive) {
+      togglePlanMode();
     }
   });
 
@@ -619,6 +762,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       openSessionSwitcher,
       toggleActivity: () => setShowActivity((v) => !v),
       setPetState,
+      setPlanState,
+      setMode,
       attachments,
       setAttachments,
     };
@@ -627,7 +772,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       ret.catch((e) => appendSystem(`✗ 命令 ${cmd.name} 抛错：${(e as Error).message}`));
     }
     setInput("");
-  }, [transport, input, appendSystem, applySessionPayload, setContextWindow, resetContextWindow, resetTokenUsage, openSessionSwitcher, attachments]);
+  }, [transport, input, appendSystem, applySessionPayload, setContextWindow, resetContextWindow, resetTokenUsage, openSessionSwitcher, attachments, setMode]);
 
   const handleSubmit = useCallback((text: string) => {
     const pendingAttachments = attachments;
@@ -750,6 +895,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
               onSubmit={handleSubmit}
               onPasteRequest={handlePasteRequest}
               disabled={busy || activeQuestionId !== null || showSessionSwitcher}
+              mode={planState?.mode ?? "execute"}
               getHistoryAt={getHistoryAt}
               delegateNavKeys={slashActive || activeQuestionId !== null || showSessionSwitcher}
             />
@@ -766,6 +912,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             round={round}
             maxRounds={maxRounds}
             busy={busy}
+            mode={planState?.mode ?? "execute"}
+            planStatus={planState?.status}
           />
         </Box>
       </Box>

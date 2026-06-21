@@ -203,6 +203,7 @@ class ToolExecutor:
         tool_calls: List[Dict[str, Any]],
         round_idx: int = 0,
         cancel_token: Optional[CancelToken] = None,
+        execution_policy: Optional[Any] = None,
     ) -> List[ToolCallResult]:
         """执行一批 tool_calls，返回**保持 tool_calls 输入顺序**的结果列表。
 
@@ -217,6 +218,12 @@ class ToolExecutor:
             token——已 cancel 就一个都不发，全部填占位。已 submit 的工具不
             被强制中止（线程池不可中断；这跟 LLM 流式不一样，工具进程要靠它
             自己的超时机制处理硬中断）
+
+        execution_policy（Plan Mode 服务端工具管控）：
+          传入一个可调用策略对象（如 PlanExecutionPolicy），在 _run_one 中
+          每个工具执行前先 check()。如果策略拒绝，直接返回 denied_result()
+          而不调用真正的工具 runner。这比 prompt 层面的"请勿使用写入工具"
+          更可靠——prompt 可能被模型忽略，服务端拒绝则是硬保证。
         """
         if not tool_calls:
             return []
@@ -242,10 +249,10 @@ class ToolExecutor:
 
         if should_parallelize(tool_calls):
             logger.info("executor mode: parallel round=%s calls=%s", round_idx, len(tool_calls))
-            results = self._execute_parallel(tool_calls, round_idx, cancel_token)
+            results = self._execute_parallel(tool_calls, round_idx, cancel_token, execution_policy)
         else:
             logger.info("executor mode: serial round=%s calls=%s", round_idx, len(tool_calls))
-            results = self._execute_serial(tool_calls, round_idx, cancel_token)
+            results = self._execute_serial(tool_calls, round_idx, cancel_token, execution_policy)
 
         # 批量总量上限检查：单轮所有 tool results 总字符超限时从最长的开始持久化
         cap_batch_results(results, self._persist_dir)
@@ -258,6 +265,7 @@ class ToolExecutor:
         tool_calls: List[Dict[str, Any]],
         round_idx: int,
         cancel_token: Optional[CancelToken],
+        execution_policy: Optional[Any],
     ) -> List[ToolCallResult]:
         """串行执行一批 tool_calls。
 
@@ -278,7 +286,7 @@ class ToolExecutor:
                 )
                 results.append(self._cancelled_placeholder(tc))
                 continue
-            results.append(self._run_one(tc, round_idx))
+            results.append(self._run_one(tc, round_idx, execution_policy=execution_policy))
         return results
 
     # ---------- 并行 ----------
@@ -288,6 +296,7 @@ class ToolExecutor:
         tool_calls: List[Dict[str, Any]],
         round_idx: int,
         cancel_token: Optional[CancelToken],
+        execution_policy: Optional[Any],
     ) -> List[ToolCallResult]:
         # 每个 worker 拿一份 ctx 副本：同一个 contextvars.Context 不能并发
         # 多次 ctx.run（会抛 "context already entered"）。我们在主线程抓
@@ -301,7 +310,7 @@ class ToolExecutor:
             futs = {
                 ex.submit(
                     contextvars.copy_context().run,
-                    self._run_one, tc, round_idx,
+                    self._run_one, tc, round_idx, execution_policy,
                 ): i
                 for i, tc in enumerate(tool_calls)
             }
@@ -317,6 +326,7 @@ class ToolExecutor:
         self,
         tool_call: Dict[str, Any],
         round_idx: int,
+        execution_policy: Optional[Any] = None,
     ) -> ToolCallResult:
         call_id = tool_call.get("id", "") or f"call_{uuid.uuid4().hex[:8]}"
         name = tool_call.get("function", {}).get("name", "")
@@ -329,6 +339,45 @@ class ToolExecutor:
             call_id,
             sorted(args.keys()),
         )
+
+        # Plan Mode 服务端工具管控：在真正的 runner 执行前先过策略检查。
+        # 这比 prompt 层面的"plan mode 请勿写入"更可靠——prompt 可能被模型忽略。
+        # 策略拒绝时仍然 emit ToolStart + ToolComplete 事件，保证 UI 工具面板
+        # 能正常展示"被拒绝"状态（is_error=True），而不是静默丢失工具调用记录。
+        if execution_policy is not None:
+            try:
+                allowed, reason = execution_policy.check(name, args)
+            except Exception as e:  # noqa: BLE001
+                # 策略检查自身异常 → 保守拒绝，避免策略 bug 导致越权执行
+                logger.exception("execution policy failed: name=%s call_id=%s", name, call_id)
+                allowed, reason = False, f"execution policy error: {type(e).__name__}: {e}"
+            if not allowed:
+                result = execution_policy.denied_result(name, args, reason or "tool denied")
+                logger.warning(
+                    "tool denied by execution policy: round=%s name=%s call_id=%s reason=%s",
+                    round_idx,
+                    name,
+                    call_id,
+                    reason,
+                )
+                if self._bus is not None:
+                    self._bus.emit(ToolStart(
+                        call_id=call_id, name=name, arguments=args,
+                        round_idx=round_idx,
+                    ))
+                    self._bus.emit(ToolComplete(
+                        call_id=call_id, name=name, result=result,
+                        duration_seconds=0.0, is_error=True,
+                        round_idx=round_idx,
+                    ))
+                return ToolCallResult(
+                    call_id=call_id,
+                    name=name,
+                    arguments=args,
+                    result=result,
+                    duration_seconds=0.0,
+                    is_error=True,
+                )
 
         permission = check_platform_tool_permission(name, args)
         if permission.denied:

@@ -45,11 +45,15 @@ from agent.cancel import (
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import (
-    BackgroundNotification, Cancelled, Done, Error, RoundEnd, RoundStart,
+    BackgroundNotification, Cancelled, Done, Error, PlanApproved, PlanDelta,
+    PlanModeChanged, PlanReady, PlanRejected, PlanStart, RoundEnd, RoundStart, TextDelta,
 )
 from agent.executor import ToolExecutor
 from agent.message_logger import MessageLogger
 from agent.multimodal_input import process_multimodal_prompt, sanitize_multimodal_payload
+from agent.plan_parser import PlanSegment, ProposedPlanParser, split_proposed_plan_text
+from agent.plan_policy import PLAN_READ_ACTIONS, PLAN_READ_TOOLS, PlanExecutionPolicy
+from agent.plan_state import PlanStateStore
 from agent.question_registry import QuestionRegistry
 from constant.llm.constant_llm import ConstantLLM
 from context import (
@@ -246,6 +250,78 @@ class _SessionCompactSummarizer:
         )
 
 
+class _PlanParsingEventBus:
+    """EventBus 代理，将流式文本路由为 normal TextDelta 或 PlanDelta 事件。
+
+    这是 Plan Mode 流式解析的关键组件。Plan Mode 下，LLM 的 think() 调用
+    传入这个 facade 而非真实的 self.event_bus。内部用 ProposedPlanParser
+    实时检测 <proposed_plan> 块边界：
+
+    - 块外的文本 → 继续发 TextDelta（用户看到正常回答）
+    - 块内的文本 → 发 PlanDelta（前端渲染到独立的计划面板）
+    - 检测到块结束 → finish() 保存 pending plan 并 emit PlanReady
+
+    为什么用 facade 而非在 cb_agents 层解析：
+    cb_agents 只负责 OpenAI 协议适配（chunk 重组），不应该感知业务语义。
+    计划块解析是 session 层的协作模式逻辑，通过替换 event_bus 实现零侵入。
+    """
+
+    def __init__(self, session: "AgentSession") -> None:
+        self.session = session
+        self.parser = ProposedPlanParser()
+        self.visible_accumulated = ""
+        self.plan_accumulated = ""
+        self.latest_plan_text: Optional[str] = None
+        self.saved_plan_text: Optional[str] = None
+
+    def emit(self, event: Any) -> None:
+        if not isinstance(event, TextDelta):
+            self.session.event_bus.emit(event)
+            return
+
+        for segment in self.parser.push(event.delta):
+            self._emit_segment(segment, event.round_idx)
+
+    def finish(self, round_idx: int) -> None:
+        for segment in self.parser.finish():
+            self._emit_segment(segment, round_idx)
+        plan = (self.latest_plan_text or "").strip()
+        if plan:
+            self.session._save_pending_plan(plan, round_idx=round_idx)
+            self.saved_plan_text = plan
+
+    def _emit_segment(self, segment: PlanSegment, round_idx: int) -> None:
+        if segment.kind == "normal":
+            if not segment.text:
+                return
+            self.visible_accumulated += segment.text
+            self.session.event_bus.emit(TextDelta(
+                delta=segment.text,
+                accumulated=self.visible_accumulated,
+                round_idx=round_idx,
+            ))
+            return
+        if segment.kind == "plan_start":
+            self.plan_accumulated = ""
+            self.session.event_bus.emit(PlanStart(round_idx=round_idx))
+            return
+        if segment.kind == "plan_delta":
+            if not segment.text:
+                return
+            self.plan_accumulated += segment.text
+            self.session.event_bus.emit(PlanDelta(
+                delta=segment.text,
+                accumulated=self.plan_accumulated,
+                round_idx=round_idx,
+            ))
+            return
+        if segment.kind == "plan_end":
+            plan = self.plan_accumulated.strip()
+            if plan:
+                self.latest_plan_text = plan
+            self.plan_accumulated = ""
+
+
 class AgentSession:
     """单个 agent 会话。一个进程里通常只有一个，但多会话场景也支持。
 
@@ -319,6 +395,7 @@ class AgentSession:
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
         self._pending_context_update_text = ""
+        self.plan_store = PlanStateStore(session_store=self.session_store)
         if self.session_store is not None:
             try:
                 # 启动自动恢复最近会话:这里只恢复普通 user/assistant 消息和
@@ -385,7 +462,70 @@ class AgentSession:
             "session": summary,
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
+            "plan_state": self.plan_state(),
         }
+
+    def plan_state(self) -> Dict[str, Any]:
+        """返回当前活跃会话的 Plan Mode 完整状态。
+
+        包含 mode / status / revision / pending_plan / approved_plan /
+        last_feedback 等字段。供 Gateway RPC 和 TUI 状态同步使用。
+        """
+        return self.plan_store.load(include_content=True)
+
+    def collaboration_mode(self) -> str:
+        """返回当前协作模式: "execute" 或 "plan"。
+
+        这个值影响:
+        - 工具列表过滤（plan 模式只暴露只读工具）
+        - 工具 schema 过滤（_filter_tools_schema_for_plan_mode）
+        - 工具执行策略（_plan_execution_policy 启用服务端拒绝）
+        - 上下文注入（_plan_context_text 注入 Plan Mode 指令）
+        - 计划块解析（_PlanParsingEventBus 截获流式输出）
+        """
+        mode = str(self.plan_store.load(include_content=False).get("mode") or "execute")
+        return mode if mode in {"execute", "plan"} else "execute"
+
+    def set_collaboration_mode(self, mode: str) -> Dict[str, Any]:
+        """切换协作模式，emit PlanModeChanged 事件通知所有前端。
+
+        mode 必须是 "execute" 或 "plan"。
+        返回包含新 mode / plan_state / session 摘要的 payload。
+        """
+        state = self.plan_store.set_mode(mode)
+        self.event_bus.emit(PlanModeChanged(mode=state.get("mode", mode), plan_state=state))
+        return {
+            "mode": state.get("mode", mode),
+            "plan_state": state,
+            "session": self.current_session_payload().get("session"),
+        }
+
+    def approve_plan(self) -> Dict[str, Any]:
+        """批准当前 pending plan，切回 execute 模式。
+
+        current.md → approved.md（复制），status → approved，
+        后续 LLM 上下文会注入已批准计划内容作为实施指南。
+        emit PlanApproved + PlanModeChanged(execute)。
+        如果没有 pending plan 则抛 ValueError。
+        """
+        state = self.plan_store.approve()
+        plan = str(state.get("approved_plan") or "")
+        self.event_bus.emit(PlanApproved(plan=plan, plan_state=state))
+        self.event_bus.emit(PlanModeChanged(mode="execute", plan_state=state))
+        return {"approved": True, "mode": "execute", "plan": plan, "plan_state": state}
+
+    def reject_plan(self, feedback: str) -> Dict[str, Any]:
+        """拒绝当前 pending plan，附修改反馈。
+
+        feedback 持久化到 state.json，下一轮 chat 注入 LLM 上下文
+        告知模型"用户拒绝 + 反馈"，LLM 应提交修订后的替代计划。
+        mode 保持在 plan，status → rejected。
+        emit PlanRejected + PlanModeChanged(plan)。
+        """
+        state = self.plan_store.reject(feedback)
+        self.event_bus.emit(PlanRejected(feedback=str(feedback or ""), plan_state=state))
+        self.event_bus.emit(PlanModeChanged(mode="plan", plan_state=state))
+        return {"rejected": True, "mode": "plan", "plan_state": state}
 
     def create_session(self) -> Dict[str, Any]:
         """创建并切换到一个全新的空会话。
@@ -396,9 +536,19 @@ class AgentSession:
         self.history.clear()
         self._pending_context_update_text = ""
         if self.session_store is None:
-            return {"session": None, "history": [], "context_window": self.context_window_usage()}
+            return {
+                "session": None,
+                "history": [],
+                "context_window": self.context_window_usage(),
+                "plan_state": self.plan_state(),
+            }
         summary = self.session_store.create_session()
-        return {"session": summary, "history": [], "context_window": self.context_window_usage()}
+        return {
+            "session": summary,
+            "history": [],
+            "context_window": self.context_window_usage(),
+            "plan_state": self.plan_state(),
+        }
 
     def switch_session(self, session_id: str) -> Dict[str, Any]:
         """切换到已有会话并恢复它最近的普通 history。
@@ -428,6 +578,7 @@ class AgentSession:
             "session": summary,
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
+            "plan_state": self.plan_state(),
         }
 
     def compact_context(self) -> Dict[str, Any]:
@@ -451,6 +602,7 @@ class AgentSession:
                 "session": self.current_session_payload().get("session"),
                 "history": self.export_history(),
                 "context_window": self.context_window_usage(),
+                "plan_state": self.plan_state(),
                 "summary": "",
                 "before_messages": 0,
                 "after_messages": 0,
@@ -510,6 +662,7 @@ class AgentSession:
             "session": self.current_session_payload().get("session"),
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
+            "plan_state": self.plan_state(),
             "summary": str(boundary.content or ""),
             "before_messages": before_messages,
             "after_messages": after_messages,
@@ -620,7 +773,8 @@ class AgentSession:
         第二轮的请求是 system + ctx_update(旧,来自 history) + ctx_update(新,本轮)
         + user_q → 前缀 [system, ctx_update(旧)] 与上轮一致,缓存命中。
         """
-        enabled_tools = frozenset(self.registry.list_tools())
+        # Plan Mode 工具过滤：plan 模式下只暴露只读工具
+        enabled_tools = frozenset(self._enabled_tools_for_prompt())
 
         def _run(coro):
             """同步上下文里调 async 的辅助闭包。
@@ -665,6 +819,11 @@ class AgentSession:
             # 运行时补充指令: Bash 权限声明、通讯平台信息、UI 状态等
             # (来自 run_agent.py 的 _build_system_instructions)
             context_parts.append(system_instructions.strip())
+
+        # Plan Mode: 将 Plan Mode 行为指令 + 状态摘要注入运行时上下文
+        plan_context = self._plan_context_text()
+        if plan_context:
+            context_parts.append(plan_context)
 
         state_text = self._session_state_text()
         if state_text:
@@ -752,6 +911,161 @@ class AgentSession:
         except Exception:
             logger.exception("skill_manager.list_commands 调用失败")
         return []
+
+    def _enabled_tools_for_prompt(self) -> List[str]:
+        """返回当前模式下应暴露给 LLM 的工具名列表。
+
+        execute 模式：返回全部注册工具。
+        plan 模式：只返回 PLAN_READ_TOOLS + PLAN_READ_ACTIONS 的键 + bash。
+        这决定 system prompt 中 "Available tools:" 段的内容。
+        注意：工具 schema 过滤在 _filter_tools_schema_for_plan_mode 中独立完成，
+        这里只控制名称列表。
+        """
+        tools = self.registry.list_tools()
+        if self.collaboration_mode() != "plan":
+            return tools
+        allowed = set(PLAN_READ_TOOLS) | set(PLAN_READ_ACTIONS.keys()) | {"bash"}
+        return [name for name in tools if name in allowed]
+
+    def _filter_tools_schema_for_plan_mode(
+        self,
+        tools_schema: Optional[List[Dict[str, Any]]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """在 Plan Mode 下过滤 OpenAI tools schema，仅保留只读工具。
+
+        plan 模式：
+        - 移除所有不在白名单中的工具（模型根本看不到它们）
+        - 对保留的工具，在 description 末尾追加 Plan Mode 使用限制提示
+          （如 bash → "only non-mutating exploration commands"）
+        - 深拷贝 schema entry 后再修改，不污染原始 ToolRegistry 缓存
+
+        execute 模式或 tools_schema 为 None → 原样返回。
+        """
+        if tools_schema is None or self.collaboration_mode() != "plan":
+            return tools_schema
+        allowed = set(PLAN_READ_TOOLS) | set(PLAN_READ_ACTIONS.keys()) | {"bash"}
+        filtered: List[Dict[str, Any]] = []
+        for entry in tools_schema:
+            fn = entry.get("function") if isinstance(entry, dict) else None
+            name = str((fn or {}).get("name") or "")
+            if name not in allowed:
+                continue
+            # 深拷贝后追加 Plan Mode 注释，不污染 registry 原始 schema
+            cloned = copy.deepcopy(entry)
+            cloned_fn = cloned.get("function") if isinstance(cloned, dict) else None
+            if isinstance(cloned_fn, dict):
+                note = self._plan_tool_note(name)
+                if note:
+                    desc = str(cloned_fn.get("description") or "")
+                    cloned_fn["description"] = (desc + "\n\n" + note).strip()
+            filtered.append(cloned)
+        return filtered
+
+    def _plan_tool_note(self, tool_name: str) -> str:
+        """为 Plan Mode 下的工具生成 description 补充说明。
+
+        - bash: 详细说明只允许非修改性探索命令
+        - PLAN_READ_ACTIONS 中的工具: 列出允许的具体 action
+        - 其他白名单工具: 通用"只读/探索"提示
+        """
+        if tool_name == "bash":
+            return (
+                "Plan Mode: only non-mutating exploration commands are allowed. "
+                "Do not use redirection, background execution, installs, git checkout/reset/pull/push, "
+                "or filesystem mutation commands."
+            )
+        if tool_name in PLAN_READ_ACTIONS:
+            actions = ", ".join(sorted(PLAN_READ_ACTIONS[tool_name]))
+            return f"Plan Mode: only read-only actions are allowed: {actions}."
+        return "Plan Mode: use this only for reading or exploration, not for modification."
+
+    def _plan_context_text(self) -> str:
+        """生成 Plan Mode 上下文，注入到每轮 chat 的 context_update 消息中。
+
+        两段内容:
+        1. Plan Mode 行为指令（仅在 plan 模式下注入）
+           - 告知 LLM 当前处于计划模式
+           - 明确允许和禁止的操作
+           - 指示使用 <proposed_plan> 块提交计划
+           - 提示服务端会拒绝写入类工具调用
+        2. PlanStateStore.context_text()（状态摘要）
+           - pending/rejected/approved 状态的计划内容摘要
+           - 拒绝反馈（如有）
+        """
+        state = self.plan_store.load(include_content=True)
+        mode = str(state.get("mode") or "execute")
+        state_text = self.plan_store.context_text()
+        parts: List[str] = []
+        if mode == "plan":
+            parts.append(
+                "[Plan Mode Instructions]\n"
+                "You are in Plan Mode. Your job is to investigate, ask clarifying questions when needed, "
+                "and produce an implementation plan for the user to approve.\n"
+                "- You may read files, search, inspect state, ask the user questions, and run read-only bash.\n"
+                "- You must not modify files, write code, update todo/memory/knowledge, start background tasks, "
+                "delegate to execution agents, or call mutating MCP/tools.\n"
+                "- Server-side policy will reject mutating tool calls; treat rejections as a signal to continue "
+                "with read-only exploration.\n"
+                "- When ready, put the complete Markdown plan inside exactly one "
+                "<proposed_plan>...</proposed_plan> block. The plan should be self-contained, actionable, "
+                "and include verification steps.\n"
+                "- If the user rejected a previous plan, address the feedback and submit a complete replacement plan."
+            )
+        if state_text:
+            parts.append(state_text)
+        return "\n\n".join(parts)
+
+    def _save_pending_plan(self, plan: str, *, round_idx: int = 0) -> Dict[str, Any]:
+        """持久化 pending plan 并 emit PlanReady 事件。
+
+        在两种路径中被调用：
+        1. 流式路径：_PlanParsingEventBus.finish() 检测到 </proposed_plan>
+        2. 非流式路径：_handle_plan_blocks_in_answer() 在完整回答中提取到计划块
+        """
+        state = self.plan_store.save_pending_plan(plan)
+        self.event_bus.emit(PlanReady(plan=plan, plan_state=state, round_idx=round_idx))
+        return state
+
+    def _plan_execution_policy(self) -> Optional[PlanExecutionPolicy]:
+        """Plan Mode 下返回 PlanExecutionPolicy，execute 模式返回 None。
+
+        None 意味着 ToolExecutor 不启用策略检查，所有工具正常执行。
+        PlanExecutionPolicy 实例在每次 _tool_loop 的 executor.execute() 调用时
+        传入，在 _run_one 中对每个工具做 check() 硬拦截。
+        """
+        if self.collaboration_mode() == "plan":
+            return PlanExecutionPolicy()
+        return None
+
+    def _handle_plan_blocks_in_answer(
+        self,
+        answer: str,
+        *,
+        round_idx: int,
+        plan_bus: Optional[_PlanParsingEventBus] = None,
+    ) -> str:
+        """处理非流式 LLM 回答中可能包含的 <proposed_plan> 块。
+
+        用于两种场景：
+        1. 不支持 FC 的模型（result 是 list），回答一次性返回
+        2. FC 模型的最终 answer 字段
+
+        从 answer 中分离：
+        - visible_text: 计划块外的普通回答 → 返回给用户
+        - plan: 最后一个 <proposed_plan> 块的内容 → 持久化并 emit PlanReady
+
+        如果流式解析（plan_bus）已经保存过同一份计划，跳过重复保存。
+        """
+        if self.collaboration_mode() != "plan" or not answer:
+            return answer
+        visible, plan = split_proposed_plan_text(answer)
+        if plan is not None and plan.strip():
+            proposed = plan.strip()
+            # 去重：流式路径可能已经通过 plan_bus.finish() 保存过
+            saved = (plan_bus.saved_plan_text or "").strip() if plan_bus is not None else ""
+            if proposed != saved:
+                self._save_pending_plan(proposed, round_idx=round_idx)
+        return visible
 
     def _chat_impl(
         self,
@@ -858,6 +1172,8 @@ class AgentSession:
             if self.llm.is_Function_Calling
             else None
         )
+        # Plan Mode: 过滤 tools schema（移除写入工具 + 追加使用限制描述）
+        tools_schema = self._filter_tools_schema_for_plan_mode(tools_schema)
         logger.info(
             "chat prepare: tools schema built tools=%s elapsed=%.2fs total=%.2fs",
             len(tools_schema or []),
@@ -915,6 +1231,12 @@ class AgentSession:
                 user_content=request_content,
                 system_instructions=system_instructions,
                 memory_query=history_user_text,
+            )
+            # Plan Mode: preflight compact 后重建 messages，也要重建过滤后的 tools schema
+            tools_schema = self._filter_tools_schema_for_plan_mode(
+                self.registry.get_tools_description_openai_schema()
+                if self.llm.is_Function_Calling
+                else None
             )
 
         # 记录本轮初始消息（含 system/user/history）
@@ -1040,6 +1362,12 @@ class AgentSession:
         # 重读 CLAUDE.md / 重算 env_info(用户编辑了记忆文件后能立刻生效)。
         self.history.clear()
         self._pending_context_update_text = ""
+        # Plan Mode: clear 时同步清空 plan state 并广播 PlanModeChanged
+        try:
+            state = self.plan_store.clear()
+            self.event_bus.emit(PlanModeChanged(mode=state.get("mode", "execute"), plan_state=state))
+        except Exception:
+            logger.exception("Plan state clear failed")
         if self.session_store is not None:
             try:
                 self.session_store.clear_active_session()
@@ -1093,6 +1421,11 @@ class AgentSession:
         state_text = self._session_state_text()
         if state_text:
             parts.append("[State]\n" + state_text)
+
+        # Plan Mode 上下文也纳入 token 估算，避免 Context% 偏低
+        plan_context = self._plan_context_text()
+        if plan_context:
+            parts.append("[Plan]\n" + plan_context)
 
         history_dicts = self._sliced_history_dicts()
         if history_dicts:
@@ -1562,13 +1895,20 @@ class AgentSession:
                 except Exception:
                     logger.exception("message_logger 写入失败")
 
+            # Plan Mode: 用 _PlanParsingEventBus 代理替换真实 event_bus。
+            # 这样 LLM 的流式输出 TextDelta 会被实时解析，<proposed_plan> 块内的
+            # 文本自动路由为 PlanDelta 事件，块外文本继续走正常 TextDelta。
+            plan_bus = _PlanParsingEventBus(self) if self.collaboration_mode() == "plan" else None
             result = self.llm.think(
                 llm_messages,
                 tools=tools_schema,
-                event_bus=self.event_bus,
+                event_bus=plan_bus if plan_bus is not None else self.event_bus,
                 cancel_event=token.event,
                 round_idx=round_idx,
             )
+            # 流式结束后，flush 解析器缓冲区中残留的计划块内容
+            if plan_bus is not None:
+                plan_bus.finish(round_idx)
             if self.message_logger is not None:
                 try:
                     logged_messages = list(llm_messages)
@@ -1586,7 +1926,13 @@ class AgentSession:
 
             # 不支持 FC 的模型返回 [text, None]
             if isinstance(result, list):
-                final = result[0] or ""
+                # Plan Mode: 非流式模型可能把 <proposed_plan> 嵌在回答文本里，
+                # 需要分离计划块和可见文本
+                final = self._handle_plan_blocks_in_answer(
+                    result[0] or "",
+                    round_idx=round_idx,
+                    plan_bus=plan_bus,
+                )
                 logger.info("round final without tools: round=%s answer_chars=%s", round_idx, len(final))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
@@ -1606,7 +1952,13 @@ class AgentSession:
                 ))
                 return round_idx, "", trace_collector, loop_compactions
 
-            answer = result.get("answer", "") or ""
+            # Plan Mode: FC 模型的 answer 字段也可能包含 <proposed_plan> 块。
+            # 流式解析（plan_bus）处理增量输出，这里处理完整 answer 中的残余块。
+            answer = self._handle_plan_blocks_in_answer(
+                result.get("answer", "") or "",
+                round_idx=round_idx,
+                plan_bus=plan_bus,
+            )
             tool_calls = result.get("tool_calls") or []
             reasoning = result.get("reasoning_content")
             # 流式中途被 cancel：cb_agents 已 emit Cancelled，answer 是已收的部分
@@ -1653,8 +2005,13 @@ class AgentSession:
 
             # 调度执行（事件由 ToolExecutor 自己 emit ToolStart/ToolComplete）
             # token 透传给 executor：串行/并发模式下都在工具间做 cancel 检查
+            # Plan Mode: 传入 PlanExecutionPolicy，在 executor 层硬拒绝写入工具。
+            # execute 模式下 _plan_execution_policy() 返回 None，正常执行。
             results = self.executor.execute(
-                tool_calls, round_idx=round_idx, cancel_token=token,
+                tool_calls,
+                round_idx=round_idx,
+                cancel_token=token,
+                execution_policy=self._plan_execution_policy(),
             )
             for call, exec_result in zip(tool_calls, results):
                 # 完整工具结果按 OpenAI tool calling 协议回灌给本轮 messages,

@@ -16,6 +16,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import { Box, Text, useInput } from "ink";
 import { theme } from "../theme.js";
+import type { PlanMode } from "../types.js";
 
 export interface PromptInputProps {
   value: string;
@@ -23,6 +24,7 @@ export interface PromptInputProps {
   onSubmit: (v: string) => void;
   onPasteRequest?: (insertText: (text: string) => void) => void;
   disabled: boolean;
+  mode?: PlanMode;
   /** 历史读取器：null 表示无更多 / 边界。idx 0=最新一条，递增=更老 */
   getHistoryAt?: (idx: number) => string | null;
   /** 浮层（如 SlashCommandPicker）激活时设 true：拦截 ↑/↓/Enter/Esc 给浮层处理，
@@ -30,7 +32,7 @@ export interface PromptInputProps {
   delegateNavKeys?: boolean;
 }
 
-export function PromptInput({ value, onChange, onSubmit, onPasteRequest, disabled, getHistoryAt, delegateNavKeys }: PromptInputProps) {
+export function PromptInput({ value, onChange, onSubmit, onPasteRequest, disabled, mode = "execute", getHistoryAt, delegateNavKeys }: PromptInputProps) {
   const [cursor, setCursor] = useState(value.length);
   const [historyIdx, setHistoryIdx] = useState<number | null>(null);
   const valueRef = useRef(value);
@@ -51,6 +53,7 @@ export function PromptInput({ value, onChange, onSubmit, onPasteRequest, disable
 
   useInput((input, key) => {
     if (disabled) return;
+    if (key.tab) return;
 
     // 浮层激活时：上/下/回车/Esc 让给浮层；字符编辑继续在这里处理
     if (delegateNavKeys && (key.upArrow || key.downArrow || key.return || key.escape)) {
@@ -159,7 +162,7 @@ export function PromptInput({ value, onChange, onSubmit, onPasteRequest, disable
       <Text color={disabled ? theme.border : theme.primary}>{"> "}</Text>
       {disabled
         ? <Text dimColor>（agent 正在工作，等待结束）</Text>
-        : <CursorText value={value} cursor={cursor} placeholder="跟 cb-agent 说点什么…" />}
+        : <CursorText value={value} cursor={cursor} placeholder={mode === "plan" ? "Plan Mode: ask for a plan or review..." : "跟 cb-agent 说点什么…"} />}
     </Box>
   );
 }

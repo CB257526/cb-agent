@@ -40,6 +40,7 @@ from agent.executor import (
     READ_ONLY_IF_ACTION, READ_ONLY_TOOLS,
     ToolCallResult, ToolExecutor, should_parallelize,
 )
+from agent.plan_policy import PlanExecutionPolicy
 from agent.platforms.context import (
     reset_current_platform_conversation,
     reset_current_platform_sender,
@@ -160,6 +161,46 @@ class TestExecutorSerial(unittest.TestCase):
         self.assertIn("RuntimeError", results[0].result)
 
         completes = [e for e in self.events if isinstance(e, ToolComplete)]
+        self.assertTrue(completes[0].is_error)
+
+    def test_plan_policy_denial_emits_protocol_events_without_runner(self):
+        """验证 PlanExecutionPolicy 拒绝时不调用 runner，且 emit 完整协议事件。
+
+        核心断言：
+        1. runner 从未被调用（拒绝发生在 runner 之前）
+        2. 返回 ToolCallResult，is_error=True
+        3. result JSON 包含 plan_mode_denied=True
+        4. ToolStart + ToolComplete 事件正常 emit（UI 面板能看到被拒绝状态）
+        """
+        calls = []
+
+        def runner(name, args):
+            calls.append((name, args))
+            raise AssertionError("denied plan-mode tool should not execute")
+
+        ex = ToolExecutor(runner, self.bus)
+        results = ex.execute(
+            [_tc("bash", '{"command":"rm file"}', call_id="call_plan_deny")],
+            round_idx=3,
+            execution_policy=PlanExecutionPolicy(),
+        )
+
+        # 断言 1: runner 从未被调用
+        self.assertEqual(calls, [])
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].is_error)
+        # 断言 3: 拒绝 payload 完整
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["plan_mode_denied"])
+        self.assertEqual(payload["tool"], "bash")
+
+        # 断言 4: 协议事件正常 emit
+        starts = [e for e in self.events if isinstance(e, ToolStart)]
+        completes = [e for e in self.events if isinstance(e, ToolComplete)]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(len(completes), 1)
+        self.assertEqual(starts[0].call_id, "call_plan_deny")
+        self.assertEqual(completes[0].call_id, "call_plan_deny")
         self.assertTrue(completes[0].is_error)
 
 

@@ -19,7 +19,7 @@ import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { AgentEvent, CompactPayload, MCPStatusPayload, PetCommandResult, PetState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, CompactPayload, MCPStatusPayload, PetCommandResult, PetState, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
@@ -205,6 +205,22 @@ export class Transport extends EventEmitter {
    * 压缩要调 LLM 做摘要，耗时远超普通 RPC，给 120s 长超时。 */
   compactSession(): Promise<CompactPayload> {
     return this.requestRpc("session.compact", {}, 120000);
+  }
+
+  setMode(mode: PlanMode): Promise<{ mode: PlanMode; plan_state: PlanState; session?: SessionSummary | null }> {
+    return this.requestRpc("session.set_mode", { mode });
+  }
+
+  getPlanState(): Promise<{ plan_state: PlanState }> {
+    return this.requestRpc("session.get_plan_state");
+  }
+
+  approvePlan(): Promise<{ approved: true; mode: "execute"; plan: string; plan_state: PlanState }> {
+    return this.requestRpc("session.approve_plan");
+  }
+
+  rejectPlan(feedback: string): Promise<{ rejected: true; mode: "plan"; plan_state: PlanState }> {
+    return this.requestRpc("session.reject_plan", { feedback });
   }
 
   /** 列出项目级本地会话摘要。只返回短 preview，不返回 transcript 全文。 */

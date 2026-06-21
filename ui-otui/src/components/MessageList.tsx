@@ -11,6 +11,7 @@
  */
 
 import { For, Switch, Match } from "solid-js";
+import { SyntaxStyle } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import { ToolBlock } from "./ToolBlock.js";
@@ -19,6 +20,45 @@ import { TodoPanel } from "./TodoPanel.js";
 import { QuestionPanel } from "./QuestionPanel.js";
 import { AssistantMessage } from "./AssistantMessage.js";
 import type { ChatItem } from "../types.js";
+
+const planSyntaxStyle = SyntaxStyle.create();
+
+function PlanPanel(props: { item: ChatItem }) {
+  const theme = useTheme();
+  const status = () => props.item.planStatus ?? "idle";
+  const color = () =>
+    status() === "approved" ? theme.success :
+    status() === "rejected" ? theme.error :
+    status() === "pending" ? theme.warning :
+    theme.info;
+
+  return (
+    <box
+      flexDirection="column"
+      border={["left"]}
+      borderColor={color()}
+      paddingLeft={1}
+      marginTop={1}
+    >
+      <text fg={color()}>
+        <b>plan</b>
+        <span style={{ fg: theme.textMuted }}>
+          {props.item.planRevision ? `  rev ${props.item.planRevision}` : ""}
+          {`  ${status()}`}
+        </span>
+      </text>
+      <markdown
+        content={props.item.text}
+        syntaxStyle={planSyntaxStyle}
+        fg={theme.markdownText}
+        bg={theme.background}
+      />
+      {status() === "pending" ? (
+        <text fg={theme.textMuted}>/plan approve  or  /plan reject &lt;feedback&gt;</text>
+      ) : null}
+    </box>
+  );
+}
 
 function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
   const theme = useTheme();
@@ -46,6 +86,10 @@ function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
 
       <Match when={item().role === "todo"}>
         <TodoPanel item={item()} />
+      </Match>
+
+      <Match when={item().role === "plan"}>
+        <PlanPanel item={item()} />
       </Match>
 
       <Match when={item().role === "ask_question"}>

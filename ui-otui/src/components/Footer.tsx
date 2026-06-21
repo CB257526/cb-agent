@@ -46,6 +46,8 @@ export function Footer() {
   });
   const mcpConnected = () => state.mcp?.connected ?? 0;
   const mcpFailed = () => state.mcp?.failed ?? 0;
+  const mode = () => state.planState?.mode ?? "execute";
+  const planStatus = () => state.planState?.status ?? "idle";
 
   return (
     <box flexDirection="row" justifyContent="space-between" flexShrink={0} paddingLeft={1} paddingRight={1}>
@@ -59,6 +61,10 @@ export function Footer() {
         </Show>
         <text fg={theme.textMuted}>
           {state.model}
+          <span style={{ fg: mode() === "plan" ? theme.warning : theme.success }}>
+            {"  "}{mode() === "plan" ? "PLAN" : "EXEC"}
+            {mode() === "plan" && planStatus() !== "idle" ? `:${planStatus()}` : ""}
+          </span>
           <Show when={state.session}>
             <span style={{ fg: theme.textMuted }}> · {shortSessionId(state.session!.session_id)}</span>
           </Show>

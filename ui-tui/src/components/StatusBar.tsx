@@ -4,7 +4,7 @@ import { Spinner } from "./Spinner.js";
 import { Byline } from "./Byline.js";
 import { KeyboardShortcutHint } from "./KeyboardShortcutHint.js";
 import { theme } from "../theme.js";
-import type { ContextWindow } from "../types.js";
+import type { ContextWindow, PlanMode, PlanStatus } from "../types.js";
 
 export interface StatusBarProps {
   model: string;
@@ -16,10 +16,12 @@ export interface StatusBarProps {
   round: number;
   maxRounds: number;
   busy: boolean;
+  mode?: PlanMode;
+  planStatus?: PlanStatus;
 }
 
 /** 底部状态栏：左边 spinner + 模型/上下文窗口/累计用量/round；右边快捷键 byline。 */
-export function StatusBar({ model, sessionId, promptTokens, completionTokens, cachedPromptTokens = 0, contextWindow, round, maxRounds, busy }: StatusBarProps) {
+export function StatusBar({ model, sessionId, promptTokens, completionTokens, cachedPromptTokens = 0, contextWindow, round, maxRounds, busy, mode = "execute", planStatus }: StatusBarProps) {
   const billableTokens = Math.max(0, promptTokens + completionTokens - cachedPromptTokens);
   const totalK = (billableTokens / 1000).toFixed(1);
   const contextUsed = contextWindow?.used_tokens ?? 0;
@@ -34,6 +36,10 @@ export function StatusBar({ model, sessionId, promptTokens, completionTokens, ca
         <Text dimColor>
           <Byline>
             <Text>{model}</Text>
+            <Text color={mode === "plan" ? theme.warning : theme.success}>
+              {mode === "plan" ? "PLAN" : "EXEC"}
+              {mode === "plan" && planStatus && planStatus !== "idle" ? `:${planStatus}` : ""}
+            </Text>
             {sessionId ? <Text>session {shortSessionId(sessionId)}</Text> : null}
             <Text>
               Context {formatTokenCount(contextUsed)}/{formatTokenCount(contextMax)}{" "}
@@ -49,6 +55,7 @@ export function StatusBar({ model, sessionId, promptTokens, completionTokens, ca
         <Text dimColor>
           <Byline>
             <KeyboardShortcutHint shortcut="Enter" action="send" />
+            <KeyboardShortcutHint shortcut="Tab" action="mode" />
             <KeyboardShortcutHint shortcut="↑/↓" action="history" />
             <KeyboardShortcutHint shortcut="/" action="commands" />
             <KeyboardShortcutHint shortcut="/sessions" action="switch" />

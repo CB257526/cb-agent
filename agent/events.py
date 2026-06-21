@@ -276,6 +276,92 @@ class PetUpdated:
     type: str = field(default="pet_updated", init=False)
 
 
+# ========== Plan Mode 事件 ==========
+# Plan Mode 是协作式双模式（plan / execute）的事件体系。
+# 流程：用户切到 plan 模式 → LLM 输出 <proposed_plan> 块
+# → 流式解析出 PlanStart / PlanDelta 事件 → 解析完毕后 emit PlanReady
+# → 用户审批（approve/reject）→ PlanApproved / PlanRejected → PlanModeChanged。
+
+
+@dataclass
+class PlanModeChanged:
+    """当前会话的协作模式发生变化（plan ↔ execute）。
+
+    当用户通过 /plan 命令或 UI 切换协作模式时触发。
+    前端应据此切换工具栏、输入框提示和工具列表展示。
+    """
+    mode: str
+    plan_state: Dict[str, Any]
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="plan_mode_changed", init=False)
+
+
+@dataclass
+class PlanStart:
+    """流式解析器在 LLM 输出中检测到 <proposed_plan> 开始标签。
+
+    此时前端应重置计划面板，准备接收后续 PlanDelta 增量。
+    """
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="plan_start", init=False)
+
+
+@dataclass
+class PlanDelta:
+    """<proposed_plan> 块内的流式 Markdown 增量。
+
+    与 TextDelta 类似，但 delta 只包含计划块内的文本（不含块外正常回答）。
+    accumulated 是当前计划块从 PlanStart 到现在的累计文本。
+    """
+    delta: str
+    accumulated: str = ""
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="plan_delta", init=False)
+
+
+@dataclass
+class PlanReady:
+    """流式解析器检测到 </proposed_plan> 结束标签，计划块完整就绪。
+
+    此时 pending plan 已持久化到磁盘（plan/current.md），
+    前端应展示审批按钮（approve / reject）。
+    """
+    plan: str
+    plan_state: Dict[str, Any]
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="plan_ready", init=False)
+
+
+@dataclass
+class PlanApproved:
+    """用户批准了 pending plan，后端已切回 execute 模式。
+
+    approved_plan 内容进入上下文注入，LLM 将在 execute 模式下按计划实施。
+    同时 emit PlanModeChanged(mode="execute")。
+    """
+    plan: str
+    plan_state: Dict[str, Any]
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="plan_approved", init=False)
+
+
+@dataclass
+class PlanRejected:
+    """用户拒绝了 pending plan 并提供了修改反馈。
+
+    反馈文本（feedback）会注入下一轮 plan 模式的上下文，
+    LLM 应读取反馈并提交修订后的替代计划。
+    同时 emit PlanModeChanged(mode="plan")，保持在 plan 模式。
+    """
+    feedback: str
+    plan_state: Dict[str, Any]
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="plan_rejected", init=False)
+
+
 # ========== Hook 事件（HookManager 触发 hook 时的可见性广播）==========
 
 
@@ -398,6 +484,12 @@ Event = Union[
     TodoListUpdated,
     MCPStatus,
     PetUpdated,
+    PlanModeChanged,
+    PlanStart,
+    PlanDelta,
+    PlanReady,
+    PlanApproved,
+    PlanRejected,
     SubagentStarted,
     SubagentProgress,
     SubagentCompleted,
@@ -422,8 +514,15 @@ __all__ = [
     "BackgroundNotification",
     "AskUserQuestion",
     "AskUserQuestionAnswered",
+    "TodoListUpdated",
     "MCPStatus",
     "PetUpdated",
+    "PlanModeChanged",
+    "PlanStart",
+    "PlanDelta",
+    "PlanReady",
+    "PlanApproved",
+    "PlanRejected",
     "SubagentStarted",
     "SubagentProgress",
     "SubagentCompleted",

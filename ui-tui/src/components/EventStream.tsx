@@ -149,6 +149,9 @@ function renderItem(
   if (item.role === "todo") {
     return <TodoPanel items={item.todoItems ?? []} />;
   }
+  if (item.role === "plan") {
+    return <PlanPanel item={item} />;
+  }
   if (item.role === "system") {
     return <SystemMessage text={item.text} />;
   }
@@ -164,6 +167,34 @@ function renderItem(
     );
   }
   return <Text dimColor>{item.text}</Text>;
+}
+
+function PlanPanel({ item }: { item: ChatItem }) {
+  const status = item.planStatus ?? "idle";
+  const color =
+    status === "approved" ? theme.success :
+    status === "rejected" ? theme.error :
+    status === "pending" ? theme.warning :
+    theme.info;
+  return (
+    <Pane color={color}>
+      <Box flexDirection="column">
+        <Box>
+          <Text color={color} bold>plan</Text>
+          {item.planRevision ? <Text dimColor>  rev {item.planRevision}</Text> : null}
+          <Text dimColor>  {status}</Text>
+        </Box>
+        <Box marginTop={1} flexDirection="column">
+          <Markdown text={item.text} />
+        </Box>
+        {status === "pending" ? (
+          <Box marginTop={1}>
+            <Text dimColor>/plan approve  or  /plan reject &lt;feedback&gt;</Text>
+          </Box>
+        ) : null}
+      </Box>
+    </Pane>
+  );
 }
 
 function SystemMessage({ text }: { text: string }) {

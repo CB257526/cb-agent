@@ -133,6 +133,14 @@ class Gateway:
             self._handle_create_session(rpc_id)
         elif method == "session.switch":
             self._handle_switch_session(rpc_id, params)
+        elif method == "session.set_mode":
+            self._handle_set_mode(rpc_id, params)
+        elif method == "session.get_plan_state":
+            self._handle_get_plan_state(rpc_id)
+        elif method == "session.approve_plan":
+            self._handle_approve_plan(rpc_id)
+        elif method == "session.reject_plan":
+            self._handle_reject_plan(rpc_id, params)
         elif method == "session.list_tools":
             self._handle_list_tools(rpc_id)
         elif method == "session.load_skill":
@@ -420,6 +428,124 @@ class Gateway:
             return
         self.transport.write(make_response(rpc_id, result=payload))
 
+    def _handle_set_mode(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        """RPC: session.set_mode → 切换 Plan/Execute 协作模式。
+
+        前端通过此 RPC 请求切换协作模式（/plan 命令或 UI 按钮）。
+        - "plan": LLM 只能做探索性阅读和提问，禁止修改文件
+        - "execute": 正常模式，所有工具可用
+        切换成功后通过 PlanModeChanged 事件广播给所有前端。
+        session busy 时拒绝（与 chat 互斥）。
+        """
+        if rpc_id is None:
+            return
+        if self._is_busy():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+        mode = params.get("mode")
+        if mode not in ("execute", "plan"):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "params.mode must be execute or plan"},
+            ))
+            return
+        try:
+            payload = self.session.set_collaboration_mode(str(mode))
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=payload))
+
+    def _handle_get_plan_state(self, rpc_id: Any) -> None:
+        """RPC: session.get_plan_state → 查询当前 Plan 状态。
+
+        前端在连接恢复或模式切换后调用此 RPC 同步 plan 面板状态。
+        返回当前 plan 模式、pending/approved 计划内容和状态信息。
+        不检查 busy，允许在 chat 进行中查询。
+        """
+        if rpc_id is None:
+            return
+        try:
+            state = self.session.plan_state()
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result={"plan_state": state}))
+
+    def _handle_approve_plan(self, rpc_id: Any) -> None:
+        """RPC: session.approve_plan → 用户批准 pending plan。
+
+        将 current.md 复制为 approved.md，状态切为 approved，
+        mode 切回 execute，approved_plan 内容注入后续 LLM 上下文。
+        通过 PlanApproved + PlanModeChanged 事件广播。
+        要求存在 pending plan（current.md），否则返回 ValueError。
+        """
+        if rpc_id is None:
+            return
+        if self._is_busy():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+        try:
+            payload = self.session.approve_plan()
+        except ValueError as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": str(e)},
+            ))
+            return
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=payload))
+
+    def _handle_reject_plan(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        """RPC: session.reject_plan → 用户拒绝 pending plan 并附反馈。
+
+        feedback 文本持久化到 state.json，下一轮 chat 注入 LLM 上下文
+        告知模型"用户拒绝了上一个计划，请根据反馈修改"。
+        mode 保持在 plan，status 切为 rejected。
+        通过 PlanRejected + PlanModeChanged 事件广播。
+        """
+        if rpc_id is None:
+            return
+        if self._is_busy():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+        feedback = params.get("feedback", "")
+        if not isinstance(feedback, str):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "params.feedback must be string"},
+            ))
+            return
+        try:
+            payload = self.session.reject_plan(feedback)
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=payload))
+
     def _handle_list_tools(self, rpc_id: Any) -> None:
         """返回当前 registry 注册的工具列表，供 UI 端 / 命令展示。
 
@@ -664,6 +790,7 @@ class Gateway:
                 "session": session_payload.get("session"),
                 "history": session_payload.get("history", []),
                 "context_window": session_payload.get("context_window"),
+                "plan_state": session_payload.get("plan_state"),
             },
         })
         logger.info(

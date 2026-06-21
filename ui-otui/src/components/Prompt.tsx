@@ -21,7 +21,7 @@ import { AttachmentQueue } from "./AttachmentQueue.js";
 
 export function Prompt() {
   const theme = useTheme();
-  const { state, submit, runCommand, getHistoryAt, pasteFromClipboard } = useSession();
+  const { state, submit, runCommand, getHistoryAt, pasteFromClipboard, togglePlanMode } = useSession();
   const [value, setValue] = createSignal("");
   const [pickerIndex, setPickerIndex] = createSignal(0);
   const [historyIdx, setHistoryIdx] = createSignal(-1);
@@ -84,6 +84,12 @@ export function Prompt() {
 
   useKeyboard((key: KeyEvent) => {
     if (disabled()) return;
+
+    if (key.name === "tab" && !slashActive()) {
+      key.preventDefault?.();
+      togglePlanMode();
+      return;
+    }
 
     // slash 面板激活：方向键选命令、Enter 执行、Esc 关闭
     if (slashActive()) {
@@ -162,7 +168,9 @@ export function Prompt() {
               ? "请在上方作答…"
               : state.busy
                 ? "agent 正在工作…"
-                : "输入消息，回车发送（/ 看命令）"
+                : state.planState?.mode === "plan"
+                  ? "Plan Mode: ask for a plan or review..."
+                  : "输入消息，回车发送（/ 看命令）"
           }
           placeholderColor={theme.textMuted}
           textColor={theme.text}

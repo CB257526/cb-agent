@@ -32,6 +32,12 @@ export type EventType =
   | "subagent_completed"
   | "hook_started"
   | "hook_completed"
+  | "plan_mode_changed"
+  | "plan_start"
+  | "plan_delta"
+  | "plan_ready"
+  | "plan_approved"
+  | "plan_rejected"
   | "gateway_ready";  // gateway 自定义，不在 events.py 里
 
 export interface BaseEvent {
@@ -125,6 +131,61 @@ export interface GatewayReady extends BaseEvent {
   history?: RestoredHistoryMessage[];
   /** 启动恢复后当前会话的上下文窗口估算。 */
   context_window?: ContextWindow | null;
+  plan_state?: PlanState | null;
+}
+
+export type PlanMode = "execute" | "plan";
+export type PlanStatus = "idle" | "pending" | "approved" | "rejected";
+
+export interface PlanState {
+  plan_id?: string;
+  mode: PlanMode;
+  status: PlanStatus;
+  revision: number;
+  pending_revision?: number | null;
+  approved_revision?: number | null;
+  current_path?: string | null;
+  approved_path?: string | null;
+  last_feedback?: string;
+  updated_at?: string;
+  pending_plan?: string;
+  approved_plan?: string;
+  pending_plan_preview?: string;
+  approved_plan_preview?: string;
+}
+
+export interface PlanModeChanged extends BaseEvent {
+  type: "plan_mode_changed";
+  mode: PlanMode;
+  plan_state: PlanState;
+}
+
+export interface PlanStart extends BaseEvent {
+  type: "plan_start";
+}
+
+export interface PlanDelta extends BaseEvent {
+  type: "plan_delta";
+  delta: string;
+  accumulated: string;
+}
+
+export interface PlanReady extends BaseEvent {
+  type: "plan_ready";
+  plan: string;
+  plan_state: PlanState;
+}
+
+export interface PlanApproved extends BaseEvent {
+  type: "plan_approved";
+  plan: string;
+  plan_state: PlanState;
+}
+
+export interface PlanRejected extends BaseEvent {
+  type: "plan_rejected";
+  feedback: string;
+  plan_state: PlanState;
 }
 
 export interface AskQuestionOption {
@@ -317,6 +378,12 @@ export type AgentEvent =
   | SubagentCompleted
   | HookStarted
   | HookCompleted
+  | PlanModeChanged
+  | PlanStart
+  | PlanDelta
+  | PlanReady
+  | PlanApproved
+  | PlanRejected
   | BaseEvent;  // 兜底，未识别的事件不崩溃
 
 // ========== UI 内部状态 ==========
@@ -382,6 +449,7 @@ export interface SessionPayload {
   session: SessionSummary | null;
   history: RestoredHistoryMessage[];
   context_window?: ContextWindow | null;
+  plan_state?: PlanState | null;
 }
 
 /** session.compact 的返回形状。 */
@@ -393,7 +461,7 @@ export interface CompactPayload extends SessionPayload {
   no_op?: boolean;
 }
 
-export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought";
+export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought" | "plan";
 
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */
 export interface ChatItem {
@@ -420,4 +488,6 @@ export interface ChatItem {
   answerCancelled?: boolean;
   // todo（todo role 用）：每次 todo 写入产生一个新 item，items 是该次写入后的全量列表
   todoItems?: TodoItem[];
+  planStatus?: PlanStatus;
+  planRevision?: number | null;
 }

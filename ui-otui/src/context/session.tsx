@@ -36,6 +36,8 @@ import type {
   QueuedAttachment,
   PromptAttachmentInput,
   DialogSpec,
+  PlanMode,
+  PlanState,
   RestoredHistoryMessage,
   SessionPayload,
 } from "../types.js";
@@ -52,6 +54,7 @@ const nextId = () => `i${++_idCounter}`;
 export interface SessionState {
   items: ChatItem[];
   busy: boolean;
+  planState: PlanState | null;
   model: string;
   promptTokens: number;
   completionTokens: number;
@@ -93,6 +96,25 @@ function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
       if (m.role === "assistant") return { id: nextId(), role: "assistant", text: m.content } as ChatItem;
       return { id: nextId(), role: "system", text: m.content } as ChatItem;
     });
+}
+
+function planStateToItem(state: PlanState | null | undefined): ChatItem | null {
+  if (!state) return null;
+  const status = state.status ?? "idle";
+  const text =
+    status === "approved"
+      ? (state.approved_plan || state.approved_plan_preview || "")
+      : (state.pending_plan || state.pending_plan_preview || "");
+  if (!text.trim()) return null;
+  return {
+    id: nextId(),
+    role: "plan",
+    text,
+    planStatus: status,
+    planRevision: status === "approved"
+      ? (state.approved_revision ?? state.revision ?? null)
+      : (state.pending_revision ?? state.revision ?? null),
+  };
 }
 
 function formatCompactTokens(tokens: unknown): string {
@@ -151,6 +173,12 @@ interface SessionContextValue {
   openDialog: (spec: DialogSpec) => void;
   /** 关闭浮层弹窗。 */
   closeDialog: () => void;
+  /** Set Plan/Execute mode. */
+  setPlanMode: (mode: PlanMode) => Promise<void>;
+  /** Toggle Plan/Execute mode. */
+  togglePlanMode: () => void;
+  /** Update local Plan state from RPC/events. */
+  setPlanState: (state: PlanState | null) => void;
 }
 
 const SessionContext = createContext<SessionContextValue>();
@@ -161,6 +189,7 @@ export function SessionProvider(props: ParentProps) {
   const [state, setState] = createStore<SessionState>({
     items: [],
     busy: false,
+    planState: null,
     model: "connecting…",
     promptTokens: 0,
     completionTokens: 0,
@@ -184,6 +213,7 @@ export function SessionProvider(props: ParentProps) {
   // prompt.submit 是 fire-and-forget，但后端会立刻回一个 accepted/error。
   // 附件队列等这个 ack 后再清空，避免 submit 被拒时用户得重挑文件。
   let pendingSubmitId: string | null = null;
+  let streamingPlanId: string | null = null;
 
   // 本次 chat 是否产生过任何可见输出（文本/思考/工具调用）。submit 时复位，
   // 收到 text_delta/reasoning_delta/tool_start 置 true；done 时若仍为 false，
@@ -224,6 +254,28 @@ export function SessionProvider(props: ParentProps) {
     );
   };
 
+  const appendPlanText = (delta: string) => {
+    setState(
+      produce((s) => {
+        if (streamingPlanId) {
+          const existing = s.items.find((it) => it.id === streamingPlanId);
+          if (existing) {
+            existing.text += delta;
+            return;
+          }
+        }
+        streamingPlanId = nextId();
+        s.items.push({
+          id: streamingPlanId,
+          role: "plan",
+          text: delta,
+          planStatus: "idle",
+          planRevision: null,
+        });
+      }),
+    );
+  };
+
   const onEvent = (ev: AgentEvent) => {
     const e = ev as any;
     switch (ev.type) {
@@ -231,13 +283,86 @@ export function SessionProvider(props: ParentProps) {
         setState("model", e.model ?? "unknown");
         setState("session", e.session ?? null);
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
+        if (e.plan_state !== undefined) setState("planState", e.plan_state ?? null);
         {
           const notice = describeAutoCompact(e);
           if (notice) appendSystem(notice);
         }
-        if (Array.isArray(e.history) && e.history.length > 0) {
-          setState("items", restoredHistoryToItems(e.history));
+        if (Array.isArray(e.history)) {
+          const restored = restoredHistoryToItems(e.history);
+          const planItem = planStateToItem(e.plan_state);
+          if (planItem) restored.push(planItem);
+          if (restored.length > 0) setState("items", restored);
         }
+        break;
+
+      case "plan_mode_changed":
+        setState("planState", e.plan_state ?? null);
+        break;
+
+      case "plan_start":
+        streamingPlanId = null;
+        break;
+
+      case "plan_delta":
+        sawOutput = true;
+        appendPlanText(e.delta as string);
+        break;
+
+      case "plan_ready":
+        sawOutput = true;
+        setState("planState", e.plan_state ?? null);
+        setState(
+          produce((s) => {
+            const id = streamingPlanId;
+            streamingPlanId = null;
+            if (!id) {
+              s.items.push({
+                id: nextId(),
+                role: "plan",
+                text: String(e.plan ?? ""),
+                planStatus: "pending",
+                planRevision: e.plan_state?.pending_revision ?? e.plan_state?.revision ?? null,
+              });
+              return;
+            }
+            const item = s.items.find((it) => it.id === id);
+            if (item) {
+              item.text ||= String(e.plan ?? "");
+              item.planStatus = "pending";
+              item.planRevision = e.plan_state?.pending_revision ?? e.plan_state?.revision ?? null;
+            }
+          }),
+        );
+        break;
+
+      case "plan_approved":
+        setState("planState", e.plan_state ?? null);
+        setState(
+          produce((s) => {
+            for (const item of s.items) {
+              if (item.role === "plan" && item.planStatus === "pending") {
+                item.planStatus = "approved";
+                item.planRevision = e.plan_state?.approved_revision ?? item.planRevision;
+              }
+            }
+          }),
+        );
+        appendSystem("Plan approved. Switched back to EXEC mode.");
+        break;
+
+      case "plan_rejected":
+        setState("planState", e.plan_state ?? null);
+        setState(
+          produce((s) => {
+            for (const item of s.items) {
+              if (item.role === "plan" && item.planStatus === "pending") {
+                item.planStatus = "rejected";
+              }
+            }
+          }),
+        );
+        appendSystem("Plan rejected. Feedback will be included in the next Plan Mode turn.");
         break;
 
       case "round_start":
@@ -439,8 +564,13 @@ export function SessionProvider(props: ParentProps) {
 
   /** 切换/新建会话返回的 payload → 重绘对话流：恢复 history + 同步 session/上下文窗口。 */
   const applySessionPayload = (payload: SessionPayload) => {
-    setState("items", restoredHistoryToItems(payload.history ?? []));
+    const restored = restoredHistoryToItems(payload.history ?? []);
+    const planItem = planStateToItem(payload.plan_state);
+    if (planItem) restored.push(planItem);
+    setState("items", restored);
     setState("session", payload.session ?? null);
+    if (payload.plan_state !== undefined) setState("planState", payload.plan_state ?? null);
+    streamingPlanId = null;
     setState("promptTokens", 0);
     setState("completionTokens", 0);
     setState("cachedPromptTokens", 0);
@@ -450,6 +580,20 @@ export function SessionProvider(props: ParentProps) {
     setState("round", 0);
     setState("todos", []);
     setState("activeQuestionId", null);
+  };
+
+  const setPlanMode = async (mode: PlanMode) => {
+    try {
+      const payload = await transport.setMode(mode);
+      setState("planState", payload.plan_state ?? null);
+    } catch (e) {
+      appendSystem(`Plan mode switch failed: ${(e as Error).message}`);
+    }
+  };
+
+  const togglePlanMode = () => {
+    const current = state.planState?.mode ?? "execute";
+    void setPlanMode(current === "plan" ? "execute" : "plan");
   };
 
   const runCommand = (cmd: SlashCommand, commandLine?: string) => {
@@ -480,6 +624,8 @@ export function SessionProvider(props: ParentProps) {
       attachments: state.attachments,
       setAttachments,
       setPet: (pet) => setState("pet", pet),
+      setPlanState: (planState) => setState("planState", planState),
+      setPlanMode,
       setPending: (label) => setState("pending", label),
       openDialog: (spec) => setState("dialog", spec),
       applySessionPayload,
@@ -577,6 +723,9 @@ export function SessionProvider(props: ParentProps) {
     setPet: (pet) => setState("pet", pet),
     openDialog: (spec) => setState("dialog", spec),
     closeDialog: () => setState("dialog", null),
+    setPlanMode,
+    togglePlanMode,
+    setPlanState: (planState) => setState("planState", planState),
   };
 
   return <SessionContext.Provider value={value}>{props.children}</SessionContext.Provider>;
