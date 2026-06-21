@@ -55,6 +55,7 @@ export interface SessionState {
   model: string;
   promptTokens: number;
   completionTokens: number;
+  cachedPromptTokens: number;
   contextWindow: ContextWindow | null;
   round: number;
   maxRounds: number;
@@ -92,6 +93,36 @@ function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
       if (m.role === "assistant") return { id: nextId(), role: "assistant", text: m.content } as ChatItem;
       return { id: nextId(), role: "system", text: m.content } as ChatItem;
     });
+}
+
+function formatCompactTokens(tokens: unknown): string {
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) return "0";
+  if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
+  return `${Math.round(tokens)}`;
+}
+
+function describeAutoCompact(e: any): string | null {
+  const payload = e.auto_compact;
+  if (!payload?.compacted || !Array.isArray(payload.events) || payload.events.length === 0) {
+    return null;
+  }
+  const compressedToolMessages = payload.events.reduce((sum: number, item: any) => {
+    return sum + Number(item?.compressed_tool_messages || 0);
+  }, 0);
+  const historyEvents = payload.events.filter((item: any) => {
+    if (!item) return false;
+    if (item.reason && item.reason !== "tool_loop") return true;
+    return !!item.history_compaction;
+  });
+  const context = e.context_window;
+  const contextText = context
+    ? `Context ${formatCompactTokens(context.used_tokens)}/${formatCompactTokens(context.max_tokens)} ${context.percent ?? 0}%`
+    : "Context refreshed";
+  const parts: string[] = [];
+  if (compressedToolMessages > 0) parts.push(`tool results ${compressedToolMessages}`);
+  if (historyEvents.length > 0) parts.push(`history ${historyEvents.length}`);
+  if (parts.length === 0) parts.push("context guard");
+  return `已自动压缩上下文：${parts.join("，")}，${contextText}。`;
 }
 
 interface SessionContextValue {
@@ -133,6 +164,7 @@ export function SessionProvider(props: ParentProps) {
     model: "connecting…",
     promptTokens: 0,
     completionTokens: 0,
+    cachedPromptTokens: 0,
     contextWindow: null,
     round: 0,
     maxRounds: 0,
@@ -199,6 +231,10 @@ export function SessionProvider(props: ParentProps) {
         setState("model", e.model ?? "unknown");
         setState("session", e.session ?? null);
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
+        {
+          const notice = describeAutoCompact(e);
+          if (notice) appendSystem(notice);
+        }
         if (Array.isArray(e.history) && e.history.length > 0) {
           setState("items", restoredHistoryToItems(e.history));
         }
@@ -264,6 +300,7 @@ export function SessionProvider(props: ParentProps) {
       case "token_usage":
         setState("promptTokens", (p) => p + (e.prompt_tokens ?? 0));
         setState("completionTokens", (c) => c + (e.completion_tokens ?? 0));
+        setState("cachedPromptTokens", (c) => c + (e.cached_prompt_tokens ?? e.prompt_cache_hit_tokens ?? 0));
         break;
 
       case "todo_list_updated":
@@ -404,6 +441,9 @@ export function SessionProvider(props: ParentProps) {
   const applySessionPayload = (payload: SessionPayload) => {
     setState("items", restoredHistoryToItems(payload.history ?? []));
     setState("session", payload.session ?? null);
+    setState("promptTokens", 0);
+    setState("completionTokens", 0);
+    setState("cachedPromptTokens", 0);
     if (payload.context_window !== undefined) setState("contextWindow", payload.context_window ?? null);
     // 切会话即结束上一会话的流式态，清空 round / busy，防止残留动效
     setState("busy", false);
@@ -420,6 +460,22 @@ export function SessionProvider(props: ParentProps) {
       args: line.slice(cmd.name.length).trim(),
       appendSystem,
       setItems: (items) => setState("items", items),
+      resetSessionStats: () => {
+        setState("promptTokens", 0);
+        setState("completionTokens", 0);
+        setState("cachedPromptTokens", 0);
+        setState("contextWindow", (prev) =>
+          prev
+            ? {
+                ...prev,
+                used_tokens: 0,
+                remaining_tokens: prev.max_tokens,
+                percent: 0,
+              }
+            : prev,
+        );
+      },
+      setContextWindow: (contextWindow) => setState("contextWindow", contextWindow),
       toggleActivity: () => setState("showActivity", (v) => !v),
       attachments: state.attachments,
       setAttachments,

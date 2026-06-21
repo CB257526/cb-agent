@@ -54,6 +54,7 @@ describe("commands", () => {
     let applySessionPayloadMock: ReturnType<typeof vi.fn>;
     let setContextWindowMock: ReturnType<typeof vi.fn>;
     let resetContextWindowMock: ReturnType<typeof vi.fn>;
+    let resetTokenUsageMock: ReturnType<typeof vi.fn>;
     let openSessionSwitcherMock: ReturnType<typeof vi.fn>;
     let toggleActivityMock: ReturnType<typeof vi.fn>;
     let setPetStateMock: ReturnType<typeof vi.fn>;
@@ -66,6 +67,7 @@ describe("commands", () => {
       applySessionPayloadMock = vi.fn();
       setContextWindowMock = vi.fn();
       resetContextWindowMock = vi.fn();
+      resetTokenUsageMock = vi.fn();
       openSessionSwitcherMock = vi.fn();
       toggleActivityMock = vi.fn();
       setPetStateMock = vi.fn();
@@ -89,6 +91,7 @@ describe("commands", () => {
         applySessionPayload: applySessionPayloadMock,
         setContextWindow: setContextWindowMock,
         resetContextWindow: resetContextWindowMock,
+        resetTokenUsage: resetTokenUsageMock,
         openSessionSwitcher: openSessionSwitcherMock,
         toggleActivity: toggleActivityMock,
         setPetState: setPetStateMock,
@@ -124,6 +127,7 @@ describe("commands", () => {
       const updater = setItemsMock.mock.calls[0][0];
       expect(updater([{ id: "x", role: "user", text: "old" }])).toEqual([]);
       expect(resetContextWindowMock).toHaveBeenCalledOnce();
+      expect(resetTokenUsageMock).toHaveBeenCalledOnce();
       expect(appendSystemMock).toHaveBeenCalled();
     });
 

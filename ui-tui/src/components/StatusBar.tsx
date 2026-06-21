@@ -11,6 +11,7 @@ export interface StatusBarProps {
   sessionId?: string | null;
   promptTokens: number;
   completionTokens: number;
+  cachedPromptTokens?: number;
   contextWindow?: ContextWindow | null;
   round: number;
   maxRounds: number;
@@ -18,12 +19,14 @@ export interface StatusBarProps {
 }
 
 /** 底部状态栏：左边 spinner + 模型/上下文窗口/累计用量/round；右边快捷键 byline。 */
-export function StatusBar({ model, sessionId, promptTokens, completionTokens, contextWindow, round, maxRounds, busy }: StatusBarProps) {
-  const totalK = ((promptTokens + completionTokens) / 1000).toFixed(1);
+export function StatusBar({ model, sessionId, promptTokens, completionTokens, cachedPromptTokens = 0, contextWindow, round, maxRounds, busy }: StatusBarProps) {
+  const billableTokens = Math.max(0, promptTokens + completionTokens - cachedPromptTokens);
+  const totalK = (billableTokens / 1000).toFixed(1);
   const contextUsed = contextWindow?.used_tokens ?? 0;
   const contextMax = contextWindow?.max_tokens ?? 8000;
   const contextPercent = contextWindow?.percent ?? 0;
-  const contextColor = contextPercent >= 85 ? theme.error : contextPercent >= 65 ? theme.warning : theme.success;
+  const triggerPercent = contextWindow?.auto_compact_trigger_percent ?? 80;
+  const contextColor = contextPercent >= triggerPercent ? theme.error : contextPercent >= 65 ? theme.warning : theme.success;
   return (
     <Box flexDirection="row" justifyContent="space-between">
       <Box>

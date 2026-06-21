@@ -34,13 +34,15 @@ export function Footer() {
   const theme = useTheme();
   const { state } = useSession();
 
-  const totalK = () => ((state.promptTokens + state.completionTokens) / 1000).toFixed(1);
+  const totalK = () =>
+    (Math.max(0, state.promptTokens + state.completionTokens - state.cachedPromptTokens) / 1000).toFixed(1);
   const ctxUsed = () => state.contextWindow?.used_tokens ?? 0;
   const ctxMax = () => state.contextWindow?.max_tokens ?? 8000;
   const ctxPercent = () => state.contextWindow?.percent ?? 0;
   const ctxColor = createMemo(() => {
     const p = ctxPercent();
-    return p >= 85 ? theme.error : p >= 65 ? theme.warning : theme.success;
+    const trigger = state.contextWindow?.auto_compact_trigger_percent ?? 80;
+    return p >= trigger ? theme.error : p >= 65 ? theme.warning : theme.success;
   });
   const mcpConnected = () => state.mcp?.connected ?? 0;
   const mcpFailed = () => state.mcp?.failed ?? 0;

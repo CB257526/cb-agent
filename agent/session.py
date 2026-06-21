@@ -30,6 +30,7 @@ ToolRegistry / Executor / LLM 仍从外部传入,便于测试和换前端。
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -64,10 +65,12 @@ from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
 from agent.compact_boundary import (
     COMPACT_BOUNDARY_KIND,
+    find_last_compact_boundary_index,
     get_messages_after_compact_boundary,
     make_compact_boundary_message,
 )
 from agent.message_protocol import drop_orphan_tool_messages
+from agent.microcompact import apply_microcompact
 from agent.work_context import (
     COMPACT_RECORD_LIMIT,
     LocalSessionStore,
@@ -720,7 +723,21 @@ class AgentSession:
         常规请求不再改写旧 tool result,避免破坏 provider prompt cache 前缀。
         """
         sliced = get_messages_after_compact_boundary(self.history)
-        dicts = [m.to_dict() for m in sliced[-self.history_window:]]
+        if len(sliced) > self.history_window:
+            last_boundary_idx = find_last_compact_boundary_index(sliced)
+            if last_boundary_idx == 0:
+                # compact_boundary 是切片后的第一条消息（索引 0）。
+                # 即使 compact 之后又经过了很多轮对话，也必须保留这条 boundary
+                # 作为锚点消息。否则模型会丢失"前面发生了什么"的摘要信息，
+                # 导致跨轮连贯性断裂。
+                # 策略：boundary 占 1 个槽位，剩余 window-1 个槽位给尾部最新消息。
+                tail_capacity = max(0, self.history_window - 1)
+                sliced = [sliced[0]] + (sliced[-tail_capacity:] if tail_capacity else [])
+            else:
+                # boundary 不在切片首位（可能在中间或不存在），直接取尾部 window 条。
+                # 此时不需要锚点保护，因为 boundary 之前的消息仍在切片范围内。
+                sliced = sliced[-self.history_window:]
+        dicts = [m.to_dict() for m in sliced]
         drop_orphan_tool_messages(dicts)
         return dicts
 
@@ -1101,6 +1118,9 @@ class AgentSession:
         """
         model_max_tokens = self._model_max_tokens()
         max_tokens = self._context_budget_tokens()
+        # 自动 compact 的触发阈值（token 数），与 preflight 三级阈值使用同一口径。
+        # 这里暴露给 TUI 状态栏，让用户看到「Context% 到达多少会触发自动压缩」。
+        trigger_tokens = self._auto_compact_trigger_tokens()
         text = self._dynamic_context_text()
         used_tokens = count_tokens(text) if text else 0
         percent = min(100.0, (used_tokens / max_tokens) * 100.0)
@@ -1113,6 +1133,12 @@ class AgentSession:
             "scope": "state+history",
             "model_max_tokens": model_max_tokens,
             "threshold_ratio": ConstantLLM.CONTEXT_USAGE_RATIO,
+            # TUI 状态栏用：告诉用户自动 compact 会在多少 token / 百分之多少时触发
+            "auto_compact_trigger_tokens": trigger_tokens,
+            "auto_compact_trigger_percent": round(
+                (trigger_tokens / max_tokens) * 100.0,
+                1,
+            ),
         }
 
     def _estimate_request_tokens(
@@ -1147,14 +1173,17 @@ class AgentSession:
     PREDICTIVE_GROWTH_OUTPUT_BUDGET = 20_000
     PREDICTIVE_GROWTH_TOOL_BUDGET = 15_000
 
-    # autocompact 动态 buffer。模型窗口越大,留出的安全余量越多,避免巨大 prompt
-    # 在边界附近抖动触发反复压缩。CC 同款分档。
-    AUTOCOMPACT_BUFFER_SMALL = 13_000   # 窗口 < 400k
-    AUTOCOMPACT_BUFFER_MEDIUM = 30_000  # 400k ≤ 窗口 < 800k
-    AUTOCOMPACT_BUFFER_LARGE = 50_000   # 窗口 ≥ 800k
-
-    # blocking 阈值:autocompact 失败/关闭后,窗口剩余 ≤ 这个值就拒绝继续。
+    # blocking 阈值：autocompact 失败/关闭后，窗口剩余 ≤ 这个值就拒绝继续。
+    # 注意：这个常量只用作 _full_window_blocking_threshold() 的上限参考，
+    # 实际 blocking 阈值会取 min(BLOCKING_LIMIT_BUFFER, full_window // 5)，
+    # 避免在极小测试窗口上误杀。
     BLOCKING_LIMIT_BUFFER = 3_000
+    # 自动 compact 触发比例，对齐 ConstantLLM.CONTEXT_USAGE_RATIO（默认 0.8）。
+    # 这意味着当 token 使用量达到 context_budget（模型窗口的 80%）的 80% 时触发，
+    # 即模型窗口的 64%。与 TUI 状态栏的颜色变化保持同步。
+    # 旧设计使用三档固定 buffer（13k/30k/50k），在不同窗口规模上表现不一致；
+    # 新设计用比例统一，模型窗口越大 → 触发阈值成比例放大，更合理。
+    AUTOCOMPACT_TRIGGER_RATIO = ConstantLLM.CONTEXT_USAGE_RATIO
 
     def _estimate_max_turn_growth(self) -> int:
         """估算本轮请求至此之后还可能增长的 token 数。
@@ -1163,19 +1192,43 @@ class AgentSession:
         - 模型最终输出占用(粗略上限 20k);
         - 一次工具调用返回(粗略上限 15k,涵盖 file_read 等大输出)。
 
-        这个值用于 predictive autocompact:如果当前请求 + 估算增长 > 模型完整
-        窗口,就提前触发 compact,而不是等到 API 返回 413 才被动处理。
+        这个值用于 predictive autocompact:如果当前请求 + 估算增长 > 状态栏
+        显示的自动 compact 触发阈值,就提前触发 compact,而不是等到 API 返回
+        413 才被动处理。
         """
         return self.PREDICTIVE_GROWTH_OUTPUT_BUDGET + self.PREDICTIVE_GROWTH_TOOL_BUDGET
 
-    def _dynamic_autocompact_buffer(self) -> int:
-        """模型窗口对应的 autocompact buffer。"""
-        window = self._model_max_tokens()
-        if window >= 800_000:
-            return self.AUTOCOMPACT_BUFFER_LARGE
-        if window >= 400_000:
-            return self.AUTOCOMPACT_BUFFER_MEDIUM
-        return self.AUTOCOMPACT_BUFFER_SMALL
+    def _auto_compact_trigger_tokens(self) -> int:
+        """返回自动 compact 的触发阈值（token 数）。
+
+        阈值 = context_budget × AUTOCOMPACT_TRIGGER_RATIO。
+        context_budget 已经是模型窗口 × CONTEXT_USAGE_RATIO（默认 0.8），
+        再乘 AUTOCOMPACT_TRIGGER_RATIO（默认也是 0.8），所以实际触发点是
+        模型完整窗口的 64%。
+
+        这个值同时用于：
+        - TUI 状态栏显示「自动 compact 触发点」
+        - preflight 三级阈值（predictive / autocompact）的判断
+        - _auto_compact_history 的触发判断
+        - _prepare_loop_messages_for_llm 的 microcompact 触发判断
+        """
+        return max(1, int(self._context_budget_tokens() * self.AUTOCOMPACT_TRIGGER_RATIO))
+
+    def _full_window_blocking_threshold(self) -> int:
+        """返回阻塞阈值：当请求 token 数 ≥ 此值时拒绝继续。
+
+        设计要点：
+        - 对于正常大小的窗口（≥15k），reserve = BLOCKING_LIMIT_BUFFER = 3000，
+          即窗口剩余不足 3000 token 时触发 blocking。
+        - 对于极小窗口（测试用 fake 模型窗口可能只有 700），直接减 3000 会变成
+          负数导致误杀。此时取 full_window // 5 作为 reserve，保证至少保留 20%
+          的窗口空间，避免假阳性。
+        - 返回值至少为 1，防止边界情况下的除零或负值。
+        """
+        full_window = self._model_max_tokens()
+        # reserve 取固定上限和动态比例的较小值，兼顾正常窗口和极小测试窗口
+        reserve = min(self.BLOCKING_LIMIT_BUFFER, max(1, full_window // 5))
+        return max(1, full_window - reserve)
 
     def _auto_compact_history(
         self,
@@ -1196,7 +1249,11 @@ class AgentSession:
         """
         before_usage = self.context_window_usage()
         budget = int(before_usage["max_tokens"])
-        if not force and int(before_usage["used_tokens"]) < budget:
+        # 使用与 preflight 相同的触发阈值（auto_compact_trigger_tokens），
+        # 而非旧的固定 buffer。这样 post_turn / 手动 / preflight 三条路径
+        # 共享同一个触发标准，行为一致可预测。
+        trigger_tokens = self._auto_compact_trigger_tokens()
+        if not force and int(before_usage["used_tokens"]) < trigger_tokens:
             return None
         before_messages = len(self.history)
         state_text = self._session_state_text()
@@ -1233,6 +1290,7 @@ class AgentSession:
             "before_tokens": int(before_usage.get("used_tokens") or 0),
             "after_tokens": int(after_usage.get("used_tokens") or 0),
             "budget_tokens": budget,
+            "trigger_tokens": trigger_tokens,
             "request_tokens": request_tokens,
             "persisted": bool(payload.get("persisted")),
         }
@@ -1258,12 +1316,10 @@ class AgentSession:
 
         按优先级从严到宽:
 
-        1. **Predictive**:current + estimateMaxTurnGrowth > 模型完整窗口
-           触发 autocompact。这里的窗口是真实窗口(model_max_tokens),不是 80%
-           的工作窗口——预判逻辑要尽量晚点开火,但不能等到 API 401 才动。
-        2. **Autocompact**:current ≥ 模型完整窗口 - dynamic_buffer
-           触发 autocompact。dynamic_buffer 按窗口规模分档(13k/30k/50k)。
-        3. **Blocking**:autocompact 失败/no-op 后,如果 current ≥ 完整窗口 - 3k
+        1. **Predictive**:current + estimateMaxTurnGrowth > 状态栏显示的
+           auto_compact_trigger_tokens 时触发 autocompact。
+        2. **Autocompact**:current ≥ auto_compact_trigger_tokens 时触发。
+        3. **Blocking**:autocompact 失败/no-op 后,如果 current 接近完整模型窗口
            emit Error 并返回特殊事件,_chat_impl 会据此终止本轮。
 
         命中前两级会调 _auto_compact_history,在 history 追加 compact_boundary;
@@ -1273,11 +1329,16 @@ class AgentSession:
         del user_query, system_instructions  # 估算直接读 messages
         request_tokens = self._estimate_request_tokens(messages, tools_schema)
         full_window = self._model_max_tokens()
+        # 统一的触发阈值（context_budget × AUTOCOMPACT_TRIGGER_RATIO）。
+        # 旧设计用 full_window - dynamic_buffer（13k/30k/50k 分档），
+        # 新设计用比例统一，与 TUI 状态栏显示一致。
+        trigger_tokens = self._auto_compact_trigger_tokens()
         growth = self._estimate_max_turn_growth()
-        buffer = self._dynamic_autocompact_buffer()
 
-        # 1. Predictive
-        if request_tokens + growth > full_window:
+        # 1. Predictive（预测性触发）
+        # 当前请求 + 预估本轮增长 > 触发阈值 → 提前 compact。
+        # 这是最早介入的一级，不等 API 返回 413 才被动处理。
+        if request_tokens + growth > trigger_tokens:
             event = self._auto_compact_history(
                 reason="preflight_predictive",
                 round_idx=0,
@@ -1286,11 +1347,13 @@ class AgentSession:
             )
             if event is not None:
                 event["full_window"] = full_window
+                event["trigger_tokens"] = trigger_tokens
                 event["growth_estimate"] = growth
                 return event
 
-        # 2. Autocompact
-        if request_tokens >= full_window - buffer:
+        # 2. Autocompact（已达触发阈值）
+        # 当前请求已经 ≥ 触发阈值，但还没到 blocking 程度 → 立即 compact。
+        if request_tokens >= trigger_tokens:
             event = self._auto_compact_history(
                 reason="preflight_autocompact",
                 round_idx=0,
@@ -1299,11 +1362,15 @@ class AgentSession:
             )
             if event is not None:
                 event["full_window"] = full_window
-                event["buffer_tokens"] = buffer
+                event["trigger_tokens"] = trigger_tokens
                 return event
 
-        # 3. Blocking
-        if request_tokens >= full_window - self.BLOCKING_LIMIT_BUFFER:
+        # 3. Blocking（阻塞拒绝）
+        # 请求已经接近完整模型窗口，autocompact 失败或无操作空间 → 拒绝本轮。
+        # 使用 _full_window_blocking_threshold() 而非直接 full_window - 3000，
+        # 避免在极小测试窗口上误杀。
+        blocking_threshold = self._full_window_blocking_threshold()
+        if request_tokens >= blocking_threshold:
             logger.error(
                 "blocking limit reached: request=%s window=%s buffer=%s",
                 request_tokens, full_window, self.BLOCKING_LIMIT_BUFFER,
@@ -1312,7 +1379,7 @@ class AgentSession:
                 where="session",
                 message=(
                     f"上下文窗口即将耗尽 (请求 {request_tokens} tokens >= "
-                    f"{full_window - self.BLOCKING_LIMIT_BUFFER}),"
+                    f"{blocking_threshold}),"
                     "且自动 compact 无法继续释放空间。请手动 /clear 或 /compact 后重试。"
                 ),
                 round_idx=0,
@@ -1322,12 +1389,69 @@ class AgentSession:
                 "round_idx": 0,
                 "request_tokens": request_tokens,
                 "full_window": full_window,
+                "blocking_threshold": blocking_threshold,
                 "blocked": True,
             }
 
         return None
 
     # ---------- 工具循环 ----------
+
+    def _prepare_loop_messages_for_llm(
+        self,
+        messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]],
+        round_idx: int,
+    ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """为工具循环的每一轮准备发给 LLM 的请求体，必要时仅压缩 LLM 副本。
+
+        核心设计原则：**压缩的是副本，原始 messages 不动**。
+
+        工具循环中 messages 会累积越来越多的 assistant(tool_calls) + role=tool
+        消息。当累积量超过触发阈值时，直接发给 LLM 可能导致上下文超窗。
+
+        解决方案：
+        1. deepcopy 一份 messages 作为 llm_messages（浅拷贝不够，因为 dict
+           内部嵌套的 content/list 会被 microcompact 原地修改）。
+        2. 对 llm_messages 执行 microcompact：将旧的、重复的 tool_result 替换为
+           {"cleared": true} 占位符，只保留最近几次工具结果原文。
+        3. 原始 messages 保持不变 → 工具循环结束时 _chat_impl 从中提取完整的
+           tool_calls + tool_result 原始消息 commit 到 self.history → 跨轮恢复
+           时模型仍能看到完整工具调用细节。
+        4. 压缩事件记录到返回值中，最终汇总进 Done.auto_compact.events，
+           供 TUI 调试面板展示。
+
+        Returns:
+            (llm_messages, compaction_event | None)
+            - llm_messages: 发给 LLM 的消息列表（可能是压缩后的副本或原始引用）
+            - compaction_event: 压缩审计事件，未触发压缩时为 None
+        """
+        before_tokens = self._estimate_request_tokens(messages, tools_schema)
+        trigger_tokens = self._auto_compact_trigger_tokens()
+        # 未达触发阈值 → 直接返回原始 messages，零开销
+        if before_tokens < trigger_tokens:
+            return messages, None
+
+        # 深拷贝后压缩，保证原始 messages 不受影响
+        llm_messages = copy.deepcopy(messages)
+        # microcompact 将旧的 tool_result 替换为轻量占位符，
+        # 返回被压缩的消息条数；0 表示没有可压缩的内容
+        cleared = apply_microcompact(llm_messages)
+        if cleared <= 0:
+            return messages, None
+
+        after_tokens = self._estimate_request_tokens(llm_messages, tools_schema)
+        return llm_messages, {
+            "reason": "tool_loop",
+            "round_idx": round_idx,
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "budget_tokens": self._context_budget_tokens(),
+            "trigger_tokens": trigger_tokens,
+            "request_tokens": before_tokens,
+            "compressed_tool_messages": cleared,
+            "persisted": False,  # loop 内压缩不落盘，只活在当轮
+        }
 
     def _tool_loop(
         self,
@@ -1352,9 +1476,11 @@ class AgentSession:
         # 本轮 messages 在循环结束后会被 _chat_impl 提取协议消息 commit 到
         # self.history,跨轮恢复时模型直接看到原始 tool_calls + tool_result。
         trace_collector = TraceCollector()
-        # _tool_loop 内已不再做局部消息压缩。所有跨轮压缩都集中在 preflight
-        # 三级阈值 + microcompact + autocompact;loop_compactions 保留为空列表
-        # 是为了维持 _chat_impl 的解构调用兼容。
+        # Loop 内只压缩发给 LLM 的请求副本，保留原始 messages 用于 history
+        # commit 和 transcript 审计。事件会汇总进 Done.auto_compact。
+        # 这是 CC 对齐的关键设计：旧的 loop_compactions 为空列表只是兼容占位，
+        # 现在真正使用 —— 每轮 think 前检查是否需要 microcompact，
+        # 压缩的是深拷贝副本，原始 messages 不丢工具调用细节。
         loop_compactions: List[Dict[str, Any]] = []
         max_rounds = self.max_tool_rounds
         for round_idx in range(1, max_rounds + 1):
@@ -1378,23 +1504,58 @@ class AgentSession:
                 round_idx=round_idx,
                 max_rounds=max_rounds,
             ))
+            # 每轮 think 前准备 LLM 请求副本：如果累计 token 超过触发阈值，
+            # 对副本执行 microcompact（压缩旧 tool_result），原始 messages 不动。
+            # 返回的 llm_messages 可能是副本（已压缩）或原始引用（未达阈值）。
+            llm_messages, loop_compaction = self._prepare_loop_messages_for_llm(
+                messages,
+                tools_schema,
+                round_idx,
+            )
+            if loop_compaction is not None:
+                loop_compactions.append(loop_compaction)
+                logger.info("loop microcompact before think: %s", loop_compaction)
+            # 即使用 microcompact 压缩后，仍需检查压缩后的请求是否仍然过大。
+            # 如果连压缩后都超过 blocking 阈值，说明本轮的上下文已经无法安全
+            # 发送给 LLM，直接终止工具循环并返回友好提示。
+            request_tokens_est = self._estimate_request_tokens(llm_messages, tools_schema)
+            if request_tokens_est >= self._full_window_blocking_threshold():
+                self.event_bus.emit(Error(
+                    where="session",
+                    message=(
+                        f"context window would overflow in tool loop "
+                        f"(request {request_tokens_est} tokens)"
+                    ),
+                    round_idx=round_idx,
+                ))
+                self.event_bus.emit(RoundEnd(
+                    round_idx=round_idx,
+                    has_tool_calls=False,
+                    final=True,
+                ))
+                return (
+                    round_idx,
+                    partial_answer or "[上下文窗口已满] 工具循环中的请求过大，已停止本轮。",
+                    trace_collector,
+                    loop_compactions,
+                )
             logger.info(
                 "round start: round=%s messages=%s request_tokens_est=%s",
                 round_idx,
-                len(messages),
-                self._estimate_request_tokens(messages, tools_schema),
+                len(llm_messages),
+                request_tokens_est,
             )
             if self.messages_snapshot_hook is not None:
                 try:
                     # CLI 的 /msg dump 是落到终端/日志的调试视图，只展示脱敏副本。
-                    self.messages_snapshot_hook(sanitize_multimodal_payload(messages), round_idx)
+                    self.messages_snapshot_hook(sanitize_multimodal_payload(llm_messages), round_idx)
                 except Exception:
                     logger.exception("messages_snapshot_hook 抛异常，已吞")
 
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        messages,
+                        llm_messages,
                         tools=tools_schema,
                         label=f"第 {round_idx} 轮 think 前",
                     )
@@ -1402,7 +1563,7 @@ class AgentSession:
                     logger.exception("message_logger 写入失败")
 
             result = self.llm.think(
-                messages,
+                llm_messages,
                 tools=tools_schema,
                 event_bus=self.event_bus,
                 cancel_event=token.event,
@@ -1410,7 +1571,7 @@ class AgentSession:
             )
             if self.message_logger is not None:
                 try:
-                    logged_messages = list(messages)
+                    logged_messages = list(llm_messages)
                     assistant_payload = _llm_result_to_assistant_payload(result)
                     if assistant_payload is not None:
                         logged_messages.append(assistant_payload)

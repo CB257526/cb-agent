@@ -11,7 +11,7 @@
 import type { Transport } from "./transport.js";
 import { basename } from "node:path";
 import { statSync } from "node:fs";
-import type { ChatItem, MCPStatusPayload, PetState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
+import type { ChatItem, ContextWindow, MCPStatusPayload, PetState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
 import { readClipboardImageAttachment } from "./clipboardImage.js";
 
 export interface CommandCtx {
@@ -23,6 +23,10 @@ export interface CommandCtx {
   appendSystem: (text: string) => void;
   /** 替换整个对话流（/clear 用）。 */
   setItems: (items: ChatItem[]) => void;
+  /** Reset visible Context and token usage counters after local clearing. */
+  resetSessionStats: () => void;
+  /** Refresh the visible Context counter from a management RPC response. */
+  setContextWindow: (contextWindow: ContextWindow | null) => void;
   /** 切换后端日志面板。 */
   toggleActivity: () => void;
   /** 当前待随下一条 prompt 一起提交的附件队列。 */
@@ -128,19 +132,23 @@ export const COMMANDS: readonly SlashCommand[] = [
   {
     name: "/clear",
     description: "清空对话历史（前后端都清）",
-    handler: ({ transport, setItems, appendSystem }) => {
+    handler: ({ transport, setItems, appendSystem, resetSessionStats }) => {
       transport.clearHistory();
       setItems([]);
+      resetSessionStats();
       appendSystem("对话已清空。");
     },
   },
   {
     name: "/compact",
     description: "压缩并释放当前会话上下文",
-    handler: async ({ transport, appendSystem, setPending }) => {
+    handler: async ({ transport, appendSystem, setPending, setContextWindow }) => {
       setPending("正在压缩上下文…");
       try {
         const payload = await transport.compactSession();
+        if (payload.context_window !== undefined) {
+          setContextWindow(payload.context_window ?? null);
+        }
         if (payload.no_op) {
           appendSystem("当前没有可压缩的上下文。");
           return;

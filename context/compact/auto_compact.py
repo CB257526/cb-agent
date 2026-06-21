@@ -10,9 +10,8 @@
 5. fallback: summarizer.summarize(...) (LLM 调用)
 6. 用 make_compact_boundary_message 替换待压缩段,保留最近 N 条原始消息
 
-阈值默认: 0.85(对齐 ConstantLLM.CONTEXT_USAGE_RATIO=0.8 略高 5%,避免和
-ContextBuilder 的预算判断重复触发,实测 0.85 在国内 OpenAI 兼容 API 上比
-0.80 更稳)。
+阈值默认复用 ConstantLLM.CONTEXT_USAGE_RATIO。这样独立调用本模块时也与
+session.py / TUI 使用同一条安全比例配置。
 """
 
 from __future__ import annotations
@@ -22,6 +21,10 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence
 
 from core.message import Message
+# 复用 ConstantLLM.CONTEXT_USAGE_RATIO 作为默认阈值比例。
+# 这样 auto_compact 模块独立调用时也与 session.py / TUI 使用同一条安全比例配置，
+# 避免两处阈值不一致导致的行为分裂。
+from constant.llm.constant_llm import ConstantLLM
 
 from ..budget.tokens import count_tokens
 from ..budget.window import get_context_window_for_model
@@ -36,7 +39,13 @@ from .summarizer import RuleBasedSummarizer, Summarizer
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_THRESHOLD_PCT = 0.85
+# 默认阈值比例，直接从 ConstantLLM 读取（默认 0.8）。
+# 旧值 0.85 比 session.py 的 0.80 略高 5%，原意是避免和 ContextBuilder 的预算判断
+# 重复触发。但实测 0.85 在国内 OpenAI 兼容 API 上不如 0.80 稳定，且两个阈值不一致
+# 导致 TUI 状态栏颜色变化与自动 compact 触发点不同步。
+# 现在统一为 CONTEXT_USAGE_RATIO：TUI 显示、preflight 检查、auto_compact 模块
+# 全部共用同一个比例，行为一致可预测。
+DEFAULT_THRESHOLD_PCT = ConstantLLM.CONTEXT_USAGE_RATIO
 DEFAULT_KEEP_RECENT = 6
 
 

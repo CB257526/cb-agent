@@ -350,6 +350,8 @@ export interface ContextWindow {
   model_max_tokens?: number;
   /** max_tokens 相对 model_max_tokens 的比例，默认 0.8。 */
   threshold_ratio?: number;
+  auto_compact_trigger_tokens?: number;
+  auto_compact_trigger_percent?: number;
   source?: string;
   scope?: string;
 }
@@ -363,6 +365,7 @@ export interface AutoCompactEvent {
   before_tokens?: number;
   after_tokens?: number;
   budget_tokens?: number;
+  trigger_tokens?: number;
   request_tokens?: number | null;
   compressed_tool_messages?: number;
   persisted?: boolean;

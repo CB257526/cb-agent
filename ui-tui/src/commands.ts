@@ -29,6 +29,8 @@ export interface CommandCtx {
   setContextWindow: (contextWindow: ContextWindow | null) => void;
   /** 将底部 Context 指标重置为 0，同时保留当前窗口上限。 */
   resetContextWindow: () => void;
+  /** Reset the visible per-session token usage counters. */
+  resetTokenUsage: () => void;
   /** 打开可见的会话切换面板。 */
   openSessionSwitcher: () => void;
   /** 切换后端日志面板 */
@@ -127,10 +129,11 @@ export const COMMANDS: readonly SlashCommand[] = [
   {
     name: "/clear",
     description: "清空对话历史（前后端都清）",
-    handler: ({ transport, setItems, appendSystem, resetContextWindow }) => {
+    handler: ({ transport, setItems, appendSystem, resetContextWindow, resetTokenUsage }) => {
       transport.clearHistory();
       setItems(() => []);
       resetContextWindow();
+      resetTokenUsage();
       appendSystem("对话已清空。");
     },
   },

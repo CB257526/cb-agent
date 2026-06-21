@@ -525,6 +525,104 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
+    def test_history_window_keeps_compact_boundary_anchor(self):
+        """验证 history_window 截断时保留 compact_boundary 锚点。
+
+        场景：compact_boundary 是切片后的第一条消息（索引 0），且切片长度
+        超过 history_window。此时不能简单取尾部 window 条 —— 那样会把 boundary
+        锚点消息挤出窗口，导致模型丢失「前面发生过什么」的压缩摘要。
+
+        预期行为：
+        - 切片结果长度 = history_window（3 条）
+        - 第一条必须是 compact_boundary（ANCHOR_SUMMARY）
+        - 剩余 2 条是尾部最新消息（tail-4, tail-5）
+        - tail-0 ~ tail-3 被正确截断
+        """
+        original = ConstantLLM.llm_dict.get("fake")
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "image_ability": False, "max_tokens": 100000,
+            }
+            llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+            from core.message import Message
+            from agent.compact_boundary import make_compact_boundary_message
+
+            # 构造：boundary 锚点 + 6 条尾部消息，window=3
+            s.history.append(make_compact_boundary_message("ANCHOR_SUMMARY"))
+            for i in range(6):
+                s.history.append(Message.create_user_message(f"tail-{i}"))
+            s.history_window = 3
+
+            dicts = s._sliced_history_dicts()
+
+            # 应该返回 3 条：boundary + 最后 2 条 tail
+            self.assertEqual(len(dicts), 3)
+            self.assertIn("ANCHOR_SUMMARY", str(dicts[0].get("content")))
+            joined = json.dumps(dicts, ensure_ascii=False)
+            self.assertIn("tail-4", joined)
+            self.assertIn("tail-5", joined)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_preflight_auto_compact_at_display_context_threshold(self):
+        """验证 preflight 在达到自动 compact 触发阈值时触发（非旧固定 buffer）。
+
+        场景：模型窗口 20000，context_budget = 16000（80%），
+        auto_compact_trigger_tokens = 12800（16000 × 80% = 模型窗口的 64%）。
+        注入 15000 × "word " 让 request_tokens 远超 12800，然后发 chat。
+
+        预期行为：
+        - chat 正常返回 "ok"（compact 成功释放空间后继续）
+        - history 中出现了 compact_boundary 消息
+        - Done.auto_compact 非空
+        - 触发原因是 "preflight_predictive"（预测性触发，非旧的 autocompact/buffer）
+
+        旧设计：需要在 full_window - buffer(13k/30k/50k) 才触发。
+        新设计：在 context_budget × AUTOCOMPACT_TRIGGER_RATIO 就触发，
+        比旧设计更早介入，更安全。
+        """
+        original = ConstantLLM.llm_dict.get("fake")
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "image_ability": False, "max_tokens": 20000,
+            }
+            llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+            from core.message import Message
+
+            # 注入大量文本让 request_tokens 超过 auto_compact_trigger_tokens
+            s.history.append(Message.create_user_message("word " * 15000))
+            answer = s.chat("continue")
+
+            self.assertEqual(answer, "ok")
+            # 验证 compact_boundary 已写入 history
+            self.assertTrue(any(
+                (m.metadata or {}).get("kind") == "compact_boundary"
+                for m in s.history
+            ))
+            # 验证 Done 事件包含 auto_compact 信息
+            dones = [e for e in self.events if isinstance(e, Done)]
+            self.assertTrue(dones[-1].auto_compact)
+            reasons = [item.get("reason") for item in dones[-1].auto_compact["events"]]
+            self.assertIn("preflight_predictive", reasons)
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
     def test_tool_call_blocks_when_full_window_overflows(self):
         """模型完整窗口被即将超过时,preflight blocking 阈值会拒绝继续。"""
         original = ConstantLLM.llm_dict.get("fake")
@@ -606,6 +704,78 @@ class TestAgentSessionBasic(unittest.TestCase):
                 m.get("role") == "tool" and long_content in str(m.get("content", ""))
                 for m in next_turn_messages
             ))
+
+    def test_loop_microcompact_only_compacts_llm_request_copy(self):
+        """验证 tool loop 中的 microcompact 只压缩 LLM 请求副本，不碰原始 history。
+
+        场景：10 轮 file_read 工具调用，每轮返回 1500 个 "word "，累计大量
+        tool_result 内容。到第 11 轮（最终回答轮）时，发给 LLM 的请求会触发
+        microcompact。
+
+        核心断言（三点验证）：
+        1. **LLM 请求副本被压缩**：最后一轮发给 LLM 的 messages 中，存在 role=tool
+           且 content 包含 '"cleared": true' 的消息 —— 旧 tool_result 被替换为
+           占位符。
+        2. **原始 history 完好无损**：self.history 中 tool 消息的 content 仍然包含
+           原始长文本（long_content），没有被压缩破坏。
+        3. **压缩事件被记录**：Done.auto_compact.events 中存在 reason="tool_loop"
+           且 compressed_tool_messages > 0 的审计条目。
+
+        如果 microcompact 错误地修改了原始 messages 而非副本，断言 2 会失败；
+        如果 microcompact 根本没触发，断言 1 和 3 会失败。
+        """
+        original = ConstantLLM.llm_dict.get("fake")
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "image_ability": False, "max_tokens": 20000,
+            }
+            # 10 轮工具调用 + 1 轮最终回答
+            tool_rounds = [
+                {"answer": "", "tool_calls": [_tc("file_read", "{}", call_id=f"call_{i}")]}
+                for i in range(10)
+            ]
+            llm = FakeLLM(tool_rounds + [{"answer": "done", "tool_calls": []}])
+            long_content = "word " * 1500
+            self.registry.execute_tool = MagicMock(return_value=json.dumps({
+                "content": long_content,
+            }, ensure_ascii=False))
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+            )
+
+            answer = s.chat("start")
+
+            # 最终回答正确
+            self.assertEqual(answer, "done")
+            # 断言 1：LLM 最终请求中存在被 microcompact 清除的 tool 消息
+            final_request = llm.calls[-1]["messages"]
+            cleared_tool_messages = [
+                m for m in final_request
+                if m.get("role") == "tool" and '"cleared": true' in str(m.get("content"))
+            ]
+            self.assertGreaterEqual(len(cleared_tool_messages), 1)
+            # 断言 2：self.history 中 tool 消息的原始内容完整保留
+            self.assertTrue(any(
+                (m.role.value if hasattr(m.role, "value") else str(m.role)) == "tool"
+                and long_content in str(m.content)
+                for m in s.history
+            ))
+            # 断言 3：压缩事件被正确记录到 Done.auto_compact
+            dones = [e for e in self.events if isinstance(e, Done)]
+            events = (dones[-1].auto_compact or {}).get("events", [])
+            self.assertTrue(any(
+                item.get("reason") == "tool_loop"
+                and item.get("compressed_tool_messages", 0) > 0
+                for item in events
+            ))
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
 
     def test_session_store_restores_history_and_clear_deletes_active(self):
         with tempfile.TemporaryDirectory() as td:

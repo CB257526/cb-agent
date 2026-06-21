@@ -112,6 +112,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [maxRounds, setMaxRounds] = useState(0);
   const [promptTokens, setPromptTokens] = useState(0);
   const [completionTokens, setCompletionTokens] = useState(0);
+  const [cachedPromptTokens, setCachedPromptTokens] = useState(0);
   const [contextWindow, setContextWindow] = useState<ContextWindow | null>(null);
   const [protocolErrors, setProtocolErrors] = useState(0);
   const [stderrLines, setStderrLines] = useState<string[]>([]);
@@ -255,9 +256,16 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     }));
   }, []);
 
+  const resetTokenUsage = useCallback(() => {
+    setPromptTokens(0);
+    setCompletionTokens(0);
+    setCachedPromptTokens(0);
+  }, []);
+
   const applySessionPayload = useCallback((payload: SessionPayload, notice?: string) => {
     flushNow();
     resetFlushRhythm();
+    resetTokenUsage();
     setCurrentSession(payload.session ?? null);
     if (payload.context_window !== undefined) {
       setContextWindow(payload.context_window ?? null);
@@ -270,7 +278,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     setRound(0);
     setBusy(false);
     setActiveQuestionId(null);
-  }, [flushNow, resetFlushRhythm]);
+  }, [flushNow, resetFlushRhythm, resetTokenUsage]);
 
   const refreshSessions = useCallback(async () => {
     setSessionsLoading(true);
@@ -430,8 +438,9 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
 
         case "token_usage": {
           const e = ev as any;
-          setPromptTokens((p) => p + e.prompt_tokens);
-          setCompletionTokens((c) => c + e.completion_tokens);
+          setPromptTokens((p) => p + (e.prompt_tokens ?? 0));
+          setCompletionTokens((c) => c + (e.completion_tokens ?? 0));
+          setCachedPromptTokens((c) => c + (e.cached_prompt_tokens ?? e.prompt_cache_hit_tokens ?? 0));
           break;
         }
 
@@ -606,6 +615,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       applySessionPayload,
       setContextWindow,
       resetContextWindow,
+      resetTokenUsage,
       openSessionSwitcher,
       toggleActivity: () => setShowActivity((v) => !v),
       setPetState,
@@ -617,7 +627,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       ret.catch((e) => appendSystem(`✗ 命令 ${cmd.name} 抛错：${(e as Error).message}`));
     }
     setInput("");
-  }, [transport, input, appendSystem, applySessionPayload, setContextWindow, resetContextWindow, openSessionSwitcher, attachments]);
+  }, [transport, input, appendSystem, applySessionPayload, setContextWindow, resetContextWindow, resetTokenUsage, openSessionSwitcher, attachments]);
 
   const handleSubmit = useCallback((text: string) => {
     const pendingAttachments = attachments;
@@ -751,6 +761,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             sessionId={currentSession?.session_id}
             promptTokens={promptTokens}
             completionTokens={completionTokens}
+            cachedPromptTokens={cachedPromptTokens}
             contextWindow={contextWindow}
             round={round}
             maxRounds={maxRounds}
