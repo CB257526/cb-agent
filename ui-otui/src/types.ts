@@ -18,6 +18,7 @@ export type EventType =
   | "tool_complete"
   | "round_start"
   | "round_end"
+  | "context_window_updated"
   | "done"
   | "error"
   | "cancelled"
@@ -97,6 +98,12 @@ export interface RoundEnd extends BaseEvent {
   round_idx: number;
   has_tool_calls: boolean;
   final: boolean;
+}
+
+export interface ContextWindowUpdated extends BaseEvent {
+  type: "context_window_updated";
+  context_window: ContextWindow | null;
+  reason?: string;
 }
 
 export interface Done extends BaseEvent {
@@ -364,6 +371,7 @@ export type AgentEvent =
   | ToolComplete
   | RoundStart
   | RoundEnd
+  | ContextWindowUpdated
   | Done
   | ErrorEvent
   | Cancelled

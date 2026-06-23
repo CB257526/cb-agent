@@ -470,6 +470,33 @@ class TestPermissionPromptChannel(unittest.TestCase):
         self.assertTrue(result["session_cancelled"])
         self.assertIn("权限拒绝", result["stderr"])
 
+    def test_bash_permission_other_feedback_does_not_cancel_session(self):
+        """用户选择 Other 是给模型改方案的反馈，不应中断整个 agent 回合。"""
+
+        class FeedbackChannel:
+            def ask(self, *_a, **_kw):
+                return {
+                    "answer": "Other",
+                    "other_text": "不要运行脚本，先读取配置文件确认入口",
+                    "cancelled": False,
+                }
+
+        gate = self._gate(channel=FeedbackChannel())
+        tool = BashTool(permission=gate)
+        token = CancelToken()
+        reset_token = set_current_cancel_token(token)
+        try:
+            result = json.loads(tool.run({"command": "python build.py"}))
+        finally:
+            reset_current_cancel_token(reset_token)
+
+        self.assertFalse(token.is_cancelled())
+        self.assertFalse(result["session_cancelled"])
+        self.assertTrue(result["is_error"])
+        self.assertEqual(result["permission_feedback"], "不要运行脚本，先读取配置文件确认入口")
+        self.assertIn("替代建议", result["stderr"])
+        self.assertEqual(result["permission"]["user_feedback"], "不要运行脚本，先读取配置文件确认入口")
+
 
 class TestFileRead(unittest.TestCase):
 

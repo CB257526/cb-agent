@@ -1,34 +1,42 @@
 /**
- * Prompt（M5）：单行输入框 + Enter 提交 + slash 命令面板 + ↑/↓ 历史导航。
+ * Prompt（M5）：多行输入框 + Enter 提交 + slash 命令面板 + ↑/↓ 历史导航。
  *
- * OpenTUI 内置 <input> 原生处理退格/长按 delete/光标移动（旧 Ink 版长按 delete 失灵的
+ * OpenTUI 内置 <textarea> 原生处理退格/长按 delete/光标移动（旧 Ink 版长按 delete 失灵的
  * 根治点）。本组件在其之上叠加：
  *   - slash 面板：输入以 "/" 开头且无空格时弹出，↑/↓ 选命令、Enter 执行、Esc 关闭
  *   - 历史导航：输入框为空时 ↑/↓ 翻 historyStore（命令面板激活时让位给面板）
+ *   - Shift+Enter 换行，长文本按宽度自动换行
  *
  * 键盘拦截用 useKeyboard 全局监听；命令面板/历史导航激活时 preventDefault 掉方向键，
- * 避免 <input> 自己消费。
+ * 避免 <textarea> 自己消费。
  */
 
 import { createSignal, createMemo, Show } from "solid-js";
-import { useKeyboard } from "@opentui/solid";
-import type { KeyEvent, PasteEvent } from "@opentui/core";
+import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
+import type { KeyEvent, PasteEvent, TextareaRenderable } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import { filterCommands } from "../commands.js";
 import { SlashCommandPicker } from "./SlashCommandPicker.js";
 import { AttachmentQueue } from "./AttachmentQueue.js";
 
+type TextareaKeyBinding = {
+  name: string;
+  shift?: boolean;
+  action: "submit" | "newline";
+};
+
 export function Prompt() {
   const theme = useTheme();
+  const dimensions = useTerminalDimensions();
   const { state, submit, runCommand, getHistoryAt, pasteFromClipboard, togglePlanMode } = useSession();
   const [value, setValue] = createSignal("");
   const [pickerIndex, setPickerIndex] = createSignal(0);
   const [historyIdx, setHistoryIdx] = createSignal(-1);
 
-  let inputRef: { value: string } | undefined;
+  let inputRef: TextareaRenderable | undefined;
   // 程序化改值（翻历史 / 粘贴）时置 true：让 onInput 跳过"重置 historyIdx"逻辑。
-  // 否则 setInputValue 写 inputRef.value 会触发 Input 的 input 事件，把刚设好的
+  // 否则 setInputValue 写 textarea 内容会触发 contentChange，把刚设好的
   // historyIdx 又重置成 -1，导致方向键只能翻一次就失灵。
   let programmatic = false;
 
@@ -38,9 +46,26 @@ export function Prompt() {
   const setInputValue = (v: string) => {
     programmatic = true;
     setValue(v);
-    if (inputRef) inputRef.value = v;
+    if (inputRef) inputRef.setText(v);
     programmatic = false;
   };
+
+  const inputHeight = createMemo(() => {
+    const width = Math.max(20, dimensions().width - 52);
+    const rows = value()
+      .split("\n")
+      .reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / width)), 0);
+    return Math.max(1, Math.min(6, rows));
+  });
+
+  const textareaKeyBindings: TextareaKeyBinding[] = [
+    { name: "return", action: "submit" },
+    { name: "kpenter", action: "submit" },
+    { name: "linefeed", action: "submit" },
+    { name: "return", shift: true, action: "newline" },
+    { name: "kpenter", shift: true, action: "newline" },
+    { name: "linefeed", shift: true, action: "newline" },
+  ];
 
   // slash 面板：以 "/" 开头、无空格、未禁用时激活
   const slashActive = createMemo(
@@ -61,7 +86,7 @@ export function Prompt() {
   // ctrl+v 按键——所以之前监听 key.name==="v" 在真实终端永远收不到，只有
   // 直接喂 \x16 字节的探针能触发（导致误判）。
   //
-  // 文本粘贴：event.bytes 解码出文本，input 默认行为会自动插入，这里不拦截。
+  // 文本粘贴：event.bytes 解码出文本，textarea 默认行为会自动插入，这里不拦截。
   // 图片/文件粘贴：Windows Terminal 发来的是「空的」括号粘贴（bytes 为空或全空白），
   // 此时主动去读系统剪贴板，把图片/文件加入附件队列。
   const handlePaste = (event: PasteEvent) => {
@@ -161,7 +186,10 @@ export function Prompt() {
         <SlashCommandPicker query={value().slice(1)} selectedIndex={pickerIndex()} />
       </Show>
       <box border borderColor={theme.borderActive} paddingLeft={1} paddingRight={1}>
-        <input
+        <textarea
+          height={inputHeight()}
+          maxHeight={6}
+          wrapMode="word"
           focused={!disabled()}
           placeholder={
             state.activeQuestionId !== null
@@ -174,8 +202,11 @@ export function Prompt() {
           }
           placeholderColor={theme.textMuted}
           textColor={theme.text}
+          focusedTextColor={theme.text}
           cursorColor={theme.primary}
-          onInput={(v: string) => {
+          keyBindings={textareaKeyBindings}
+          onContentChange={() => {
+            const v = inputRef?.plainText ?? "";
             setValue(v);
             // 程序化改值（翻历史/粘贴）不算用户键入，不重置历史索引
             if (programmatic) return;
@@ -184,7 +215,7 @@ export function Prompt() {
           }}
           onPaste={handlePaste}
           onSubmit={handleSubmit}
-          ref={(r: { value: string }) => (inputRef = r)}
+          ref={(r: TextareaRenderable) => (inputRef = r)}
         />
       </box>
     </box>

@@ -436,11 +436,22 @@ class SkillManager:
             candidates: 候选 Skill 列表
             detail: 详细级别 (full/compact/name_only)
         """
-        lines = ["<available-skills>", "以下 Skill 可通过 Skill 工具调用：", ""]
+        lines = [
+            "<available-skills>",
+            "以下 Skill 已由 SkillManager 发现，可通过 skill 工具按名称调用：",
+            "",
+        ]
         for skill in candidates:
             lines.append(skill.to_metadata_string(detail))
         lines.append("")
-        lines.append("当用户请求匹配某个 Skill 的使用场景时，使用 Skill 工具调用对应的 Skill。")
+        lines.append(
+            "规则：当用户请求匹配某个 Skill 的使用场景时，直接调用 skill 工具；"
+            "不要用 bash/grep/ls/npx 去搜索、安装或验证这个 Skill 是否存在。"
+        )
+        lines.append(
+            "source=file:... 是 Skill 的来源定位符；需要正文时调用 skill，"
+            "需要参考文档时再次调用 skill 并设置 document 参数。"
+        )
         lines.append("</available-skills>")
         return "\n".join(lines)
 
@@ -484,17 +495,52 @@ class SkillManager:
         body = skill.render(args)
 
         # 列出可用的参考文档名称，提示 LLM 可按需加载
-        refs = skill.get_references()
-        parts = [f"## Skill: {skill.name}", "", body]
+        refs = skill.get_reference_paths()
+        parts = [
+            f"## Skill: {skill.name}",
+            "",
+            SkillManager._format_skill_source_block(skill),
+            "",
+            body,
+        ]
 
         if refs:
-            ref_names = ", ".join(refs.keys())
+            ref_names = ", ".join(
+                f"{name} ({path})" for name, path in refs.items()
+            )
             parts.append("")
             parts.append(
                 f"[可用参考文档: {ref_names} -- 如需查看，请再次调用 skill 工具并设置 document 参数]"
             )
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _format_skill_source_block(skill: Skill) -> str:
+        """格式化 Skill 来源和本地资源清单，帮助模型避免猜路径。"""
+        lines = [
+            "<skill-source>",
+            f"name: {skill.name}",
+            f"source: {skill.source_locator}",
+            f"skill_dir: {skill.skill_dir}",
+            f"skill_file: {skill.skill_file}",
+            "note: This skill is already installed and loaded by SkillManager; do not search for or install it with shell commands.",
+        ]
+
+        refs = skill.get_reference_paths()
+        if refs:
+            lines.append("references:")
+            for name, path in refs.items():
+                lines.append(f"- {name}: file:{path}")
+
+        scripts = skill.get_scripts()
+        if scripts:
+            lines.append("scripts:")
+            for name, path in scripts.items():
+                lines.append(f"- {name}: file:{path}")
+
+        lines.append("</skill-source>")
+        return "\n".join(lines)
 
     def load_skill_reference(self, name: str, reference_name: str) -> str:
         """加载 Skill 的单个参考文档
@@ -510,12 +556,26 @@ class SkillManager:
         if not skill:
             return f"未找到名为 '{name}' 的 Skill"
 
+        ref_paths = skill.get_reference_paths()
         refs = skill.get_references()
         if reference_name not in refs:
-            available = list(refs.keys())
+            available = [
+                f"{ref_name} ({path})" for ref_name, path in ref_paths.items()
+            ]
             return f"Skill '{name}' 中未找到参考文档 '{reference_name}'。可用文档: {', '.join(available)}"
 
-        return refs[reference_name]
+        source_path = ref_paths.get(reference_name)
+        return "\n".join([
+            f"## Skill Reference: {skill.name}/{reference_name}",
+            "",
+            "<skill-reference-source>",
+            f"skill: {skill.name}",
+            f"document: {reference_name}",
+            f"source: file:{source_path}" if source_path else "source: unknown",
+            "</skill-reference-source>",
+            "",
+            refs[reference_name],
+        ])
 
     def match_skill(self, user_message: str) -> Optional[str]:
         """关键词匹配 Skill（降级方案，用于无 function-calling 的场景）

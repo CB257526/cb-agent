@@ -34,6 +34,16 @@ class Skill:
     aliases: Optional[list] = None         # 别名
     version: Optional[str] = None          # 版本号
 
+    @property
+    def skill_file(self) -> Path:
+        """返回此 Skill 的主说明文件路径。"""
+        return self.skill_dir / "SKILL.md"
+
+    @property
+    def source_locator(self) -> str:
+        """返回给模型看的稳定来源定位符。"""
+        return f"file:{self.skill_file}"
+
     def to_metadata_string(self, detail: str = "full") -> str:
         """L1 表示：用于系统提示词中的 Skill 列表
 
@@ -42,17 +52,19 @@ class Skill:
         - "compact": name + 截断的 description
         - "name_only": 仅名称
         """
+        locator = f" source={self.source_locator}"
         if detail == "name_only":
-            return f"- {self.name}"
+            return f"- {self.name} ({locator.strip()})"
 
         if detail == "compact":
             desc = self.description[:80] + "..." if len(self.description) > 80 else self.description
-            return f"- {self.name}: {desc}"
+            return f"- {self.name}: {desc} ({locator.strip()})"
 
         # full
         parts = [f"- {self.name}: {self.description}"]
         if self.when_to_use:
             parts.append(f" — {self.when_to_use}")
+        parts.append(f" ({locator.strip()})")
         return "".join(parts)
 
     def matches_paths(self, file_paths: list) -> bool:
@@ -97,14 +109,14 @@ class Skill:
 
         return result
 
-    def get_references(self) -> dict:
+    def get_reference_paths(self) -> dict:
         """扫描 Skill 参考文档
 
         兼容旧结构下 skill_dir 根目录的 *.md，同时支持文档推荐的
         references/*.md；SKILL.md 永远不作为参考文档暴露。
 
         Returns:
-            {文件名(不含扩展名): 文件内容} 的字典
+            {文件名(不含扩展名): 文件路径} 的字典
         """
         refs = {}
         if not self.skill_dir.is_dir():
@@ -116,15 +128,25 @@ class Skill:
             for md_file in base_dir.glob("*.md"):
                 if md_file.name.lower() == "skill.md":
                     continue
-                try:
-                    content = md_file.read_text(encoding="utf-8")
-                    key = md_file.stem  # 文件名不含扩展名
-                    refs[key] = content
-                except (OSError, UnicodeDecodeError):
-                    continue
+                key = md_file.stem  # 文件名不含扩展名
+                refs[key] = md_file
 
         add_md_files(self.skill_dir)
         add_md_files(self.skill_dir / "references")
+        return refs
+
+    def get_references(self) -> dict:
+        """扫描 Skill 参考文档并读取内容。
+
+        Returns:
+            {文件名(不含扩展名): 文件内容} 的字典
+        """
+        refs = {}
+        for key, md_file in self.get_reference_paths().items():
+            try:
+                refs[key] = md_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
         return refs
 
     def get_scripts(self) -> dict:

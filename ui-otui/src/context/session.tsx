@@ -476,6 +476,10 @@ export function SessionProvider(props: ParentProps) {
         );
         break;
 
+      case "context_window_updated":
+        if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
+        break;
+
       case "done":
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
         // 整轮没有任何文本/思考/工具输出 = 模型空响应。提示可能原因，避免用户以为 UI 卡了。

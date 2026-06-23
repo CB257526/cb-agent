@@ -319,6 +319,7 @@ class GateResult:
     reason: str = ""
     matched_rule: Optional[Rule] = None
     permission_unavailable: bool = False  # 非 TTY 时为 True
+    user_feedback: str = ""  # 用户通过 Other 给出的替代操作建议；不等同于授权
 
 
 class PermissionGate:
@@ -460,6 +461,15 @@ class PermissionGate:
         if result.get("cancelled"):
             return GateResult(Decision.DENY, reason="用户取消")
         answer = result.get("answer", "")
+        other_text = (result.get("other_text") or "").strip()
+        if answer == "Other":
+            if other_text:
+                return GateResult(
+                    Decision.DENY,
+                    reason=f"用户未授权执行，并建议改用其他方案：{other_text}",
+                    user_feedback=other_text,
+                )
+            return GateResult(Decision.DENY, reason="用户未授权执行，并选择提供其他方案但未填写内容")
         if answer == opt_once:
             return GateResult(Decision.ALLOW, reason="本次允许")
         if answer == opt_cwd:

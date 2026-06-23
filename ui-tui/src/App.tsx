@@ -585,6 +585,12 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           break;
         }
 
+        case "context_window_updated":
+          if ((ev as any).context_window !== undefined) {
+            setContextWindow((ev as any).context_window ?? null);
+          }
+          break;
+
         case "done":
           flushNow();
           resetFlushRhythm();

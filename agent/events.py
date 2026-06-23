@@ -141,6 +141,20 @@ class RoundEnd:
 
 
 @dataclass
+class ContextWindowUpdated:
+    """工具循环中的上下文窗口估算刷新。
+
+    Done 事件仍会携带最终的跨轮 state/history 估算；这个事件用于 UI 在工具
+    循环尚未结束时刷新 Context 指标，通常 scope=current_request。
+    """
+    context_window: Dict[str, Any]
+    reason: str = "tool_loop"
+    round_idx: int = 0
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="context_window_updated", init=False)
+
+
+@dataclass
 class Done:
     """整个 chat 调用结束（最终回答已就绪）。"""
     final_answer: str
@@ -475,6 +489,7 @@ Event = Union[
     ToolComplete,
     RoundStart,
     RoundEnd,
+    ContextWindowUpdated,
     Done,
     Error,
     Cancelled,
@@ -508,6 +523,7 @@ __all__ = [
     "ToolComplete",
     "RoundStart",
     "RoundEnd",
+    "ContextWindowUpdated",
     "Done",
     "Error",
     "Cancelled",

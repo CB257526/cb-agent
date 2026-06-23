@@ -134,6 +134,39 @@ def test_references_directory_and_alias_dedupe():
     print("[PASS] 参考文档目录和别名去重测试通过\n")
 
 
+def test_skill_overview_includes_source_locator_and_usage_rule():
+    """测试 L1 概览会告诉模型 Skill 来源和调用规则。"""
+    print("=" * 60)
+    print("测试 5: Skill 来源定位符")
+    print("=" * 60)
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        skill_dir = root / "locator-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: locator-skill\n"
+            "description: locator skill\n"
+            "---\n"
+            "body\n",
+            encoding="utf-8",
+        )
+
+        manager = SkillManager(skills_dir=root)
+        overview = manager.build_skills_overview(max_chars=4000)
+        print(overview)
+
+        assert "locator-skill" in overview
+        assert f"source=file:{skill_dir / 'SKILL.md'}" in overview
+        assert "不要用 bash/grep/ls/npx 去搜索、安装或验证这个 Skill 是否存在" in overview
+
+    print("[PASS] Skill 来源定位符测试通过\n")
+
+
 def test_multiple_skill_dirs_project_overrides_user():
     """测试默认设计中的多目录扫描和后扫描目录覆盖。"""
     print("=" * 60)
@@ -224,9 +257,57 @@ def test_skill_tool():
     print()
 
     assert "## Skill: pdf" in result
+    assert "<skill-source>" in result
+    assert "source: file:" in result
     assert len(result_ref) > 100
+    assert "<skill-reference-source>" in result_ref
     assert "未找到" in result2
     print("[PASS] SkillTool 测试通过\n")
+
+
+def test_load_skill_content_includes_resource_paths():
+    """测试 L2 Skill 内容会明确给出资源路径，避免模型自行搜索。"""
+    print("=" * 60)
+    print("测试 7: L2 Skill 资源路径")
+    print("=" * 60)
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        skill_dir = root / "resource-skill"
+        refs_dir = skill_dir / "references"
+        scripts_dir = skill_dir / "scripts"
+        refs_dir.mkdir(parents=True)
+        scripts_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: resource-skill\n"
+            "description: resource skill\n"
+            "---\n"
+            "body\n",
+            encoding="utf-8",
+        )
+        (refs_dir / "guide.md").write_text("guide body", encoding="utf-8")
+        (scripts_dir / "helper.py").write_text("print('ok')\n", encoding="utf-8")
+
+        manager = SkillManager(skills_dir=root)
+        content = manager.load_skill_content("resource-skill")
+        ref = manager.load_skill_reference("resource-skill", "guide")
+
+        print(content)
+        print(ref)
+
+        assert f"skill_dir: {skill_dir}" in content
+        assert f"skill_file: {skill_dir / 'SKILL.md'}" in content
+        assert f"- guide: file:{refs_dir / 'guide.md'}" in content
+        assert f"- helper: file:{scripts_dir / 'helper.py'}" in content
+        assert "do not search for or install it with shell commands" in content
+        assert f"source: file:{refs_dir / 'guide.md'}" in ref
+        assert "guide body" in ref
+
+    print("[PASS] L2 Skill 资源路径测试通过\n")
 
 
 def test_run_skill_script_tool():
@@ -424,8 +505,10 @@ if __name__ == "__main__":
     test_skills_overview()
     test_load_skill_content()
     test_references_directory_and_alias_dedupe()
+    test_skill_overview_includes_source_locator_and_usage_rule()
     test_multiple_skill_dirs_project_overrides_user()
     test_skill_tool()
+    test_load_skill_content_includes_resource_paths()
     test_run_skill_script_tool()
     test_tool_registry()
     test_variable_substitution()

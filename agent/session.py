@@ -45,7 +45,7 @@ from agent.cancel import (
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import (
-    BackgroundNotification, Cancelled, Done, Error, PlanApproved, PlanDelta,
+    BackgroundNotification, Cancelled, ContextWindowUpdated, Done, Error, PlanApproved, PlanDelta,
     PlanModeChanged, PlanReady, PlanRejected, PlanStart, RoundEnd, RoundStart, TextDelta,
 )
 from agent.executor import ToolExecutor
@@ -1498,6 +1498,67 @@ class AgentSession:
             text = str(payload)
         return count_tokens(text)
 
+    def _request_context_window_usage(
+        self,
+        messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]] = None,
+        *,
+        used_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """估算当前工具循环请求体占用，用于 UI 实时刷新 Context 指标。"""
+        model_max_tokens = self._model_max_tokens()
+        max_tokens = self._context_budget_tokens()
+        trigger_tokens = self._auto_compact_trigger_tokens()
+        used = (
+            used_tokens
+            if used_tokens is not None
+            else self._estimate_request_tokens(messages, tools_schema)
+        )
+        percent = min(100.0, (used / max_tokens) * 100.0)
+        return {
+            "used_tokens": used,
+            "max_tokens": max_tokens,
+            "remaining_tokens": max(0, max_tokens - used),
+            "percent": round(percent, 1),
+            "source": "estimate",
+            "scope": "current_request",
+            "model_max_tokens": model_max_tokens,
+            "threshold_ratio": ConstantLLM.CONTEXT_USAGE_RATIO,
+            "auto_compact_trigger_tokens": trigger_tokens,
+            "auto_compact_trigger_percent": round(
+                (trigger_tokens / max_tokens) * 100.0,
+                1,
+            ),
+        }
+
+    def _emit_context_window_update(
+        self,
+        *,
+        reason: str,
+        round_idx: int,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        tools_schema: Optional[List[Dict[str, Any]]] = None,
+        used_tokens: Optional[int] = None,
+    ) -> None:
+        """广播 Context 指标刷新；失败只记日志，不能打断工具循环。"""
+        try:
+            context_window = (
+                self._request_context_window_usage(
+                    messages,
+                    tools_schema,
+                    used_tokens=used_tokens,
+                )
+                if messages is not None
+                else self.context_window_usage()
+            )
+            self.event_bus.emit(ContextWindowUpdated(
+                context_window=context_window,
+                reason=reason,
+                round_idx=round_idx,
+            ))
+        except Exception:
+            logger.exception("context_window_updated emit failed")
+
     # ---------- 三级阈值常量 ----------
 
     # 预测性 compact 时,假设本轮还会增长这么多 tokens(LLM 输出 + 一次工具调用
@@ -1852,6 +1913,13 @@ class AgentSession:
             # 如果连压缩后都超过 blocking 阈值，说明本轮的上下文已经无法安全
             # 发送给 LLM，直接终止工具循环并返回友好提示。
             request_tokens_est = self._estimate_request_tokens(llm_messages, tools_schema)
+            self._emit_context_window_update(
+                reason="round_start",
+                round_idx=round_idx,
+                messages=llm_messages,
+                tools_schema=tools_schema,
+                used_tokens=request_tokens_est,
+            )
             if request_tokens_est >= self._full_window_blocking_threshold():
                 self.event_bus.emit(Error(
                     where="session",
@@ -1990,6 +2058,12 @@ class AgentSession:
                 # thinking 模式要求 reasoning_content 回传，否则下一轮 400
                 assistant_msg["reasoning_content"] = reasoning
             messages.append(assistant_msg)
+            self._emit_context_window_update(
+                reason="tool_calls_planned",
+                round_idx=round_idx,
+                messages=messages,
+                tools_schema=tools_schema,
+            )
             tool_names = [
                 call.get("function", {}).get("name", "?")
                 for call in tool_calls
@@ -2038,6 +2112,12 @@ class AgentSession:
                     is_error=exec_result.is_error,
                     round_idx=round_idx,
                 )
+                self._emit_context_window_update(
+                    reason="tool_result",
+                    round_idx=round_idx,
+                    messages=messages,
+                    tools_schema=tools_schema,
+                )
 
             # load_image 多模态分支：图片不能塞进 role=tool（中转站多不接受），
             # 工具把 image_url 块排进 pending_images 缓冲，这里在全部 tool 消息回灌
@@ -2059,6 +2139,12 @@ class AgentSession:
             self.event_bus.emit(RoundEnd(
                 round_idx=round_idx, has_tool_calls=True, final=False,
             ))
+            self._emit_context_window_update(
+                reason="round_end",
+                round_idx=round_idx,
+                messages=messages,
+                tools_schema=tools_schema,
+            )
             logger.info("round end with tools: round=%s tool_results=%s", round_idx, len(results))
 
         # 超出最大轮数
@@ -2501,7 +2587,8 @@ class AgentSession:
 
         if self.skill_manager is not None:
             try:
-                overview = self.skill_manager.build_skills_overview(max_chars=1500)
+                skill_budget = max(3000, min(8000, int(self._model_max_tokens() * 0.01 * 4)))
+                overview = self.skill_manager.build_skills_overview(max_chars=skill_budget)
                 if overview:
                     parts.append("")
                     parts.append(overview)

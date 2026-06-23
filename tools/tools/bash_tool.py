@@ -123,6 +123,7 @@ def _gate_result_to_dict(gate_res) -> Optional[Dict[str, Any]]:
             gate_res.matched_rule.to_dict() if gate_res.matched_rule else None
         ),
         "permission_unavailable": gate_res.permission_unavailable,
+        "user_feedback": gate_res.user_feedback,
     }
 
 
@@ -331,6 +332,29 @@ class BashTool(Tool):
                 )
             if gate_res.decision == Decision.DENY:
                 logger.warning("bash: 权限拒绝 — %s", gate_res.reason)
+                if gate_res.user_feedback:
+                    feedback_msg = (
+                        "[权限反馈] 用户没有授权执行该 bash 命令，并给出了替代建议："
+                        f"{gate_res.user_feedback}"
+                    )
+                    return json.dumps({
+                        "stdout": "",
+                        "stderr": feedback_msg,
+                        "exit_code": -1,
+                        "cwd": self._session.cwd,
+                        "interrupted": False,
+                        "timeout": False,
+                        "is_error": True,
+                        "semantic": None,
+                        "background": False,
+                        "classification": classify_command(command),
+                        "permission_unavailable": gate_res.permission_unavailable,
+                        "warnings": warnings,
+                        "permission": _gate_result_to_dict(gate_res),
+                        "permission_feedback": gate_res.user_feedback,
+                        "session_cancelled": False,
+                        "__display__": _build_bash_display(error_override=feedback_msg),
+                    }, ensure_ascii=False)
                 # 用户已经明确拒绝本次 bash 执行时，应结束当前 agent 回合，而不是
                 # 让模型在下一轮继续尝试同一个受限能力。这里通过当前 CancelToken
                 # 走统一取消路径，CLI/TUI/QQ 都会收到 Cancelled 事件并释放 busy。

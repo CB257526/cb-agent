@@ -173,10 +173,74 @@ def _bashlex_split(command: str) -> List[List[str]]:
 _OPERATOR_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\|(?!\|))\s*")
 
 
+def _split_operators_outside_quotes(command: str) -> List[str]:
+    """按 shell 操作符切段，但忽略单双引号内的 &&/||/; 和管道符。
+
+    这是 bashlex 不可用时的降级路径，不能用简单正则直接 split；否则
+    `echo "a && b"` 会被误切成两段，进而影响权限和安全判断。
+    """
+    segments: List[str] = []
+    buf: List[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            i += 1
+            continue
+
+        if ch == "\\":
+            buf.append(ch)
+            escaped = True
+            i += 1
+            continue
+
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+
+        two = command[i:i + 2]
+        if two in ("&&", "||"):
+            raw = "".join(buf).strip()
+            if raw:
+                segments.append(raw)
+            buf = []
+            i += 2
+            continue
+
+        if ch in (";", "|"):
+            raw = "".join(buf).strip()
+            if raw:
+                segments.append(raw)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    raw = "".join(buf).strip()
+    if raw:
+        segments.append(raw)
+    return segments
+
+
 def _shlex_split(command: str) -> List[List[str]]:
     """降级路径：按 && || ; | 切，每段 shlex 解析，剥环境变量前缀。"""
     segments: List[List[str]] = []
-    for raw in _OPERATOR_SPLIT.split(command):
+    for raw in _split_operators_outside_quotes(command):
         raw = raw.strip()
         if not raw:
             continue

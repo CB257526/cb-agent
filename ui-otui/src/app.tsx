@@ -41,6 +41,16 @@ function Shell(props: { transport: Transport }) {
   const { state, toggleActivity, setItems, closeDialog } = useSession();
 
   useKeyboard((key: KeyEvent) => {
+    if (key.ctrl && key.name === "c") {
+      const selected = renderer.getSelection()?.getSelectedText?.() ?? "";
+      if (selected) {
+        key.preventDefault?.();
+        renderer.copyToClipboardOSC52(selected);
+        renderer.clearSelection();
+        return;
+      }
+    }
+
     // 弹窗打开时：Ctrl-C 只关弹窗，不退出（其余键交给 SelectDialog 自身处理）
     if (state.dialog) {
       if (key.ctrl && key.name === "c") {
