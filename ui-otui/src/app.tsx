@@ -10,7 +10,7 @@
 
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent } from "@opentui/core";
-import { Show } from "solid-js";
+import { onCleanup, Show } from "solid-js";
 import type { Transport } from "./transport.js";
 import { theme } from "./theme.js";
 import { ThemeProvider } from "./context/theme.js";
@@ -22,6 +22,7 @@ import { Sidebar } from "./components/Sidebar.js";
 import { Footer } from "./components/Footer.js";
 import { ActivityPanel } from "./components/ActivityPanel.js";
 import { SelectDialog } from "./components/SelectDialog.js";
+import { writeClipboardText } from "./clipboardImage.js";
 
 export function App(props: { transport: Transport }) {
   return (
@@ -38,15 +39,39 @@ export function App(props: { transport: Transport }) {
 function Shell(props: { transport: Transport }) {
   const dimensions = useTerminalDimensions();
   const renderer = useRenderer();
-  const { state, toggleActivity, setItems, closeDialog } = useSession();
+  const { state, toggleActivity, setItems, closeDialog, appendSystem } = useSession();
+
+  const copySelectionText = (text: string): boolean => {
+    if (!text) return false;
+    let osc52Copied = false;
+    try {
+      osc52Copied = renderer.copyToClipboardOSC52(text);
+    } catch {
+      osc52Copied = false;
+    }
+    writeClipboardText(text).catch((error) => {
+      const fallback = osc52Copied ? "（已尝试 OSC52 终端复制）" : "";
+      appendSystem(`复制选区失败：${(error as Error).message}${fallback}`);
+    });
+    renderer.clearSelection();
+    return true;
+  };
+
+  const previousCopySelection = renderer.console.onCopySelection;
+  renderer.console.onCopySelection = (text: string) => {
+    copySelectionText(text);
+  };
+  onCleanup(() => {
+    renderer.console.onCopySelection = previousCopySelection;
+  });
 
   useKeyboard((key: KeyEvent) => {
     if (key.ctrl && key.name === "c") {
       const selected = renderer.getSelection()?.getSelectedText?.() ?? "";
       if (selected) {
         key.preventDefault?.();
-        renderer.copyToClipboardOSC52(selected);
-        renderer.clearSelection();
+        key.stopPropagation?.();
+        copySelectionText(selected);
         return;
       }
     }

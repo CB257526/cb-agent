@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createWriteStream, mkdirSync, statSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, release } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { QueuedAttachment } from "./types.js";
@@ -60,11 +60,49 @@ function errorCode(error: unknown): number | null {
   return null;
 }
 
+function isWsl(): boolean {
+  const osRelease = release().toLowerCase();
+  return osRelease.includes("microsoft") || osRelease.includes("wsl");
+}
+
 function cleanExecMessage(error: unknown): string {
   const stderr = (error as { stderr?: unknown } | null)?.stderr;
   if (typeof stderr === "string" && stderr.trim()) return stderr.trim();
   const message = (error as Error | null)?.message;
   return message || "未知错误";
+}
+
+function pipeCommandInput(command: string, args: string[], input: string, timeoutMs = 5000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["pipe", "ignore", "pipe"], windowsHide: true });
+    let settled = false;
+    let stderr = "";
+
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve();
+    };
+
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(new Error(`${command} timed out while writing clipboard`));
+    }, timeoutMs);
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", finish);
+    child.on("close", (code) => {
+      if (code === 0) finish();
+      else finish(new Error(stderr.trim() || `${command} exited with code ${code}`));
+    });
+    child.stdin.on("error", finish);
+    child.stdin.end(input);
+  });
 }
 
 async function readClipboardTextWindows(): Promise<string | null> {
@@ -207,6 +245,52 @@ async function readClipboardImageLinux(target: string): Promise<void> {
   throw new Error("Linux 剪贴板图片需要 wl-paste 或 xclip，或改用 /attach <path>。");
 }
 
+async function writeClipboardTextWindows(text: string): Promise<void> {
+  await pipeCommandInput(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+    ],
+    text,
+  );
+}
+
+async function writeClipboardTextMac(text: string): Promise<void> {
+  if (!(await commandExists("pbcopy"))) {
+    throw new Error("macOS clipboard write requires pbcopy.");
+  }
+  await pipeCommandInput("pbcopy", [], text);
+}
+
+async function writeClipboardTextLinux(text: string): Promise<void> {
+  if (isWsl()) {
+    try {
+      await writeClipboardTextWindows(text);
+      return;
+    } catch {
+      // Fall through to native Linux clipboard tools.
+    }
+  }
+  if (process.env.WAYLAND_DISPLAY && (await commandExists("wl-copy"))) {
+    await pipeCommandInput("wl-copy", [], text);
+    return;
+  }
+  if (await commandExists("xclip")) {
+    await pipeCommandInput("xclip", ["-selection", "clipboard"], text);
+    return;
+  }
+  if (await commandExists("xsel")) {
+    await pipeCommandInput("xsel", ["--clipboard", "--input"], text);
+    return;
+  }
+  throw new Error("Linux clipboard write requires wl-copy, xclip, or xsel.");
+}
+
 function pipeCommandToFile(command: string, args: string[], target: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -245,6 +329,19 @@ function pipeCommandToFile(command: string, args: string[], target: string): Pro
       if (childCode === 0) finish();
     });
   });
+}
+
+export async function writeClipboardText(text: string): Promise<void> {
+  if (text.length === 0) return;
+  if (process.platform === "win32") {
+    await writeClipboardTextWindows(text);
+    return;
+  }
+  if (process.platform === "darwin") {
+    await writeClipboardTextMac(text);
+    return;
+  }
+  await writeClipboardTextLinux(text);
 }
 
 export async function readClipboardText(): Promise<string | null> {
