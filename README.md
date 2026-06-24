@@ -13,7 +13,7 @@
 
 <p align="center">
   🧠 <b>零向量依赖即开即用</b> · 🚀 <b>Section/Boundary 静态缓存命中拉满</b><br>
-  📱 <b>QQ / 微信 / TUI / CLI 全平台制霸</b> · 🧩 <b>MCP / Skills / Hooks 随便扩展</b>
+  📱 <b>QQ / 微信 / TUI / CLI 全平台制霸</b> · 🧩 <b>MCP / Skills / Hooks / Plan Mode 随便扩展</b>
 </p>
 
 ---
@@ -25,6 +25,7 @@
 
 ✨ 默认走轻量 Markdown 记忆，**零向量库、零 embedding、零外部服务**就能跑起来。
 ✨ 想要更猛的？设置 `CBAGENT_ENABLE_FULL_MEMORY=1` 解锁完整向量记忆与 RAG。
+✨ 动手前先做计划？切 **Plan Mode** 先写方案，批准了再撸袖子干 (`･ω･)ﾉ
 
 看看它能帮你做什么……(｀・ω・´) ⬇️
 
@@ -32,24 +33,51 @@
 
 ## 🚀 一分钟！就能跑起来！
 
-```bash
+<details open>
+<summary><b>Windows (PowerShell)</b> 🪟</summary>
+
+```powershell
 # 1. 拿到项目 (∩´∀｀)∩
 git clone <your-fork-url> cb-agent
 cd cb-agent
 
-# 2. 搓个虚拟环境 (Windows PowerShell)
+# 2. 搓个虚拟环境
 python -m venv ..\venv
 ..\venv\Scripts\Activate.ps1
 
 # 3. 装依赖 ✨
-pip install -r requirements.txt && pip install -e .
+pip install -r requirements.txt; pip install -e .
 
-# 4. 配 .env（填 LLM_MODEL_ID、LLM_API_KEY、LLM_BASE_URL）
+# 4. 配 .env
 Copy-Item .env.example .env
 
 # 5. 启动！！ヽ(✧∀✧)ﾉ
 python run_agent.py
 ```
+</details>
+
+<details>
+<summary><b>macOS / Linux</b> 🍎🐧</summary>
+
+```bash
+# 1. 拿到项目 (∩´∀｀)∩
+git clone <your-fork-url> cb-agent
+cd cb-agent
+
+# 2. 搓个虚拟环境
+python3 -m venv ../venv
+source ../venv/bin/activate
+
+# 3. 装依赖 ✨
+pip install -r requirements.txt && pip install -e .
+
+# 4. 配 .env
+cp .env.example .env
+
+# 5. 启动！！ヽ(✧∀✧)ﾉ
+python run_agent.py
+```
+</details>
 
 > 详细的安装姿势请看 [📚 部署与配置](docs/部署与配置.md) 喵~
 
@@ -62,6 +90,7 @@ python run_agent.py
 | 🔄 多轮 Function Calling | 流式 tool_calls 分片累积、tool result 回灌 |
 | ⚡ 高缓存命中上下文 | System message 纯静态化，动态内容塞独立 user 消息；Section 级 LRU 缓存（100 条），跨轮复用 provider KV cache，**快就一个字** |
 | 🎣 Hooks 生命周期钩子 | `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `PreCompact` / `Stop`，双向可阻断，想怎么拦截就怎么拦截 |
+| 📋 Plan Mode 协作模式 | 「先计划后执行」—— plan 阶段只暴露只读工具，批准后自动切 execute；双层防护（prompt 层 + 服务端硬拒绝），剁手都改不了东西 |
 | 📝 三层 Markdown 记忆 | 全局/项目/短期，默认启用，**零向量依赖** |
 | 🧠 旧向量记忆/RAG | 可选 `--memory-system full`，Episodic/Semantic/Working 三层全开 |
 | 🔀 多会话隔离 | 新建 / 切换 / 清理，不同会话 history/state 互不打扰 |
@@ -107,7 +136,7 @@ python run_agent.py
 | [📖 项目介绍](docs/项目介绍.md) | 项目定位、架构图、完整能力表、平台展示图片 |
 | [📦 部署与配置](docs/部署与配置.md) | 环境准备、安装（light/full）、.env 配置、CLI/TUI/OTUI/QQ/微信/Linux 启动 |
 | [🔧 功能详解](docs/功能详解.md) | 记忆系统（light/full/off）、会话 & compact、桌宠、工具系统、MCP、Skills、CLI 命令 |
-| [🧑‍💻 开发指南](docs/开发指南.md) | 项目结构、五大子系统、缓存命中设计、Hooks、测试命令、技术报告、FAQ |
+| [🧑‍💻 开发指南](docs/开发指南.md) | 项目结构、五大子系统、缓存命中设计、Hooks、Plan Mode、测试命令、技术报告、FAQ |
 
 ---
 
