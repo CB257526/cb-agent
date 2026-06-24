@@ -33,6 +33,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -69,7 +70,6 @@ from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
 from agent.compact_boundary import (
     COMPACT_BOUNDARY_KIND,
-    find_last_compact_boundary_index,
     get_messages_after_compact_boundary,
     make_compact_boundary_message,
 )
@@ -192,6 +192,28 @@ def _format_context_update_text(context_text: str) -> str:
         + context_text
         + "\n</context-update>"
     )
+
+
+def _strip_plan_sections_from_context_update(content: Any) -> Any:
+    """Remove persisted Plan Mode sections from historical context updates.
+
+    PlanStateStore is the source of truth for pending/approved plans and is
+    injected fresh every turn. Keeping old plan sections in active history would
+    duplicate the plan once per turn after full-history restore.
+    """
+    if not isinstance(content, str) or "[Plan Mode " not in content:
+        return content
+    text = content
+    for header in ("Plan Mode Instructions", "Plan Mode State"):
+        text = re.sub(
+            rf"\n?\[{re.escape(header)}\][\s\S]*?(?=\n\n\[[^\]\n]+\]|\n</context-update>|$)",
+            "",
+            text,
+        )
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if text == "<context-update>\n</context-update>":
+        return ""
+    return text
 
 
 def _make_context_update_message(context_text: str) -> Message:
@@ -341,7 +363,7 @@ class AgentSession:
         skill_manager: Optional[SkillManager] = None,
         bash_prompt_provider=None,
         ctx_enabled: bool = True,
-        history_window: int = 12,  # 最多保留 12 轮历史记录
+        history_window: int = 12,  # Legacy debug knob; active history is no longer window-trimmed.
         messages_snapshot_hook=None,
         session_store: Optional[LocalSessionStore] = None,
         trace_summarizer: Optional[TraceSummarizer] = None,
@@ -374,6 +396,8 @@ class AgentSession:
         self.skill_manager = skill_manager
         self.bash_prompt_provider = bash_prompt_provider
         self.ctx_enabled = ctx_enabled
+        # Legacy debug knob. Active history is now restored and sent in full;
+        # overflow is handled by compact, not by silently trimming messages.
         self.history_window = history_window
         self.messages_snapshot_hook = messages_snapshot_hook
         self.session_store = session_store
@@ -402,9 +426,7 @@ class AgentSession:
                 # 【工作记录】assistant 消息,不恢复 role=tool,也不恢复
                 # assistant.tool_calls。tool 协议消息只在同一轮 tool loop 内合法,
                 # 跨进程/跨轮直接回灌会造成 tool_call_id 对不上的协议风险。
-                self.history = self.session_store.load_latest_history(
-                    max_messages=self.history_window,
-                )
+                self.history = self.session_store.load_latest_history()
             except Exception:
                 logger.exception("本地会话历史恢复失败,忽略")
                 self.history = []
@@ -560,9 +582,7 @@ class AgentSession:
         if self.session_store is None:
             raise RuntimeError("local session store is not enabled")
         summary = self.session_store.switch_session(session_id)
-        self.history = self.session_store.load_latest_history(
-            max_messages=self.history_window,
-        )
+        self.history = self.session_store.load_latest_history()
         self._pending_context_update_text = ""
         # 切换会话与 /clear 一样要清掉 system prompt section 缓存和 MemoryLoader
         # memoize：env_info 的缓存键含 cwd，CLAUDE.md memory 段也按上一会话状态
@@ -854,9 +874,16 @@ class AgentSession:
 
         # [*] context_update —— 运行时上下文作为低优先级 user 消息
         context_text = "\n\n".join(p.strip() for p in context_parts if p and p.strip())
+        persist_context_parts = [p for p in context_parts if p != plan_context]
+        persist_context_text = "\n\n".join(
+            p.strip() for p in persist_context_parts if p and p.strip()
+        )
         # 暂存到 _pending_context_update_text,本轮结束时才 commit 到 history,
         # 保证"发给 LLM 的请求"和"commit 到 history 的"是同一份 context_update
-        self._pending_context_update_text = context_text
+        # Plan text is injected from PlanStateStore on every turn, so the
+        # persisted context_update deliberately omits plan_context to avoid
+        # repeating an approved plan once per historical turn.
+        self._pending_context_update_text = persist_context_text
         if context_text:
             messages.append({
                 "role": "user",
@@ -868,35 +895,21 @@ class AgentSession:
         return messages
 
     def _sliced_history_dicts(self) -> List[Dict[str, Any]]:
-        """按 CC 模式构造跨轮 history 的 OpenAI dict 列表。
-
-        三步,与真正发给 LLM 的口径完全一致:
-        1. boundary 切片:取最后一个 compact_boundary 之后(含)的消息;无
-           boundary 时返回全部 history。boundary 之前的原始消息留在 history
-           用于审计/恢复,但不再进入下一轮 prompt。
-        2. history_window 限位:再取尾部 N 条,防止极长会话整段灌入。
-        3. 孤儿清理:window 截断这一刀可能正好落在 assistant(tool_calls) 和它
-           的 tool 响应之间,导致切片开头出现"无父" tool 消息。OpenAI 兼容
-           协议会因此报 400,这里把这类孤儿丢弃,保证请求体合法。
-
-        常规请求不再改写旧 tool result,避免破坏 provider prompt cache 前缀。
-        """
-        sliced = get_messages_after_compact_boundary(self.history)
-        if len(sliced) > self.history_window:
-            last_boundary_idx = find_last_compact_boundary_index(sliced)
-            if last_boundary_idx == 0:
-                # compact_boundary 是切片后的第一条消息（索引 0）。
-                # 即使 compact 之后又经过了很多轮对话，也必须保留这条 boundary
-                # 作为锚点消息。否则模型会丢失"前面发生了什么"的摘要信息，
-                # 导致跨轮连贯性断裂。
-                # 策略：boundary 占 1 个槽位，剩余 window-1 个槽位给尾部最新消息。
-                tail_capacity = max(0, self.history_window - 1)
-                sliced = [sliced[0]] + (sliced[-tail_capacity:] if tail_capacity else [])
-            else:
-                # boundary 不在切片首位（可能在中间或不存在），直接取尾部 window 条。
-                # 此时不需要锚点保护，因为 boundary 之前的消息仍在切片范围内。
-                sliced = sliced[-self.history_window:]
-        dicts = [m.to_dict() for m in sliced]
+        """Return the full active history after the latest compact boundary."""
+        active = get_messages_after_compact_boundary(self.history)
+        dicts: List[Dict[str, Any]] = []
+        for m in active:
+            item = m.to_dict()
+            if (
+                isinstance(item, dict)
+                and item.get("role") == "user"
+                and isinstance(item.get("content"), str)
+                and "<context-update>" in item.get("content", "")
+            ):
+                item["content"] = _strip_plan_sections_from_context_update(item.get("content"))
+                if not str(item.get("content") or "").strip():
+                    continue
+            dicts.append(item)
         drop_orphan_tool_messages(dicts)
         return dicts
 
@@ -1572,11 +1585,8 @@ class AgentSession:
     # 实际 blocking 阈值会取 min(BLOCKING_LIMIT_BUFFER, full_window // 5)，
     # 避免在极小测试窗口上误杀。
     BLOCKING_LIMIT_BUFFER = 3_000
-    # 自动 compact 触发比例，对齐 ConstantLLM.CONTEXT_USAGE_RATIO（默认 0.8）。
-    # 这意味着当 token 使用量达到 context_budget（模型窗口的 80%）的 80% 时触发，
-    # 即模型窗口的 64%。与 TUI 状态栏的颜色变化保持同步。
-    # 旧设计使用三档固定 buffer（13k/30k/50k），在不同窗口规模上表现不一致；
-    # 新设计用比例统一，模型窗口越大 → 触发阈值成比例放大，更合理。
+    # Kept for compatibility with UI payloads. Compact now triggers at the
+    # configured context budget, not at an earlier percentage.
     AUTOCOMPACT_TRIGGER_RATIO = ConstantLLM.CONTEXT_USAGE_RATIO
 
     def _estimate_max_turn_growth(self) -> int:
@@ -1593,20 +1603,8 @@ class AgentSession:
         return self.PREDICTIVE_GROWTH_OUTPUT_BUDGET + self.PREDICTIVE_GROWTH_TOOL_BUDGET
 
     def _auto_compact_trigger_tokens(self) -> int:
-        """返回自动 compact 的触发阈值（token 数）。
-
-        阈值 = context_budget × AUTOCOMPACT_TRIGGER_RATIO。
-        context_budget 已经是模型窗口 × CONTEXT_USAGE_RATIO（默认 0.8），
-        再乘 AUTOCOMPACT_TRIGGER_RATIO（默认也是 0.8），所以实际触发点是
-        模型完整窗口的 64%。
-
-        这个值同时用于：
-        - TUI 状态栏显示「自动 compact 触发点」
-        - preflight 三级阈值（predictive / autocompact）的判断
-        - _auto_compact_history 的触发判断
-        - _prepare_loop_messages_for_llm 的 microcompact 触发判断
-        """
-        return max(1, int(self._context_budget_tokens() * self.AUTOCOMPACT_TRIGGER_RATIO))
+        """返回自动 compact 的触发阈值（token 数）。"""
+        return max(1, self._context_budget_tokens())
 
     def _full_window_blocking_threshold(self) -> int:
         """返回阻塞阈值：当请求 token 数 ≥ 此值时拒绝继续。
@@ -1706,64 +1704,39 @@ class AgentSession:
         messages: List[Dict[str, Any]],
         tools_schema: Optional[List[Dict[str, Any]]],
     ) -> Optional[Dict[str, Any]]:
-        """本轮第一次 think 前的三级阈值检查(对齐 Claude Code)。
-
-        按优先级从严到宽:
-
-        1. **Predictive**:current + estimateMaxTurnGrowth > 状态栏显示的
-           auto_compact_trigger_tokens 时触发 autocompact。
-        2. **Autocompact**:current ≥ auto_compact_trigger_tokens 时触发。
-        3. **Blocking**:autocompact 失败/no-op 后,如果 current 接近完整模型窗口
-           emit Error 并返回特殊事件,_chat_impl 会据此终止本轮。
-
-        命中前两级会调 _auto_compact_history,在 history 追加 compact_boundary;
-        _chat_impl 收到非 None 事件后会重建 messages,boundary 切片让新请求体
-        立即变小。
-        """
+        """Compact only when the full active-history request exceeds budget."""
         del user_query, system_instructions  # 估算直接读 messages
         request_tokens = self._estimate_request_tokens(messages, tools_schema)
         full_window = self._model_max_tokens()
-        # 统一的触发阈值（context_budget × AUTOCOMPACT_TRIGGER_RATIO）。
-        # 旧设计用 full_window - dynamic_buffer（13k/30k/50k 分档），
-        # 新设计用比例统一，与 TUI 状态栏显示一致。
-        trigger_tokens = self._auto_compact_trigger_tokens()
-        growth = self._estimate_max_turn_growth()
+        budget_tokens = self._context_budget_tokens()
 
-        # 1. Predictive（预测性触发）
-        # 当前请求 + 预估本轮增长 > 触发阈值 → 提前 compact。
-        # 这是最早介入的一级，不等 API 返回 413 才被动处理。
-        if request_tokens + growth > trigger_tokens:
-            event = self._auto_compact_history(
-                reason="preflight_predictive",
-                round_idx=0,
-                force=True,
-                request_tokens=request_tokens,
-            )
-            if event is not None:
-                event["full_window"] = full_window
-                event["trigger_tokens"] = trigger_tokens
-                event["growth_estimate"] = growth
-                return event
+        if request_tokens <= budget_tokens:
+            return None
 
-        # 2. Autocompact（已达触发阈值）
-        # 当前请求已经 ≥ 触发阈值，但还没到 blocking 程度 → 立即 compact。
-        if request_tokens >= trigger_tokens:
-            event = self._auto_compact_history(
-                reason="preflight_autocompact",
-                round_idx=0,
-                force=True,
-                request_tokens=request_tokens,
-            )
-            if event is not None:
-                event["full_window"] = full_window
-                event["trigger_tokens"] = trigger_tokens
-                return event
+        event = self._auto_compact_history(
+            reason="preflight_context_overflow",
+            round_idx=0,
+            force=True,
+            request_tokens=request_tokens,
+        )
+        if event is not None:
+            event["full_window"] = full_window
+            event["budget_tokens"] = budget_tokens
+            return event
 
-        # 3. Blocking（阻塞拒绝）
-        # 请求已经接近完整模型窗口，autocompact 失败或无操作空间 → 拒绝本轮。
-        # 使用 _full_window_blocking_threshold() 而非直接 full_window - 3000，
-        # 避免在极小测试窗口上误杀。
         blocking_threshold = self._full_window_blocking_threshold()
+        if request_tokens < blocking_threshold:
+            event = self._auto_compact_history(
+                reason="preflight_budget_overflow",
+                round_idx=0,
+                force=True,
+                request_tokens=request_tokens,
+            )
+            if event is not None:
+                event["full_window"] = full_window
+                event["budget_tokens"] = budget_tokens
+                return event
+
         if request_tokens >= blocking_threshold:
             logger.error(
                 "blocking limit reached: request=%s window=%s buffer=%s",
@@ -2323,6 +2296,56 @@ class AgentSession:
             parts.append("待办/阻塞：" + "；".join(_clip_compact_text(x, 120) for x in pending[-8:]))
         return _clip_compact_text("\n".join(parts), 6000)
 
+    def _plan_snapshot_for_compact(self) -> str:
+        """Render compact-only plan metadata without duplicating the full plan.
+
+        Approved/pending plans are persisted by PlanStateStore and injected into
+        every turn via _plan_context_text(). Compact summaries should preserve
+        implementation progress and decisions around the plan, but they do not
+        need to copy the full Markdown plan into the boundary summary.
+        """
+        try:
+            state = self.plan_store.load(include_content=True)
+        except Exception:
+            logger.exception("plan state read failed for compact")
+            return ""
+
+        mode = str(state.get("mode") or "execute")
+        status = str(state.get("status") or "idle")
+        pending_plan = str(state.get("pending_plan") or "")
+        approved_plan = str(state.get("approved_plan") or "")
+        feedback = str(state.get("last_feedback") or "")
+        if (
+            mode == "execute"
+            and status == "idle"
+            and not pending_plan
+            and not approved_plan
+            and not feedback
+        ):
+            return ""
+
+        parts = [
+            f"计划状态：mode={mode}; status={status}; revision={state.get('revision') or 0}",
+        ]
+        current_path = state.get("current_path")
+        approved_path = state.get("approved_path")
+        if current_path:
+            parts.append("当前计划文件：" + str(current_path))
+        if approved_path:
+            parts.append("已批准计划文件：" + str(approved_path))
+        if feedback:
+            parts.append("最近拒绝反馈：" + _clip_compact_text(feedback, 300))
+        if pending_plan:
+            parts.append(
+                "待审批计划全文由 PlanState 每轮注入；压缩摘要只需保留围绕该计划的用户意见、阻塞和修订方向。"
+            )
+        if approved_plan:
+            parts.append(
+                "已批准计划全文由 PlanState 每轮注入，直到用户清空会话或提交新计划；"
+                "压缩摘要必须保留实施进度、已完成步骤、剩余步骤、偏离原因和阻塞。"
+            )
+        return _clip_compact_text("\n".join(parts), 1600)
+
     def _make_compact_summary(
         self,
         *,
@@ -2347,6 +2370,16 @@ class AgentSession:
         if client is None or not model:
             return fallback
         focus_text = f"\n摘要关注主题：{focus}" if focus else ""
+        plan_snapshot = self._plan_snapshot_for_compact()
+        compact_user_content = (
+            "[当前会话历史]\n"
+            f"{self._history_text_for_compact(messages)}\n\n"
+            "[本地滚动状态]\n"
+            f"{self._state_snapshot_for_compact(state_text)}"
+        )
+        if plan_snapshot:
+            compact_user_content += f"\n\n[计划状态]\n{plan_snapshot}"
+        compact_user_content += focus_text
 
         try:
             response = client.chat.completions.create(
@@ -2359,19 +2392,16 @@ class AgentSession:
                         "content": (
                             "你是 cb-agent 的上下文压缩器。请把当前会话历史和工作状态压缩成"
                             "一条中文摘要，保留后续继续任务必须知道的信息：当前任务、用户偏好、"
-                            "关键结论、已读文件、已改文件、最近命令、待办/阻塞。不要编造。"
+                            "关键结论、已读文件、已改文件、最近命令、待办/阻塞、"
+                            "可执行文件路径/用户给定路径/产物路径、工具版本或不可用原因、"
+                            "以及已批准计划的实施进度。计划全文会由 PlanState 独立注入，"
+                            "不要在摘要中复写完整计划；不要编造。"
                             "输出不超过1200字，并以【上下文压缩】开头。"
                         ),
                     },
                     {
                         "role": "user",
-                        "content": (
-                            "[当前会话历史]\n"
-                            f"{self._history_text_for_compact(messages)}\n\n"
-                            "[本地滚动状态]\n"
-                            f"{self._state_snapshot_for_compact(state_text)}"
-                            f"{focus_text}"
-                        ),
+                        "content": compact_user_content,
                     },
                 ],
             )
@@ -2401,12 +2431,15 @@ class AgentSession:
         近轮对话窗口。
         """
         state_snapshot = self._state_snapshot_for_compact(state_text)
+        plan_snapshot = self._plan_snapshot_for_compact()
         history_text = self._history_text_for_compact(messages)
         parts = ["【上下文压缩】"]
         if focus:
             parts.append("关注主题：" + _clip_compact_text(focus, 120))
         if state_snapshot:
             parts.append("状态摘要：" + _clip_compact_text(state_snapshot, 700))
+        if plan_snapshot:
+            parts.append("计划状态：" + _clip_compact_text(plan_snapshot, 450))
         if history_text:
             parts.append("最近对话：" + _clip_compact_text(history_text, 500))
         if len(parts) == 1:

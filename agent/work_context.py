@@ -890,7 +890,7 @@ class LocalSessionStore:
             "pending": [],
         }
 
-    def load_latest_history(self, max_messages: int = 12) -> List[Message]:
+    def load_latest_history(self, max_messages: Optional[int] = None) -> List[Message]:
         """从 transcript 恢复最近 history（CC 模式：raw messages 累积）。
 
         新格式：每条 transcript 记录的 ``messages`` 字段是本轮 commit 到 history
@@ -934,6 +934,8 @@ class LocalSessionStore:
 
         if not messages:
             return []
+        if max_messages is None:
+            return drop_orphan_tool_message_objects(messages)
         return _trim_restored_history(messages, max_messages)
 
     def save_pending_user_message(self, user_query: str) -> None:

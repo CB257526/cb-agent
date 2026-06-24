@@ -387,13 +387,12 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_history_window_cut_drops_orphan_tool_message(self):
-        """P0 回归:history_window 截断落在 assistant(tool_calls) 与 tool 之间时,
-        发给 LLM 的请求体不能出现孤儿 tool 消息(否则 OpenAI 兼容协议 400)。
+    def test_history_window_no_longer_cuts_tool_call_pair(self):
+        """history_window 不再裁剪 active history,工具调用链应完整保留。
 
-        构造:第一轮一个 file_read 工具调用 -> 第二轮收尾。然后手动把
-        history_window 调到 2,使下一轮切片尾部正好从 tool 结果开始(它的
-        assistant.tool_calls 父消息被挤出窗口)。再发一句,检查请求体合法。
+        构造:第一轮一个 file_read 工具调用 -> 第二轮收尾。即使手动把
+        history_window 调到 2,下一轮也不应按消息数截断,因此 tool 结果仍能
+        在前文找到它的 assistant.tool_calls。
         """
         call_id = "call_orphan_cut"
         original = ConstantLLM.llm_dict.get("fake")
@@ -420,7 +419,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             s.chat("读 a.txt")
             # 第一轮后 history:user, assistant(tool_calls), tool, assistant(final)
-            # 把窗口压到 2,下一轮切片尾部 = [tool, assistant(final)] —— tool 成孤儿
+            # history_window 只是兼容字段,不再按消息数裁剪 active history。
             s.history_window = 2
 
             s.chat("继续")
@@ -525,18 +524,11 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_history_window_keeps_compact_boundary_anchor(self):
-        """验证 history_window 截断时保留 compact_boundary 锚点。
+    def test_history_window_no_longer_truncates_after_compact_boundary(self):
+        """验证 active history 在 compact boundary 之后会完整发送。
 
-        场景：compact_boundary 是切片后的第一条消息（索引 0），且切片长度
-        超过 history_window。此时不能简单取尾部 window 条 —— 那样会把 boundary
-        锚点消息挤出窗口，导致模型丢失「前面发生过什么」的压缩摘要。
-
-        预期行为：
-        - 切片结果长度 = history_window（3 条）
-        - 第一条必须是 compact_boundary（ANCHOR_SUMMARY）
-        - 剩余 2 条是尾部最新消息（tail-4, tail-5）
-        - tail-0 ~ tail-3 被正确截断
+        compact_boundary 之前的历史仍会被切掉,但 boundary 之后不再按
+        history_window 做消息数截断。
         """
         original = ConstantLLM.llm_dict.get("fake")
         try:
@@ -552,7 +544,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             from core.message import Message
             from agent.compact_boundary import make_compact_boundary_message
 
-            # 构造：boundary 锚点 + 6 条尾部消息，window=3
+            # 构造：boundary 锚点 + 6 条尾部消息，history_window=3 也不截断
             s.history.append(make_compact_boundary_message("ANCHOR_SUMMARY"))
             for i in range(6):
                 s.history.append(Message.create_user_message(f"tail-{i}"))
@@ -560,34 +552,118 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             dicts = s._sliced_history_dicts()
 
-            # 应该返回 3 条：boundary + 最后 2 条 tail
-            self.assertEqual(len(dicts), 3)
+            # 应该返回完整 active history：boundary + 6 条 tail
+            self.assertEqual(len(dicts), 7)
             self.assertIn("ANCHOR_SUMMARY", str(dicts[0].get("content")))
             joined = json.dumps(dicts, ensure_ascii=False)
-            self.assertIn("tail-4", joined)
-            self.assertIn("tail-5", joined)
+            for i in range(6):
+                self.assertIn(f"tail-{i}", joined)
         finally:
             if original is None:
                 ConstantLLM.llm_dict.pop("fake", None)
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_preflight_auto_compact_at_display_context_threshold(self):
-        """验证 preflight 在达到自动 compact 触发阈值时触发（非旧固定 buffer）。
+    def test_approved_plan_is_injected_once_without_history_duplication(self):
+        """Approved plan 由 PlanState 每轮注入,不随历史 context_update 重复累积。"""
+        original = ConstantLLM.llm_dict.get("fake")
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True, "is_reasoning": False,
+                "image_ability": False, "max_tokens": 100000,
+            }
+            unique = "UNIQUE_APPROVED_PLAN_STEP_42"
+            plan = f"# Approved Plan\n\n- {unique}\n- keep implementing"
+            llm = FakeLLM([
+                {"answer": "first ok", "tool_calls": []},
+                {"answer": "second ok", "tool_calls": []},
+            ])
+
+            with tempfile.TemporaryDirectory() as td:
+                store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+                s = AgentSession(
+                    llm=llm, registry=self.registry, executor=self.executor,
+                    event_bus=self.bus, ctx_enabled=False, session_store=store,
+                )
+                s.plan_store.save_pending_plan(plan)
+                s.plan_store.approve()
+
+                # 模拟旧版本已经把 plan 段写进历史 context_update 的情况。
+                from core.message import Message, MessageRole
+                s.history.append(Message(
+                    role=MessageRole.USER,
+                    content=(
+                        "<context-update>\n"
+                        "[Plan Mode State]\n"
+                        "Approved plan for implementation:\n"
+                        f"{unique}\n\n"
+                        "[Local SessionState]\n"
+                        "keep-this-state\n"
+                        "</context-update>"
+                    ),
+                    metadata={"kind": "context_update"},
+                ))
+
+                sliced = json.dumps(s._sliced_history_dicts(), ensure_ascii=False)
+                self.assertNotIn(unique, sliced)
+                self.assertIn("keep-this-state", sliced)
+
+                s.chat("first")
+                first_request = json.dumps(llm.calls[0]["messages"], ensure_ascii=False)
+                self.assertEqual(first_request.count(unique), 1)
+
+                # 本轮落进 history 的 context_update 不应包含 plan 文本。
+                history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
+                self.assertEqual(history_dump.count(unique), 1)  # 仅来自上面模拟的旧历史
+
+                s.chat("second")
+                second_request = json.dumps(llm.calls[1]["messages"], ensure_ascii=False)
+                self.assertEqual(second_request.count(unique), 1)
+                self.assertIn(unique, s._dynamic_context_text())
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_compact_summary_preserves_plan_state_without_copying_full_plan(self):
+        """compact 摘要记录计划状态/实施进度要求,计划全文继续由 PlanState 注入。"""
+        from core.message import Message
+
+        llm = FakeLLM([])
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            unique = "UNIQUE_FULL_PLAN_BODY_SHOULD_NOT_BE_COPIED"
+            plan = "# Approved Plan\n\n" + "\n".join(
+                f"- step {i} {unique}" for i in range(20)
+            )
+            s.plan_store.save_pending_plan(plan)
+            s.plan_store.approve()
+
+            summary = s._rule_compact_summary(
+                messages=[Message.create_user_message("已完成 step 1, 下一步 step 2")],
+                state_text="",
+            )
+
+            self.assertIn("计划状态", summary)
+            self.assertIn("已批准计划全文由 PlanState 每轮注入", summary)
+            self.assertNotIn(unique, summary)
+
+    def test_preflight_auto_compact_when_full_request_exceeds_budget(self):
+        """验证 preflight 只在完整请求超过安全上下文预算时触发 compact。
 
         场景：模型窗口 20000，context_budget = 16000（80%），
-        auto_compact_trigger_tokens = 12800（16000 × 80% = 模型窗口的 64%）。
-        注入 15000 × "word " 让 request_tokens 远超 12800，然后发 chat。
+        注入 16500 × "word " 让 request_tokens 超过 context_budget，然后发 chat。
 
         预期行为：
         - chat 正常返回 "ok"（compact 成功释放空间后继续）
         - history 中出现了 compact_boundary 消息
         - Done.auto_compact 非空
-        - 触发原因是 "preflight_predictive"（预测性触发，非旧的 autocompact/buffer）
-
-        旧设计：需要在 full_window - buffer(13k/30k/50k) 才触发。
-        新设计：在 context_budget × AUTOCOMPACT_TRIGGER_RATIO 就触发，
-        比旧设计更早介入，更安全。
+        - 触发原因是 "preflight_context_overflow"
         """
         original = ConstantLLM.llm_dict.get("fake")
         try:
@@ -602,8 +678,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             from core.message import Message
 
-            # 注入大量文本让 request_tokens 超过 auto_compact_trigger_tokens
-            s.history.append(Message.create_user_message("word " * 15000))
+            # 注入大量文本让 request_tokens 超过 context_budget
+            s.history.append(Message.create_user_message("word " * 16500))
             answer = s.chat("continue")
 
             self.assertEqual(answer, "ok")
@@ -616,7 +692,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             dones = [e for e in self.events if isinstance(e, Done)]
             self.assertTrue(dones[-1].auto_compact)
             reasons = [item.get("reason") for item in dones[-1].auto_compact["events"]]
-            self.assertIn("preflight_predictive", reasons)
+            self.assertIn("preflight_context_overflow", reasons)
         finally:
             if original is None:
                 ConstantLLM.llm_dict.pop("fake", None)

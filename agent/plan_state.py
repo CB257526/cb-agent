@@ -239,12 +239,15 @@ class PlanStateStore:
                 + _clip(state.get("last_feedback"), 1600)
                 + "\nRevise the plan and submit a complete replacement."
             )
-        if state.get("pending_plan"):
-            parts.append("Pending plan:\n" + _clip(state.get("pending_plan"), 2400))
+        if status in {"pending", "rejected"} and state.get("pending_plan"):
+            parts.append(
+                "Pending plan:\n"
+                + str(state.get("pending_plan") or "")
+            )
         if state.get("approved_plan"):
             parts.append(
                 "Approved plan for implementation:\n"
-                + _clip(state.get("approved_plan"), 3000)
+                + str(state.get("approved_plan") or "")
                 + "\nFollow this approved plan when implementing unless the user changes direction."
             )
         return "\n\n".join(parts)

@@ -121,6 +121,28 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertEqual(history[2].tool_name, "file_read")
             self.assertEqual(history[3].content, "已经看完 a.py")
 
+    def test_default_load_latest_history_restores_full_active_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+
+            for i in range(8):
+                store.append_turn(
+                    user_query=f"问题 {i}",
+                    final_answer=f"回答 {i}",
+                    committed_messages=[_user(f"问题 {i}"), _assistant(f"回答 {i}")],
+                )
+
+            restored = LocalSessionStore(root)
+            full_history = restored.load_latest_history()
+            limited_history = restored.load_latest_history(max_messages=12)
+
+            self.assertEqual(len(full_history), 16)
+            self.assertEqual(len(limited_history), 12)
+            text = "\n".join(str(m.content) for m in full_history)
+            self.assertIn("问题 0", text)
+            self.assertIn("回答 7", text)
+
     def test_append_turn_with_state_structured_fields(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"

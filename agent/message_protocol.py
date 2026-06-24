@@ -3,9 +3,10 @@
 背景:
 - CC 对齐重构后,self.history 累积的是原始协议消息:
   user → assistant(tool_calls=[a,b]) → tool(a) → tool(b) → assistant(final) → ...
-- _build_chat_messages 会先按 compact_boundary 切片,再用 history_window 取尾部
-  N 条。这一刀可能正好落在 assistant(tool_calls) 和它的 tool 响应之间,导致切片
-  开头出现"孤儿 tool 消息"——它的父 assistant.tool_calls 被切掉了。
+- _build_chat_messages 会先按 compact_boundary 切片,再保留完整 active history。
+  旧版本和显式 max_messages 恢复路径仍可能截断在 assistant(tool_calls) 和它的
+  tool 响应之间,导致切片开头出现"孤儿 tool 消息"——它的父
+  assistant.tool_calls 被切掉了。
 - OpenAI 兼容协议(DeepSeek 等)对此会直接报错:
   "messages with role 'tool' must be a response to a preceding message with
   'tool_calls'"。跨进程恢复(_trim_restored_history)截断时也有同样风险。
@@ -45,7 +46,7 @@ def _role_of(message: Any) -> str:
 def drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> int:
     """原地丢弃孤儿 tool 消息(dict 版)。返回被丢弃的条数。
 
-    用于 _build_chat_messages:切片 + window 截断后、microcompact 之前调用,
+    用于 _build_chat_messages:active history 切片后、microcompact 之前调用,
     保证发给 LLM 的请求体里每条 role=tool 都能在前文找到声明它 tool_call_id
     的 assistant.tool_calls。
     """
