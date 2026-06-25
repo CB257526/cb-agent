@@ -51,8 +51,15 @@ pip install -r requirements.txt; pip install -e .
 # 4. 配 .env
 Copy-Item .env.example .env
 
+# 需要提前检查bun是否安装
+bun --version
+#没有安装bun，先安装bun https://bun.sh/
+powershell -c "irm bun.sh/install.ps1 | iex"
+
 # 5. 启动！！ヽ(✧∀✧)ﾉ
-python run_agent.py
+cd .\ui-otui\
+bun install
+bun start
 ```
 </details>
 
@@ -74,12 +81,19 @@ pip install -r requirements.txt && pip install -e .
 # 4. 配 .env
 cp .env.example .env
 
+# 需要提前检查bun是否安装
+bun --version
+#没有安装bun，先安装bun https://bun.sh/
+curl -fsSL https://bun.sh/install | bash
+
 # 5. 启动！！ヽ(✧∀✧)ﾉ
-python run_agent.py
+cd ./ui-otui/
+bun install
+bun start
 ```
 </details>
 
-> 详细的安装姿势请看 [📚 部署与配置](docs/部署与配置.md) 喵~
+> 详细的安装姿势请看 [📚 详细安装姿势](docs/详细安装姿势.md) 喵~
 
 ---
 
@@ -156,4 +170,4 @@ python run_agent.py
 
 ## 📜 License
 
-MIT (｀・ω・´) 随便用，随便改！
+MIT
