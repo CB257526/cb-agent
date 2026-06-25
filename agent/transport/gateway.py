@@ -40,7 +40,7 @@ from typing import Any, Dict, Optional, TextIO
 
 from agent.cancel import CancelToken
 from agent.event_bus import EventBus
-from agent.events import Event, PetUpdated
+from agent.events import Event, PermissionModeChanged, PetUpdated
 from agent.session import AgentSession
 from agent.transport.jsonrpc import StdioTransport, make_event_message, make_response
 
@@ -135,6 +135,10 @@ class Gateway:
             self._handle_switch_session(rpc_id, params)
         elif method == "session.set_mode":
             self._handle_set_mode(rpc_id, params)
+        elif method == "session.set_permission_mode":
+            self._handle_set_permission_mode(rpc_id, params)
+        elif method == "session.get_permission_mode":
+            self._handle_get_permission_mode(rpc_id)
         elif method == "session.get_plan_state":
             self._handle_get_plan_state(rpc_id)
         elif method == "session.approve_plan":
@@ -460,6 +464,50 @@ class Gateway:
                 error={"code": _ERR_INTERNAL, "message": str(e)},
             ))
             return
+        self.transport.write(make_response(rpc_id, result=payload))
+
+    def _current_permission_mode(self) -> str:
+        provider = getattr(self.session, "permission_mode_provider", None)
+        if callable(provider):
+            mode = provider()
+        else:
+            mode = "request_approval"
+        return mode if mode in ("request_approval", "full_access") else "request_approval"
+
+    def _handle_get_permission_mode(self, rpc_id: Any) -> None:
+        if rpc_id is None:
+            return
+        self.transport.write(make_response(
+            rpc_id,
+            result={"permission_mode": self._current_permission_mode()},
+        ))
+
+    def _handle_set_permission_mode(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        if rpc_id is None:
+            return
+        mode = params.get("permission_mode")
+        if mode not in ("request_approval", "full_access"):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "params.permission_mode must be request_approval or full_access"},
+            ))
+            return
+        setter = getattr(self.session, "permission_mode_setter", None)
+        if not callable(setter):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": "permission mode setter unavailable"},
+            ))
+            return
+        try:
+            payload = setter(str(mode))
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.event_bus.emit(PermissionModeChanged(permission_mode=payload["permission_mode"]))
         self.transport.write(make_response(rpc_id, result=payload))
 
     def _handle_get_plan_state(self, rpc_id: Any) -> None:
@@ -791,6 +839,7 @@ class Gateway:
                 "history": session_payload.get("history", []),
                 "context_window": session_payload.get("context_window"),
                 "plan_state": session_payload.get("plan_state"),
+                "permission_mode": self._current_permission_mode(),
             },
         })
         logger.info(

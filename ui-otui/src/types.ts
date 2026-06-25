@@ -28,6 +28,7 @@ export type EventType =
   | "todo_list_updated"
   | "mcp_status"
   | "pet_updated"
+  | "permission_mode_changed"
   | "subagent_started"
   | "subagent_progress"
   | "subagent_completed"
@@ -139,9 +140,11 @@ export interface GatewayReady extends BaseEvent {
   /** 启动恢复后当前会话的上下文窗口估算。 */
   context_window?: ContextWindow | null;
   plan_state?: PlanState | null;
+  permission_mode?: PermissionMode;
 }
 
 export type PlanMode = "execute" | "plan";
+export type PermissionMode = "request_approval" | "full_access";
 export type PlanStatus = "idle" | "pending" | "approved" | "rejected";
 
 export interface PlanState {
@@ -165,6 +168,11 @@ export interface PlanModeChanged extends BaseEvent {
   type: "plan_mode_changed";
   mode: PlanMode;
   plan_state: PlanState;
+}
+
+export interface PermissionModeChanged extends BaseEvent {
+  type: "permission_mode_changed";
+  permission_mode: PermissionMode;
 }
 
 export interface PlanStart extends BaseEvent {
@@ -381,6 +389,7 @@ export type AgentEvent =
   | TodoListUpdated
   | MCPStatusEvent
   | PetUpdated
+  | PermissionModeChanged
   | SubagentStarted
   | SubagentProgress
   | SubagentCompleted

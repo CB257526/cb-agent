@@ -264,6 +264,26 @@ class ToolRegistry:
                     continue
                 except Exception:
                     pass
+            if tool.name == "bash":
+                try:
+                    from tools.tools.bash_tool import BashTool
+
+                    cloned.register_tool(BashTool(
+                        is_subagent=True,
+                        dangerously_skip_permissions_provider=getattr(
+                            tool,
+                            "_dangerously_skip_permissions_provider",
+                            None,
+                        ),
+                        dangerously_skip_permissions=bool(getattr(
+                            tool,
+                            "_dangerously_skip_permissions",
+                            False,
+                        )),
+                    ))
+                    continue
+                except Exception:
+                    pass
             cloned.register_tool(tool)
 
         if "list_tools" in selected_tool_names:

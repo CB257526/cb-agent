@@ -29,7 +29,7 @@ type TextareaKeyBinding = {
 export function Prompt() {
   const theme = useTheme();
   const dimensions = useTerminalDimensions();
-  const { state, submit, runCommand, getHistoryAt, pasteFromClipboard, togglePlanMode } = useSession();
+  const { state, submit, runCommand, getHistoryAt, pasteFromClipboard, togglePlanMode, togglePermissionMode } = useSession();
   const [value, setValue] = createSignal("");
   const [pickerIndex, setPickerIndex] = createSignal(0);
   const [historyIdx, setHistoryIdx] = createSignal(-1);
@@ -113,6 +113,12 @@ export function Prompt() {
     if (key.name === "tab" && !slashActive()) {
       key.preventDefault?.();
       togglePlanMode();
+      return;
+    }
+
+    if (key.ctrl && key.name === "r" && !slashActive()) {
+      key.preventDefault?.();
+      togglePermissionMode();
       return;
     }
 

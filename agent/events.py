@@ -290,6 +290,14 @@ class PetUpdated:
     type: str = field(default="pet_updated", init=False)
 
 
+@dataclass
+class PermissionModeChanged:
+    """Runtime permission mode changed by a UI/RPC client."""
+    permission_mode: str
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="permission_mode_changed", init=False)
+
+
 # ========== Plan Mode 事件 ==========
 # Plan Mode 是协作式双模式（plan / execute）的事件体系。
 # 流程：用户切到 plan 模式 → LLM 输出 <proposed_plan> 块
@@ -499,6 +507,7 @@ Event = Union[
     TodoListUpdated,
     MCPStatus,
     PetUpdated,
+    PermissionModeChanged,
     PlanModeChanged,
     PlanStart,
     PlanDelta,
@@ -533,6 +542,7 @@ __all__ = [
     "TodoListUpdated",
     "MCPStatus",
     "PetUpdated",
+    "PermissionModeChanged",
     "PlanModeChanged",
     "PlanStart",
     "PlanDelta",

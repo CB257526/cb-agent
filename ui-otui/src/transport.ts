@@ -19,7 +19,7 @@ import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { AgentEvent, CompactPayload, MCPStatusPayload, PetCommandResult, PetState, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, CompactPayload, MCPStatusPayload, PermissionMode, PetCommandResult, PetState, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
@@ -209,6 +209,14 @@ export class Transport extends EventEmitter {
 
   setMode(mode: PlanMode): Promise<{ mode: PlanMode; plan_state: PlanState; session?: SessionSummary | null }> {
     return this.requestRpc("session.set_mode", { mode });
+  }
+
+  setPermissionMode(permission_mode: PermissionMode): Promise<{ permission_mode: PermissionMode }> {
+    return this.requestRpc("session.set_permission_mode", { permission_mode });
+  }
+
+  getPermissionMode(): Promise<{ permission_mode: PermissionMode }> {
+    return this.requestRpc("session.get_permission_mode");
   }
 
   getPlanState(): Promise<{ plan_state: PlanState }> {

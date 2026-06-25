@@ -37,6 +37,7 @@ import type {
   PromptAttachmentInput,
   DialogSpec,
   PlanMode,
+  PermissionMode,
   PlanState,
   RestoredHistoryMessage,
   SessionPayload,
@@ -55,6 +56,7 @@ export interface SessionState {
   items: ChatItem[];
   busy: boolean;
   planState: PlanState | null;
+  permissionMode: PermissionMode;
   model: string;
   promptTokens: number;
   completionTokens: number;
@@ -177,6 +179,8 @@ interface SessionContextValue {
   setPlanMode: (mode: PlanMode) => Promise<void>;
   /** Toggle Plan/Execute mode. */
   togglePlanMode: () => void;
+  /** Toggle Bash/tool permission risk mode. */
+  togglePermissionMode: () => void;
   /** Update local Plan state from RPC/events. */
   setPlanState: (state: PlanState | null) => void;
 }
@@ -190,6 +194,7 @@ export function SessionProvider(props: ParentProps) {
     items: [],
     busy: false,
     planState: null,
+    permissionMode: "request_approval",
     model: "connecting…",
     promptTokens: 0,
     completionTokens: 0,
@@ -284,6 +289,7 @@ export function SessionProvider(props: ParentProps) {
         setState("session", e.session ?? null);
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
         if (e.plan_state !== undefined) setState("planState", e.plan_state ?? null);
+        if (e.permission_mode !== undefined) setState("permissionMode", e.permission_mode ?? "request_approval");
         {
           const notice = describeAutoCompact(e);
           if (notice) appendSystem(notice);
@@ -298,6 +304,10 @@ export function SessionProvider(props: ParentProps) {
 
       case "plan_mode_changed":
         setState("planState", e.plan_state ?? null);
+        break;
+
+      case "permission_mode_changed":
+        setState("permissionMode", e.permission_mode ?? "request_approval");
         break;
 
       case "plan_start":
@@ -600,6 +610,20 @@ export function SessionProvider(props: ParentProps) {
     void setPlanMode(current === "plan" ? "execute" : "plan");
   };
 
+  const setPermissionMode = async (permissionMode: PermissionMode) => {
+    try {
+      const payload = await transport.setPermissionMode(permissionMode);
+      setState("permissionMode", payload.permission_mode ?? permissionMode);
+    } catch (e) {
+      appendSystem(`Permission mode switch failed: ${(e as Error).message}`);
+    }
+  };
+
+  const togglePermissionMode = () => {
+    const next = state.permissionMode === "full_access" ? "request_approval" : "full_access";
+    void setPermissionMode(next);
+  };
+
   const runCommand = (cmd: SlashCommand, commandLine?: string) => {
     const line = (commandLine ?? cmd.name).trim();
     const ctx: CommandCtx = {
@@ -729,6 +753,7 @@ export function SessionProvider(props: ParentProps) {
     closeDialog: () => setState("dialog", null),
     setPlanMode,
     togglePlanMode,
+    togglePermissionMode,
     setPlanState: (planState) => setState("planState", planState),
   };
 

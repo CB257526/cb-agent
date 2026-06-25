@@ -669,6 +669,51 @@ class TestBashToolEndToEnd(unittest.TestCase):
         gate.evaluate.assert_not_called()
         gate.prompt_user.assert_not_called()
 
+    def test_dangerously_skip_permissions_provider_is_dynamic(self):
+        reset_session()
+        enabled = False
+        gate = PermissionGate(
+            store=PermissionStore(store_path=Path(tempfile.mkdtemp()) / "p.json"),
+            strict=True,
+        )
+        tool = BashTool(
+            permission=gate,
+            dangerously_skip_permissions_provider=lambda: enabled,
+        )
+
+        blocked = json.loads(tool.run({"command": "rm -rf /"}))
+        self.assertEqual(blocked["exit_code"], -1)
+        self.assertEqual(blocked["semantic"], "fatal")
+
+        enabled = True
+        with patch(
+            "tools.tools.bash_tool.subprocess.run",
+            return_value=MagicMock(stdout="", stderr="", returncode=0),
+        ):
+            allowed = json.loads(tool.run({"command": "rm -rf /"}))
+        self.assertEqual(allowed["exit_code"], 0)
+        self.assertTrue(allowed["permission"]["dangerously_skipped"])
+
+    def test_clone_filtered_creates_subagent_bash_tool(self):
+        from tools.toolRegistry import ToolRegistry
+
+        reset_session()
+        enabled = False
+        root_bash = BashTool(
+            dangerously_skip_permissions_provider=lambda: enabled,
+        )
+        registry = ToolRegistry()
+        registry.register_tool(root_bash)
+
+        cloned = registry.clone_filtered(allow_names=["bash"])
+        sub_bash = cloned.get_tool("bash")
+
+        self.assertIsNot(sub_bash, root_bash)
+        self.assertTrue(getattr(sub_bash, "_is_subagent"))
+        self.assertFalse(sub_bash.dangerously_skip_permissions_enabled())
+        enabled = True
+        self.assertTrue(sub_bash.dangerously_skip_permissions_enabled())
+
 
 class TestBashPermissionTool(unittest.TestCase):
     """bash_permission 工具：让模型直接管 allowlist。"""

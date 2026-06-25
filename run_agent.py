@@ -186,6 +186,10 @@ class AgentRunner:
         self.memory_system = memory_system
         self.communication_platform = communication_platform
         self.dangerously_skip_permissions = dangerously_skip_permissions
+        self._permission_mode_lock = threading.RLock()
+        self._permission_mode = (
+            "full_access" if dangerously_skip_permissions else "request_approval"
+        )
         logger.info(
             "AgentRunner init: use_mcp=%s has_mcp=%s ctx_enabled=%s attach_cli_renderer=%s memory_system=%s communication_platform=%s dangerously_skip_permissions=%s log_level=%s",
             use_mcp,
@@ -311,6 +315,21 @@ class AgentRunner:
 
     # ---------- 会话创建 ----------
 
+    def permission_mode(self) -> str:
+        with self._permission_mode_lock:
+            return self._permission_mode
+
+    def dangerously_skip_permissions_enabled(self) -> bool:
+        return self.permission_mode() == "full_access"
+
+    def set_permission_mode(self, mode: str) -> dict[str, str]:
+        if mode not in ("request_approval", "full_access"):
+            raise ValueError("permission mode must be request_approval or full_access")
+        with self._permission_mode_lock:
+            self._permission_mode = mode
+            self.dangerously_skip_permissions = mode == "full_access"
+        return {"permission_mode": mode}
+
     def _create_message_logger(self, scope: str) -> MessageLogger | None:
         """按会话创建 LLM messages 日志。
 
@@ -399,6 +418,8 @@ class AgentRunner:
         # 运行态以回调形式挂到每个 session 上；状态只服务展示，不写入 history。
         session.mcp_status_provider = self.mcp_status
         session.mcp_background_loader = self.start_mcp_background_loading
+        session.permission_mode_provider = self.permission_mode
+        session.permission_mode_setter = self.set_permission_mode
         return session
 
     def _platform_session_store_root(self, conversation: ConversationKey) -> Path:
@@ -537,7 +558,10 @@ class AgentRunner:
             LsTool(),
             SkillTool(self._skill_manager),
             RunSkillScriptTool(self._skill_manager, skill_executor),
-            BashTool(dangerously_skip_permissions=self.dangerously_skip_permissions),
+            BashTool(
+                dangerously_skip_permissions=self.dangerously_skip_permissions,
+                dangerously_skip_permissions_provider=self.dangerously_skip_permissions_enabled,
+            ),
             BashTaskTool(),
             BashPermissionTool(),
             FileReadTool(),

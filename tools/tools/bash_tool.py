@@ -19,7 +19,7 @@ import signal
 import subprocess
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from agent.cancel import get_current_cancel_token
 from tools.tool import Tool, ToolParameter
@@ -157,6 +157,7 @@ class BashTool(Tool):
         is_subagent: bool = False,
         question_channel: Optional[Any] = None,
         dangerously_skip_permissions: bool = False,
+        dangerously_skip_permissions_provider: Optional[Callable[[], bool]] = None,
     ):
         permission_note = (
             "当前进程已开启 --dangerously-skip-permissions，Bash 权限确认和高危命令拦截都会跳过。"
@@ -192,6 +193,7 @@ class BashTool(Tool):
         # PermissionGate 弹窗，所有命令直接交给系统 shell。warnings 仍会计算并写入
         # 结果，作为最基本的审计线索。
         self._dangerously_skip_permissions = dangerously_skip_permissions
+        self._dangerously_skip_permissions_provider = dangerously_skip_permissions_provider
 
         self._last_command = ""
         self._last_elapsed = 0.0
@@ -263,6 +265,15 @@ class BashTool(Tool):
             ),
         ]
 
+    def dangerously_skip_permissions_enabled(self) -> bool:
+        if self._dangerously_skip_permissions_provider is None:
+            return bool(self._dangerously_skip_permissions)
+        try:
+            return bool(self._dangerously_skip_permissions_provider())
+        except Exception:
+            logger.exception("bash permission mode provider failed")
+            return bool(self._dangerously_skip_permissions)
+
     def run(self, parameters: Dict[str, Any]) -> str:
         """执行 Shell 命令。
 
@@ -283,7 +294,8 @@ class BashTool(Tool):
 
         # 安全检测。危险跳过模式下连 fatal 也放行，确保启动参数语义是“完全权限”；
         # 这种模式只应在受信任环境中手动开启。
-        fatal = None if self._dangerously_skip_permissions else check_fatal(command)
+        dangerously_skip_permissions = self.dangerously_skip_permissions_enabled()
+        fatal = None if dangerously_skip_permissions else check_fatal(command)
         if fatal:
             logger.warning("bash: 拒绝危险命令 — %s", fatal)
             return json.dumps({
@@ -308,7 +320,7 @@ class BashTool(Tool):
         # - 主 agent 模式下：fatal 上游已拦；只读命令直接 ALLOW；warnings 或非只读 → 弹窗
         gate_res = None
         permission_payload = None
-        if self._dangerously_skip_permissions:
+        if dangerously_skip_permissions:
             logger.warning(
                 "bash: --dangerously-skip-permissions 已启用，跳过安全拦截和权限确认: %s",
                 command,
