@@ -127,6 +127,16 @@ python run_agent.py
   <em>💬 QQ 群聊 &nbsp;&nbsp;&nbsp; 📱 微信私聊</em>
 </p>
 
+<br>
+
+<p align="center">
+  <video src="video/output.mp4" controls width="800" poster="img/opentui界面.png">
+    您的浏览器不支持视频播放，请 <a href="video/output.mp4">下载视频</a> 观看 (｀・ω・´)
+  </video>
+  <br>
+  <em>🎬 项目宣传视频 — 一分半钟带你了解 cb-agent 能做什么！</em>
+</p>
+
 ---
 
 ## 📚 文档索引 (づ｡◕‿‿◕｡)づ
