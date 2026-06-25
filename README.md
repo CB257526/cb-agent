@@ -144,9 +144,8 @@ bun start
 <br>
 
 <p align="center">
-  <video src="video/output.mp4" controls width="800" poster="img/opentui界面.png">
-    您的浏览器不支持视频播放，请 <a href="video/output.mp4">下载视频</a> 观看 (｀・ω・´)
-  </video>
+  <!-- 项目宣传视频 -->
+  <a href="https://v.douyin.com/Io2Ic8s2QQA/" target="_blank">
   <br>
   <em>🎬 项目宣传视频 — 一分半钟带你了解 cb-agent 能做什么！</em>
 </p>
