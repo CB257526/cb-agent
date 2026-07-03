@@ -298,6 +298,17 @@ class PermissionModeChanged:
     type: str = field(default="permission_mode_changed", init=False)
 
 
+@dataclass
+class ModelChanged:
+    """Runtime LLM request target changed by a UI/RPC client."""
+    model: str
+    model_key: Optional[str] = None
+    provider: Optional[str] = None
+    context_window: Optional[Dict[str, Any]] = None
+    timestamp: float = field(default_factory=_now)
+    type: str = field(default="model_changed", init=False)
+
+
 # ========== Plan Mode 事件 ==========
 # Plan Mode 是协作式双模式（plan / execute）的事件体系。
 # 流程：用户切到 plan 模式 → LLM 输出 <proposed_plan> 块
@@ -508,6 +519,7 @@ Event = Union[
     MCPStatus,
     PetUpdated,
     PermissionModeChanged,
+    ModelChanged,
     PlanModeChanged,
     PlanStart,
     PlanDelta,
@@ -543,6 +555,7 @@ __all__ = [
     "MCPStatus",
     "PetUpdated",
     "PermissionModeChanged",
+    "ModelChanged",
     "PlanModeChanged",
     "PlanStart",
     "PlanDelta",

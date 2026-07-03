@@ -310,6 +310,11 @@ export function SessionProvider(props: ParentProps) {
         setState("permissionMode", e.permission_mode ?? "request_approval");
         break;
 
+      case "model_changed":
+        setState("model", e.model ?? "unknown");
+        if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
+        break;
+
       case "plan_start":
         streamingPlanId = null;
         break;

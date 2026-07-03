@@ -1,0 +1,20 @@
+{
+  "providers": [
+    {
+      "name": "Kimi",
+      "options": {
+        "baseURL": "https://api.moonshot.cn/v1",
+        "apiKey": ""
+      },
+      "models": {
+        "kimi-k2.7-code": {
+          "name": "Kimi K2.7 Code",
+          "is_tool": true,
+          "is_reasoning": true,
+          "max_tokens": 1000000,
+          "image_ability": true
+        }
+      }
+    }
+  ]
+}

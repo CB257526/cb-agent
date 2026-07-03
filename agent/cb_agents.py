@@ -6,9 +6,11 @@ import threading
 import time
 from openai import OpenAI
 from dotenv import load_dotenv
+from pathlib import Path
 from typing import List, Dict, Optional, Any
 import json
 from constant.llm.constant_llm import ConstantLLM
+from constant.llm.model_config import ModelChoice, ModelConfigManager
 from agent.event_bus import EventBus
 from agent.events import (
     Cancelled, ReasoningDelta, TextDelta, TokenUsage, ToolCallPlanned,
@@ -295,13 +297,21 @@ class CbAgentsLLM:
         """
         初始化客户端。优先使用传入参数，如果未提供，则从环境变量加载。
         """
-        self.model = model or os.getenv("LLM_MODEL_ID")
-        apiKey = apiKey or os.getenv("LLM_API_KEY")
-        baseUrl = baseUrl or os.getenv("LLM_BASE_URL")
+        self.model_config = ModelConfigManager.load(Path(__file__).resolve().parents[1])
+        env_model = model or os.getenv("LLM_MODEL_ID")
+        configured_choice = self.model_config.find_by_model(env_model or "") if env_model else self.model_config.first_choice()
+        self.current_model_key: Optional[str] = configured_choice.key if configured_choice is not None else None
+
+        self.model = env_model or (configured_choice.model_id if configured_choice is not None else None)
+        apiKey = apiKey or (configured_choice.api_key if configured_choice is not None else None) or os.getenv("LLM_API_KEY")
+        baseUrl = baseUrl or (configured_choice.base_url if configured_choice is not None else None) or os.getenv("LLM_BASE_URL")
         timeout = timeout or int(os.getenv("LLM_TIMEOUT", 60))
         self.provider = provider
         self.is_Function_Calling = self._is_able_Function_Calling()
         self.timeout = timeout
+        self.base_url = baseUrl
+        self.api_key = apiKey
+        self._client_lock = threading.RLock()
         # 当前正在读取的 OpenAI stream 句柄表。取消请求来自 Gateway/TUI 或 CLI signal
         # 线程，而真正读 chunk 的代码在 chat worker 里；保存句柄后，取消方就能主动
         # close stream，而不是被动等“下一个 chunk 到来”才检查 cancel_event。
@@ -322,6 +332,7 @@ class CbAgentsLLM:
             raise ValueError("模型ID、API密钥和服务地址必须被提供或在.env文件中定义。")
 
         self.client = OpenAI(api_key=apiKey, base_url=baseUrl, timeout=timeout)
+        self._publish_current_model_env()
         logger.info(
             "LLM client initialized: model=%s base_url=%s function_calling=%s timeout=%s",
             self.model,
@@ -329,6 +340,88 @@ class CbAgentsLLM:
             self.is_Function_Calling,
             timeout,
         )
+
+    def _publish_current_model_env(self) -> None:
+        """Keep legacy env readers aligned with the active runtime model.
+
+        Most of the code now reads ``self.llm.model`` or ``ConstantLLM`` with an
+        explicit model id. A few older helper paths still consult LLM_MODEL_ID,
+        so updating these process env values keeps runtime switching coherent.
+        """
+        if self.model:
+            os.environ["LLM_MODEL_ID"] = str(self.model)
+        if self.base_url:
+            os.environ["LLM_BASE_URL"] = str(self.base_url)
+        if self.api_key:
+            os.environ["LLM_API_KEY"] = str(self.api_key)
+
+    def _choice_or_raise(self, key_or_model: str) -> ModelChoice:
+        choice = self.model_config.find(key_or_model)
+        if choice is None:
+            available = ", ".join(c.model_id for c in self.model_config.choices) or "(none)"
+            raise ValueError(f"未找到模型配置: {key_or_model}. 可用模型: {available}")
+        return choice
+
+    def list_models(self) -> Dict[str, Any]:
+        return {
+            "models": self.model_config.public_models(
+                current_key=self.current_model_key,
+                current_model=self.model,
+            ),
+            "current": {
+                "key": self.current_model_key,
+                "model": self.model,
+                "base_url": self.base_url,
+                "is_tool": self.is_Function_Calling,
+                "max_tokens": ConstantLLM.model_max_tokens(self.model),
+                "image_ability": ConstantLLM.resolve_image_ability(self.model, default=False),
+                "is_reasoning": ConstantLLM.resolve_is_reasoning(self.model, default=False),
+            },
+            "config_path": str(self.model_config.path) if self.model_config.path is not None else None,
+        }
+
+    def switch_model(self, key_or_model: str) -> Dict[str, Any]:
+        """Switch the active OpenAI-compatible request target.
+
+        AgentSession/history are intentionally untouched; subsequent requests use
+        the new client/model while the conversation context remains shared.
+        """
+        with self._stream_lock:
+            if self._active_streams:
+                raise RuntimeError("当前仍有 LLM stream 运行中，不能切换模型")
+        choice = self._choice_or_raise(key_or_model)
+        api_key = choice.api_key or os.getenv("LLM_API_KEY")
+        base_url = choice.base_url or os.getenv("LLM_BASE_URL")
+        if not all([choice.model_id, api_key, base_url]):
+            raise ValueError(f"模型 {choice.model_id} 缺少 apiKey/baseURL 配置")
+
+        with self._client_lock:
+            self.model = choice.model_id
+            self.current_model_key = choice.key
+            self.api_key = api_key
+            self.base_url = base_url
+            self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
+            self.is_Function_Calling = self._is_able_Function_Calling()
+            self._publish_current_model_env()
+
+        logger.info(
+            "LLM model switched: model=%s provider=%s base_url=%s function_calling=%s",
+            choice.model_id,
+            choice.provider_name,
+            base_url,
+            self.is_Function_Calling,
+        )
+        return {
+            "key": choice.key,
+            "model": choice.model_id,
+            "name": choice.display_name,
+            "provider": choice.provider_name,
+            "base_url": base_url,
+            "is_tool": self.is_Function_Calling,
+            "is_reasoning": ConstantLLM.resolve_is_reasoning(choice.model_id, default=False),
+            "max_tokens": ConstantLLM.model_max_tokens(choice.model_id),
+            "image_ability": ConstantLLM.resolve_image_ability(choice.model_id, default=False),
+        }
 
     def _next_stream_id(self) -> int:
         """生成本进程内递增 stream id，便于日志把一次 LLM 请求串起来。"""

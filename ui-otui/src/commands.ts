@@ -124,6 +124,13 @@ function formatQueuedAttachments(attachments: QueuedAttachment[]): string {
   return "待发送附件：\n" + lines.join("\n");
 }
 
+function formatTokenWindow(tokens: unknown): string {
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) return "?";
+  if (tokens >= 1000000) return `${(tokens / 1000000).toFixed(1)}M`;
+  if (tokens >= 1000) return `${(tokens / 1000).toFixed(0)}k`;
+  return `${Math.round(tokens)}`;
+}
+
 export const COMMANDS: readonly SlashCommand[] = [
   {
     name: "/help",
@@ -252,6 +259,57 @@ export const COMMANDS: readonly SlashCommand[] = [
         openDialog({ title: `已注册 ${result.tools.length} 个工具`, options });
       } catch (e) {
         appendSystem(`✗ /tools 失败：${(e as Error).message}`);
+      }
+    },
+  },
+  {
+    name: "/model",
+    description: "切换模型（共享当前会话上下文）",
+    handler: async ({ transport, appendSystem, openDialog, setPending, setContextWindow }) => {
+      setPending("正在读取模型列表…");
+      try {
+        const result = await transport.listModels();
+        if (!result.models.length) {
+          appendSystem("未找到模型配置。请创建 .cbagent/models.json，或继续使用 LLM_MODEL_ID/LLM_API_KEY/LLM_BASE_URL。");
+          return;
+        }
+        const options = result.models.map((m) => {
+          const caps = [
+            m.is_tool ? "FC" : "no FC",
+            m.image_ability ? "vision" : "text",
+            m.is_reasoning ? "reasoning" : "",
+            formatTokenWindow(m.max_tokens),
+          ].filter(Boolean);
+          return {
+            name: `${m.current ? "▶ " : ""}${m.name || m.model}`,
+            description: `${m.provider} · ${m.model} · ${caps.join(" · ")}`,
+            value: m.key,
+          };
+        });
+        openDialog({
+          title: "Select model",
+          options,
+          visibleCount: 5,
+          onSelect: async (modelKey) => {
+            setPending("正在切换模型…");
+            try {
+              const payload = await transport.setModel(modelKey);
+              if (payload.context_window !== undefined) {
+                setContextWindow(payload.context_window ?? null);
+              }
+              const m = payload.model;
+              appendSystem(`已切换模型：${m.provider ? `${m.provider} / ` : ""}${m.name || m.model}`);
+            } catch (e) {
+              appendSystem(`/model 失败：${(e as Error).message}`);
+            } finally {
+              setPending(null);
+            }
+          },
+        });
+      } catch (e) {
+        appendSystem(`/model 失败：${(e as Error).message}`);
+      } finally {
+        setPending(null);
       }
     },
   },

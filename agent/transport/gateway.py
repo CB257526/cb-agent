@@ -40,7 +40,7 @@ from typing import Any, Dict, Optional, TextIO
 
 from agent.cancel import CancelToken
 from agent.event_bus import EventBus
-from agent.events import Event, PermissionModeChanged, PetUpdated
+from agent.events import Event, ModelChanged, PermissionModeChanged, PetUpdated
 from agent.session import AgentSession
 from agent.transport.jsonrpc import StdioTransport, make_event_message, make_response
 
@@ -141,6 +141,10 @@ class Gateway:
             self._handle_get_permission_mode(rpc_id)
         elif method == "session.get_plan_state":
             self._handle_get_plan_state(rpc_id)
+        elif method == "session.list_models":
+            self._handle_list_models(rpc_id)
+        elif method == "session.set_model":
+            self._handle_set_model(rpc_id, params)
         elif method == "session.approve_plan":
             self._handle_approve_plan(rpc_id)
         elif method == "session.reject_plan":
@@ -623,6 +627,79 @@ class Gateway:
             ))
             return
         self.transport.write(make_response(rpc_id, result={"tools": tools}))
+
+    def _handle_list_models(self, rpc_id: Any) -> None:
+        """返回统一模型配置中的模型列表，不暴露 apiKey。"""
+        if rpc_id is None:
+            return
+        llm = getattr(self.session, "llm", None)
+        list_models = getattr(llm, "list_models", None)
+        if not callable(list_models):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": "model registry unavailable"},
+            ))
+            return
+        try:
+            payload = list_models()
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+        self.transport.write(make_response(rpc_id, result=payload))
+
+    def _handle_set_model(self, rpc_id: Any, params: Dict[str, Any]) -> None:
+        """切换 LLM 请求目标。AgentSession/history 保持不变。"""
+        if rpc_id is None:
+            return
+        if self._is_busy():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+        model_key = params.get("model_key") or params.get("model")
+        if not isinstance(model_key, str) or not model_key.strip():
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": "params.model_key required"},
+            ))
+            return
+
+        llm = getattr(self.session, "llm", None)
+        switch_model = getattr(llm, "switch_model", None)
+        if not callable(switch_model):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": "model switch unavailable"},
+            ))
+            return
+        try:
+            model = switch_model(model_key.strip())
+            context_window = self.session.context_window_usage()
+        except ValueError as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": str(e)},
+            ))
+            return
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+
+        payload = {"model": model, "context_window": context_window}
+        self.event_bus.emit(ModelChanged(
+            model=model.get("model") or "",
+            model_key=model.get("key"),
+            provider=model.get("provider"),
+            context_window=context_window,
+        ))
+        self.transport.write(make_response(rpc_id, result=payload))
 
     def _handle_load_skill(self, rpc_id: Any, params: Dict[str, Any]) -> None:
         """用户显式加载 Skill，供 TUI /skill 命令使用。"""

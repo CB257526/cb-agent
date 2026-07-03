@@ -29,6 +29,7 @@ export type EventType =
   | "mcp_status"
   | "pet_updated"
   | "permission_mode_changed"
+  | "model_changed"
   | "subagent_started"
   | "subagent_progress"
   | "subagent_completed"
@@ -173,6 +174,14 @@ export interface PlanModeChanged extends BaseEvent {
 export interface PermissionModeChanged extends BaseEvent {
   type: "permission_mode_changed";
   permission_mode: PermissionMode;
+}
+
+export interface ModelChanged extends BaseEvent {
+  type: "model_changed";
+  model: string;
+  model_key?: string | null;
+  provider?: string | null;
+  context_window?: ContextWindow | null;
 }
 
 export interface PlanStart extends BaseEvent {
@@ -390,6 +399,7 @@ export type AgentEvent =
   | MCPStatusEvent
   | PetUpdated
   | PermissionModeChanged
+  | ModelChanged
   | SubagentStarted
   | SubagentProgress
   | SubagentCompleted
@@ -478,6 +488,38 @@ export interface CompactPayload extends SessionPayload {
   no_op?: boolean;
 }
 
+export interface ModelChoice {
+  key: string;
+  provider: string;
+  model: string;
+  name: string;
+  current?: boolean;
+  is_tool?: boolean;
+  is_reasoning?: boolean;
+  max_tokens?: number;
+  image_ability?: boolean;
+  base_url?: string;
+}
+
+export interface ModelListPayload {
+  models: ModelChoice[];
+  current?: {
+    key?: string | null;
+    model?: string | null;
+    base_url?: string | null;
+    is_tool?: boolean;
+    is_reasoning?: boolean;
+    max_tokens?: number;
+    image_ability?: boolean;
+  };
+  config_path?: string | null;
+}
+
+export interface ModelSwitchPayload {
+  model: ModelChoice;
+  context_window?: ContextWindow | null;
+}
+
 export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought" | "plan";
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */
 export interface ChatItem {
@@ -525,6 +567,8 @@ export interface DialogOption {
 export interface DialogSpec {
   title: string;
   options: DialogOption[];
+  /** Number of options visible at once; SelectDialog scrolls for the rest. */
+  visibleCount?: number;
   /** 选中回调；弹窗在调用前已关闭。空列表时弹窗只展示标题与提示。 */
   onSelect?: (value: string) => void;
 }

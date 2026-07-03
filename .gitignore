@@ -240,3 +240,5 @@ test_mem_debug/
 # 通讯平台表情包资源
 # 表情包可能由 agent 或用户自行下载生成，通常体积较大且带个人偏好，不纳入版本库。
 assets/stickers/
+models.json
+.DS_Store

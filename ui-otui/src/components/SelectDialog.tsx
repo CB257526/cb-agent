@@ -76,7 +76,8 @@ export function SelectDialog(props: { spec: DialogSpec }) {
   const LINES_PER_ITEM = 2;
   const MAX_VISIBLE = 10;
   const listHeight = createMemo(() => {
-    const n = Math.min(options().length, MAX_VISIBLE);
+    const visible = Math.max(1, Math.min(props.spec.visibleCount ?? MAX_VISIBLE, MAX_VISIBLE));
+    const n = Math.min(options().length, visible);
     return Math.max(1, n) * LINES_PER_ITEM;
   });
 
