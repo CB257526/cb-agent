@@ -24,7 +24,7 @@ export function SelectDialog(props: { spec: DialogSpec }) {
 
   // OpenTUI select 需要 {name, description, value} 形状的 options
   const options = createMemo(() =>
-    props.spec.options.map((o) => ({
+    (props.spec.options ?? []).map((o) => ({
       name: o.name,
       description: o.description ?? "",
       value: o.value,
@@ -39,7 +39,7 @@ export function SelectDialog(props: { spec: DialogSpec }) {
     // props.spec 是 Solid 响应式 getter，读的是 state.dialog；closeDialog() 把
     // state.dialog 置 null 后，props.spec 立刻变 null，再读 props.spec.onSelect
     // 就成了 null?.()，回调被静默跳过——这正是"选中回车没切换"的根因。
-    const picked = props.spec.options[index()];
+    const picked = (props.spec.options ?? [])[index()];
     const onSelect = props.spec.onSelect;
     closeDialog();
     if (picked && typeof picked.value === "string") onSelect?.(picked.value);
@@ -47,6 +47,13 @@ export function SelectDialog(props: { spec: DialogSpec }) {
 
   // 弹窗自己接管全部键：上/下移动（循环）、回车确认、Esc 关闭。
   useKeyboard((key: KeyEvent) => {
+    if (props.spec.content) {
+      if (key.name === "escape" || key.name === "return" || key.name === "enter" || key.name === "linefeed") {
+        key.preventDefault?.();
+        closeDialog();
+      }
+      return;
+    }
     const n = options().length;
     if (key.name === "up") {
       key.preventDefault?.();
@@ -109,33 +116,40 @@ export function SelectDialog(props: { spec: DialogSpec }) {
           </text>
         </box>
 
-        {/* 选项列表 */}
+        {/* 内容或选项列表 */}
         <Show
-          when={options().length > 0}
-          fallback={<text fg={theme.textMuted}>（空）</text>}
+          when={!props.spec.content}
+          fallback={<text fg={theme.text}>{props.spec.content}</text>}
         >
-          <select
-            focused={false}
-            selectedIndex={index()}
-            height={listHeight()}
-            options={options()}
-            showDescription={true}
-            showScrollIndicator={true}
-            wrapSelection={true}
-            backgroundColor={theme.backgroundPanel}
-            textColor={theme.text}
-            focusedBackgroundColor={theme.backgroundPanel}
-            focusedTextColor={theme.text}
-            selectedBackgroundColor={theme.backgroundElement}
-            selectedTextColor={theme.borderActive}
-            descriptionColor={theme.textMuted}
-            selectedDescriptionColor={theme.textMuted}
-          />
+          <Show
+            when={options().length > 0}
+            fallback={<text fg={theme.textMuted}>（空）</text>}
+          >
+            <select
+              focused={false}
+              selectedIndex={index()}
+              height={listHeight()}
+              options={options()}
+              showDescription={true}
+              showScrollIndicator={true}
+              wrapSelection={true}
+              backgroundColor={theme.backgroundPanel}
+              textColor={theme.text}
+              focusedBackgroundColor={theme.backgroundPanel}
+              focusedTextColor={theme.text}
+              selectedBackgroundColor={theme.backgroundElement}
+              selectedTextColor={theme.borderActive}
+              descriptionColor={theme.textMuted}
+              selectedDescriptionColor={theme.textMuted}
+            />
+          </Show>
         </Show>
 
         {/* 底部提示 */}
         <box flexShrink={0} paddingTop={1}>
-          <text fg={theme.textMuted}>↑/↓ 选择 · Enter 确认 · Esc 关闭</text>
+          <text fg={theme.textMuted}>
+            {props.spec.content ? "Enter/Esc 关闭" : "↑/↓ 选择 · Enter 确认 · Esc 关闭"}
+          </text>
         </box>
       </box>
     </box>

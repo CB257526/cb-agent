@@ -76,6 +76,7 @@ from agent.renderers.cli import CLIRenderer
 from agent.message_logger import MessageLogger
 from agent.session import AgentSession
 from agent.subagents import SubagentRegistry, SubagentTaskRegistry
+from agent.usage_metrics import UsageMetricsRecorder
 from agent.work_context import LocalSessionStore, TraceSummarizer
 from constant.llm.constant_llm import ConstantLLM
 from context import MemoryLoader
@@ -228,6 +229,8 @@ class AgentRunner:
 
         # 2. 事件总线（要在工具注册前建好，TodoTool 等工具构造期就要拿到）
         self.event_bus = EventBus()
+        self.usage_metrics = UsageMetricsRecorder(self.logging_settings.log_dir / "metrics")
+        self.usage_metrics.attach(self.event_bus)
         self.pet_event_bridge = PetEventBridge(self.pet_manager)
         self.pet_event_bridge.attach(self.event_bus)
 
@@ -420,6 +423,7 @@ class AgentRunner:
         session.mcp_background_loader = self.start_mcp_background_loading
         session.permission_mode_provider = self.permission_mode
         session.permission_mode_setter = self.set_permission_mode
+        session.usage_metrics = self.usage_metrics
         return session
 
     def _platform_session_store_root(self, conversation: ConversationKey) -> Path:

@@ -19,7 +19,7 @@ import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { AgentEvent, CompactPayload, MCPStatusPayload, ModelListPayload, ModelSwitchPayload, PermissionMode, PetCommandResult, PetState, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, CacheStatsPayload, CompactPayload, MCPStatusPayload, ModelListPayload, ModelSwitchPayload, PermissionMode, PetCommandResult, PetState, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 
 export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
 export const STDERR_UI_LINE_MAX = 4000;
@@ -259,6 +259,11 @@ export class Transport extends EventEmitter {
   /** 切换当前 LLM 请求目标；会话 history 不变。 */
   setModel(model_key: string): Promise<ModelSwitchPayload> {
     return this.requestRpc("session.set_model", { model_key });
+  }
+
+  /** 获取今天的 prompt cache 命中统计。 */
+  cacheStats(): Promise<CacheStatsPayload> {
+    return this.requestRpc("session.cache_stats");
   }
 
   /** 手动加载 Skill 内容，供 /skill 命令展示。 */

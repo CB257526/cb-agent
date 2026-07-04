@@ -12,6 +12,7 @@
  */
 
 import { createSignal, createMemo, Show } from "solid-js";
+import { wrapAnsi } from "bun";
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent, PasteEvent, TextareaRenderable } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
@@ -22,8 +23,10 @@ import { AttachmentQueue } from "./AttachmentQueue.js";
 
 type TextareaKeyBinding = {
   name: string;
+  ctrl?: boolean;
   shift?: boolean;
-  action: "submit" | "newline";
+  super?: boolean;
+  action: "submit" | "newline" | "select-all";
 };
 
 export function Prompt() {
@@ -33,6 +36,7 @@ export function Prompt() {
   const [value, setValue] = createSignal("");
   const [pickerIndex, setPickerIndex] = createSignal(0);
   const [historyIdx, setHistoryIdx] = createSignal(-1);
+  const [textareaWidth, setTextareaWidth] = createSignal(0);
 
   let inputRef: TextareaRenderable | undefined;
   // 程序化改值（翻历史 / 粘贴）时置 true：让 onInput 跳过"重置 historyIdx"逻辑。
@@ -50,11 +54,30 @@ export function Prompt() {
     programmatic = false;
   };
 
-  const inputHeight = createMemo(() => {
-    const width = Math.max(20, dimensions().width - 52);
-    const rows = value()
+  const visualRowsForText = (text: string, width: number) =>
+    text
       .split("\n")
-      .reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / width)), 0);
+      .reduce((sum, line) => {
+        if (!line) return sum + 1;
+        return sum + Math.max(1, wrapAnsi(line, width, {
+          hard: true,
+          trim: false,
+          wordWrap: true,
+        }).split("\n").length);
+      }, 0);
+
+  const inputHeight = createMemo(() => {
+    const text = value();
+    if (!text) return 1;
+    const width = Math.max(1, textareaWidth() || dimensions().width - 48);
+    // EditorView 给真实渲染行数；wrapAnsi 估算用于删除收缩时兜底，
+    // 避免内部 viewport 偶尔晚一拍导致输入框残留空白行。
+    const estimatedRows = visualRowsForText(text, width);
+    const vlc = inputRef?.editorView.getTotalVirtualLineCount();
+    const rows =
+      typeof vlc === "number" && Number.isFinite(vlc) && vlc > 0
+        ? Math.min(vlc, estimatedRows)
+        : estimatedRows;
     return Math.max(1, Math.min(6, rows));
   });
 
@@ -65,6 +88,9 @@ export function Prompt() {
     { name: "return", shift: true, action: "newline" },
     { name: "kpenter", shift: true, action: "newline" },
     { name: "linefeed", shift: true, action: "newline" },
+    // Ctrl+A / Super+A 全选（终端原生只传 Ctrl+A，super 版本给 macOS 用）
+    { name: "a", ctrl: true, action: "select-all" },
+    { name: "a", super: true, action: "select-all" },
   ];
 
   // slash 面板：以 "/" 开头、无空格、未禁用时激活
@@ -211,6 +237,9 @@ export function Prompt() {
           focusedTextColor={theme.text}
           cursorColor={theme.primary}
           keyBindings={textareaKeyBindings}
+          onSizeChange={function () {
+            setTextareaWidth(Math.max(1, this.width));
+          }}
           onContentChange={() => {
             const v = inputRef?.plainText ?? "";
             setValue(v);

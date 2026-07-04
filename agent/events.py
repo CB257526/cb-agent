@@ -72,6 +72,7 @@ class TokenUsage:
     prompt_cache_hit_tokens: Optional[int] = None
     prompt_cache_miss_tokens: Optional[int] = None
     cache_hit_rate: Optional[float] = None
+    model: Optional[str] = None
     round_idx: int = 0
     timestamp: float = field(default_factory=_now)
     type: str = field(default="token_usage", init=False)

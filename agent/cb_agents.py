@@ -817,6 +817,7 @@ class CbAgentsLLM:
                 prompt_cache_hit_tokens=usage_dict.get("prompt_cache_hit_tokens"),
                 prompt_cache_miss_tokens=usage_dict.get("prompt_cache_miss_tokens"),
                 cache_hit_rate=usage_dict.get("cache_hit_rate"),
+                model=self.model,
                 round_idx=round_idx,
             ))
 
@@ -990,6 +991,7 @@ class CbAgentsLLM:
                 prompt_cache_hit_tokens=usage_dict.get("prompt_cache_hit_tokens"),
                 prompt_cache_miss_tokens=usage_dict.get("prompt_cache_miss_tokens"),
                 cache_hit_rate=usage_dict.get("cache_hit_rate"),
+                model=self.model,
                 round_idx=round_idx,
             ))
 

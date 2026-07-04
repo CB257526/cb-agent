@@ -145,6 +145,8 @@ class Gateway:
             self._handle_list_models(rpc_id)
         elif method == "session.set_model":
             self._handle_set_model(rpc_id, params)
+        elif method == "session.cache_stats":
+            self._handle_cache_stats(rpc_id)
         elif method == "session.approve_plan":
             self._handle_approve_plan(rpc_id)
         elif method == "session.reject_plan":
@@ -699,6 +701,28 @@ class Gateway:
             provider=model.get("provider"),
             context_window=context_window,
         ))
+        self.transport.write(make_response(rpc_id, result=payload))
+
+    def _handle_cache_stats(self, rpc_id: Any) -> None:
+        """返回今天的 prompt cache 命中统计。"""
+        if rpc_id is None:
+            return
+        metrics = getattr(self.session, "usage_metrics", None)
+        summarize_today = getattr(metrics, "summarize_today", None)
+        if not callable(summarize_today):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": "usage metrics unavailable"},
+            ))
+            return
+        try:
+            payload = summarize_today()
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
         self.transport.write(make_response(rpc_id, result=payload))
 
     def _handle_load_skill(self, rpc_id: Any, params: Dict[str, Any]) -> None:

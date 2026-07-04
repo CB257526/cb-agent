@@ -520,6 +520,26 @@ export interface ModelSwitchPayload {
   context_window?: ContextWindow | null;
 }
 
+export interface CacheStatsBucket {
+  model?: string | null;
+  requests: number;
+  supported_requests: number;
+  unsupported_requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cache_hit_tokens: number;
+  cache_denominator_tokens: number;
+  cache_hit_rate: number | null;
+}
+
+export interface CacheStatsPayload {
+  date: string;
+  path: string;
+  total: CacheStatsBucket;
+  models: CacheStatsBucket[];
+}
+
 export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought" | "plan";
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */
 export interface ChatItem {
@@ -566,7 +586,9 @@ export interface DialogOption {
 /** 浮层 Select 弹窗描述。/sessions /tools /mcp 等命令用它开小窗而非往对话流打印。 */
 export interface DialogSpec {
   title: string;
-  options: DialogOption[];
+  options?: DialogOption[];
+  /** Read-only content panel. If set, SelectDialog shows this instead of options. */
+  content?: string;
   /** Number of options visible at once; SelectDialog scrolls for the rest. */
   visibleCount?: number;
   /** 选中回调；弹窗在调用前已关闭。空列表时弹窗只展示标题与提示。 */

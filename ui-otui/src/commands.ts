@@ -11,7 +11,7 @@
 import type { Transport } from "./transport.js";
 import { basename } from "node:path";
 import { statSync } from "node:fs";
-import type { ChatItem, ContextWindow, MCPStatusPayload, PetState, PlanMode, PlanState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
+import type { CacheStatsBucket, ChatItem, ContextWindow, MCPStatusPayload, PetState, PlanMode, PlanState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
 import { readClipboardImageAttachment } from "./clipboardImage.js";
 
 export interface CommandCtx {
@@ -129,6 +129,28 @@ function formatTokenWindow(tokens: unknown): string {
   if (tokens >= 1000000) return `${(tokens / 1000000).toFixed(1)}M`;
   if (tokens >= 1000) return `${(tokens / 1000).toFixed(0)}k`;
   return `${Math.round(tokens)}`;
+}
+
+function formatCacheRate(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "N/A";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function formatCompactNumber(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "0";
+  if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`;
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return `${Math.round(value)}`;
+}
+
+function formatCacheBucketDescription(bucket: CacheStatsBucket): string {
+  const rate = formatCacheRate(bucket.cache_hit_rate);
+  const hit = formatCompactNumber(bucket.cache_hit_tokens);
+  const den = formatCompactNumber(bucket.cache_denominator_tokens);
+  const req = bucket.requests ?? 0;
+  const unsupported = bucket.unsupported_requests ?? 0;
+  const suffix = unsupported > 0 ? ` · unsupported ${unsupported}` : "";
+  return `hit ${rate} · ${hit}/${den} tokens · requests ${req}${suffix}`;
 }
 
 export const COMMANDS: readonly SlashCommand[] = [
@@ -308,6 +330,40 @@ export const COMMANDS: readonly SlashCommand[] = [
         });
       } catch (e) {
         appendSystem(`/model 失败：${(e as Error).message}`);
+      } finally {
+        setPending(null);
+      }
+    },
+  },
+  {
+    name: "/cache",
+    description: "查看今天 prompt cache 命中率",
+    handler: async ({ transport, appendSystem, openDialog, setPending }) => {
+      setPending("正在读取缓存命中统计…");
+      try {
+        const stats = await transport.cacheStats();
+        const options = [
+          {
+            name: "Total",
+            description: formatCacheBucketDescription(stats.total),
+            value: "__total__",
+          },
+          ...stats.models.map((item) => ({
+            name: String(item.model || "unknown"),
+            description: formatCacheBucketDescription(item),
+            value: String(item.model || "unknown"),
+          })),
+        ];
+        openDialog({
+          title: `Prompt cache ${stats.date}`,
+          options,
+          visibleCount: 5,
+        });
+        if (stats.total.requests === 0) {
+          appendSystem("今天还没有记录到 LLM usage。");
+        }
+      } catch (e) {
+        appendSystem(`/cache 失败：${(e as Error).message}`);
       } finally {
         setPending(null);
       }
