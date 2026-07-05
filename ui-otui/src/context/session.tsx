@@ -24,6 +24,7 @@ import { createStore, produce } from "solid-js/store";
 import { useTransport } from "./transport.js";
 import { findCommand, makeQueuedAttachment, type SlashCommand, type CommandCtx } from "../commands.js";
 import { readClipboardForPaste } from "../clipboardImage.js";
+import { appendOtuiDiagnostic } from "../diagnostics.js";
 import { HistoryStore } from "../historyStore.js";
 import type {
   AgentEvent,
@@ -147,6 +148,33 @@ function describeAutoCompact(e: any): string | null {
   if (historyEvents.length > 0) parts.push(`history ${historyEvents.length}`);
   if (parts.length === 0) parts.push("context guard");
   return `已自动压缩上下文：${parts.join("，")}，${contextText}。`;
+}
+
+function safeText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function safeRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (value === undefined || value === null || value === "") return {};
+  return { value: safeText(value) };
+}
+
+function safeNumber(value: unknown): number | undefined {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function safeArray<T = unknown>(value: unknown): T[] {
+  return Array.isArray(value) ? value as T[] : [];
 }
 
 interface SessionContextValue {
@@ -281,7 +309,7 @@ export function SessionProvider(props: ParentProps) {
     );
   };
 
-  const onEvent = (ev: AgentEvent) => {
+  const handleEvent = (ev: AgentEvent) => {
     const e = ev as any;
     switch (ev.type) {
       case "gateway_ready":
@@ -321,7 +349,7 @@ export function SessionProvider(props: ParentProps) {
 
       case "plan_delta":
         sawOutput = true;
-        appendPlanText(e.delta as string);
+        appendPlanText(safeText(e.delta));
         break;
 
       case "plan_ready":
@@ -335,7 +363,7 @@ export function SessionProvider(props: ParentProps) {
               s.items.push({
                 id: nextId(),
                 role: "plan",
-                text: String(e.plan ?? ""),
+                text: safeText(e.plan),
                 planStatus: "pending",
                 planRevision: e.plan_state?.pending_revision ?? e.plan_state?.revision ?? null,
               });
@@ -343,7 +371,7 @@ export function SessionProvider(props: ParentProps) {
             }
             const item = s.items.find((it) => it.id === id);
             if (item) {
-              item.text ||= String(e.plan ?? "");
+              item.text ||= safeText(e.plan);
               item.planStatus = "pending";
               item.planRevision = e.plan_state?.pending_revision ?? e.plan_state?.revision ?? null;
             }
@@ -387,12 +415,12 @@ export function SessionProvider(props: ParentProps) {
 
       case "text_delta":
         sawOutput = true;
-        appendAssistantText(e.delta as string);
+        appendAssistantText(safeText(e.delta));
         break;
 
       case "reasoning_delta":
         sawOutput = true;
-        appendThoughtText(e.delta as string);
+        appendThoughtText(safeText(e.delta));
         break;
 
       case "tool_start":
@@ -402,9 +430,9 @@ export function SessionProvider(props: ParentProps) {
           id: nextId(),
           role: "tool",
           text: "",
-          toolCallId: e.call_id,
-          toolName: e.name,
-          toolArgs: e.arguments,
+          toolCallId: safeText(e.call_id),
+          toolName: safeText(e.name || "unknown"),
+          toolArgs: safeRecord(e.arguments),
           toolDone: false,
           collapsed: true,
         });
@@ -428,9 +456,9 @@ export function SessionProvider(props: ParentProps) {
             }
             if (idx >= 0) {
               const it = s.items[idx];
-              it.toolResult = e.result;
-              it.toolDuration = e.duration_seconds;
-              it.toolError = e.is_error;
+              it.toolResult = safeText(e.result);
+              it.toolDuration = safeNumber(e.duration_seconds);
+              it.toolError = !!e.is_error;
               it.toolDone = true;
             }
           }),
@@ -438,15 +466,15 @@ export function SessionProvider(props: ParentProps) {
         break;
 
       case "token_usage":
-        setState("promptTokens", (p) => p + (e.prompt_tokens ?? 0));
-        setState("completionTokens", (c) => c + (e.completion_tokens ?? 0));
-        setState("cachedPromptTokens", (c) => c + (e.cached_prompt_tokens ?? e.prompt_cache_hit_tokens ?? 0));
+        setState("promptTokens", (p) => p + (safeNumber(e.prompt_tokens) ?? 0));
+        setState("completionTokens", (c) => c + (safeNumber(e.completion_tokens) ?? 0));
+        setState("cachedPromptTokens", (c) => c + (safeNumber(e.cached_prompt_tokens ?? e.prompt_cache_hit_tokens) ?? 0));
         break;
 
       case "todo_list_updated":
-        setState("todos", e.items ?? []);
+        setState("todos", safeArray<TodoItem>(e.items));
         // 沿用旧偏好：每次写入新增一张快照卡片，不去重
-        appendItem({ id: nextId(), role: "todo", text: "", todoItems: e.items ?? [] });
+        appendItem({ id: nextId(), role: "todo", text: "", todoItems: safeArray<TodoItem>(e.items) });
         break;
 
       case "mcp_status":
@@ -462,11 +490,11 @@ export function SessionProvider(props: ParentProps) {
           id: nextId(),
           role: "ask_question",
           text: "",
-          questionId: e.question_id,
-          question: e.question,
-          options: e.options,
-          multiSelect: e.multi_select,
-          recommendedIndex: e.recommended_index,
+          questionId: safeText(e.question_id),
+          question: safeText(e.question),
+          options: safeArray(e.options),
+          multiSelect: !!e.multi_select,
+          recommendedIndex: safeNumber(e.recommended_index) ?? null,
           allowOther: e.allow_other,
           answered: false,
         });
@@ -511,17 +539,27 @@ export function SessionProvider(props: ParentProps) {
         break;
 
       case "error":
-        appendSystem(`✗ ${e.where}: ${e.message}`);
+        appendSystem(`✗ ${safeText(e.where)}: ${safeText(e.message)}`);
         setState("busy", false);
         break;
 
       case "cancelled":
-        appendSystem(`⏸ 已中断 (${e.where})`);
+        appendSystem(`⏸ 已中断 (${safeText(e.where)})`);
         setState("busy", false);
         break;
 
       default:
         break;
+    }
+  };
+
+  const onEvent = (ev: AgentEvent) => {
+    try {
+      handleEvent(ev);
+    } catch (error) {
+      appendOtuiDiagnostic(`failed to handle agent event type=${(ev as any)?.type ?? "unknown"}`, error);
+      appendSystem(`UI 处理后端事件失败：${(error as Error).message}`);
+      setState("busy", false);
     }
   };
 
@@ -552,8 +590,8 @@ export function SessionProvider(props: ParentProps) {
     appendSystem(`协议解析错误：${err.message}（详情见 ${transport.stderrLogFile}）`);
   };
 
-  const onExit = (code: number | null) => {
-    appendSystem(`Python agent 进程退出 (code=${code ?? "?"})`);
+  const onExit = (code: number | null, signal?: NodeJS.Signals | null) => {
+    appendSystem(`Python agent 进程退出 (code=${code ?? "?"}${signal ? `, signal=${signal}` : ""})`);
     setState("exited", true);
   };
 

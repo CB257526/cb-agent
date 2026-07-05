@@ -118,9 +118,9 @@ def resolve_logging_settings(
     )
 
 
-def configure_logging(project_root: Path) -> LoggingSettings:
+def configure_logging(project_root: Path, workspace_root: Path | None = None) -> LoggingSettings:
     load_dotenv(project_root / ".env")
-    settings = resolve_logging_settings(project_root=project_root)
+    settings = resolve_logging_settings(project_root=workspace_root or project_root)
     settings.system_log_dir.mkdir(parents=True, exist_ok=True)
     settings.conversation_log_dir.mkdir(parents=True, exist_ok=True)
 

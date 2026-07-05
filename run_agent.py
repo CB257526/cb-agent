@@ -51,6 +51,13 @@ from typing import Any, Dict, List
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+APP_ROOT = Path(os.environ.get("CBAGENT_APP_ROOT") or _HERE).expanduser().resolve()
+WORKSPACE_ROOT = Path(os.environ.get("CBAGENT_WORKSPACE") or os.getcwd()).expanduser().resolve()
+try:
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chdir(WORKSPACE_ROOT)
+except Exception:
+    WORKSPACE_ROOT = Path.cwd().resolve()
 
 # Windows 控制台输出 UTF-8（避免 emoji/中文 GBK 异常）
 if sys.platform == "win32":
@@ -62,7 +69,7 @@ if sys.platform == "win32":
 
 from agent.logging_config import configure_logging
 
-_LOG_SETTINGS = configure_logging(Path(_HERE))
+_LOG_SETTINGS = configure_logging(APP_ROOT, workspace_root=WORKSPACE_ROOT)
 logger = logging.getLogger(__name__)
 
 from agent.cb_agents import CbAgentsLLM
@@ -100,6 +107,7 @@ from tools.tools.todo_tool import TodoTool
 from tools.tools.bash_tool import BashTool
 from tools.tools.bash_task_tool import BashTaskTool
 from tools.tools.bash_permission_tool import BashPermissionTool
+from tools.tools.bash_session import reset_session
 from tools.tools.file_read_tool import FileReadTool
 from tools.tools.load_image_tool import LoadImageTool
 from tools.tools.file_write_tool import FileWriteTool
@@ -116,6 +124,8 @@ try:
     _HAS_MCP = True
 except Exception:
     _HAS_MCP = False
+
+reset_session(str(WORKSPACE_ROOT))
 
 
 # 日志：默认只显示 WARNING 以上，避免被各模块的 INFO 刷屏
@@ -244,18 +254,18 @@ class AgentRunner:
 
         # 3b. Hook 管理器（读 .cbagent/hooks.json，可选；无配置时 enabled=False）。
         # 必须在 ToolExecutor 之前建好，作为 PreToolUse/PostToolUse 的拦截层透传进去。
-        hooks_cfg = load_hooks_config(Path(_HERE) / ".cbagent" / "hooks.json")
+        hooks_cfg = load_hooks_config(WORKSPACE_ROOT / ".cbagent" / "hooks.json")
         self.hook_manager = HookManager(
             hooks_cfg,
             event_bus=self.event_bus,
-            cwd=Path(_HERE),
+            cwd=WORKSPACE_ROOT,
         )
         if self.hook_manager.enabled:
             _info("已加载 hooks 配置")
 
         # 4. 工具调度器（依赖 event_bus）
-        self.subagent_registry = SubagentRegistry(Path(_HERE))
-        self.subagent_task_registry = SubagentTaskRegistry(Path(_HERE) / ".cbagent" / "subagents")
+        self.subagent_registry = SubagentRegistry(WORKSPACE_ROOT)
+        self.subagent_task_registry = SubagentTaskRegistry(WORKSPACE_ROOT / ".cbagent" / "subagents")
 
         self.executor = ToolExecutor(
             runner=self.registry.execute_tool,
@@ -272,7 +282,7 @@ class AgentRunner:
         # 普通 CLI/TUI 仍使用项目级 .cbagent/sessions；通讯平台的会话目录由
         # get_or_create_platform_session() 按群/好友另行创建。
         self.session = self._create_agent_session(
-            session_store=LocalSessionStore(Path(_HERE) / ".cbagent" / "sessions"),
+            session_store=LocalSessionStore(WORKSPACE_ROOT / ".cbagent" / "sessions"),
             message_logger_scope="main",
         )
 
@@ -361,7 +371,7 @@ class AgentRunner:
             parent_registry=self.registry,
             parent_event_bus=self.event_bus,
             hook_manager=self.hook_manager,
-            cwd=Path(_HERE),
+            cwd=WORKSPACE_ROOT,
             ctx_enabled=self.ctx_enabled,
             skill_manager=self._skill_manager,
             bash_prompt_provider=self._memory_prompt_provider,
@@ -399,7 +409,7 @@ class AgentRunner:
         - 群聊传入 None，使用临时内存 history，处理完对象释放，不写 transcript。
         """
 
-        memory_loader = MemoryLoader(cwd=Path(_HERE)) if self.ctx_enabled else None
+        memory_loader = MemoryLoader(cwd=WORKSPACE_ROOT) if self.ctx_enabled else None
         session = AgentSession(
             llm=self.llm,
             registry=self.registry,
@@ -431,7 +441,7 @@ class AgentRunner:
 
         safe_id = _safe_runtime_name(f"{conversation.kind}_{conversation.id}")
         return (
-            Path(_HERE)
+            WORKSPACE_ROOT
             / ".cbagent"
             / "platform_sessions"
             / _safe_runtime_name(conversation.platform)
@@ -506,7 +516,7 @@ class AgentRunner:
                 if not path.exists():
                     path.write_text(templates[name], encoding="utf-8")
 
-            short_term = get_short_term_memory_path(Path(_HERE))
+            short_term = get_short_term_memory_path(WORKSPACE_ROOT)
             short_term.parent.mkdir(parents=True, exist_ok=True)
             if not short_term.exists():
                 short_term.write_text(
@@ -516,7 +526,7 @@ class AgentRunner:
                     encoding="utf-8",
                 )
 
-            knowledge_root = get_knowledge_root(Path(_HERE))
+            knowledge_root = get_knowledge_root(WORKSPACE_ROOT)
             (knowledge_root / "pages").mkdir(parents=True, exist_ok=True)
         except Exception as e:
             _err(f"轻量记忆目录初始化失败(继续启动): {e}")

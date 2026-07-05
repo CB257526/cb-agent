@@ -36,7 +36,7 @@ export function ToolBlock(props: { item: ChatItem }) {
     const f = formatArgsFull(item().toolArgs);
     return f ? truncate(f, ARGS_MAX) : "";
   };
-  const result = () => item().toolResult ?? "";
+  const result = () => stringifyToolValue(item().toolResult ?? "");
   const renderResult = () => {
     const r = result();
     const display = extractDisplay(r) ?? r;
@@ -128,9 +128,27 @@ export function ToolBlock(props: { item: ChatItem }) {
 
 // ── 纯函数辅助（从旧 ToolBlock.tsx 移植，逻辑不变） ──
 
+function stringifyToolValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function entriesOfArgs(args?: Record<string, unknown>): Array<[string, unknown]> {
+  if (!args || typeof args !== "object") return [];
+  try {
+    return Object.entries(args);
+  } catch {
+    return [];
+  }
+}
+
 function summarizeArgs(args?: Record<string, unknown>): string {
-  if (!args) return "";
-  const entries = Object.entries(args);
+  const entries = entriesOfArgs(args);
   if (entries.length === 0) return "";
   const parts = entries.slice(0, 3).map(([k, v]) => `${k}=${formatValue(v)}`);
   if (entries.length > 3) parts.push("...");
@@ -147,8 +165,7 @@ function formatValue(v: unknown): string {
 }
 
 function formatArgsFull(args?: Record<string, unknown>): string {
-  if (!args) return "";
-  const entries = Object.entries(args);
+  const entries = entriesOfArgs(args);
   if (entries.length === 0) return "";
   if (entries.length === 1 && typeof entries[0][1] === "string") {
     return entries[0][1] as string;

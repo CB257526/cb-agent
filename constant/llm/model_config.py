@@ -205,7 +205,6 @@ class ModelConfigManager:
         roots: List[Path] = []
         if project_root is not None:
             roots.append(project_root)
-        roots.append(Path.cwd())
         package_root = Path(__file__).resolve().parents[2]
         roots.append(package_root)
 

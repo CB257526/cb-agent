@@ -151,6 +151,19 @@ class TestExecutorSerial(unittest.TestCase):
         self.assertEqual(completes[0].is_error, False)
         self.assertGreaterEqual(completes[0].duration_seconds, 0.0)
 
+    def test_tool_complete_event_stringifies_non_string_result(self):
+        def runner(name, args):
+            return {"ok": True, "tool": name}
+
+        ex = ToolExecutor(runner, self.bus)
+        results = ex.execute([_tc("bash")], round_idx=2)
+
+        completes = [e for e in self.events if isinstance(e, ToolComplete)]
+        self.assertEqual(len(completes), 1)
+        self.assertIsInstance(results[0].result, str)
+        self.assertIsInstance(completes[0].result, str)
+        self.assertEqual(json.loads(completes[0].result)["tool"], "bash")
+
     def test_runner_exception_caught(self):
         def runner(name, args):
             raise RuntimeError("boom")

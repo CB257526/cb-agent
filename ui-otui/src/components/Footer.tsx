@@ -25,6 +25,7 @@ function formatPercent(percent: number): string {
 }
 
 function shortSessionId(sessionId: string): string {
+  if (typeof sessionId !== "string") return String(sessionId ?? "");
   const parts = sessionId.split("_");
   if (parts.length >= 4) return `${parts[1]}_${parts[2]}_${parts[3]}`;
   return sessionId;

@@ -13,7 +13,7 @@
 
 import { createSignal, createMemo, Show } from "solid-js";
 import { wrapAnsi } from "bun";
-import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
+import { useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent, PasteEvent, TextareaRenderable } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
@@ -108,9 +108,9 @@ export function Prompt() {
     setHistoryIdx(-1);
   };
 
-  // 粘贴处理：真实终端的 Ctrl-V 会被解析成"括号粘贴"事件（onPaste），而不是
-  // ctrl+v 按键——所以之前监听 key.name==="v" 在真实终端永远收不到，只有
-  // 直接喂 \x16 字节的探针能触发（导致误判）。
+  // 粘贴处理：多数真实终端的 Ctrl-V/Cmd-V 会被解析成 bracketed paste
+  // 事件（onPaste），但不同终端/启动方式对剪贴板图片的行为不完全一致；
+  // useKeyboard 里仍保留快捷键兜底，直接读取系统剪贴板。
   //
   // 文本粘贴：event.bytes 解码出文本，textarea 默认行为会自动插入，这里不拦截。
   // 图片/文件粘贴：Windows Terminal 发来的是「空的」括号粘贴（bytes 为空或全空白），
@@ -133,8 +133,25 @@ export function Prompt() {
     });
   };
 
+  usePaste(handlePaste);
+
   useKeyboard((key: KeyEvent) => {
     if (disabled()) return;
+
+    const keyName = String(key.name || "").toLowerCase();
+    const keySequence = String((key as { sequence?: unknown }).sequence || "");
+    const isPasteShortcut =
+      keyName === "paste"
+      || ((key.ctrl || key.super || key.meta) && keyName === "v")
+      || keySequence === "\x16";
+    if (isPasteShortcut) {
+      key.preventDefault?.();
+      pasteFromClipboard((t) => {
+        if (!t) return;
+        setInputValue(value() + t);
+      });
+      return;
+    }
 
     if (key.name === "tab" && !slashActive()) {
       key.preventDefault?.();

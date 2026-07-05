@@ -15,8 +15,9 @@ from agent.event_bus import EventBus
 from agent.events import (
     Cancelled, ReasoningDelta, TextDelta, TokenUsage, ToolCallPlanned,
 )
-# 加载 .env 文件中的环境变量
-load_dotenv()
+# 加载安装目录中的 .env，避免全局 cbagent 启动时误读用户工作目录的 .env。
+_APP_ROOT = Path(os.environ.get("CBAGENT_APP_ROOT") or Path(__file__).resolve().parents[1]).expanduser().resolve()
+load_dotenv(_APP_ROOT / ".env")
 logger = logging.getLogger(__name__)
 
 LLM_CONSOLE_IO_ENV = "CBAGENT_LLM_CONSOLE_IO"

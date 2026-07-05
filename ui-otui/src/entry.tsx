@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { App } from "./app.js";
 import { Transport } from "./transport.js";
 import { win32DisableProcessedInput, win32InstallCtrlCGuard } from "./terminal-win32.js";
+import { appendOtuiDiagnostic, installProcessDiagnostics } from "./diagnostics.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -43,9 +44,15 @@ function resolvePython(projectRoot: string): string {
 async function main() {
   // ui-otui/src/entry.tsx → ui-otui/src → ui-otui → cb-agent
   const projectRoot = resolve(__dirname, "..", "..");
+  const workspaceCwd = resolve(process.env.CBAGENT_WORKSPACE || projectRoot);
+  installProcessDiagnostics(workspaceCwd);
   const python = resolvePython(projectRoot);
 
-  const transport = new Transport({ python, cwd: projectRoot });
+  const transport = new Transport({
+    python,
+    agentRoot: projectRoot,
+    workspaceCwd,
+  });
 
   const renderer = await createCliRenderer({
     exitOnCtrlC: false,
@@ -59,7 +66,10 @@ async function main() {
   // 该标志位关闭（setRawMode 切换 / 外部改回都会被重新清掉）。
   win32DisableProcessedInput();
   const unhookCtrlCGuard = win32InstallCtrlCGuard();
-  renderer.once("destroy", () => unhookCtrlCGuard?.());
+  renderer.once("destroy", () => {
+    appendOtuiDiagnostic("renderer destroyed");
+    unhookCtrlCGuard?.();
+  });
 
   render(() => <App transport={transport} />, renderer);
 }

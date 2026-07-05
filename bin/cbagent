@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  if [[ "$TARGET" == /* ]]; then
+    SOURCE="$TARGET"
+  else
+    SOURCE="$DIR/$TARGET"
+  fi
+done
+
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+AGENT_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+WORKSPACE="$(pwd -P)"
+VENV_ROOT=""
+if [ -x "$AGENT_ROOT/../venv/bin/python" ]; then
+  VENV_ROOT="$(cd "$AGENT_ROOT/../venv" >/dev/null 2>&1 && pwd)"
+elif [ -x "$AGENT_ROOT/venv/bin/python" ]; then
+  VENV_ROOT="$(cd "$AGENT_ROOT/venv" >/dev/null 2>&1 && pwd)"
+fi
+
+export CBAGENT_APP_ROOT="$AGENT_ROOT"
+export CBAGENT_WORKSPACE="$WORKSPACE"
+if [ -n "$VENV_ROOT" ]; then
+  export VIRTUAL_ENV="$VENV_ROOT"
+  export PATH="$VENV_ROOT/bin:$PATH"
+fi
+
+cd "$AGENT_ROOT/ui-otui"
+exec bun src/entry.tsx "$@"

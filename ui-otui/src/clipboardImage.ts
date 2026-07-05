@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, statSync, unlinkSync } from "node:fs";
-import { homedir, release } from "node:os";
+import { accessSync, constants, createWriteStream, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { release } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { QueuedAttachment } from "./types.js";
@@ -18,7 +18,7 @@ export type ClipboardPaste =
 let seq = 0;
 
 function attachmentPath(): string {
-  const dir = join(homedir(), ".cb-agent", "attachments");
+  const dir = join(process.env.CBAGENT_WORKSPACE || process.cwd(), ".cbagent", "attachments");
   mkdirSync(dir, { recursive: true });
   seq += 1;
   return join(dir, `clipboard-${Date.now()}-${seq}.png`);
@@ -63,6 +63,39 @@ function errorCode(error: unknown): number | null {
 function isWsl(): boolean {
   const osRelease = release().toLowerCase();
   return osRelease.includes("microsoft") || osRelease.includes("wsl");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function canExecute(path: string): boolean {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveCommand(command: string, fallbackDirs: string[] = []): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "sh",
+      ["-lc", `command -v ${shellQuote(command)}`],
+      { timeout: 2000 },
+    );
+    const resolved = stdout.trim().split(/\r?\n/)[0];
+    if (resolved) return resolved;
+  } catch {
+    // Fall through to common absolute locations.
+  }
+
+  for (const dir of fallbackDirs) {
+    const candidate = join(dir, command);
+    if (canExecute(candidate)) return candidate;
+  }
+  return null;
 }
 
 function cleanExecMessage(error: unknown): string {
@@ -189,17 +222,14 @@ $img.Dispose()
 }
 
 async function commandExists(command: string): Promise<boolean> {
-  try {
-    await execFileAsync("sh", ["-lc", `command -v ${command} >/dev/null 2>&1`], { timeout: 2000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return (await resolveCommand(command)) !== null;
 }
 
 async function readClipboardTextMac(): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync("pbpaste", [], { timeout: 4000 });
+    const pbpaste = await resolveCommand("pbpaste", ["/usr/bin"]);
+    if (!pbpaste) return null;
+    const { stdout } = await execFileAsync(pbpaste, [], { timeout: 4000 });
     return stdout.length > 0 ? stdout : null;
   } catch {
     return null;
@@ -207,10 +237,15 @@ async function readClipboardTextMac(): Promise<string | null> {
 }
 
 async function readClipboardImageMac(target: string): Promise<void> {
-  if (!(await commandExists("pngpaste"))) {
+  const pngpaste = await resolveCommand("pngpaste", [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/local/bin",
+  ]);
+  if (!pngpaste) {
     throw new Error("macOS 剪贴板图片需要安装 pngpaste，或改用 /attach <path>。");
   }
-  await execFileAsync("pngpaste", [target], { timeout: 8000 });
+  await execFileAsync(pngpaste, [target], { timeout: 8000 });
 }
 
 async function readClipboardTextLinux(): Promise<string | null> {

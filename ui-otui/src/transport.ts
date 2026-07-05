@@ -18,10 +18,23 @@
 import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { AgentEvent, CacheStatsPayload, CompactPayload, MCPStatusPayload, ModelListPayload, ModelSwitchPayload, PermissionMode, PetCommandResult, PetState, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
+import { appendOtuiDiagnostic } from "./diagnostics.js";
 
-export const RUN_AGENT_ARGS = ["run_agent.py", "--transport", "jsonrpc", "--memory-system", "light"];
+export function buildRunAgentArgs(agentRoot: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const args = [
+    join(agentRoot, "run_agent.py"),
+    "--transport",
+    "jsonrpc",
+    "--memory-system",
+    "light",
+  ];
+  if (isTruthyEnv(env.CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS)) {
+    args.push("--dangerously-skip-permissions");
+  }
+  return args;
+}
 export const STDERR_UI_LINE_MAX = 4000;
 
 export function defaultGatewayLogPath(cwd: string, now = Date.now()): string {
@@ -32,24 +45,27 @@ function isTruthyEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
 }
 
-export function buildRunAgentArgs(env: NodeJS.ProcessEnv = process.env): string[] {
-  const args = [...RUN_AGENT_ARGS];
-  if (isTruthyEnv(env.CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS)) {
-    args.push("--dangerously-skip-permissions");
-  }
-  return args;
-}
-
 function clipStderrForUi(line: string): string {
   if (line.length <= STDERR_UI_LINE_MAX) return line;
   const omitted = line.length - STDERR_UI_LINE_MAX;
   return `${line.slice(0, STDERR_UI_LINE_MAX)}…（实时日志已截断 ${omitted} 字符，完整内容见日志文件）`;
 }
 
+function pathWithPythonDir(python: string, env: NodeJS.ProcessEnv): string | undefined {
+  if (!isAbsolute(python)) return env.PATH;
+  const pythonDir = dirname(python);
+  const current = env.PATH ?? "";
+  return current ? `${pythonDir}${delimiter}${current}` : pythonDir;
+}
+
 export interface TransportOptions {
   /** Python 解释器路径。默认环境变量 CB_AGENT_PYTHON 或 "python"。 */
   python?: string;
-  /** run_agent.py 所在的工作目录。默认 ../（ui-tui 的父目录） */
+  /** cb-agent 安装目录，用于定位 run_agent.py。默认 ../（ui-tui 的父目录）。 */
+  agentRoot?: string;
+  /** 用户工作目录。Python 子进程从这里启动，项目级 .cbagent 状态也写到这里。 */
+  workspaceCwd?: string;
+  /** @deprecated 兼容旧调用；未提供 workspaceCwd/agentRoot 时同时作为两者默认值。 */
   cwd?: string;
   /** 额外环境变量 */
   env?: NodeJS.ProcessEnv;
@@ -60,7 +76,7 @@ export interface TransportOptions {
 export interface TransportEvents {
   event: (ev: AgentEvent) => void;
   response: (id: string | number, body: { result?: unknown; error?: { code: number; message: string } }) => void;
-  exit: (code: number | null) => void;
+  exit: (code: number | null, signal?: NodeJS.Signals | null) => void;
   /** 协议解析失败、stdout 出现非 JSON 行——通常是 Python 端漏了 stdout 重定向 */
   protocolError: (raw: string, err: Error) => void;
   /** Python 端的 stderr 一行（不含末尾换行）。同时还在写日志文件，事件只是给 UI 实时面板用。 */
@@ -78,40 +94,74 @@ export class Transport extends EventEmitter {
   private stderrBuf = "";
   private rpcCounter = 0;
   private stderrLogPath: string;
+  private closed = false;
 
   constructor(opts: TransportOptions = {}) {
     super();
     const python = opts.python ?? process.env.CB_AGENT_PYTHON ?? "python";
-    const cwd = opts.cwd ?? join(process.cwd(), "..");
+    const legacyRoot = opts.cwd ?? join(process.cwd(), "..");
+    const agentRoot = resolve(opts.agentRoot ?? legacyRoot);
+    const workspaceCwd = resolve(opts.workspaceCwd ?? process.env.CBAGENT_WORKSPACE ?? legacyRoot);
 
     // 解析 stderr 日志路径
-    const logsDir = join(cwd, ".cbagent", "logs", "system");
+    const logsDir = join(workspaceCwd, ".cbagent", "logs", "system");
     mkdirSync(logsDir, { recursive: true });
-    this.stderrLogPath = opts.stderrLog ?? defaultGatewayLogPath(cwd);
-    const childEnv = { ...process.env, ...opts.env, PYTHONIOENCODING: "utf-8" };
+    this.stderrLogPath = opts.stderrLog ?? defaultGatewayLogPath(workspaceCwd);
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...opts.env,
+      CBAGENT_APP_ROOT: agentRoot,
+      CBAGENT_WORKSPACE: workspaceCwd,
+      PYTHONIOENCODING: "utf-8",
+    };
+    childEnv.PATH = pathWithPythonDir(python, childEnv);
 
-    this.proc = spawn(python, buildRunAgentArgs(childEnv), {
-      cwd,
+    this.proc = spawn(python, buildRunAgentArgs(agentRoot, childEnv), {
+      cwd: workspaceCwd,
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    appendOtuiDiagnostic(`spawn python=${python} agentRoot=${agentRoot} workspace=${workspaceCwd}`);
 
     // stdout: NDJSON 协议
     this.proc.stdout.setEncoding("utf-8");
     this.proc.stdout.on("data", (chunk: string) => this.handleStdout(chunk));
+    this.proc.stdout.on("error", (err) => {
+      appendOtuiDiagnostic("python stdout stream error", err);
+      this.emit("protocolError", "stdout-error", err as Error);
+    });
 
     // stderr: 同时做两件事
     //   1. 全量写日志文件（保留最完整记录，事故归档）
     //   2. 行缓冲解析后 emit stderr 事件（UI 实时面板用，行内不带换行）
     const logStream = createWriteStream(this.stderrLogPath, { flags: "a" });
+    logStream.on("error", (err) => {
+      appendOtuiDiagnostic(`gateway stderr log write failed: ${this.stderrLogPath}`, err);
+      this.emit("stderr", `OTUI 日志写入失败：${(err as Error).message}`);
+    });
     this.proc.stderr.setEncoding("utf-8");
     this.proc.stderr.on("data", (chunk: string) => {
       logStream.write(chunk);
       this.handleStderr(chunk);
     });
+    this.proc.stderr.on("error", (err) => {
+      appendOtuiDiagnostic("python stderr stream error", err);
+      this.emit("stderr", `Python stderr stream error: ${(err as Error).message}`);
+    });
+    this.proc.stdin.on("error", (err) => {
+      appendOtuiDiagnostic("python stdin stream error", err);
+      this.emit("protocolError", "stdin-error", err as Error);
+    });
 
-    this.proc.on("exit", (code) => this.emit("exit", code));
+    this.proc.on("exit", (code, signal) => {
+      this.closed = true;
+      appendOtuiDiagnostic(`python process exit code=${code ?? "?"} signal=${signal ?? "none"}`);
+      logStream.end();
+      this.emit("exit", code, signal);
+    });
     this.proc.on("error", (err) => {
+      this.closed = true;
+      appendOtuiDiagnostic("python process spawn/runtime error", err);
       this.emit("protocolError", "spawn-failed", err);
     });
   }
@@ -162,7 +212,28 @@ export class Transport extends EventEmitter {
   private sendRpc(method: string, params: Record<string, unknown> = {}): string {
     const id = `r${++this.rpcCounter}`;
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
-    this.proc.stdin.write(msg);
+    const fail = (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      appendOtuiDiagnostic(`RPC ${method} write failed id=${id}`, error);
+      queueMicrotask(() => {
+        this.emit("response", id, {
+          error: { code: -32000, message: `Python agent 不可写入：${message}` },
+        });
+      });
+    };
+
+    if (this.closed || !this.proc.stdin.writable) {
+      fail(new Error("python process is not running"));
+      return id;
+    }
+
+    try {
+      this.proc.stdin.write(msg, (err) => {
+        if (err) fail(err);
+      });
+    } catch (error) {
+      fail(error);
+    }
     return id;
   }
 
@@ -302,6 +373,8 @@ export class Transport extends EventEmitter {
   }
 
   close(): void {
+    this.closed = true;
+    appendOtuiDiagnostic("transport close requested");
     try {
       this.proc.stdin.end();
     } catch { /* noop */ }

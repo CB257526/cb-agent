@@ -168,6 +168,16 @@ def _append_hook_context(result: str, context: str) -> str:
     return f"{result}\n\n[hook 注入上下文]\n{context}"
 
 
+def _stringify_tool_result(result: Any) -> str:
+    """Normalize arbitrary Tool.run return values before events/history see them."""
+    if isinstance(result, str):
+        return result
+    try:
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except Exception:
+        return str(result)
+
+
 # ========== 调度器 ==========
 
 
@@ -453,13 +463,7 @@ class ToolExecutor:
             )
             is_error = True
         duration = time.perf_counter() - start
-
-        if self._bus is not None:
-            self._bus.emit(ToolComplete(
-                call_id=call_id, name=name, result=result,
-                duration_seconds=duration, is_error=is_error,
-                round_idx=round_idx,
-            ))
+        result = _stringify_tool_result(result)
 
         # PostToolUse hook：工具成功执行后触发，可注入额外上下文给模型。
         # additional_context 追加进 result JSON 的约定字段 _hook_context，零协议改动：
@@ -503,6 +507,13 @@ class ToolExecutor:
                     "tool result persisted: name=%s call_id=%s dir=%s",
                     name, call_id, self._persist_dir,
                 )
+
+        if self._bus is not None:
+            self._bus.emit(ToolComplete(
+                call_id=call_id, name=name, result=result,
+                duration_seconds=duration, is_error=is_error,
+                round_idx=round_idx,
+            ))
 
         return ToolCallResult(
             call_id=call_id, name=name, arguments=args,

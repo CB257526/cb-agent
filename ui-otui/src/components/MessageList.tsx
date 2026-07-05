@@ -10,10 +10,11 @@
  * done 后用 markdown），所以 ItemRenderer 透传 isLast。
  */
 
-import { For, Switch, Match } from "solid-js";
+import { ErrorBoundary, For, Switch, Match } from "solid-js";
 import { SyntaxStyle } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
+import { appendOtuiDiagnostic } from "../diagnostics.js";
 import { ToolBlock } from "./ToolBlock.js";
 import { ReasoningBlock } from "./ReasoningBlock.js";
 import { TodoPanel } from "./TodoPanel.js";
@@ -105,6 +106,17 @@ function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
   );
 }
 
+function ItemError(props: { error: unknown }) {
+  const theme = useTheme();
+  const message = props.error instanceof Error ? props.error.message : String(props.error);
+  appendOtuiDiagnostic("message item render failed", props.error);
+  return (
+    <box paddingLeft={1} marginTop={1}>
+      <text fg={theme.error}>UI 渲染该消息失败：{message}</text>
+    </box>
+  );
+}
+
 export function MessageList() {
   const theme = useTheme();
   const { state } = useSession();
@@ -125,7 +137,9 @@ export function MessageList() {
       <box height={1} />
       <For each={state.items}>
         {(item, index) => (
-          <ItemRenderer item={item} isLast={index() === state.items.length - 1} />
+          <ErrorBoundary fallback={(error) => <ItemError error={error} />}>
+            <ItemRenderer item={item} isLast={index() === state.items.length - 1} />
+          </ErrorBoundary>
         )}
       </For>
     </scrollbox>
