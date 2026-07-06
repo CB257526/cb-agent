@@ -2,7 +2,7 @@
 
 把 LLM 一轮返回的 tool_calls 合理调度执行：
 - **全部是只读**（file_read / glob / grep / ls / search / bash_task list/output/wait）→ 线程池并发
-- **任一非只读**（bash / file_edit / file_write / todo / bash_permission / skill / MCP）→ 串行
+- **任一非只读**（bash / file_edit / file_write / todo / bash_permission / MCP）→ 串行
 
 为什么不更激进地"按工具组合"细判：
 - bash 命令的"是否只读"是命令文本动态决定的（cat 只读 vs rm 写），但 cb-agent
@@ -56,7 +56,6 @@ READ_ONLY_TOOLS: Set[str] = {
     "search",
     "rag",                 # 仅 query
     "memory_search",
-    "skill",               # 加载 SKILL.md 是读盘
 }
 
 # 纯读但需要二次判别 action 的工具

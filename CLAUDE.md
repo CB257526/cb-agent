@@ -72,11 +72,11 @@ user input → ContextBuilder (GSSC) → CbAgentsLLM.think (streaming FC)
 
 3. **`tools/` — Tool abstraction with two sources**
    - `tools/tool.py` defines the `Tool` ABC; `tools/toolRegistry.py` is the registry.
-   - Native tools live in `tools/tools/` (memory, rag, search, todo, skill, run_skill_script, bash). Each subclasses `Tool` and implements `get_parameters` / `validate_parameters` / `run`.
+   - Native tools live in `tools/tools/` (memory, rag, search, todo, bash, file tools, etc.). Each subclasses `Tool` and implements `get_parameters` / `validate_parameters` / `run`.
    - MCP tools come in via `tools/mcp_tools/mcptools_add.py:load_mcp_tools` — it reads `mcp.json`, launches each server, and **auto-expands every server's tool list into individual `MCPWrappedTool` instances** registered alongside native tools. The agent never sees the difference.
 
 4. **`skills/` — Prompt-as-Capability**
-   Skills are Markdown files with YAML frontmatter under `.cbagent/skills/<name>/SKILL.md`. `SkillManager` discovers them; the `SkillTool` (native tool) loads a skill's full body into the conversation when the LLM calls it; `RunSkillScriptTool` runs Python scripts bundled in the skill dir. Three-level lazy loading (manifest → body → referenced files) is the budget-saving mechanism — don't eagerly load skill bodies. Bundled examples: `pdf` (PDF ops) and `skill-creator` (meta).
+   Skills are Markdown files with YAML frontmatter under `.cbagent/skills/<name>/SKILL.md`. `SkillManager` discovers them and renders only a budgeted name/description/file index into context. Explicit `$skill` mentions inject the markdown body for the current turn; implicit use means the LLM reads the listed `SKILL.md` with `file_read`. Bundled scripts are run through `bash`, with script hits recorded after the fact.
 
 5. **`memory/` — Three-layer memory + multimodal RAG**
    - `memory/types/` — `episodic`, `semantic`, `working`, `perceptual` memory classes.
@@ -93,7 +93,7 @@ user input → ContextBuilder (GSSC) → CbAgentsLLM.think (streaming FC)
 | | Tool | MCP | Skill |
 |---|---|---|---|
 | What it is | Atomic Python function | External process speaking MCP | Markdown workflow + optional scripts |
-| How LLM uses it | OpenAI function call | OpenAI function call (wrapped) | Calls `skill` tool to load body, then uses other Tools to act |
+| How LLM uses it | OpenAI function call | OpenAI function call (wrapped) | Reads SKILL.md when the overview or `$skill` mention says it applies, then uses normal tools |
 | When to add one | New atomic capability in-process | Reusing an existing MCP server | Multi-step workflow you want the LLM to follow declaratively |
 
 Don't reach for a Skill when a Tool is enough, and don't reach for a Tool when an MCP server already exposes the capability.

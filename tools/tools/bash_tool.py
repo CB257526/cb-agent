@@ -19,6 +19,7 @@ import signal
 import subprocess
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from agent.cancel import get_current_cancel_token
@@ -156,6 +157,7 @@ class BashTool(Tool):
         permission: Optional[PermissionGate] = None,
         is_subagent: bool = False,
         question_channel: Optional[Any] = None,
+        skill_observer: Optional[Any] = None,
         dangerously_skip_permissions: bool = False,
         dangerously_skip_permissions_provider: Optional[Callable[[], bool]] = None,
     ):
@@ -189,6 +191,7 @@ class BashTool(Tool):
         if question_channel is not None and self._permission.question_channel is None:
             self._permission.question_channel = question_channel
         self._is_subagent = is_subagent
+        self._skill_observer = skill_observer
         # 危险模式由显式启动参数开启。开启后 BashTool 不做 fatal 拦截，也不走
         # PermissionGate 弹窗，所有命令直接交给系统 shell。warnings 仍会计算并写入
         # 结果，作为最基本的审计线索。
@@ -394,6 +397,9 @@ class BashTool(Tool):
                 }, ensure_ascii=False)
             permission_payload = _gate_result_to_dict(gate_res)
 
+        execution_cwd = self._effective_cwd(override_cwd)
+        skill_script_hits = self._record_skill_script_hits(command, execution_cwd)
+
         self._last_command = command
         t0 = time.perf_counter()
 
@@ -404,7 +410,14 @@ class BashTool(Tool):
 
         # 后台分支：暂沿用旧字典实现，commit 6 抽出到 BackgroundRegistry
         if run_in_background:
-            return self._run_background(command, shell, all_cmd, warnings, permission_payload)
+            return self._run_background(
+                command,
+                shell,
+                all_cmd,
+                warnings,
+                permission_payload,
+                skill_script_hits=skill_script_hits,
+            )
 
         # 前台同步
         proc = None
@@ -491,6 +504,7 @@ class BashTool(Tool):
             "background": False,
             "classification": classify_command(command),
             "warnings": warnings,
+            "skill_script_hits": skill_script_hits,
             "output_truncated": processed.output_truncated,
             "output_file": processed.output_file,
             "permission": permission_payload,
@@ -506,7 +520,15 @@ class BashTool(Tool):
 
     # ========== 后台执行（走 BackgroundRegistry） ==========
 
-    def _run_background(self, command, shell, all_cmd, warnings, permission_payload=None) -> str:
+    def _run_background(
+        self,
+        command,
+        shell,
+        all_cmd,
+        warnings,
+        permission_payload=None,
+        skill_script_hits=None,
+    ) -> str:
         registry = get_background_registry()
         task_id = uuid.uuid4().hex[:12]
         try:
@@ -524,6 +546,7 @@ class BashTool(Tool):
                 "background": False,
                 "classification": classify_command(command),
                 "warnings": warnings,
+                "skill_script_hits": skill_script_hits or [],
                 "permission": permission_payload,
                 "__display__": _build_bash_display(error_override=f"后台启动失败: {e}"),
             }, ensure_ascii=False)
@@ -544,11 +567,38 @@ class BashTool(Tool):
             "output_file": task.output_path,
             "classification": classify_command(command),
             "warnings": warnings,
+            "skill_script_hits": skill_script_hits or [],
             "permission": permission_payload,
             "__display__": _build_bash_display(
                 background=True, background_task_id=task.id,
             ),
         }, ensure_ascii=False)
+
+    def _effective_cwd(self, override_cwd: Optional[str]) -> str:
+        try:
+            if not override_cwd:
+                return self._session.cwd
+            path = Path(override_cwd)
+            if not path.is_absolute():
+                path = Path(self._session.cwd) / path
+            return str(path.resolve())
+        except Exception:
+            logger.exception("bash effective cwd resolution failed")
+            return self._session.cwd
+
+    def _record_skill_script_hits(self, command: str, cwd: str) -> list[dict[str, str]]:
+        observer = self._skill_observer
+        if observer is None:
+            return []
+        record = getattr(observer, "record_script_hits", None)
+        if not callable(record):
+            return []
+        try:
+            result = record(command, cwd=cwd)
+            return list(result or [])
+        except Exception:
+            logger.exception("skill script hit observer failed")
+            return []
 
 
 # 模块级单例

@@ -270,6 +270,7 @@ class ToolRegistry:
 
                     cloned.register_tool(BashTool(
                         is_subagent=True,
+                        skill_observer=getattr(tool, "_skill_observer", None),
                         dangerously_skip_permissions_provider=getattr(
                             tool,
                             "_dangerously_skip_permissions_provider",

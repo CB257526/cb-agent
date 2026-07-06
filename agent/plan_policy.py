@@ -36,7 +36,6 @@ PLAN_READ_TOOLS = {
     "ls",
     "my_advanced_search",
     "search",
-    "skill",
 }
 
 PLAN_READ_ACTIONS = {

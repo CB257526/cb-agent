@@ -1,1123 +1,247 @@
-# cb-agent Skills 系统设计与使用指南
+# cb-agent Skills 系统指南
 
-## 目录
+本文描述重构后的 Skill 系统。新的 Skill 不再是模型可调用工具，也不再有专门的脚本执行链；它是一份可发现、可按需读取的 Markdown 操作手册。
 
-1. [设计理念](#1-设计理念)
-2. [架构概览](#2-架构概览)
-3. [核心概念](#3-核心概念)
-4. [SKILL.md 文件格式](#4-skillmd-文件格式)
-5. [目录结构规范](#5-目录结构规范)
-6. [三级加载机制](#6-三级加载机制)
-7. [变量替换系统](#7-变量替换系统)
-8. [条件激活](#8-条件激活)
-9. [预算控制与使用追踪](#9-预算控制与使用追踪)
-10. [热重载](#10-热重载)
-11. [API 参考](#11-api-参考)
-12. [工具集成](#12-工具集成)
-13. [端到端使用示例](#13-端到端使用示例)
-14. [创建自定义 Skill](#14-创建自定义-skill)
-15. [设计决策与权衡](#15-设计决策与权衡)
-16. [v2 更新日志](#16-v2-更新日志)
+## 设计目标
 
----
+- 启动 prompt 只放轻量目录：`name`、`description`、`SKILL.md` 路径。
+- Skill 正文按需读取：显式 `$skill` 只注入当前轮，隐式使用由模型根据目录自行 `file_read`。
+- 脚本统一走 `bash`：SkillManager 只在 bash 执行后记录脚本命中，绝不替 agent 执行脚本。
+- 元数据保持克制：只消费 `name`、`description`、`metadata.short-description`。
+- 兼容旧资源布局：继续发现根目录 `*.md` 参考文档和 `scripts/` 脚本。
 
-## 1. 设计理念
+## 目录结构
 
-### Prompt as Capability（提示词即能力）
+推荐结构：
 
-cb-agent 的 Skills 系统采用 **"提示词即能力"** 的设计理念：
-
-- **Skill 不是 Tool**：Tool 是一个原子化的函数调用（如搜索、读文件）；Skill 是一个完整的工作流，由提示词、参考文档和可执行脚本组合而成。
-- **声明式定义**：Skill 用 Markdown + YAML frontmatter 声明，不需要写代码即可创建。
-- **上下文注入**：Skill 的核心机制是将 Markdown 提示词内容注入到对话上下文中，让 LLM 按照 Skill 定义的流程执行任务。
-- **渐进式加载**：采用三级加载策略，只在需要时加载完整内容，节省上下文窗口。
-
-### 与 Tool 的区别
-
-| 维度 | Tool | Skill |
-|------|------|-------|
-| 本质 | 函数调用 | 提示词指令 |
-| 定义方式 | Python 代码继承 Tool ABC | Markdown + YAML frontmatter |
-| 调用方式 | LLM 通过 function calling 执行 | LLM 读取指令后使用 Tool 执行 |
-| 返回值 | 执行结果字符串 | 指令文本（LLM 据此行动） |
-| 适用场景 | 原子操作（搜索、存储、计算） | 复杂工作流（PDF处理、代码审查） |
-
----
-
-## 2. 架构概览
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Skills 系统架构                          │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              Skill 来源层                            │    │
-│  │  .cbagent/skills/                                   │    │
-│  │  ├── pdf/SKILL.md                                   │    │
-│  │  ├── skill-creator/SKILL.md                         │    │
-│  │  └── my-custom-skill/SKILL.md                       │    │
-│  └─────────────────────┬───────────────────────────────┘    │
-│                        │                                    │
-│                        ▼                                    │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              SkillManager                           │    │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────────────┐    │    │
-│  │  │ 发现     │ │ 解析     │ │ 内容加载          │    │    │
-│  │  │ Discovery│ │ Parsing  │ │ Content Loading   │    │    │
-│  │  └──────────┘ └──────────┘ └──────────────────┘    │    │
-│  └─────────────────────┬───────────────────────────────┘    │
-│                        │                                    │
-│       ┌────────────────┼────────────────┐                   │
-│       ▼                ▼                ▼                   │
-│  ┌──────────┐   ┌──────────────┐  ┌──────────────┐         │
-│  │ L1 概览  │   │ L2 内容      │  │ L3 资源      │         │
-│  │ 系统提示词│   │ SkillTool    │  │ 脚本/文档    │         │
-│  │ 始终注入  │   │ 按需加载     │  │ 按需加载     │         │
-│  └──────────┘   └──────────────┘  └──────────────┘         │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              工具层                                  │    │
-│  │  SkillTool          RunSkillScriptTool              │    │
-│  │  (调用 Skill)        (执行 Skill 脚本)               │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. 核心概念
-
-### 3.1 Skill 的组成
-
-一个 Skill 由以下部分组成：
-
-```
+```text
 my-skill/
-├── SKILL.md          # 主文件（必需）：YAML frontmatter + Markdown 正文
-├── reference.md      # 参考文档（可选）：补充说明
-├── forms.md          # 参考文档（可选）：特定主题指南
-├── scripts/          # 可执行脚本目录（可选）
-│   ├── helper.py
-│   └── processor.py
-├── agents/           # 子 Agent 指令目录（可选）
-│   └── reviewer.md
-└── assets/           # 资源文件目录（可选）
-    └── template.html
+├── SKILL.md
+├── references/
+│   └── guide.md
+├── scripts/
+│   └── helper.py
+└── assets/
+    └── template.json
 ```
 
-### 3.2 三级加载模型
+兼容结构：
 
-| 级别 | 内容 | 加载时机 | 注入位置 |
-|------|------|----------|----------|
-| L1 | name + description + when_to_use | 每次请求 | 系统提示词 |
-| L2 | SKILL.md 正文 + 参考文档 | LLM 调用 SkillTool | 工具返回值 |
-| L3 | scripts/、agents/、assets/ | LLM 按需调用 | 工具执行 |
-
-### 3.3 执行流程
-
-```
-用户: "帮我填写这个PDF表单 /tmp/app.pdf"
-         │
-         ▼
-系统提示词中包含 L1 概览 (LLM 看到可用的 Skill 列表)
-         │
-         ▼
-LLM 判断: 用户请求匹配 "pdf" Skill
-         │
-         ▼
-LLM 调用: skill(name="pdf")
-         │
-         ▼
-SkillTool 返回 SKILL.md 正文 (7595 字符)
-  正文写着: "If you need to fill out a PDF form, read FORMS.md"
-         │
-         ▼
-LLM 判断: 用户要填写表单，需要查看 FORMS.md
-         │
-         ▼
-LLM 调用: skill(name="pdf", document="forms")
-         │
-         ▼
-SkillTool 返回 forms.md 内容 (11854 字符)
-         │
-         ▼
-LLM 按 forms.md 的指令执行:
-  1. 调用 run_skill_script 检查 PDF 是否有可填写字段
-  2. 分析表单结构
-  3. 使用 pypdf/pdf-lib 填写表单
+```text
+legacy-skill/
+├── SKILL.md
+├── forms.md
+└── scripts/
+    └── inspect.py
 ```
 
----
+`references/*.md` 是新推荐位置；Skill 根目录下除 `SKILL.md` 外的 `*.md` 仍会作为参考文档暴露，方便旧内置 Skill 不迁移也可用。
 
-## 4. SKILL.md 文件格式
+## SKILL.md 格式
 
-### 4.1 基本结构
+最小示例：
 
 ```markdown
 ---
-name: my-skill
-description: 一行描述这个 Skill 做什么
-when_to_use: 当用户要求做 X、Y、Z 时使用此 Skill
----
-
-# Skill 标题
-
-这里是 Skill 的正文内容，LLM 读取后会按照这些指令执行任务。
-
-## 步骤
-
-1. 首先分析用户需求
-2. 然后执行操作
-3. 最后验证结果
-```
-
-### 4.2 Frontmatter 字段详解
-
-#### 必需字段
-
-| 字段 | 类型 | 说明 | 示例 |
-|------|------|------|------|
-| `name` | string | Skill 标识符，kebab-case，最长 64 字符 | `pdf`, `code-review` |
-| `description` | string | 一行描述，最长 1024 字符，用于 L1 列表展示 | `处理PDF文件的各类操作` |
-
-#### 可选字段
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `when_to_use` | string | 空 | 详细的触发条件描述，帮助 LLM 判断何时调用 |
-| `allowed-tools` | list | null | 工具权限白名单，如 `["Read", "Write", "Bash"]` |
-| `arguments` | list | null | 声明的参数名，用于 `$arg` 变量替换 |
-| `argument-hint` | string | null | 参数提示文本，如 `"[file path]"` |
-| `model` | string | null | 模型覆盖，如 `"haiku"`, `"sonnet"` |
-| `user-invocable` | bool | true | 用户是否可通过 `/name` 调用 |
-| `disable-model-invocation` | bool | false | 禁止 LLM 自动调用 |
-| `license` | string | null | 许可证信息 |
-| `compatibility` | string | null | 依赖或兼容性说明 |
-| `paths` | list | null | 条件激活的 glob 模式，仅在操作匹配文件时激活 Skill |
-| `aliases` | list | null | Skill 的备用名称，可通过别名调用 |
-| `version` | string | null | Skill 版本号，如 `"1.0"`、`"2.3.1"` |
-
-#### 字段格式示例
-
-```yaml
----
 name: pdf
-description: 处理PDF文件的各类操作
-when_to_use: >
-  当用户提到PDF文件、需要提取PDF文本、合并/拆分PDF、
-  填写PDF表单、或进行PDF OCR时使用此Skill
-allowed-tools:
-  - Read
-  - Write
-  - Bash
-arguments:
-  - filename
-  - format
-argument-hint: "[filename] [--format=csv|json]"
-model: sonnet
-user-invocable: true
-disable-model-invocation: false
-license: MIT
----
-```
-
-### 4.3 Frontmatter 解析规则
-
-1. **分隔符**：以 `---` 开头和结尾
-2. **键值对**：`key: value` 格式，冒号后需有空格
-3. **列表**：以 `- ` 开头的行，归属最近的 key
-4. **长文本**：续行自动拼接到前一个 key 的值
-5. **引号**：值可以用 `"` 或 `'` 包裹，会被自动去除
-
-```yaml
-# 键值对
-name: pdf
-
-# 列表
-arguments:
-  - filename
-  - format
-
-# 长文本（续行拼接）
-description: This is a very long description that
-  spans multiple lines and will be joined together
-```
-
+description: Handle PDF inspection, extraction, form filling, and conversion tasks.
+metadata:
+  short-description: PDF workflows
 ---
 
-## 5. 目录结构规范
+# PDF Skill
 
-### 5.1 最简 Skill
-
-```
-.cbagent/skills/
-└── my-skill/
-    └── SKILL.md
+When the user asks to inspect or modify a PDF, follow these steps...
 ```
 
-### 5.2 带参考文档
+当前只消费这些字段：
 
-```
-.cbagent/skills/
-└── pdf/
-    ├── SKILL.md
-    ├── forms.md          # PDF 表单填写指南
-    └── reference.md      # 高级 PDF 处理参考
-```
+| 字段 | 用途 |
+|---|---|
+| `name` | Skill 正式名称。缺失时使用目录名兜底。 |
+| `description` | overview 中给模型匹配任务的描述。 |
+| `metadata.short-description` | `/skills` 等紧凑展示优先使用的短描述。 |
 
-### 5.3 带可执行脚本
+旧字段会被忽略，包括 `allowed_tools`、`arguments`、`aliases`、`paths`、`when_to_use`、`user_invocable`、`disable_model_invocation` 等。它们不会报错，但也不会影响发现、匹配或权限。
 
-```
-.cbagent/skills/
-└── pdf/
-    ├── SKILL.md
-    ├── reference.md
-    └── scripts/
-        ├── check_fillable_fields.py
-        ├── fill_pdf_form.py
-        └── extract_tables.py
-```
+frontmatter 使用 `pyyaml` 解析。若遇到 `description: Build for AWS: ECS` 这类未加引号的冒号值，解析失败后会自动做一次保守加引号修复再重试。
 
-### 5.4 完整 Skill
+## 发现顺序
 
-```
-.cbagent/skills/
-└── skill-creator/
-    ├── SKILL.md
-    ├── agents/
-    │   ├── grader.md
-    │   └── comparator.md
-    ├── scripts/
-    │   ├── run_eval.py
-    │   ├── improve_description.py
-    │   └── package_skill.py
-    ├── references/
-    │   └── schemas.md
-    └── assets/
-        └── eval_review.html
-```
+默认扫描顺序从低优先级到高优先级：
 
----
+1. 用户级：`$HOME/.agents/skills`
+2. 仓库级：`.agents/skills`
+3. 安装/项目级：`.cbagent/skills`
 
-## 6. 三级加载机制
+同名 Skill 后扫描者覆盖先扫描者。显式传入 `SkillManager(skills_dir=[...])` 时，完全按传入顺序覆盖。
 
-### 6.1 L1: 概览（始终注入）
+扫描规则：
 
-L1 内容在每次请求时注入系统提示词，让 LLM 知道有哪些 Skill 可用。
+- 递归查找大写 `SKILL.md`。
+- 最大深度为 6。
+- 单个根最多扫描 2000 个目录。
+- 找到一个 `SKILL.md` 后不再深入该 Skill 目录，避免把 `references/` 或 `scripts/` 误当嵌套 Skill。
 
-**生成方式**：`SkillManager.build_skills_overview()`
+## Prompt Overview
 
-**输出格式**：
+`SkillManager.build_skills_overview()` 生成注入 system prompt 的轻量目录，格式类似：
 
-```
+```text
 <available-skills>
-以下 Skill 可通过 Skill 工具调用：
-
-- pdf: Use this skill whenever the user wants to do anything with PDF files...
-- skill-creator: Create new skills, modify and improve existing skills...
-
-当用户请求匹配某个 Skill 的使用场景时，使用 Skill 工具调用对应的 Skill。
+Skills are local markdown operating manuals...
+- pdf: Handle PDF tasks (file: /path/to/.cbagent/skills/pdf/SKILL.md)
+- skill-creator: Create or update skills (file: /path/to/.cbagent/skills/skill-creator/SKILL.md)
 </available-skills>
 ```
 
-**注入位置**：系统提示词的末尾
+overview 会告诉模型：
 
-### 6.2 L2: 正文（按需加载）
+- 看到匹配 description 的任务时，读取列出的 `SKILL.md`。
+- 相对路径从该 Skill 目录解析。
+- bundled scripts 使用 `bash` 执行。
+- 不存在 `skill` 或 `run_skill_script` 工具。
 
-当 LLM 调用 `SkillTool` 时，**只返回 SKILL.md 正文**（经过变量替换），不包含参考文档。
+预算按上下文窗口约 2% 计算，并按五级降级：
 
-**生成方式**：`SkillManager.load_skill_content(name, args)`
+1. 完整描述
+2. 截断描述
+3. 省略描述
+4. 路径别名
+5. 只提示数量和裁剪警告
 
-**设计理由**：SKILL.md 正文中通常会指引 LLM 按需读取特定参考文档（如 "如需高级功能请参阅 REFERENCE.md"、"如需填写表单请阅读 FORMS.md"）。LLM 阅读正文后自行判断是否需要加载参考文档，避免一次性加载全部内容浪费 token。
+## 显式触发
 
-**返回格式**：
+显式触发会把对应 `SKILL.md` 正文包装成 `<skill>...</skill>`，只追加到当前轮 LLM user content；历史里仍保存用户原文，避免长期膨胀。
 
-```
-## Skill: pdf
+支持形式：
 
-# PDF Processing Guide
-
-## Overview
-This guide covers essential PDF processing operations...
-For advanced features, see REFERENCE.md. If you need to fill out a PDF form, read FORMS.md.
-
-[可用参考文档: forms, reference — 如需查看，调用 Skill 工具并指定 document 参数]
-```
-
-### 6.3 参考文档（按需加载）
-
-当 LLM 判断需要查看某个参考文档时，通过 SkillTool 的 `document` 参数加载。
-
-**调用方式**：`skill(name="pdf", document="forms")`
-
-**生成方式**：`SkillManager.load_skill_reference(name, reference_name)`
-
-**返回内容**：指定的单个参考文档的完整内容。
-
-### 6.4 L3: 资源（按需加载）
-
-| 资源类型 | 访问方式 | 说明 |
-|----------|----------|------|
-| scripts/*.py | `RunSkillScriptTool` | 通过子进程执行 |
-| agents/*.md | `Skill.get_agents()` | 子 Agent 指令 |
-| assets/* | `Skill.skill_dir / "assets"` | 文件路径引用 |
-
-### 6.5 加载流程示例
-
-```
-用户: "帮我填写这个PDF表单 /tmp/app.pdf"
-  │
-  ▼
-LLM 看到 L1 概览，判断匹配 "pdf" Skill
-  │
-  ▼
-LLM 调用: skill(name="pdf")
-  │         返回 SKILL.md 正文 (7595 字符)
-  │         正文写着: "If you need to fill out a PDF form, read FORMS.md"
-  │
-  ▼
-LLM 判断需要表单填写指南
-  │
-  ▼
-LLM 调用: skill(name="pdf", document="forms")
-  │         返回 forms.md (11854 字符)
-  │
-  ▼
-LLM 按 forms.md 的指令，调用 run_skill_script 执行脚本
+```text
+请用 $pdf 处理这个文件
+请参考 [$pdf](/path/to/.cbagent/skills/pdf/SKILL.md)
 ```
 
-**Token 对比**：
-- 旧方案（一次性加载）：44156 字符
-- 新方案（按需加载）：7595 + 11854 = 19449 字符（节省 56%）
+规则：
 
----
+- `$name` 先按正式名称精确匹配。
+- 若正式名称不存在，再按 plain name 匹配 `namespace:name` 的最后一段。
+- plain name 必须唯一，否则不匹配。
+- Markdown 链接形式路径优先；路径解析失败后才用链接文字里的名称兜底。
 
-## 7. 变量替换系统
+用户入口仍保留：
 
-### 7.1 支持的变量
+- `/skills`
+- `/skill NAME [args]`
+- `/NAME [args]`
+- `session.load_skill`
 
-| 变量 | 替换为 | 示例 |
-|------|--------|------|
-| `$arg_name` | 声明的参数值 | `$filename` -> `test.pdf` |
-| `$ARGUMENTS` | 所有参数的原始字符串 | `$ARGUMENTS` -> `--filename=test.pdf --format=json` |
-| `${SKILL_DIR}` | Skill 目录的绝对路径 | `${SKILL_DIR}` -> `/path/to/.cbagent/skills/pdf` |
+这些入口不再检查 `user_invocable`，因为该字段已经不参与新系统。
 
-### 7.2 参数解析
+## 正文渲染
 
-参数字符串支持两种格式：
+`Skill.render(args)` 只保留两个兼容替换：
 
-#### key=value 格式
+| 占位符 | 替换值 |
+|---|---|
+| `$ARGUMENTS` | 显式加载时传入的参数字符串 |
+| `${SKILL_DIR}` | Skill 目录绝对路径 |
+
+正文返回值不包含 YAML frontmatter。`load_skill_content()` 会额外加上 source、references、script_files 清单，帮助模型正确定位资源。
+
+## 参考文档
+
+`Skill.get_reference_paths()` 会发现：
+
+- `references/*.md`
+- Skill 根目录下除 `SKILL.md` 外的 `*.md`
+
+如果两处有同名 stem，后扫描的 `references/*.md` 会覆盖根目录同名文档。模型通常应直接用 `file_read` 读取 overview 或 `<skill-source>` 中列出的文件。
+
+## 脚本执行
+
+Skill 脚本必须通过 `bash` 工具执行，例如：
+
+```text
+python ${SKILL_DIR}/scripts/inspect.py /tmp/input.pdf
+bash ${SKILL_DIR}/scripts/prepare.sh
+node ${SKILL_DIR}/scripts/report.js
+```
+
+`BashTool` 可注入 `skill_observer=SkillManager`。bash 执行命令时，observer 会识别 `python`、`bash`、`sh`、`node` 等运行器后面的脚本路径；如果路径位于某个已安装 Skill 的 `scripts/` 目录下，就记录一次轻量命中。
+
+记录行为：
+
+- 不改变 bash stdout/stderr/exit_code 语义。
+- 不触发二次加载 Skill。
+- JSON 结果中可附带 `skill_script_hits`，用于测试和调试。
+- subagent registry clone 出来的 `bash` 会继承同一个 observer。
+
+## 主要 API
+
+`Skill` 只保留轻量字段：
 
 ```python
-args = '--filename="test.pdf" --format="json"'
-# 解析结果: {"filename": "test.pdf", "format": "json"}
-```
-
-支持的格式：
-- `--key=value`
-- `--key="value with spaces"`
-- `--key='value with spaces'`
-- `--key=value_without_quotes`
-
-#### 原始字符串
-
-如果参数中没有 `--key=value` 格式，整个字符串作为 `$ARGUMENTS` 的值。
-
-### 7.3 SKILL.md 中使用变量
-
-```markdown
----
-name: process-file
-description: 处理指定文件
-arguments:
-  - filename
-  - format
----
-
-请处理文件: $filename
-
-输出格式: $format
-
-所有参数: $ARGUMENTS
-
-脚本位于: ${SKILL_DIR}/scripts/process.py
-```
-
-调用时：
-
-```python
-skill.render(args='--filename="data.csv" --format="json"')
-# 输出:
-# 请处理文件: data.csv
-# 输出格式: json
-# 所有参数: --filename="data.csv" --format="json"
-# 脚本位于: /path/to/skills/process-file/scripts/process.py
-```
-
----
-
-## 8. 条件激活
-
-### 8.1 概念
-
-条件激活允许 Skill 声明 glob 模式，仅在用户操作匹配文件时出现在 L1 概览中。这可以减少无关 Skill 的噪音，提高 LLM 的选择准确率。
-
-**声明 `paths` 的 Skill**：仅在文件路径匹配时激活。
-
-**未声明 `paths` 的 Skill**：始终激活（向后兼容）。
-
-### 8.2 使用 `paths` frontmatter
-
-```yaml
----
-name: pdf
-description: 处理PDF文件的各类操作
-paths:
-  - "*.pdf"
-  - "*.PDF"
----
-```
-
-支持多种格式：
-- 逗号分隔：`paths: "*.py, *.ts, *.js"`
-- YAML 列表：`paths:\n  - "*.py"\n  - "*.ts"`
-- 支持 `**` 递归匹配：`paths: "src/**/*.ts"`
-
-### 8.3 工作原理
-
-`SkillManager.build_skills_overview(file_paths=["/tmp/app.pdf"])` 被调用时：
-
-1. 对每个 Skill 调用 `matches_paths(file_paths)`
-2. 使用 Python `fnmatch` 进行 glob 匹配
-3. 先匹配完整路径，再匹配文件名
-4. `paths=None` 的 Skill 始终返回 `True`
-
-### 8.4 提取文件路径
-
-`SkillManager.extract_file_paths(messages)` 从最近 5 条对话消息中提取文件路径，供条件激活过滤使用。
-
-```python
-# 使用示例
-file_paths = SkillManager.extract_file_paths(messages)
-overview = manager.build_skills_overview(file_paths=file_paths)
-```
-
----
-
-## 9. 预算控制与使用追踪
-
-### 9.1 预算控制 L1 概览
-
-L1 概览注入到每次对话的系统提示词中，消耗上下文窗口。`build_skills_overview` 限制输出在 `max_chars` 以内（默认 2000 字符，约 500 tokens，即 200K 上下文窗口的 1%）。
-
-**三级降级策略**：
-
-| 级别 | 格式 | 触发条件 |
-|------|------|----------|
-| full | `- name: description — when_to_use` | 总长度 ≤ max_chars |
-| compact | `- name: 截断到80字符的 description` | full 超出预算 |
-| name_only | `- name` | compact 超出预算 |
-
-```python
-# 默认使用
-overview = manager.build_skills_overview()
-
-# 自定义预算
-overview = manager.build_skills_overview(max_chars=1000)
-
-# 按模型上下文窗口计算
-overview = manager.build_skills_overview_for_model(
-    model_context_window=100000  # 100K tokens
+Skill(
+    name="pdf",
+    description="...",
+    body="...",
+    skill_dir=Path("..."),
+    short_description="PDF workflows",
 )
 ```
 
-### 9.2 使用频率追踪
-
-系统自动记录 Skill 调用，按使用频率排序 L1 列表，常用 Skill 优先展示。
-
-**追踪机制**：
-- `SkillTool.run()` 中自动调用 `record_usage(name)`
-- 60 秒防抖：同一 Skill 60 秒内多次调用只记录一次
-- 30 天清理：超过 30 天的记录自动删除
-
-**排序算法**：指数衰减，7 天半衰期。
-
-```
-score = Σ exp(-decay * age)
-decay = ln(2) / 7天
-```
-
-- 7 天前使用 1 次：score ≈ 0.5
-- 今天使用 1 次：score ≈ 1.0
-- 从未使用：score = 0.0
-
-在 `build_skills_overview` 和 `match_skill` 中，候选 Skill 按 score 降序排列。
-
-### 9.3 API
-
-```python
-# 记录使用（SkillTool 自动调用，通常无需手动调用）
-manager.record_usage("pdf")
-
-# 获取分数
-score = manager.get_usage_score("pdf")  # -> float
-
-# 预算概览
-overview = manager.build_skills_overview(
-    file_paths=["/tmp/app.pdf"],
-    max_chars=2000,
-)
-
-# 按模型上下文窗口计算
-overview = manager.build_skills_overview_for_model(
-    model_context_window=200000,
-    file_paths=["/tmp/app.pdf"],
-)
-```
-
----
-
-## 10. 热重载
-
-### 10.1 概念
-
-Skill 开发过程中，修改 SKILL.md 后无需重启应用。系统通过比较文件的 mtime 自动检测变更并重载。
-
-### 10.2 使用
-
-```python
-# 在每次对话轮次前调用
-if manager.check_for_changes():
-    print("Skill 文件已更新，已自动重载")
-```
-
-`check_for_changes()` 做以下工作：
-1. 遍历 skills_dir 下的每个子目录
-2. 比较 SKILL.md 的当前 mtime 与缓存值
-3. 如有变更，清空 skills 字典并重新扫描
-
-### 10.3 性能
-
-- 每次调用只做 `stat()` 系统调用，非常轻量
-- 无需守护线程或文件监视器
-- 无额外依赖（不依赖 watchdog 等库）
-
----
-
-## 11. API 参考
-
-### 11.1 Skill 类
-
-```python
-from skills import Skill
-
-# 属性
-skill.name                    # str: Skill 名称
-skill.description             # str: 一行描述
-skill.when_to_use             # str: 详细触发条件
-skill.body                    # str: SKILL.md 正文
-skill.skill_dir               # Path: Skill 目录路径
-skill.allowed_tools           # list|None: 工具白名单
-skill.arguments               # list|None: 声明的参数
-skill.model                   # str|None: 模型覆盖
-skill.user_invocable          # bool: 用户可否调用
-skill.disable_model_invocation # bool: 禁止 LLM 调用
-
-# 方法
-skill.to_metadata_string()    # -> str: L1 表示
-skill.render(args="")         # -> str: 渲染正文（变量替换）
-skill.get_references()        # -> dict[str, str]: 参考文档
-skill.get_scripts()           # -> dict[str, Path]: 脚本路径
-skill.get_agents()            # -> dict[str, str]: 子 Agent 指令
-```
-
-### 11.2 SkillManager 类
-
-```python
-from skills import SkillManager
-from pathlib import Path
-
-# 初始化（默认扫描 .cbagent/skills/）
-manager = SkillManager()
-
-# 指定目录
-manager = SkillManager(skills_dir=Path("/path/to/skills"))
-
-# 发现与查询
-manager.list_skills()                     # -> list[Skill]: 所有 Skill
-manager.get_skill("pdf")                  # -> Skill|None: 按名称获取
-
-# 内容生成
-manager.build_skills_overview()           # -> str: L1 概览
-manager.load_skill_content("pdf")         # -> str: L2 正文（不含参考文档）
-manager.load_skill_content("pdf", args="file.pdf")  # -> str: 带参数的 L2 正文
-
-# 参考文档加载
-manager.load_skill_reference("pdf", "forms")       # -> str: 单个参考文档内容
-manager.load_skill_reference("pdf", "reference")   # -> str: 单个参考文档内容
-
-# 匹配（降级方案）
-manager.match_skill("帮我处理PDF")        # -> str|None: 匹配的 Skill 名称
-```
-
-### 11.3 SkillExecutor 类
-
-```python
-from skills import SkillExecutor
-from pathlib import Path
-
-# 初始化
-executor = SkillExecutor(timeout=60)  # 超时时间（秒）
-
-# 执行脚本
-executor.run_script(
-    script_path=Path("scripts/process.py"),
-    args=["--input=file.pdf"],
-    stdin_data=None
-)
-
-# 带上下文执行（JSON 通过 stdin 传入）
-executor.run_script_with_context(
-    script_path=Path("scripts/process.py"),
-    context={"filename": "test.pdf", "format": "json"},
-    args=["--verbose"]
-)
-```
-
----
-
-## 12. 工具集成
-
-### 12.1 SkillTool
-
-让 LLM 通过 function calling 调用 Skill。
-
-```python
-from tools.tools.skill_tool import SkillTool
-from skills import SkillManager
-
-manager = SkillManager()
-tool = SkillTool(manager)
-
-# 注册到 ToolRegistry
-registry.register_tool(tool)
-```
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `skill` | string | 是 | Skill 名称 |
-| `args` | string | 否 | 传给 Skill 的参数 |
-| `document` | string | 否 | 要加载的参考文档名称（不含 .md）。省略则加载 SKILL.md 正文 |
-
-**调用示例**：
-
-```python
-# 加载 SKILL.md 正文
-tool.run({"skill": "pdf"})
-
-# 加载指定参考文档
-tool.run({"skill": "pdf", "document": "forms"})
-
-# 带参数加载
-tool.run({"skill": "pdf", "args": "--filename=report.pdf"})
-```
-
-**返回值**：SKILL.md 正文（不含参考文档），或指定的参考文档内容
-
-### 12.2 RunSkillScriptTool
-
-让 LLM 执行 Skill 捆绑的 Python 脚本。
-
-```python
-from tools.tools.run_skill_script_tool import RunSkillScriptTool
-from skills import SkillManager, SkillExecutor
-
-manager = SkillManager()
-executor = SkillExecutor()
-tool = RunSkillScriptTool(manager, executor)
-
-# 注册到 ToolRegistry
-registry.register_tool(tool)
-```
-
-**参数**：
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `skill_name` | string | 是 | Skill 名称 |
-| `script_name` | string | 是 | 脚本名称（不含 .py） |
-| `args` | array | 否 | 命令行参数 |
-| `stdin_data` | string | 否 | stdin 数据 |
-
----
-
-## 13. 端到端使用示例
-
-### 13.1 基本使用
-
-```python
-from skills import SkillManager, SkillExecutor
-from tools.tools.skill_tool import SkillTool
-from tools.tools.run_skill_script_tool import RunSkillScriptTool
-from tools.toolRegistry import ToolRegistry
-
-# 1. 初始化
-manager = SkillManager()
-executor = SkillExecutor()
-
-# 2. 注册工具
-registry = ToolRegistry()
-registry.register_tool(SkillTool(manager))
-registry.register_tool(RunSkillScriptTool(manager, executor))
-
-# 3. 构建系统提示词
-base_prompt = "你是一个有用的助手。"
-system_prompt = base_prompt + "\n\n" + manager.build_skills_overview()
-
-# 4. 调用 LLM
-from agent.cb_agents import CbAgentsLLM
-llm = CbAgentsLLM()
-
-messages = [
-    {"role": "system", "content": system_prompt},
-    {"role": "user", "content": "帮我处理这个PDF文件 /tmp/app.pdf"}
-]
-
-[msg, tool_calls] = llm.think(
-    messages,
-    tools=registry.get_tools_description_openai_schema()
-)
-```
-
-### 13.2 完整 Agent 循环
-
-```python
-from skills import SkillManager, SkillExecutor
-from tools.tools.skill_tool import SkillTool
-from tools.tools.run_skill_script_tool import RunSkillScriptTool
-from tools.tools.search import SearchTool
-from tools.toolRegistry import ToolRegistry
-from agent.cb_agents import CbAgentsLLM
-
-# 初始化
-manager = SkillManager()
-executor = SkillExecutor()
-registry = ToolRegistry()
-registry.register_tool(SearchTool())
-registry.register_tool(SkillTool(manager))
-registry.register_tool(RunSkillScriptTool(manager, executor))
-llm = CbAgentsLLM()
-
-# 构建系统提示词
-system_prompt = "你是一个有用的助手。\n\n" + manager.build_skills_overview()
-
-# Agent 循环
-messages = [{"role": "system", "content": system_prompt}]
-
-while True:
-    user_input = input("用户: ")
-    if user_input.lower() in ("exit", "quit"):
-        break
-
-    messages.append({"role": "user", "content": user_input})
-
-    # 调用 LLM
-    [msg, tool_calls] = llm.think(
-        messages,
-        tools=registry.get_tools_description_openai_schema()
-    )
-
-    # 处理工具调用
-    if tool_calls:
-        for tc in tool_calls:
-            result = registry.execute_tool(tc["name"], tc["arguments"])
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": result
-            })
-
-        # LLM 处理工具结果
-        [msg, tool_calls] = llm.think(
-            messages,
-            tools=registry.get_tools_description_openai_schema()
-        )
-
-    # 输出回复
-    print(f"助手: {msg}")
-    messages.append({"role": "assistant", "content": msg})
-```
-
-### 13.3 手动加载 Skill
-
-```python
-from skills import SkillManager
-
-manager = SkillManager()
-
-# 获取 pdf skill 的完整内容
-content = manager.load_skill_content("pdf")
-print(content)
-
-# 带参数加载
-content = manager.load_skill_content("pdf", args="--filename=report.pdf")
-print(content)
-
-# 获取 Skill 对象
-skill = manager.get_skill("pdf")
-
-# 访问资源
-refs = skill.get_references()     # {"forms": "...", "reference": "..."}
-scripts = skill.get_scripts()     # {"check_fillable_fields": Path(...)}
-agents = skill.get_agents()       # {"grader": "..."}
-```
-
----
-
-## 14. 创建自定义 Skill
-
-### 14.1 最简示例
-
-创建文件 `.cbagent/skills/hello/SKILL.md`：
-
-```markdown
----
-name: hello
-description: 向用户打招呼并提供帮助
-when_to_use: 当用户说"你好"、"hello"或初次见面时
----
-
-# 打招呼
-
-请用中文向用户问好，语气友好热情。
-
-然后询问有什么可以帮助的，并简要介绍你的能力。
-```
-
-### 14.2 带参数的 Skill
-
-创建文件 `.cbagent/skills/code-review/SKILL.md`：
-
-```markdown
----
-name: code-review
-description: 代码审查工具
-when_to_use: 当用户要求审查代码、进行 code review 时
-arguments:
-  - target
-  - focus
-argument-hint: "[file or directory] [--focus=security|performance|style]"
-allowed-tools:
-  - Read
-  - Glob
-  - Grep
----
-
-# 代码审查
-
-请对以下目标进行代码审查: $target
-
-审查重点: $focus
-
-## 审查步骤
-
-1. 使用 Glob 工具找到相关文件
-2. 使用 Read 工具读取代码内容
-3. 使用 Grep 工具搜索潜在问题
-4. 按以下维度进行审查:
-   - 代码风格一致性
-   - 潜在的 bug
-   - 性能问题
-   - 安全漏洞
-5. 输出审查报告，包含:
-   - 问题列表（按严重程度排序）
-   - 修复建议
-   - 总体评价
-
-如需执行静态分析脚本，使用 run_skill_script 工具:
-- skill_name: code-review
-- script_name: static_analysis
-```
-
-### 14.3 带脚本的 Skill
-
-创建目录结构：
-
-```
-.cbagent/skills/pdf-processor/
-├── SKILL.md
-├── reference.md
-└── scripts/
-    ├── extract_text.py
-    └── merge_pdfs.py
-```
-
-SKILL.md:
-
-```markdown
----
-name: pdf-processor
-description: PDF文件处理工具
-when_to_use: 当用户需要处理PDF文件时
-arguments:
-  - filename
----
-
-# PDF 处理器
-
-请处理文件: $filename
-
-## 可用脚本
-
-使用 run_skill_script 工具执行以下脚本:
-
-1. **extract_text** - 提取PDF文本
-   ```
-   skill_name: pdf-processor
-   script_name: extract_text
-   args: [$filename]
-   ```
-
-2. **merge_pdfs** - 合并多个PDF
-   ```
-   skill_name: pdf-processor
-   script_name: merge_pdfs
-   args: [file1.pdf, file2.pdf, --output=merged.pdf]
-   ```
-
-详细用法参考 ${SKILL_DIR}/reference.md
-```
-
-scripts/extract_text.py:
-
-```python
-"""提取 PDF 文本"""
-import sys
-from pypdf import PdfReader
-
-def main():
-    if len(sys.argv) < 2:
-        print("用法: python extract_text.py <pdf_file>")
-        sys.exit(1)
-
-    filename = sys.argv[1]
-    reader = PdfReader(filename)
-
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text()
-        print(f"=== Page {i+1} ===")
-        print(text)
-        print()
-
-if __name__ == "__main__":
-    main()
-```
-
-### 14.4 Skill 创建清单
-
-- [ ] 创建目录 `.cbagent/skills/<skill-name>/`
-- [ ] 编写 `SKILL.md`，包含必需的 `name` 和 `description`
-- [ ] 添加 `when_to_use` 以提高触发准确率
-- [ ] 如果需要参数，声明 `arguments` 并在正文中使用 `$arg_name`
-- [ ] 如果需要执行脚本，创建 `scripts/` 目录
-- [ ] 如果需要补充文档，创建参考 *.md 文件
-- [ ] 运行测试验证 Skill 能被正确发现和加载
-
----
-
-## 15. 设计决策与权衡
-
-### 15.1 为什么用 SkillTool 而不是被动注入？
-
-**方案对比**：
-
-| 方案 | 优点 | 缺点 |
-|------|------|------|
-| 关键词匹配 + 被动注入 | 无额外 API 调用 | 匹配不准确，浪费上下文 |
-| LLM 匹配 + 被动注入 | 匹配准确 | 多一次 API 调用 |
-| **SkillTool（采用）** | LLM 自主判断，准确 | 无额外缺点 |
-
-**结论**：SkillTool 让 LLM 根据 L1 概览自主判断是否需要调用某个 Skill，比任何自动匹配算法都更准确，且与 function-calling 架构天然契合。
-
-### 15.2 为什么不引入 PyYAML？
-
-Frontmatter 格式只有 6 个已知字段，且都是简单的 key-value 或列表。逐行解析足以满足需求，避免引入额外依赖。
-
-### 15.3 三级加载的必要性
-
-- **L1 必须始终注入**：否则 LLM 不知道有哪些 Skill 可用
-- **L2 按需加载**：一个 Skill 的完整内容可能有数百行，全部注入会浪费上下文
-- **L3 资源独立**：脚本通过工具执行，文档按需读取
-
-### 15.4 变量替换 vs 模板引擎
-
-使用简单的字符串替换而非 Jinja2 等模板引擎：
-
-- Skill 正文是给 LLM 看的，不需要复杂逻辑
-- 减少依赖
-- 简单可预测
-
-### 15.5 降级匹配保留
-
-### 15.6 布尔值解析规则变更（v2）
-
-v2 收紧布尔解析：只接受 `true` / `"true"`。旧版接受的 `yes`、`1`、`on` 不再视为 `True`。对齐 Claude Code 的做法，避免意外激活。
-
-如确实需要 `true` 语义，请使用 `true` 格式（不加引号）或 `"true"` 格式（加引号）。
-
-### 15.7 条件激活 vs 始终注入
-
-条件激活 (`paths`) 可以减少 L1 噪音，但需要正确声明路径模式。对于通用 Skill（如问候 Skill）不应声明 paths，始终激活即可。
-
-### 15.8 预算控制的必要性
-
-随着 Skill 数量增长，L1 列表可能占用大量上下文。1% 上下文窗口预算（约 500 tokens）确保 Skill 列表不会挤压对话空间。三级降级策略在极端情况下仍保证可用性。
-
-`match_skill()` 方法保留作为无 function-calling 场景的降级方案：
-
-- 某些模型不支持 function calling
-- 某些场景需要预判 Skill 以优化提示词构建
-- 关键词匹配零成本，可作为快速预筛选
-
----
-
-## 16. v2 更新日志
-
-### 新增字段
-
-| 字段 | 说明 |
-|------|------|
-| `paths` | 条件激活的 glob 模式列表，仅在操作匹配文件时激活 Skill |
-| `aliases` | 备用名称列表，可通过别名调用 Skill |
-| `version` | Skill 版本号字符串 |
-
-### 新增功能
-
-| 功能 | 位置 | 说明 |
-|------|------|------|
-| 条件激活 | `Skill.matches_paths()` | 基于 fnmatch 的 glob 匹配，支持路径和文件名两种匹配方式 |
-| 预算控制 L1 | `SkillManager.build_skills_overview(max_chars=N)` | 三级降级：full → compact → name_only |
-| 按模型窗口计算 | `SkillManager.build_skills_overview_for_model(context_window=N)` | 自动按 1% 上下文窗口计算 max_chars |
-| 文件路径提取 | `SkillManager.extract_file_paths(messages)` | 从对话消息中提取文件路径用于条件激活 |
-| 使用频率追踪 | `SkillManager.record_usage(name)` | 60s 防抖，30 天清理 |
-| 使用分数计算 | `SkillManager.get_usage_score(name)` | 7 天半衰期指数衰减，L1 按分数排序 |
-| 热重载 | `SkillManager.check_for_changes()` | 基于 mtime 的轮询检测，无额外依赖 |
-| 别名匹配 | `SkillManager.match_skill()` | 关键词匹配同时检查 aliases |
-| 别名查找 | `SkillManager.get_skill(name)` | 通过别名查找 Skill |
-
-### 行为变更
-
-| 变更 | 旧行为 | 新行为 |
-|------|--------|--------|
-| 布尔解析 | `true`/`yes`/`1`/`"true"` 均视为 True | 仅 `true` / `"true"` 视为 True |
-| L1 排序 | 按发现顺序 | 按使用分数降序 |
-| `match_skill` 排序 | 按发现顺序匹配 | 按使用分数降序，优先推荐常用 Skill |
-
-### 与旧版的兼容性
-
-- 现有 Skill 无需修改，`paths=None` 的 Skill 始终激活
-- `build_skills_overview()` 无参数调用完全兼容旧版行为（默认 max_chars=2000）
-- 不记录使用则分数为 0.0，排序结果不变
-- 旧版接受的 `yes`/`1`/`on` 不再解析为 True，但现有的 pdf 和 skill-creator 均未使用布尔字段
+常用方法：
+
+| API | 说明 |
+|---|---|
+| `skill.render(args="")` | 渲染正文并替换 `$ARGUMENTS`、`${SKILL_DIR}`。 |
+| `skill.get_reference_paths()` | 返回参考文档路径。 |
+| `skill.get_script_paths()` | 返回 `scripts/` 下脚本路径。 |
+| `manager.list_skills()` | 返回当前唯一 Skill 列表。 |
+| `manager.get_skill(name)` | 按正式名称精确获取 Skill。 |
+| `manager.resolve_mention(name)` | 解析 `$name`，支持唯一 plain name。 |
+| `manager.resolve_path(path)` | 通过文件路径反查所属 Skill。 |
+| `manager.collect_explicit_mentions(text)` | 从用户文本提取显式 Skill。 |
+| `manager.build_skills_overview(max_chars=N)` | 构建预算内 prompt 目录。 |
+| `manager.load_skill_content(name, args="")` | 加载并包装 Skill 正文。 |
+| `manager.load_skill_reference(name, reference_name)` | 兼容入口，读取参考文档。 |
+| `manager.record_script_hits(command, cwd=...)` | 识别并记录 bash 脚本命中。 |
+
+## 已移除接口
+
+这些接口在新架构中不存在：
+
+- `skills.skill_executor.SkillExecutor`
+- `tools.tools.skill_tool.SkillTool`
+- `tools.tools.run_skill_script_tool.RunSkillScriptTool`
+- 模型侧 `skill` 工具
+- 模型侧 `run_skill_script` 工具
+- `SkillManager.match_skill()`
+- 基于 `paths`、`aliases`、`allowed_tools`、`user_invocable` 的旧匹配和权限行为
+
+如果某个旧 Skill 正文里仍写着“调用 run_skill_script”，应改成“使用 bash 执行 scripts/ 下的脚本”。
+
+## 创建新 Skill 检查表
+
+- 创建目录 `.agents/skills/<name>/` 或 `.cbagent/skills/<name>/`。
+- 创建 `SKILL.md`，只依赖 `name`、`description`、可选 `metadata.short-description`。
+- 把长参考资料放到 `references/*.md`。
+- 把可执行辅助脚本放到 `scripts/`。
+- 在正文里明确说明脚本如何通过 `bash` 调用。
+- 避免把大量正文塞进 `description`；description 用于发现，正文用于操作。
+- 通过 `/skills` 或 `session.load_skill` 确认可发现。
+
+## 测试建议
+
+重点覆盖：
+
+- frontmatter 冒号修复。
+- 旧字段被忽略。
+- 多根目录覆盖顺序。
+- overview 预算降级。
+- `$name` 和 `[$name](path)` 显式触发。
+- Markdown 链接路径优先。
+- 正文不含 frontmatter。
+- `references/` 与根目录 `*.md` 兼容发现。
+- 覆盖同名 Skill 后旧 `scripts/` 目录不再命中。
+- bash `skill_script_hits` 只作为轻量调试 payload。

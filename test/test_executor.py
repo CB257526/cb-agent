@@ -766,18 +766,6 @@ class TestPlatformToolPermission(unittest.TestCase):
         self.assertTrue(payload["permission_denied"])
         self.assertIn("不是只读白名单", payload["error"])
 
-    def test_run_skill_script_is_denied_for_non_root(self):
-        calls, results = self._run_as_sender(
-            "200",
-            "run_skill_script",
-            '{"skill":"demo","script":"run.py"}',
-            env={"QQ_ROOT_USERS": "100"},
-        )
-        self.assertEqual(calls, [])
-        payload = json.loads(results[0].result)
-        self.assertTrue(payload["permission_denied"])
-        self.assertIn("skill 脚本", payload["error"])
-
     def test_public_mcp_allowed_sensitive_mcp_denied(self):
         calls, results = self._run_as_sender(
             "200",

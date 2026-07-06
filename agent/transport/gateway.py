@@ -765,16 +765,6 @@ class Gateway:
                     },
                 ))
                 return
-            if not skill.user_invocable:
-                self.transport.write(make_response(
-                    rpc_id,
-                    error={
-                        "code": _ERR_INVALID_PARAMS,
-                        "message": f"Skill '{skill.name}' 不允许用户通过 slash 命令手动触发",
-                    },
-                ))
-                return
-            manager.record_usage(skill.name)
             content = manager.load_skill_content(skill.name, args)
         except Exception as e:
             self.transport.write(make_response(

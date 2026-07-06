@@ -824,7 +824,7 @@ class AgentSession:
                     cwd=Path.cwd(),
                     memory_loader=self.memory_loader if self.ctx_enabled else None,
                     mcp_clients=self.mcp_clients,
-                    skill_commands=self._collect_skill_commands(),
+                    skill_commands=[],
                     language=self.language,
                     memory_query=memory_query,
                 )
@@ -912,18 +912,6 @@ class AgentSession:
             dicts.append(item)
         drop_orphan_tool_messages(dicts)
         return dicts
-
-    def _collect_skill_commands(self) -> List[Any]:
-        """从 SkillManager 收集 skill 命令,失败返回空列表。"""
-        if self.skill_manager is None:
-            return []
-        try:
-            list_fn = getattr(self.skill_manager, "list_commands", None)
-            if callable(list_fn):
-                return list(list_fn() or [])
-        except Exception:
-            logger.exception("skill_manager.list_commands 调用失败")
-        return []
 
     def _enabled_tools_for_prompt(self) -> List[str]:
         """返回当前模式下应暴露给 LLM 的工具名列表。
@@ -1088,6 +1076,7 @@ class AgentSession:
         persistent_user_text: Optional[str] = None,
     ) -> str:
         chat_started = time.perf_counter()
+        explicit_skill_query = user_query
         # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
         user_query = self._prepend_runtime_notifications(user_query)
 
@@ -1136,6 +1125,10 @@ class AgentSession:
         ) # 处理多模态输入，生成请求内容和历史文本
         request_content = multimodal_prompt.request_content
         history_user_text = multimodal_prompt.history_text
+        request_content = self._append_explicit_skill_content(
+            request_content,
+            explicit_skill_query,
+        )
         logger.info(
             "chat prepare: multimodal processed attachments=%s elapsed=%.2fs",
             len(multimodal_prompt.attachments),
@@ -1571,6 +1564,35 @@ class AgentSession:
             ))
         except Exception:
             logger.exception("context_window_updated emit failed")
+
+    def _append_explicit_skill_content(self, request_content: Any, user_text: str) -> Any:
+        """Append explicitly mentioned skill manuals to this turn only."""
+
+        if self.skill_manager is None or not isinstance(user_text, str):
+            return request_content
+        try:
+            skills = self.skill_manager.collect_explicit_mentions(user_text)
+        except Exception:
+            logger.exception("explicit skill mention collection failed")
+            return request_content
+        if not skills:
+            return request_content
+
+        blocks: list[str] = []
+        for skill in skills:
+            try:
+                blocks.append(self.skill_manager.load_skill_content(skill.name))
+            except Exception:
+                logger.exception("explicit skill load failed: %s", skill.name)
+        if not blocks:
+            return request_content
+
+        skill_context = "\n\n".join(blocks)
+        if isinstance(request_content, str):
+            return f"{request_content}\n\n{skill_context}"
+        if isinstance(request_content, list):
+            return [*request_content, {"type": "text", "text": skill_context}]
+        return request_content
 
     # ---------- 三级阈值常量 ----------
 
@@ -2620,7 +2642,7 @@ class AgentSession:
 
         if self.skill_manager is not None:
             try:
-                skill_budget = max(3000, min(8000, int(self._model_max_tokens() * 0.01 * 4)))
+                skill_budget = max(3000, min(16000, int(self._model_max_tokens() * 0.02 * 4)))
                 overview = self.skill_manager.build_skills_overview(max_chars=skill_budget)
                 if overview:
                     parts.append("")

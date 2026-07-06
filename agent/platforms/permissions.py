@@ -161,9 +161,6 @@ def sensitive_tool_reason(tool_name: str, arguments: Dict[str, Any]) -> str:
             return "grep(output_mode=content) 会外发本地文件匹配内容"
         return ""
 
-    if name == "run_skill_script":
-        return "run_skill_script 会执行本地 skill 脚本"
-
     if name == "bash":
         return _sensitive_bash_reason(args)
 
