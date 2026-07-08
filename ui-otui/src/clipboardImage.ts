@@ -69,6 +69,10 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+function appleScriptQuote(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 function canExecute(path: string): boolean {
   try {
     accessSync(path, constants.X_OK);
@@ -236,16 +240,61 @@ async function readClipboardTextMac(): Promise<string | null> {
   }
 }
 
-async function readClipboardImageMac(target: string): Promise<void> {
+async function readClipboardImageMacWithOsascript(target: string): Promise<void> {
+  const osascript = await resolveCommand("osascript", ["/usr/bin"]);
+  if (!osascript) {
+    throw new Error("未找到 macOS 系统命令 osascript");
+  }
+
+  // 优先使用 macOS 自带剪贴板能力，避免用户为了图片粘贴额外安装 pngpaste。
+  await execFileAsync(osascript, [
+    "-e",
+    'set imageData to the clipboard as "PNGf"',
+    "-e",
+    `set targetPath to ${appleScriptQuote(target)}`,
+    "-e",
+    "set fileRef to open for access POSIX file targetPath with write permission",
+    "-e",
+    "set eof fileRef to 0",
+    "-e",
+    "write imageData to fileRef",
+    "-e",
+    "close access fileRef",
+  ], { timeout: 8000 });
+}
+
+async function readClipboardImageMacWithPngpaste(target: string): Promise<void> {
   const pngpaste = await resolveCommand("pngpaste", [
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/opt/local/bin",
   ]);
   if (!pngpaste) {
-    throw new Error("macOS 剪贴板图片需要安装 pngpaste，或改用 /attach <path>。");
+    throw new Error("未找到 pngpaste");
   }
   await execFileAsync(pngpaste, [target], { timeout: 8000 });
+}
+
+async function readClipboardImageMac(target: string): Promise<void> {
+  let osascriptError: unknown = null;
+  try {
+    await readClipboardImageMacWithOsascript(target);
+    return;
+  } catch (error) {
+    osascriptError = error;
+    // osascript 失败时可能留下空文件；先清理，再交给 pngpaste 兜底。
+    cleanup(target);
+  }
+
+  try {
+    await readClipboardImageMacWithPngpaste(target);
+  } catch (pngpasteError) {
+    const osascriptMessage = cleanExecMessage(osascriptError);
+    const pngpasteMessage = cleanExecMessage(pngpasteError);
+    throw new Error(
+      `macOS 剪贴板图片读取失败：${osascriptMessage}；pngpaste 兜底也不可用：${pngpasteMessage}。请先复制一张图片，或使用 /attach <path>。`,
+    );
+  }
 }
 
 async function readClipboardTextLinux(): Promise<string | null> {
