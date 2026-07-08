@@ -8,10 +8,10 @@
  */
 
 import type { Transport } from "./transport.js";
-import { basename } from "node:path";
+import { basename, win32 } from "node:path";
 import { statSync } from "node:fs";
 import type { Dispatch, SetStateAction } from "react";
-import type { ChatItem, ContextWindow, MCPStatusPayload, PetState, PlanMode, PlanState, QueuedAttachment, SessionPayload } from "./types.js";
+import type { ChatItem, ContextWindow, MCPStatusPayload, PlanMode, PlanState, QueuedAttachment, SessionPayload } from "./types.js";
 import { readClipboardImageAttachment } from "./clipboardImage.js";
 
 export interface CommandCtx {
@@ -35,8 +35,6 @@ export interface CommandCtx {
   openSessionSwitcher: () => void;
   /** 切换后端日志面板 */
   toggleActivity: () => void;
-  /** 更新桌宠附属状态，供 /pet 命令和事件同步使用。 */
-  setPetState: (state: PetState | null) => void;
   /** 更新 Plan Mode 状态。 */
   setPlanState?: (state: PlanState | null) => void;
   /** 切换 Plan/Execute mode。 */
@@ -89,6 +87,8 @@ function nextAttachmentId(): string {
 
 export function makeQueuedAttachment(path: string, source: QueuedAttachment["source"] = "direct"): QueuedAttachment {
   const cleanPath = path.trim().replace(/^["']|["']$/g, "");
+  // 终端可能在 macOS/Linux 上输入 Windows 路径，basename 对反斜杠不敏感时用 win32 规则兜底。
+  const fileName = basename(cleanPath);
   let size: number | null = null;
   try {
     const st = statSync(cleanPath);
@@ -100,7 +100,7 @@ export function makeQueuedAttachment(path: string, source: QueuedAttachment["sou
     id: nextAttachmentId(),
     path: cleanPath,
     source,
-    fileName: basename(cleanPath) || cleanPath,
+    fileName: (fileName === cleanPath ? win32.basename(cleanPath) : fileName) || cleanPath,
     size,
   };
 }
@@ -295,19 +295,6 @@ export const COMMANDS: readonly SlashCommand[] = [
         appendSystem("Usage: /plan [status|mode <plan|execute>|approve|reject <feedback>]");
       } catch (e) {
         appendSystem(`/plan failed: ${(e as Error).message}`);
-      }
-    },
-  },
-  {
-    name: "/pet",
-    description: "管理轻量桌宠 runtime 与宠物包",
-    handler: async ({ transport, args, appendSystem, setPetState }) => {
-      try {
-        const result = await transport.runPetCommand(args);
-        setPetState(result.state ?? null);
-        if (result.text) appendSystem(result.text);
-      } catch (e) {
-        appendSystem(`✗ /pet 失败：${(e as Error).message}`);
       }
     },
   },

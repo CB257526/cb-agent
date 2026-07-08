@@ -233,8 +233,6 @@ describe("Transport answerQuestion RPC", () => {
     t.switchSession("session_20260602_120000_abcdef12");
     t.compactSession();
     t.mcpStatus();
-    t.getPetState();
-    t.runPetCommand("show");
 
     const messages = written.map((line) => JSON.parse(line.trim()));
     expect(messages[0].method).toBe("session.list_sessions");
@@ -245,10 +243,6 @@ describe("Transport answerQuestion RPC", () => {
     expect(messages[3].params).toEqual({});
     expect(messages[4].method).toBe("session.mcp_status");
     expect(messages[4].params).toEqual({});
-    expect(messages[5].method).toBe("pet.get_state");
-    expect(messages[5].params).toEqual({});
-    expect(messages[6].method).toBe("pet.command");
-    expect(messages[6].params).toEqual({ args: "show" });
   });
 
   it("serializes load skill RPC", () => {

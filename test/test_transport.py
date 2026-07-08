@@ -40,7 +40,6 @@ from agent.executor import ToolExecutor
 from agent.session import AgentSession
 from agent.transport import Gateway, StdioTransport, make_event_message, make_response
 from agent.work_context import LocalSessionStore
-from agent.pet import PetManager
 from constant.llm.constant_llm import ConstantLLM
 from core.message import Message
 from skills.skill_manager import SkillManager
@@ -181,7 +180,6 @@ def _make_session_for_gateway(
     mcp_status_provider=None,
     mcp_background_loader=None,
     skill_manager=None,
-    pet_manager=None,
 ):
     bus = EventBus()
     reg = MagicMock()
@@ -194,7 +192,6 @@ def _make_session_for_gateway(
         llm=llm, registry=reg, executor=ex, event_bus=bus,
         memory_loader=None, skill_manager=skill_manager, ctx_enabled=False,
         session_store=session_store,
-        pet_manager=pet_manager,
     )
     if mcp_status_provider is not None:
         s.mcp_status_provider = mcp_status_provider
@@ -257,8 +254,7 @@ class TestGatewayDispatch(unittest.TestCase):
                                 wait_done: bool = False, session_store=None,
                                 mcp_status_provider=None,
                                 mcp_background_loader=None,
-                                skill_manager=None,
-                                pet_manager=None) -> List[Dict[str, Any]]:
+                                skill_manager=None) -> List[Dict[str, Any]]:
         """起 gateway，把 msgs 一行行喂进 stdin，等收到至少 wait_for 条 stdout 行
         （或看到 done 事件，wait_done=True 时），然后关 stdin、join 主线程。
         返回 stdout 解析出的所有 JSON 消息（顺序）。
@@ -269,7 +265,6 @@ class TestGatewayDispatch(unittest.TestCase):
             mcp_status_provider=mcp_status_provider,
             mcp_background_loader=mcp_background_loader,
             skill_manager=skill_manager,
-            pet_manager=pet_manager,
         )
         stdin = _PipeStdin()
         out = io.StringIO()
@@ -610,57 +605,6 @@ class TestGatewayDispatch(unittest.TestCase):
         result = replies[0]["result"]
         self.assertEqual(result["status"], "loading")
         self.assertEqual(result["servers"][0]["name"], "filesystem")
-
-    def test_gateway_pet_get_state(self):
-        """pet.get_state 返回当前桌宠快照。"""
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manager = PetManager(storage_path=root / "state.json", library_dir=root / "pets")
-            msgs = self._run_gateway_with_msgs(
-                FakeLLM([]),
-                [json.dumps({"jsonrpc": "2.0", "id": "pet1", "method": "pet.get_state"})],
-                wait_for=2,
-                pet_manager=manager,
-            )
-
-            replies = [m for m in msgs if m.get("id") == "pet1"]
-            self.assertEqual(len(replies), 1)
-            result = replies[0]["result"]
-            self.assertTrue(result["enabled"])
-            self.assertEqual(result["status"], "stopped")
-            self.assertEqual(result["activity"], "idle")
-            self.assertEqual(result["runtime"]["kind"], "cbagent-python")
-
-    def test_gateway_pet_command_broadcasts_update(self):
-        """pet.command 执行后返回文本并广播 pet_updated。"""
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            manager = PetManager(storage_path=root / "state.json", library_dir=root / "pets")
-            msgs = self._run_gateway_with_msgs(
-                FakeLLM([]),
-                [json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": "pet2",
-                    "method": "pet.command",
-                    "params": {"args": "show"},
-                })],
-                wait_for=3,
-                pet_manager=manager,
-            )
-
-            replies = [m for m in msgs if m.get("id") == "pet2"]
-            self.assertEqual(len(replies), 1)
-            result = replies[0]["result"]
-            self.assertTrue(result["changed"])
-            self.assertIn("Pet shown", result["text"])
-            self.assertTrue(result["state"]["visible"])
-
-            pet_events = [
-                m for m in msgs
-                if m.get("method") == "event" and m.get("params", {}).get("type") == "pet_updated"
-            ]
-            self.assertGreaterEqual(len(pet_events), 1)
-            self.assertEqual(pet_events[-1]["params"]["reason"], "command")
 
     def test_gateway_session_create_list_and_switch(self):
         """session.* 会话 RPC 返回摘要和普通 history，且能切回旧会话。"""

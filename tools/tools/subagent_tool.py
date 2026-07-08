@@ -162,7 +162,6 @@ class SubagentRunner:
             message_logger=message_logger,
             language=self.language,
             mcp_clients=self.mcp_clients,
-            pet_manager=None,
             hook_manager=child_hook_manager,
             system_prompt_addendum=definition.system_prompt,
             max_tool_rounds=definition.max_turns,

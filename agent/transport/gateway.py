@@ -40,7 +40,7 @@ from typing import Any, Dict, Optional, TextIO
 
 from agent.cancel import CancelToken
 from agent.event_bus import EventBus
-from agent.events import Event, ModelChanged, PermissionModeChanged, PetUpdated
+from agent.events import Event, ModelChanged, PermissionModeChanged
 from agent.session import AgentSession
 from agent.transport.jsonrpc import StdioTransport, make_event_message, make_response
 
@@ -157,10 +157,6 @@ class Gateway:
             self._handle_load_skill(rpc_id, params)
         elif method == "session.answer_question":
             self._handle_answer_question(rpc_id, params)
-        elif method == "pet.get_state":
-            self._handle_pet_get_state(rpc_id)
-        elif method == "pet.command":
-            self._handle_pet_command(rpc_id, params)
         else:
             logger.warning("rpc unknown method: method=%r id=%s", method, rpc_id)
             if rpc_id is not None:
@@ -817,73 +813,6 @@ class Gateway:
             cancelled=cancelled,
         )
         self.transport.write(make_response(rpc_id, result={"delivered": delivered}))
-
-    def _pet_unavailable_state(self) -> Dict[str, Any]:
-        return {
-            "enabled": False,
-            "status": "unavailable",
-            "visible": False,
-            "activity": "idle",
-            "current_pet_id": None,
-            "current_pet": None,
-            "pets": [],
-            "runtime": {
-                "kind": "cbagent-python",
-                "running": False,
-                "path": None,
-            },
-            "message": "Pet manager unavailable",
-        }
-
-    def _handle_pet_get_state(self, rpc_id: Any) -> None:
-        if rpc_id is None:
-            return
-        manager = getattr(self.session, "pet_manager", None)
-        if manager is None:
-            self.transport.write(make_response(rpc_id, result=self._pet_unavailable_state()))
-            return
-        try:
-            state = manager.state()
-        except Exception as e:
-            self.transport.write(make_response(
-                rpc_id,
-                error={"code": _ERR_INTERNAL, "message": str(e)},
-            ))
-            return
-        self.transport.write(make_response(rpc_id, result=state))
-
-    def _handle_pet_command(self, rpc_id: Any, params: Dict[str, Any]) -> None:
-        if rpc_id is None:
-            return
-        args = params.get("args", "")
-        if not isinstance(args, str):
-            self.transport.write(make_response(
-                rpc_id,
-                error={"code": _ERR_INVALID_PARAMS, "message": "params.args must be string"},
-            ))
-            return
-        manager = getattr(self.session, "pet_manager", None)
-        if manager is None:
-            self.transport.write(make_response(
-                rpc_id,
-                result={
-                    "text": "Pet manager unavailable",
-                    "changed": False,
-                    "state": self._pet_unavailable_state(),
-                },
-            ))
-            return
-        try:
-            result = manager.handle_command(args)
-            if result.get("changed"):
-                self.event_bus.emit(PetUpdated(state=result.get("state") or manager.state(), reason="command"))
-        except Exception as e:
-            self.transport.write(make_response(
-                rpc_id,
-                error={"code": _ERR_INTERNAL, "message": str(e)},
-            ))
-            return
-        self.transport.write(make_response(rpc_id, result=result))
 
     def _is_busy(self) -> bool:
         """线程安全读取 busy 状态，供会话切换/新建等同步 RPC 使用。"""

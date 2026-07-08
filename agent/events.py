@@ -279,19 +279,6 @@ class MCPStatus:
 
 
 @dataclass
-class PetUpdated:
-    """Desktop pet state update.
-
-    Pet state is UI/runtime state. It does not enter conversation history and it
-    does not participate in tool traces. Frontends replace the whole snapshot.
-    """
-    state: Dict[str, Any]
-    reason: str = "update"
-    timestamp: float = field(default_factory=_now)
-    type: str = field(default="pet_updated", init=False)
-
-
-@dataclass
 class PermissionModeChanged:
     """Runtime permission mode changed by a UI/RPC client."""
     permission_mode: str
@@ -518,7 +505,6 @@ Event = Union[
     AskUserQuestionAnswered,
     TodoListUpdated,
     MCPStatus,
-    PetUpdated,
     PermissionModeChanged,
     ModelChanged,
     PlanModeChanged,
@@ -554,7 +540,6 @@ __all__ = [
     "AskUserQuestionAnswered",
     "TodoListUpdated",
     "MCPStatus",
-    "PetUpdated",
     "PermissionModeChanged",
     "ModelChanged",
     "PlanModeChanged",

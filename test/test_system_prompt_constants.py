@@ -70,7 +70,6 @@ class TestSystemPromptConstants(unittest.TestCase):
         session = object.__new__(AgentSession)
         session.bash_prompt_provider = None
         session.skill_manager = None
-        session.pet_manager = None
 
         self.assertEqual(session._build_system_instructions(), "")
 

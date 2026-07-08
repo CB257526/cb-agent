@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>让你的 LLM 长出双手双脚，真的"做到"点什么 (｀・ω・´)</b><br>
-  <i>一个会写代码、能调工具、能上 QQ 微信、还能养桌宠的 LLM Agent 框架</i>
+  <i>一个会写代码、能调工具、能上 QQ 微信的 LLM Agent 框架</i>
 </p>
 
 <p align="center">
@@ -114,7 +114,6 @@ bun start
 | 💬 微信 OC | HTTP 长轮询，扫码登录嗖嗖快，CDN 媒体上传 |
 | 🔌 MCP | 读 `mcp.json` 起 MCP server，工具自动展开 |
 | 📜 Skills | Markdown 声明式工作流 + 附带脚本，**想加啥加啥** |
-| 🐱 桌宠 | Python 原生透明置顶小可爱，兼容 BongoCat Live2D 和 spritesheet |
 
 ---
 
@@ -123,13 +122,6 @@ bun start
 <p align="center">
   <img src="img/opentui界面.png" width="720" alt="OTUI 界面"><br>
   <em>✨ OTUI — 三栏布局，左侧对话、右侧 Sidebar、底部状态栏</em>
-</p>
-
-<br>
-
-<p align="center">
-  <img src="img/真实素材3-宠物界面.png" width="720" alt="桌宠界面"><br>
-  <em>🐱 桌宠浮窗 + OTUI 同屏展示</em>
 </p>
 
 <br>
@@ -158,14 +150,10 @@ bun start
 |---|---|
 | [📖 项目介绍](docs/项目介绍.md) | 项目定位、架构图、完整能力表、平台展示图片 |
 | [📦 部署与配置](docs/部署与配置.md) | 环境准备、安装（light/full）、.env 配置、CLI/TUI/OTUI/QQ/微信/Linux 启动 |
-| [🔧 功能详解](docs/功能详解.md) | 记忆系统（light/full/off）、会话 & compact、桌宠、工具系统、MCP、Skills、CLI 命令 |
+| [🔧 功能详解](docs/功能详解.md) | 记忆系统（light/full/off）、会话 & compact、工具系统、MCP、Skills、CLI 命令 |
 | [🧑‍💻 开发指南](docs/开发指南.md) | 项目结构、五大子系统、缓存命中设计、Hooks、Plan Mode、测试命令、技术报告、FAQ |
 
 ---
-
-## 🙏 致谢
-
-- [**BongoCat**](https://github.com/ayangweb/BongoCat) — 桌宠功能的灵感来源，感谢这么可爱的桌宠项目 (｀・ω・´)
 
 ## 📜 License
 

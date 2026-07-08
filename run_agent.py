@@ -125,9 +125,6 @@ from agent.events import Done, MCPStatus   # 系统事件类型：Done 表示一
 # --- 钩子系统（预处理/后处理工具调用） ---
 from agent.hooks import HookManager, load_hooks_config  # Hook 管理器及其配置加载函数
 
-# --- 桌宠系统 ---
-from agent.pet import PetEventBridge, PetManager  # 轻量桌面宠物，将宠物事件桥接到 EventBus
-
 # --- 执行引擎 ---
 from agent.executor import ToolExecutor            # 工具调用线程池调度器，并发执行 LLM 发起的工具调用
 from agent.platforms.messages import ConversationKey  # 通讯平台会话标识结构体（platform + kind + id）
@@ -340,10 +337,6 @@ class AgentRunner:
         # 初始化 light 模式的 Markdown 记忆目录结构（若目录不存在则建好）
         self._md_memory_provider = self._create_markdown_memory_provider()
 
-        # ===== 桌宠系统初始化 =====
-        self.pet_manager = PetManager()                   # 轻量桌宠管理器
-        self.pet_event_bridge: PetEventBridge | None = None  # 宠物事件桥接器（稍后创建）
-
         # ===== CLI 附件队列 =====
         # CLI 模式下 /attach <path> 添加的文件暂存在这里，下一轮 chat 时随 prompt 一起发送。
         # TUI 模式下附件通过 JSON-RPC attachments 字段传递，不走此队列。
@@ -384,10 +377,6 @@ class AgentRunner:
         )
         # 将用量统计器挂到事件总线上，自动监听相关事件
         self.usage_metrics.attach(self.event_bus)
-
-        # 桌宠事件桥接器：将 PetManager 的事件桥接到 EventBus
-        self.pet_event_bridge = PetEventBridge(self.pet_manager)
-        self.pet_event_bridge.attach(self.event_bus)
 
         # ---- Step 3: 工具注册表（ToolRegistry）+ 原生工具 ----
         self.registry = ToolRegistry()                        # 创建工具注册表
@@ -645,7 +634,6 @@ class AgentRunner:
             session_store=session_store,                   # 会话持久化存储
             trace_summarizer=self._trace_summarizer,       # 轨迹摘要器
             message_logger=self._create_message_logger(message_logger_scope),  # 消息日志
-            pet_manager=self.pet_manager,                  # 桌宠管理器
             hook_manager=self.hook_manager,                # 钩子管理器
             subagent_task_registry=getattr(self, "subagent_task_registry", None),  # 子代理任务注册表
         )
@@ -1454,7 +1442,6 @@ class AgentRunner:
                 "  /help        打印帮助\n"
                 "  /tools       列出所有已注册工具\n"
                 "  /mcp         查看 MCP 后台连接状态\n"
-                "  /pet         管理轻量桌宠 runtime 与宠物包\n"
                 "  /attach PATH 添加图片、音频或文档附件到下一轮\n"
                 "  /attachments 查看待发送附件队列\n"
                 "  /detach N|all 移除待发送附件\n"
@@ -1507,13 +1494,6 @@ class AgentRunner:
                     tail += f", error={error}"
                 print(f"  - {name}: {state}{tail}")
             print()
-
-        # ---- /pet：桌宠管理 ----
-        elif cmd == "/pet":
-            result = self.pet_manager.handle_command(raw_arg)
-            text = result.get("text") if isinstance(result, dict) else ""
-            if text:
-                print("\n" + str(text) + "\n")
 
         # ---- /attach：添加附件 ----
         elif cmd == "/attach":

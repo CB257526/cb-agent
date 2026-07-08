@@ -19,7 +19,7 @@ import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
-import { AgentEvent, CacheStatsPayload, CompactPayload, MCPStatusPayload, ModelListPayload, ModelSwitchPayload, PermissionMode, PetCommandResult, PetState, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, CacheStatsPayload, CompactPayload, MCPStatusPayload, ModelListPayload, ModelSwitchPayload, PermissionMode, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 import { appendOtuiDiagnostic } from "./diagnostics.js";
 
 export function buildRunAgentArgs(agentRoot: string, env: NodeJS.ProcessEnv = process.env): string[] {
@@ -345,16 +345,6 @@ export class Transport extends EventEmitter {
   /** 查询 MCP 后台连接状态。MCP 工具可能仍在连接中，返回的是当前快照。 */
   mcpStatus(): Promise<MCPStatusPayload> {
     return this.requestRpc("session.mcp_status");
-  }
-
-  /** 读取桌宠当前状态；只服务 UI 附属展示，不影响会话 history。 */
-  getPetState(): Promise<PetState> {
-    return this.requestRpc("pet.get_state");
-  }
-
-  /** 执行 /pet 子命令，后端负责持久化与状态广播。 */
-  runPetCommand(args = ""): Promise<PetCommandResult> {
-    return this.requestRpc("pet.command", { args });
   }
 
   /** 用户回答 AskUserQuestionTool 的提问。selected_labels 单选给一个，多选给多个。

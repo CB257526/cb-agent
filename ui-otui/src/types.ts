@@ -27,7 +27,6 @@ export type EventType =
   | "ask_user_question_answered"
   | "todo_list_updated"
   | "mcp_status"
-  | "pet_updated"
   | "permission_mode_changed"
   | "model_changed"
   | "subagent_started"
@@ -268,40 +267,6 @@ export interface MCPStatusEvent extends BaseEvent, MCPStatusPayload {
   type: "mcp_status";
 }
 
-export interface PetPackageSummary {
-  id: string;
-  displayName: string;
-  description?: string;
-  renderer: "live2d" | "spritesheet" | string;
-  path?: string;
-  ok?: boolean;
-  issues?: string[];
-}
-
-export interface PetRuntimeState {
-  kind: string;
-  running: boolean;
-  path?: string | null;
-}
-
-export interface PetState {
-  enabled: boolean;
-  status: string;
-  visible: boolean;
-  activity: string;
-  current_pet_id?: string | null;
-  current_pet?: PetPackageSummary | null;
-  pets: PetPackageSummary[];
-  runtime: PetRuntimeState;
-  message?: string | null;
-}
-
-export interface PetCommandResult {
-  text: string;
-  changed: boolean;
-  state: PetState;
-}
-
 /** prompt.submit 的附件输入。后端会重新校验路径、格式、大小和 OCR/ASR/文档转换能力。 */
 export interface PromptAttachmentInput {
   path: string;
@@ -314,12 +279,6 @@ export interface QueuedAttachment extends PromptAttachmentInput {
   id: string;
   fileName: string;
   size?: number | null;
-}
-
-export interface PetUpdated extends BaseEvent {
-  type: "pet_updated";
-  state: PetState;
-  reason?: string;
 }
 
 export interface SubagentStarted extends BaseEvent {
@@ -397,7 +356,6 @@ export type AgentEvent =
   | AskUserQuestionAnswered
   | TodoListUpdated
   | MCPStatusEvent
-  | PetUpdated
   | PermissionModeChanged
   | ModelChanged
   | SubagentStarted

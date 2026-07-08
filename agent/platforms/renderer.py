@@ -23,7 +23,6 @@ from agent.events import (
     Error,
     Event,
     MCPStatus,
-    PetUpdated,
     ReasoningDelta,
     RoundEnd,
     RoundStart,
@@ -625,9 +624,6 @@ def _format_full_event(event: Event) -> str:
         return f"Token 用量：prompt={event.prompt_tokens}, completion={event.completion_tokens}"
     if isinstance(event, MCPStatus):
         return f"MCP 状态：{event.status}，connected={event.connected}/{event.total}"
-    if isinstance(event, PetUpdated):
-        state = event.state if isinstance(event.state, dict) else {}
-        return f"Pet status update: {state.get('status', 'unknown')}"
     return ""
 
 

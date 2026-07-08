@@ -1,4 +1,0 @@
-interface:
-  display_name: "Hatch Spritesheet Pet"
-  short_description: "Generate and package transparent spritesheet desktop pets from references."
-  default_prompt: "Use $hatch-bongocat-pet to create a portable spritesheet desktop pet package from reference images or character requirements."

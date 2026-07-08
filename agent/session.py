@@ -82,8 +82,6 @@ from agent.work_context import (
     TraceCollector,
     TraceSummarizer,
 )
-from agent.pet import PetManager
-
 logger = logging.getLogger(__name__)
 
 # metadata.kind 值,标记运行时上下文更新消息。这类消息在 UI 导出和上下文压缩
@@ -370,7 +368,6 @@ class AgentSession:
         message_logger: Optional[MessageLogger] = None,
         language: Optional[str] = "Chinese",
         mcp_clients=None,
-        pet_manager: Optional[PetManager] = None,
         hook_manager: Optional[Any] = None,
         system_prompt_addendum: Optional[str] = None,
         max_tool_rounds: Optional[int] = None,
@@ -405,7 +402,6 @@ class AgentSession:
         self.message_logger = message_logger
         self.language = language
         self.mcp_clients = mcp_clients
-        self.pet_manager = pet_manager
         self.system_prompt_addendum = system_prompt_addendum or ""
         self.max_tool_rounds = int(max_tool_rounds or self.MAX_TOOL_ROUNDS)
         self.memory_writeback_enabled = memory_writeback_enabled

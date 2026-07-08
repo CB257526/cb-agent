@@ -2,16 +2,16 @@
  * cb-agent / 命令注册表（OTUI 版）。
  *
  * 从旧 ui-tui/commands.ts 移植，去掉 React 的 Dispatch/SetStateAction 依赖，改用面向
- * 新 SessionProvider 的 CommandCtx。附件/桌宠类命令待 M7/M8 接入对应面板后再补。
+ * 新 SessionProvider 的 CommandCtx。
  *
  * 每个命令是纯函数，拿到 ctx（transport + 状态操作）后做副作用。SlashCommandPicker
  * 从这里读 name/description；用户选中或回车完整输入时调 handler。
  */
 
 import type { Transport } from "./transport.js";
-import { basename } from "node:path";
+import { basename, win32 } from "node:path";
 import { statSync } from "node:fs";
-import type { CacheStatsBucket, ChatItem, ContextWindow, MCPStatusPayload, PetState, PlanMode, PlanState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
+import type { CacheStatsBucket, ChatItem, ContextWindow, MCPStatusPayload, PlanMode, PlanState, QueuedAttachment, DialogSpec, SessionPayload } from "./types.js";
 import { readClipboardImageAttachment } from "./clipboardImage.js";
 
 export interface CommandCtx {
@@ -33,8 +33,6 @@ export interface CommandCtx {
   attachments: QueuedAttachment[];
   /** 维护附件队列；命令只管队列，不直接调用 OCR/ASR（后端做）。 */
   setAttachments: (updater: (prev: QueuedAttachment[]) => QueuedAttachment[]) => void;
-  /** 更新桌宠状态，供 /pet 命令同步 Sidebar。 */
-  setPet: (state: PetState | null) => void;
   /** Update Plan Mode state. */
   setPlanState?: (state: PlanState | null) => void;
   /** Switch Plan/Execute mode. */
@@ -92,6 +90,8 @@ export function makeQueuedAttachment(
   source: QueuedAttachment["source"] = "direct",
 ): QueuedAttachment {
   const cleanPath = path.trim().replace(/^["']|["']$/g, "");
+  // 终端可能在 macOS/Linux 上输入 Windows 路径，basename 对反斜杠不敏感时用 win32 规则兜底。
+  const fileName = basename(cleanPath);
   let size: number | null = null;
   try {
     const st = statSync(cleanPath);
@@ -103,7 +103,7 @@ export function makeQueuedAttachment(
     id: nextAttachmentId(),
     path: cleanPath,
     source,
-    fileName: basename(cleanPath) || cleanPath,
+    fileName: (fileName === cleanPath ? win32.basename(cleanPath) : fileName) || cleanPath,
     size,
   };
 }
@@ -469,19 +469,6 @@ export const COMMANDS: readonly SlashCommand[] = [
         appendSystem("Usage: /plan [status|mode <plan|execute>|approve|reject <feedback>]");
       } catch (e) {
         appendSystem(`/plan failed: ${(e as Error).message}`);
-      }
-    },
-  },
-  {
-    name: "/pet",
-    description: "管理轻量桌宠 runtime 与宠物包：/pet [子命令]",
-    handler: async ({ transport, args, appendSystem, setPet }) => {
-      try {
-        const result = await transport.runPetCommand(args);
-        setPet(result.state ?? null);
-        if (result.text) appendSystem(result.text);
-      } catch (e) {
-        appendSystem(`✗ /pet 失败：${(e as Error).message}`);
       }
     },
   },

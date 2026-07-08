@@ -57,7 +57,6 @@ describe("commands", () => {
     let resetTokenUsageMock: ReturnType<typeof vi.fn>;
     let openSessionSwitcherMock: ReturnType<typeof vi.fn>;
     let toggleActivityMock: ReturnType<typeof vi.fn>;
-    let setPetStateMock: ReturnType<typeof vi.fn>;
     let setAttachmentsMock: ReturnType<typeof vi.fn>;
     let transportMock: any;
 
@@ -70,7 +69,6 @@ describe("commands", () => {
       resetTokenUsageMock = vi.fn();
       openSessionSwitcherMock = vi.fn();
       toggleActivityMock = vi.fn();
-      setPetStateMock = vi.fn();
       setAttachmentsMock = vi.fn();
       transportMock = {
         clearHistory: vi.fn(),
@@ -80,7 +78,6 @@ describe("commands", () => {
         loadSkill: vi.fn(),
         createSession: vi.fn(),
         switchSession: vi.fn(),
-        runPetCommand: vi.fn(),
       };
       ctx = {
         transport: transportMock,
@@ -94,7 +91,6 @@ describe("commands", () => {
         resetTokenUsage: resetTokenUsageMock,
         openSessionSwitcher: openSessionSwitcherMock,
         toggleActivity: toggleActivityMock,
-        setPetState: setPetStateMock,
         attachments: [],
         setAttachments: setAttachmentsMock,
       };
@@ -111,7 +107,6 @@ describe("commands", () => {
       expect(text).toContain("/sessions");
       expect(text).toContain("/compact");
       expect(text).toContain("/mcp");
-      expect(text).toContain("/pet");
       expect(text).toContain("/attach");
       expect(text).toContain("/paste-image");
       expect(text).toContain("/attachments");
@@ -306,64 +301,6 @@ describe("commands", () => {
       const text = appendSystemMock.mock.calls[0][0];
       expect(text).toContain("✗");
       expect(text).toContain("mcp timeout");
-    });
-
-    it("/pet 调后端命令并刷新桌宠状态", async () => {
-      const state = {
-        enabled: true,
-        status: "running",
-        visible: true,
-        activity: "idle",
-        current_pet_id: "demo",
-        current_pet: null,
-        pets: [],
-        runtime: { kind: "cbagent-python", running: true },
-      };
-      transportMock.runPetCommand.mockResolvedValue({
-        text: "Installed pet demo.",
-        changed: true,
-        state,
-      });
-
-      const cmd = findCommand("/pet install C:\\pets\\demo")!;
-      await cmd.handler({ ...ctx, args: "install C:\\pets\\demo" });
-
-      expect(transportMock.runPetCommand).toHaveBeenCalledWith("install C:\\pets\\demo");
-      expect(setPetStateMock).toHaveBeenCalledWith(state);
-      expect(appendSystemMock.mock.calls[0][0]).toContain("Installed pet demo.");
-    });
-
-    it.each(["status", "show", "hide", "launch", "quit", "list", "select demo"])(
-      "/pet %s 原样交给后端",
-      async (sub) => {
-        transportMock.runPetCommand.mockResolvedValue({
-          text: "",
-          changed: true,
-          state: {
-            enabled: true,
-            status: "running",
-            visible: true,
-            activity: "idle",
-            current_pet: null,
-            pets: [],
-            runtime: { kind: "cbagent-python", running: true },
-          },
-        });
-
-        const cmd = findCommand(`/pet ${sub}`)!;
-        await cmd.handler({ ...ctx, args: sub });
-
-        expect(transportMock.runPetCommand).toHaveBeenCalledWith(sub);
-      },
-    );
-
-    it("/pet RPC 报错时输出错误信息", async () => {
-      transportMock.runPetCommand.mockRejectedValue(new Error("pet timeout"));
-      const cmd = findCommand("/pet show")!;
-      await cmd.handler({ ...ctx, args: "show" });
-      const text = appendSystemMock.mock.calls[0][0];
-      expect(text).toContain("✗");
-      expect(text).toContain("pet timeout");
     });
 
     it("/attach 添加本地附件到队列", () => {

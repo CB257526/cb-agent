@@ -22,15 +22,6 @@ export function Sidebar() {
 
   const servers = () => state.mcp?.servers ?? [];
 
-  // 桌宠状态点颜色：运行中绿、可见但未运行黄、其余灰
-  const petColor = () => {
-    const pet = state.pet;
-    if (!pet) return theme.textMuted;
-    if (pet.runtime?.running) return theme.success;
-    if (pet.visible) return theme.warning;
-    return theme.textMuted;
-  };
-
   return (
     <box
       width={SIDEBAR_WIDTH}
@@ -80,20 +71,6 @@ export function Sidebar() {
               );
             }}
           </For>
-        </box>
-      </Show>
-
-      {/* 桌宠 */}
-      <Show when={state.pet?.enabled}>
-        <box flexDirection="column" paddingTop={1}>
-          <text fg={theme.textMuted}>桌宠</text>
-          <text fg={theme.text}>
-            <span style={{ fg: petColor() }}>● </span>
-            {state.pet?.current_pet?.displayName || state.pet?.current_pet_id || "未选择"}
-          </text>
-          <Show when={state.pet?.activity}>
-            <text fg={theme.textMuted}>{state.pet!.activity}</text>
-          </Show>
         </box>
       </Show>
 

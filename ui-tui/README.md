@@ -22,8 +22,6 @@ npm start
 
 启动后会自动 spawn Python 后端（默认从 `../venv/python.exe`、`../venv/Scripts/python.exe` 或 `../venv/bin/python` 找解释器）。
 
-桌宠通过 `/pet` 管理；TUI 只发送控制命令，桌面浮窗由 cb-agent 内置 Python runtime 自己处理。
-
 退出：
 
 - `Ctrl-C`（agent 工作时）→ 中断当前 chat
@@ -76,8 +74,6 @@ UI 发出的 RPC：
 transport.sendPrompt("帮我看看 X")  // → prompt.submit
 transport.cancel()                   // → session.cancel
 transport.clearHistory()             // → session.clear_history
-transport.getPetState()                // → pet.get_state
-transport.runPetCommand("show")        // → pet.command
 transport.quit()                     // → session.quit
 ```
 
@@ -128,29 +124,6 @@ CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS=1 npm start
 
 `.cbagent/logs/system/gateway-<timestamp>.log`。UI 启动时新建一个文件，把 Python stderr 全写过去。
 协议解析失败时 UI 会给出文件路径让用户去看。
-
-### 桌宠
-
-TUI 启动后会调用 `pet.get_state` 拉取当前桌宠状态；执行 `/pet` 子命令会调用 `pet.command`，后端状态变化时广播 `pet_updated`。桌宠状态不写入当前聊天 history。
-
-桌宠 runtime 是内置 Python sidecar，不需要 Rust、Node 或 Tauri 构建。它通过 WebView 内的 `pixi.js` + `easy-live2d` + Live2D Cubism Core 真实渲染 BongoCat Live2D 模型，并用全局键盘/鼠标事件驱动 BongoCat 同款参数；TUI 只负责发送 `/pet` 控制命令。
-
-可用命令：
-
-| 命令 | 说明 |
-|---|---|
-| `/pet` 或 `/pet status` | 查看 runtime、可见性、当前宠物和活动状态 |
-| `/pet install <folder>` | 安装宠物包根目录；Live2D 包根目录含 `*.model3.json`，spritesheet 包根目录含 `pet.json` |
-| `/pet list` | 列出已安装宠物、当前选择、显示名和本地库路径 |
-| `/pet select <id>` | 选择并加载宠物 |
-| `/pet uninstall <id>` | 卸载已安装宠物；`remove` / `delete` 也可用 |
-| `/pet launch` | 启动轻量 Python runtime |
-| `/pet show` / `/pet hide` | 显示或隐藏桌宠窗口 |
-| `/pet quit` | 关闭 runtime |
-
-免命令导入：把宠物包根目录直接放进项目级 `.cbagent\pet\` 或用户级 `~\.cbagent\pet\`，下一次 `/pet list`、`/pet status` 或 `/pet launch` 会自动扫描并复制到 `~\.cbagent\pets\`。`/pet launch` 会自动选中新发现的包。
-
----
 
 ## 开发
 

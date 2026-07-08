@@ -33,7 +33,6 @@ import type {
   MCPStatusPayload,
   SessionSummary,
   TodoItem,
-  PetState,
   QueuedAttachment,
   PromptAttachmentInput,
   DialogSpec,
@@ -74,8 +73,6 @@ export interface SessionState {
   exited: boolean;
   /** 待随下一条 prompt 一起提交的附件队列；发送成功后清空。 */
   attachments: QueuedAttachment[];
-  /** 桌宠状态，供 Sidebar 展示和 /pet 命令同步。 */
-  pet: PetState | null;
   /** 命令级长操作（如 /compact 调 LLM 摘要）进行中：驱动 Footer 动效，区别于 busy。 */
   pending: string | null;
   /** 当前打开的浮层 Select 弹窗；null 表示无。供 /sessions /tools /mcp 等命令使用。 */
@@ -197,8 +194,6 @@ interface SessionContextValue {
   setAttachments: (updater: (prev: QueuedAttachment[]) => QueuedAttachment[]) => void;
   /** 从系统剪贴板读取文本/文件/图片：文本插入输入框，文件/图片进附件队列。 */
   pasteFromClipboard: (insertText: (text: string) => void) => void;
-  /** 更新桌宠状态（/pet 命令用）。 */
-  setPet: (pet: PetState | null) => void;
   /** 打开浮层 Select 弹窗。 */
   openDialog: (spec: DialogSpec) => void;
   /** 关闭浮层弹窗。 */
@@ -238,7 +233,6 @@ export function SessionProvider(props: ParentProps) {
     showActivity: false,
     exited: false,
     attachments: [],
-    pet: null,
     pending: null,
     dialog: null,
   });
@@ -481,10 +475,6 @@ export function SessionProvider(props: ParentProps) {
         setState("mcp", { ...e } as MCPStatusPayload);
         break;
 
-      case "pet_updated":
-        setState("pet", e.state ?? null);
-        break;
-
       case "ask_user_question":
         appendItem({
           id: nextId(),
@@ -601,11 +591,6 @@ export function SessionProvider(props: ParentProps) {
     transport.on("stderr", onStderr);
     transport.on("protocolError", onProtoErr);
     transport.on("exit", onExit);
-    // 拉取桌宠初始状态（失败静默：宠物是附属功能，不该阻塞 UI）
-    transport
-      .getPetState()
-      .then((pet) => setState("pet", pet ?? null))
-      .catch(() => setState("pet", null));
   });
 
   onCleanup(() => {
@@ -694,7 +679,6 @@ export function SessionProvider(props: ParentProps) {
       toggleActivity: () => setState("showActivity", (v) => !v),
       attachments: state.attachments,
       setAttachments,
-      setPet: (pet) => setState("pet", pet),
       setPlanState: (planState) => setState("planState", planState),
       setPlanMode,
       setPending: (label) => setState("pending", label),
@@ -791,7 +775,6 @@ export function SessionProvider(props: ParentProps) {
     },
     setAttachments,
     pasteFromClipboard,
-    setPet: (pet) => setState("pet", pet),
     openDialog: (spec) => setState("dialog", spec),
     closeDialog: () => setState("dialog", null),
     setPlanMode,

@@ -20,7 +20,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
-import { AgentEvent, ChatItem, ContextWindow, PetState, PlanMode, PlanState, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, ChatItem, ContextWindow, PlanMode, PlanState, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
@@ -142,7 +142,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
   const [showSessionSwitcher, setShowSessionSwitcher] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
-  const [, setPetState] = useState<PetState | null>(null);
   const [attachments, setAttachments] = useState<QueuedAttachment[]>([]);
   // 当前等待用户作答的问题 id：决定 EventStream 把输入路由给哪个 panel；
   // 同时 PromptInput 在问答期 disabled，避免误打字提交 prompt
@@ -500,11 +499,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
           break;
         }
 
-        case "pet_updated": {
-          setPetState((ev as any).state ?? null);
-          break;
-        }
-
         case "round_start":
           setRound((ev as any).round_idx);
           setMaxRounds((ev as any).max_rounds);
@@ -713,20 +707,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
     };
   }, [transport, exit, appendSystem, flushNow, scheduleFlush, resetFlushRhythm]);
 
-  useEffect(() => {
-    let disposed = false;
-    transport.getPetState()
-      .then((state) => {
-        if (!disposed) setPetState(state ?? null);
-      })
-      .catch(() => {
-        if (!disposed) setPetState(null);
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [transport]);
-
   // 键盘事件：Ctrl-C 在 busy 时中断/空闲时退出；Ctrl-O 切换后端日志面板
   useInput((inputChar, key) => {
     if (key.ctrl && inputChar === "c") {
@@ -767,7 +747,6 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       resetTokenUsage,
       openSessionSwitcher,
       toggleActivity: () => setShowActivity((v) => !v),
-      setPetState,
       setPlanState,
       setMode,
       attachments,
