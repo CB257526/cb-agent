@@ -360,6 +360,23 @@ class TestGatewayDispatch(unittest.TestCase):
         self.assertEqual(len(accepts), 1)
         self.assertEqual(accepts[0]["result"]["status"], "accepted")
 
+    def test_gateway_ready_includes_active_turn_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            store.begin_active_turn(user_query="ready 恢复输入")
+
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [],
+                wait_for=1,
+                session_store=store,
+            )
+
+            ready = [m for m in msgs if m.get("params", {}).get("type") == "gateway_ready"][0]
+            history = ready["params"]["history"]
+            self.assertTrue(any(item["content"] == "ready 恢复输入" for item in history))
+            self.assertTrue(any(item.get("interrupted") for item in history))
+
     def test_gateway_unknown_method(self):
         llm = FakeLLM([])
         msgs = self._run_gateway_with_msgs(
@@ -660,6 +677,32 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertIn("第一会话问题", history_text)
             self.assertIn("第一轮回答", history_text)
             self.assertNotIn("第二会话问题", history_text)
+
+    def test_gateway_session_switch_restores_active_turn_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            first_id = store.active_session_id
+            store.begin_active_turn(user_query="切回未完成会话")
+            store.create_session()
+
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [
+                    json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": "sw-active",
+                        "method": "session.switch",
+                        "params": {"session_id": first_id},
+                    }),
+                ],
+                wait_for=2,
+                session_store=store,
+            )
+
+            switch_reply = [m for m in msgs if m.get("id") == "sw-active"][0]
+            history = switch_reply["result"]["history"]
+            self.assertTrue(any(item["content"] == "切回未完成会话" for item in history))
+            self.assertTrue(any(item.get("interrupted") for item in history))
 
 
 if __name__ == "__main__":

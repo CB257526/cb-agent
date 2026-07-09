@@ -44,6 +44,7 @@ from agent.renderers.cli import (
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore
 from constant.llm.constant_llm import ConstantLLM
+from core.message import Message
 
 
 # ========== fakes ==========
@@ -893,6 +894,82 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(restored.history, [])
             self.assertFalse(active_dir.exists())
             self.assertFalse((root / "index.json").exists())
+
+    def test_session_store_restores_active_turn_completed_tool_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            call = _tc("file_read", '{"path":"active.txt"}', call_id="call_active")
+            store.begin_active_turn(user_query="恢复工具检查点")
+            store.record_active_assistant_tool_calls(
+                round_idx=1,
+                assistant_message=Message.create_assistant_message(tool_calls=[call]),
+            )
+            store.record_active_tool_completed(
+                round_idx=1,
+                tool_message=Message.create_tool_message(
+                    tool_call_id="call_active",
+                    tool_name="file_read",
+                    tool_output=json.dumps({"path": "active.txt", "content": "abc"}, ensure_ascii=False),
+                ),
+            )
+
+            restored = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+
+            exported = restored.export_history()
+            exported_text = "\n".join(item["content"] for item in exported)
+            self.assertIn("恢复工具检查点", exported_text)
+            self.assertIn("【工具完成】file_read", exported_text)
+            self.assertTrue(any(item.get("interrupted") for item in exported))
+            self.assertTrue(any(item.get("tool", {}).get("call_id") == "call_active" for item in exported))
+
+            sliced = restored._sliced_history_dicts()
+            roles = [m.get("role") for m in sliced]
+            self.assertEqual(roles, ["user", "assistant", "tool"])
+            self.assertEqual(sliced[1]["tool_calls"][0]["id"], "call_active")
+            self.assertEqual(sliced[2]["tool_call_id"], "call_active")
+
+    def test_completed_tool_checkpoint_survives_later_tool_process_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            tool_calls = [
+                _tc("file_read", '{"path":"first.txt"}', call_id="call_first"),
+                _tc("bash", '{"command":"sleep 10"}', call_id="call_second"),
+            ]
+            llm = FakeLLM([{"answer": "", "tool_calls": tool_calls}])
+
+            def run_tool(name: str, args: Dict[str, Any]) -> str:
+                if name == "file_read":
+                    return json.dumps({"path": args.get("path"), "content": "abc"}, ensure_ascii=False)
+                raise KeyboardInterrupt()
+
+            self.registry.execute_tool = MagicMock(side_effect=run_tool)
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+
+            with self.assertRaises(KeyboardInterrupt):
+                s.chat("先读文件再跑长命令")
+
+            restored = LocalSessionStore(root).load_latest_history(max_messages=20)
+            visible = [
+                m for m in restored
+                if (m.metadata or {}).get("kind") != "context_update"
+            ]
+
+            self.assertEqual(
+                [m.role.value if hasattr(m.role, "value") else str(m.role) for m in visible],
+                ["user", "assistant", "tool"],
+            )
+            self.assertEqual([tc["id"] for tc in visible[1].tool_calls], ["call_first"])
+            self.assertEqual(visible[2].tool_call_id, "call_first")
 
     def test_agent_session_create_and_switch_keeps_histories_isolated(self):
         with tempfile.TemporaryDirectory() as td:

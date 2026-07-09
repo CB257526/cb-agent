@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from core.message import Message
+from core.message import Message, MessageRole
 from agent.message_protocol import drop_orphan_tool_message_objects
 from utils.common import count_tokens
 
@@ -252,6 +252,125 @@ def _messages_from_transcript_item(item: Dict[str, Any]) -> List[Message]:
         if msg is not None:
             out.append(msg)
     return out
+
+
+def _mark_interrupted_message(message: Message) -> Message:
+    """给 active_turn 恢复出的可见消息加本地标记。
+
+    metadata 不会进入 Message.to_dict()，因此不会影响发给模型的 OpenAI 协议；
+    它只服务 export_history/UI，让前端可以选择显示“上次中断前恢复”提示。
+    """
+    metadata = dict(message.metadata or {})
+    metadata["interrupted"] = True
+    message.metadata = metadata
+    return message
+
+
+def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Message]:
+    """把运行中检查点还原成一段协议合法的 history。
+
+    active_turn.jsonl 只记录未完成回合的安全边界：用户输入、assistant 规划出的
+    tool_calls、以及已经完成的 tool 结果。恢复时最重要的约束是 OpenAI tool
+    calling 协议合法性：每条 role=tool 前面必须有声明同一 tool_call_id 的
+    assistant.tool_calls。因此这里会主动丢弃没有完成结果的 tool_call，只恢复
+    “assistant 声明 + 对应 tool 结果”成对出现的部分。
+    """
+    if not events:
+        return []
+
+    # 如果文件里意外出现多段 turn_started（例如开发期手工追加），只采用最后一段。
+    # active_turn 的语义是“当前正在执行的一轮”，不能把多个半成品轮次拼在一起。
+    start_index = -1
+    for idx, event in enumerate(events):
+        if isinstance(event, dict) and event.get("type") == "turn_started":
+            start_index = idx
+    if start_index < 0:
+        return []
+    scoped_events = events[start_index:]
+    started = scoped_events[0]
+
+    out: List[Message] = []
+    context_payload = started.get("context_update_payload")
+    if isinstance(context_payload, dict):
+        context_message = _message_payload_to_message(context_payload)
+        if context_message is not None:
+            out.append(context_message)
+
+    user_payload = started.get("user_payload")
+    if not isinstance(user_payload, dict):
+        user_payload = {
+            "role": "user",
+            "content": str(started.get("user_query") or ""),
+        }
+    user_message = _message_payload_to_message(user_payload)
+    if user_message is None:
+        return out
+    out.append(_mark_interrupted_message(user_message))
+
+    completed_by_round: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for event in scoped_events[1:]:
+        if not isinstance(event, dict) or event.get("type") != "tool_completed":
+            continue
+        tool_payload = event.get("tool_payload")
+        if not isinstance(tool_payload, dict):
+            continue
+        call_id = str(
+            tool_payload.get("tool_call_id")
+            or event.get("tool_call_id")
+            or ""
+        )
+        if not call_id:
+            continue
+        round_key = str(event.get("round_idx") or "")
+        completed_by_round.setdefault(round_key, {})[call_id] = tool_payload
+
+    for event in scoped_events[1:]:
+        if not isinstance(event, dict) or event.get("type") != "assistant_tool_calls":
+            continue
+        assistant_payload = event.get("assistant_payload")
+        if not isinstance(assistant_payload, dict):
+            continue
+        raw_calls = assistant_payload.get("tool_calls")
+        if not isinstance(raw_calls, list) or not raw_calls:
+            continue
+        round_key = str(event.get("round_idx") or "")
+        completed = completed_by_round.get(round_key, {})
+        filtered_calls: List[Dict[str, Any]] = []
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "")
+            if call_id and call_id in completed:
+                filtered_calls.append(deepcopy(call))
+        if not filtered_calls:
+            continue
+
+        # 只把已完成的 call 放回 assistant.tool_calls。这样即使模型一次规划了
+        # 多个工具，崩溃时只完成了一部分，恢复后的协议消息仍然完全配对。
+        paired_assistant_payload = deepcopy(assistant_payload)
+        paired_assistant_payload["tool_calls"] = filtered_calls
+        assistant_message = _message_payload_to_message(paired_assistant_payload)
+        if assistant_message is None:
+            continue
+        out.append(_mark_interrupted_message(assistant_message))
+
+        # tool 结果按原 assistant.tool_calls 顺序回放，而不是按完成先后。这样恢复
+        # 出来的 history 更贴近 provider 原始协议顺序，也便于后续孤儿清理兜底。
+        for call in filtered_calls:
+            call_id = str(call.get("id") or "")
+            tool_message = _message_payload_to_message(completed.get(call_id, {}))
+            if tool_message is not None:
+                out.append(_mark_interrupted_message(tool_message))
+
+    return out
+
+
+def _active_turn_started_event(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """取 active_turn.jsonl 中最后一个 turn_started 事件。"""
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("type") == "turn_started":
+            return event
+    return {}
 
 
 def _trim_restored_history(messages: List[Message], max_messages: int) -> List[Message]:
@@ -911,6 +1030,11 @@ class LocalSessionStore:
         transcript_items = self._read_transcript_items(self.active_dir)
         compact = self._read_json(self.active_dir / "compact.json", {})
         messages: List[Message] = []
+        committed_turn_ids = {
+            str(item.get("turn_id"))
+            for item in transcript_items
+            if isinstance(item, dict) and item.get("turn_id")
+        }
 
         start_idx = 0
         if isinstance(compact, dict) and compact:
@@ -925,12 +1049,43 @@ class LocalSessionStore:
         for item in transcript_items[max(0, start_idx):]:
             messages.extend(_messages_from_transcript_item(item))
 
-        # 如果上一轮在收到用户消息后、生成最终回答前进程崩溃，pending_user.json
-        # 会留下那条未完成用户消息。恢复时把它放在尾部，确保“用户最后说了什么”
-        # 不会因为异常退出丢掉。正常完成的一轮会在 append_turn 后清除此文件。
+        # active_turn.jsonl 是 pending_user.json 的增强版：它除了用户输入，还能
+        # 保存已经完成的工具配对。恢复时同一 turn_id 的 active 优先；如果 pending
+        # 已经换成新的 turn_id，则说明新用户输入已经先落盘，不能再让旧 active
+        # 遮蔽它。
+        active_events = self._read_active_turn_events(self.active_dir)
+        active_started = _active_turn_started_event(active_events)
+        active_turn_id = str(active_started.get("turn_id") or "")
+        active_messages = _messages_from_active_turn_events(active_events)
         pending = self._read_json(self.active_dir / "pending_user.json", {})
-        if isinstance(pending, dict) and pending.get("user_query"):
-            messages.append(Message.create_user_message(str(pending.get("user_query") or "")))
+        pending_turn_id = str(pending.get("turn_id") or "") if isinstance(pending, dict) else ""
+        if pending_turn_id and pending_turn_id in committed_turn_ids:
+            pending = {}
+            pending_turn_id = ""
+        if active_turn_id and active_turn_id in committed_turn_ids:
+            # transcript 已经包含这一轮时，active_turn 只是“提交后尚未来得及删除”的
+            # 残留文件。恢复时必须跳过，否则同一轮会被展示/注入两次。
+            active_messages = []
+        if (
+            active_messages
+            and isinstance(pending, dict)
+            and pending.get("user_query")
+            and pending_turn_id
+            and active_turn_id
+            and pending_turn_id != active_turn_id
+        ):
+            # save_pending_user_message 先写 pending、再清旧 active。若进程卡在这
+            # 两步之间退出，磁盘上会同时有“新 pending + 旧 active”。此时新
+            # pending 才是最后一次可见用户输入，恢复时要让它胜出。
+            active_messages = []
+        if active_messages:
+            messages.extend(active_messages)
+        else:
+            # 如果上一轮在收到用户消息后、生成最终回答前进程崩溃，pending_user.json
+            # 会留下那条未完成用户消息。恢复时把它放在尾部，确保“用户最后说了什么”
+            # 不会因为异常退出丢掉。正常完成的一轮会在 append_turn 后清除此文件。
+            if isinstance(pending, dict) and pending.get("user_query"):
+                messages.append(Message.create_user_message(str(pending.get("user_query") or "")))
 
         if not messages:
             return []
@@ -938,7 +1093,173 @@ class LocalSessionStore:
             return drop_orphan_tool_message_objects(messages)
         return _trim_restored_history(messages, max_messages)
 
-    def save_pending_user_message(self, user_query: str) -> None:
+    @staticmethod
+    def _new_turn_id() -> str:
+        """生成本地回合 id。
+
+        turn_id 只用于 pending/active/transcript 之间做崩溃恢复去重，不暴露给模型。
+        """
+        return f"turn_{uuid.uuid4().hex}"
+
+    def _pending_turn_id_for_user(self, user_query: str) -> str:
+        """如果 pending_user.json 属于同一条用户输入，返回它的 turn_id。"""
+        if not self.active_session_id:
+            return ""
+        pending = self._read_json(self.active_dir / "pending_user.json", {})
+        if not isinstance(pending, dict):
+            return ""
+        if str(pending.get("user_query") or "") != user_query:
+            return ""
+        return str(pending.get("turn_id") or "")
+
+    def _active_turn_id_for_user(self, user_query: str) -> str:
+        """如果 active_turn.jsonl 属于同一条用户输入，返回它的 turn_id。"""
+        if not self.active_session_id:
+            return ""
+        started = _active_turn_started_event(self._read_active_turn_events(self.active_dir))
+        if str(started.get("user_query") or "") != user_query:
+            return ""
+        return str(started.get("turn_id") or "")
+
+    def begin_active_turn(
+        self,
+        *,
+        user_query: str,
+        turn_id: Optional[str] = None,
+        context_update_message: Optional[Message] = None,
+    ) -> None:
+        """开始记录当前运行中的回合。
+
+        active_turn.jsonl 的语义是“当前未完成的一轮”，所以新一轮开始时会重置
+        旧文件，只写入第一条 turn_started。后续 assistant_tool_calls 和
+        tool_completed 仍然按 JSONL 追加，保证工具完成边界可以及时 flush。
+        """
+
+        self.ensure_active()
+        self.active_dir.mkdir(parents=True, exist_ok=True)
+        resolved_turn_id = (
+            turn_id
+            or self._pending_turn_id_for_user(user_query)
+            or self._new_turn_id()
+        )
+        event: Dict[str, Any] = {
+            "type": "turn_started",
+            "ts": _now_iso(),
+            "session_id": self.active_session_id,
+            "turn_id": resolved_turn_id,
+            "user_query": user_query,
+            "user_payload": _message_to_persist_payload(
+                Message(role=MessageRole.USER, content=user_query),
+            ),
+        }
+        if context_update_message is not None:
+            event["context_update_payload"] = _message_to_persist_payload(context_update_message)
+        path = self.active_dir / "active_turn.jsonl"
+        with path.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+
+    def record_active_assistant_tool_calls(
+        self,
+        *,
+        round_idx: int,
+        assistant_message: Message,
+    ) -> None:
+        """记录模型已经完整规划出的 assistant.tool_calls。
+
+        这里只记录“规划完成”的 assistant 消息，不记录流式文本增量。真正恢复时
+        还会按已完成 tool_result 过滤 tool_calls，避免留下“有声明无结果”的半截
+        工具调用。
+        """
+
+        payload = _message_to_persist_payload(assistant_message)
+        if not payload.get("tool_calls"):
+            return
+        self._append_active_turn_event({
+            "type": "assistant_tool_calls",
+            "round_idx": int(round_idx),
+            "assistant_payload": payload,
+        })
+
+    def record_active_tool_completed(
+        self,
+        *,
+        round_idx: int,
+        tool_message: Message,
+        is_error: bool = False,
+    ) -> None:
+        """记录一个已经完成并回灌到 messages 的工具结果。
+
+        这条事件是恢复边界：只有写到这里的工具，重启后才会重新进入 history。
+        如果进程正在执行工具但尚未写入本事件，恢复时会按用户要求直接丢弃。
+        """
+
+        payload = _message_to_persist_payload(tool_message)
+        call_id = str(payload.get("tool_call_id") or "")
+        if not call_id:
+            return
+        self._append_active_turn_event({
+            "type": "tool_completed",
+            "round_idx": int(round_idx),
+            "tool_call_id": call_id,
+            "tool_name": str(payload.get("tool_name") or ""),
+            "is_error": bool(is_error),
+            "tool_payload": payload,
+        })
+
+    def clear_active_turn(self) -> None:
+        """清理当前运行中回合检查点。"""
+
+        if not self.active_session_id:
+            return
+        path = self.active_dir / "active_turn.jsonl"
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            logger.exception("清理 active_turn.jsonl 失败")
+
+    def _append_active_turn_event(self, event: Dict[str, Any]) -> None:
+        """向 active_turn.jsonl 追加一条事件并 flush。
+
+        这里不 fsync，保持和 transcript 当前写入成本一致；但每条工具完成事件都会
+        立即 flush 到 Python 文件对象，尽量缩小异常退出时丢失的窗口。
+        """
+
+        self.ensure_active()
+        self.active_dir.mkdir(parents=True, exist_ok=True)
+        payload = dict(event)
+        payload.setdefault("ts", _now_iso())
+        payload.setdefault("session_id", self.active_session_id)
+        with (self.active_dir / "active_turn.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+
+    def _read_active_turn_events(self, session_dir: Path) -> List[Dict[str, Any]]:
+        """读取运行中检查点 JSONL，坏行直接跳过。"""
+
+        path = session_dir / "active_turn.jsonl"
+        if not path.exists():
+            return []
+        events: List[Dict[str, Any]] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except Exception:
+                    logger.warning("跳过损坏的 active_turn.jsonl 行: %s", path)
+                    continue
+                if isinstance(item, dict):
+                    events.append(item)
+        except Exception:
+            logger.exception("failed to load active turn from %s", path)
+            return []
+        return events
+
+    def save_pending_user_message(self, user_query: str, *, turn_id: Optional[str] = None) -> None:
         """收到用户消息后先写一份 pending 记录。
 
         transcript.jsonl 仍只记录完整回合；pending_user.json 只用于崩溃恢复。这样可以
@@ -948,12 +1269,17 @@ class LocalSessionStore:
 
         self.ensure_active()
         self.active_dir.mkdir(parents=True, exist_ok=True)
+        resolved_turn_id = turn_id or self._new_turn_id()
         payload = {
             "ts": _now_iso(),
             "session_id": self.active_session_id,
+            "turn_id": resolved_turn_id,
             "user_query": user_query,
         }
         self._write_json(self.active_dir / "pending_user.json", payload)
+        # pending_user.json 已经原子写入后再清旧 active。若进程在两步之间退出，
+        # load_latest_history 会用 turn_id 让新 pending 覆盖旧 active，不会丢输入。
+        self.clear_active_turn()
 
     def clear_pending_user_message(self) -> None:
         """清理当前会话的 pending 用户消息。"""
@@ -965,7 +1291,7 @@ class LocalSessionStore:
             if path.exists():
                 path.unlink()
         except Exception:
-            logger.exception("failed to clear pending user message: %s", path)
+            logger.exception("清理 pending 用户消息失败")
 
     def save_compaction(
         self,
@@ -1117,6 +1443,7 @@ class LocalSessionStore:
         final_answer: str,
         committed_messages: List[Message],
         work_record: Optional[WorkRecord] = None,
+        turn_id: Optional[str] = None,
     ) -> None:
         """追加一轮 transcript，并同步更新 state.json。
 
@@ -1131,8 +1458,15 @@ class LocalSessionStore:
         """
         self.ensure_active()
         self.active_dir.mkdir(parents=True, exist_ok=True)
+        resolved_turn_id = (
+            turn_id
+            or self._active_turn_id_for_user(user_query)
+            or self._pending_turn_id_for_user(user_query)
+            or self._new_turn_id()
+        )
         item = {
             "ts": _now_iso(),
+            "turn_id": resolved_turn_id,
             "user_query": user_query,
             "final_answer": final_answer,
             "messages": [_message_to_persist_payload(m) for m in committed_messages],
@@ -1144,6 +1478,7 @@ class LocalSessionStore:
         with (self.active_dir / "transcript.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
         self.clear_pending_user_message()
+        self.clear_active_turn()
         if work_record:
             self.merge_work_record(work_record, user_query=user_query)
         else:
@@ -1274,7 +1609,13 @@ class LocalSessionStore:
 
     def _newest_mtime_iso(self, session_dir: Path) -> str:
         """取 session 目录内关键文件的最新 mtime，作为 updated_at 兜底。"""
-        paths = [session_dir, session_dir / "state.json", session_dir / "transcript.jsonl"]
+        paths = [
+            session_dir,
+            session_dir / "state.json",
+            session_dir / "transcript.jsonl",
+            session_dir / "active_turn.jsonl",
+            session_dir / "pending_user.json",
+        ]
         newest = max((p.stat().st_mtime for p in paths if p.exists()), default=session_dir.stat().st_mtime)
         return datetime.fromtimestamp(newest, timezone.utc).isoformat()
 

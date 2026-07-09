@@ -26,7 +26,7 @@ import logging
 import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -213,6 +213,7 @@ class ToolExecutor:
         round_idx: int = 0,
         cancel_token: Optional[CancelToken] = None,
         execution_policy: Optional[Any] = None,
+        result_callback: Optional[Callable[[ToolCallResult], None]] = None,
     ) -> List[ToolCallResult]:
         """执行一批 tool_calls，返回**保持 tool_calls 输入顺序**的结果列表。
 
@@ -258,13 +259,32 @@ class ToolExecutor:
 
         if should_parallelize(tool_calls):
             logger.info("executor mode: parallel round=%s calls=%s", round_idx, len(tool_calls))
-            results = self._execute_parallel(tool_calls, round_idx, cancel_token, execution_policy)
+            results = self._execute_parallel(
+                tool_calls,
+                round_idx,
+                cancel_token,
+                execution_policy,
+                result_callback,
+            )
         else:
             logger.info("executor mode: serial round=%s calls=%s", round_idx, len(tool_calls))
-            results = self._execute_serial(tool_calls, round_idx, cancel_token, execution_policy)
+            results = self._execute_serial(
+                tool_calls,
+                round_idx,
+                cancel_token,
+                execution_policy,
+                result_callback,
+            )
 
         # 批量总量上限检查：单轮所有 tool results 总字符超限时从最长的开始持久化
+        # result_callback 已经在单个工具完成时通知过一次；这里如果批量 cap 又改写
+        # 了结果，需要用同一个 call_id 再通知一次，让 active_turn 中的最终结果与
+        # 后续回灌给模型的 messages 保持一致。
+        before_batch_cap = [r.result for r in results]
         cap_batch_results(results, self._persist_dir)
+        for before, result in zip(before_batch_cap, results):
+            if result.result != before:
+                self._notify_result_callback(result_callback, result)
         return results
 
     # ---------- 串行 ----------
@@ -275,6 +295,7 @@ class ToolExecutor:
         round_idx: int,
         cancel_token: Optional[CancelToken],
         execution_policy: Optional[Any],
+        result_callback: Optional[Callable[[ToolCallResult], None]],
     ) -> List[ToolCallResult]:
         """串行执行一批 tool_calls。
 
@@ -295,7 +316,9 @@ class ToolExecutor:
                 )
                 results.append(self._cancelled_placeholder(tc))
                 continue
-            results.append(self._run_one(tc, round_idx, execution_policy=execution_policy))
+            result = self._run_one(tc, round_idx, execution_policy=execution_policy)
+            results.append(result)
+            self._notify_result_callback(result_callback, result)
         return results
 
     # ---------- 并行 ----------
@@ -306,6 +329,7 @@ class ToolExecutor:
         round_idx: int,
         cancel_token: Optional[CancelToken],
         execution_policy: Optional[Any],
+        result_callback: Optional[Callable[[ToolCallResult], None]],
     ) -> List[ToolCallResult]:
         # 每个 worker 拿一份 ctx 副本：同一个 contextvars.Context 不能并发
         # 多次 ctx.run（会抛 "context already entered"）。我们在主线程抓
@@ -323,11 +347,36 @@ class ToolExecutor:
                 ): i
                 for i, tc in enumerate(tool_calls)
             }
-            for fut, idx in futs.items():
-                results[idx] = fut.result()
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                result = fut.result()
+                results[idx] = result
+                # 并行模式下按完成顺序通知持久化层，但返回值仍按 tool_calls
+                # 原始顺序组装，保证后续 OpenAI tool 消息回灌顺序不变。
+                self._notify_result_callback(result_callback, result)
         # 这里不主动看 cancel_token：所有 future 已经 submit，让它们自然
         # 结束更安全；token 是否被 set 由 cb_agents / session 在外层处理
         return [r for r in results if r is not None]
+
+    @staticmethod
+    def _notify_result_callback(
+        callback: Optional[Callable[[ToolCallResult], None]],
+        result: ToolCallResult,
+    ) -> None:
+        """通知调用方某个工具已经完成。
+
+        这个回调只服务运行中检查点等旁路持久化；不能影响工具执行主流程。
+        """
+        if callback is None:
+            return
+        try:
+            callback(result)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "工具结果回调失败: name=%s call_id=%s",
+                result.name,
+                result.call_id,
+            )
 
     # ---------- 单条 ----------
 

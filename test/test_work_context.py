@@ -198,6 +198,194 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertEqual(text.count("尚未回答"), 1)
             self.assertIn("刚回", text)
 
+    def test_active_turn_user_restores_without_pending_duplicate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.save_pending_user_message("正在处理")
+            store.begin_active_turn(user_query="正在处理")
+
+            restored = LocalSessionStore(root)
+            history = restored.load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+
+            self.assertEqual(text.count("正在处理"), 1)
+            self.assertTrue((history[-1].metadata or {}).get("interrupted"))
+
+    def test_active_turn_completed_tool_pair_restores_protocol_messages(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            tool_calls = [{
+                "id": "call_read",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": "{\"path\":\"a.py\"}"},
+            }]
+            store.begin_active_turn(user_query="读 a.py")
+            store.record_active_assistant_tool_calls(
+                round_idx=1,
+                assistant_message=_assistant(tool_calls=tool_calls),
+            )
+            store.record_active_tool_completed(
+                round_idx=1,
+                tool_message=_tool("call_read", "file_read", "{\"content\":\"abc\"}"),
+            )
+
+            restored = LocalSessionStore(root)
+            history = restored.load_latest_history(max_messages=20)
+            roles = [m.role.value if hasattr(m.role, "value") else str(m.role) for m in history]
+
+            self.assertEqual(roles, ["user", "assistant", "tool"])
+            self.assertEqual(history[1].tool_calls[0]["id"], "call_read")
+            self.assertEqual(history[2].tool_call_id, "call_read")
+            self.assertTrue((history[1].metadata or {}).get("interrupted"))
+            self.assertTrue((history[2].metadata or {}).get("interrupted"))
+
+    def test_active_turn_partial_multi_tool_restores_only_completed_call(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            tool_calls = [
+                {
+                    "id": "call_done",
+                    "type": "function",
+                    "function": {"name": "file_read", "arguments": "{\"path\":\"a.py\"}"},
+                },
+                {
+                    "id": "call_running",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"sleep 10\"}"},
+                },
+            ]
+            store.begin_active_turn(user_query="先读文件再跑命令")
+            store.record_active_assistant_tool_calls(
+                round_idx=1,
+                assistant_message=_assistant(tool_calls=tool_calls),
+            )
+            store.record_active_tool_completed(
+                round_idx=1,
+                tool_message=_tool("call_done", "file_read", "{\"content\":\"abc\"}"),
+            )
+
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+
+            self.assertEqual(len(history), 3)
+            self.assertEqual([tc["id"] for tc in history[1].tool_calls], ["call_done"])
+            self.assertEqual(history[2].tool_call_id, "call_done")
+            dumped = json.dumps([m.to_dict() for m in history], ensure_ascii=False)
+            self.assertNotIn("call_running", dumped)
+
+    def test_append_turn_clears_active_turn_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.begin_active_turn(user_query="完整问题")
+            self.assertTrue((store.active_dir / "active_turn.jsonl").exists())
+
+            store.append_turn(
+                user_query="完整问题",
+                final_answer="完整回答",
+                committed_messages=[_user("完整问题"), _assistant("完整回答")],
+            )
+
+            self.assertFalse((store.active_dir / "active_turn.jsonl").exists())
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+            self.assertEqual(text.count("完整问题"), 1)
+            self.assertIn("完整回答", text)
+
+    def test_committed_turn_id_ignores_leftover_active_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            turn_id = "turn_committed"
+            store.append_turn(
+                user_query="已提交问题",
+                final_answer="已提交回答",
+                committed_messages=[_user("已提交问题"), _assistant("已提交回答")],
+                turn_id=turn_id,
+            )
+            # 模拟 transcript 已写成功、但进程在 clear_active_turn 前退出后留下的
+            # 残留 active_turn。恢复时应以 transcript 为准，不能把同一轮再追加一次。
+            store.begin_active_turn(user_query="已提交问题", turn_id=turn_id)
+
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+
+            self.assertEqual(text.count("已提交问题"), 1)
+            self.assertEqual(text.count("已提交回答"), 1)
+
+    def test_default_turn_id_ignores_leftover_active_after_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.begin_active_turn(user_query="默认 id 问题")
+            active_path = store.active_dir / "active_turn.jsonl"
+            active_snapshot = active_path.read_text(encoding="utf-8")
+
+            store.append_turn(
+                user_query="默认 id 问题",
+                final_answer="默认 id 回答",
+                committed_messages=[_user("默认 id 问题"), _assistant("默认 id 回答")],
+            )
+            # 模拟 append_turn 写完 transcript 后、清理 active_turn 前崩溃留下的文件。
+            active_path.write_text(active_snapshot, encoding="utf-8")
+
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+            self.assertEqual(text.count("默认 id 问题"), 1)
+            self.assertEqual(text.count("默认 id 回答"), 1)
+
+    def test_new_pending_clears_stale_active_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.begin_active_turn(user_query="旧未完成", turn_id="old_turn")
+
+            store.save_pending_user_message("新输入", turn_id="new_turn")
+
+            self.assertFalse((store.active_dir / "active_turn.jsonl").exists())
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("新输入", text)
+            self.assertNotIn("旧未完成", text)
+
+    def test_default_turn_id_pending_wins_over_stale_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.begin_active_turn(user_query="旧未完成")
+            active_path = store.active_dir / "active_turn.jsonl"
+            active_snapshot = active_path.read_text(encoding="utf-8")
+
+            store.save_pending_user_message("新输入")
+            # 模拟 pending 已写入、旧 active 尚未来得及删除时进程退出。
+            active_path.write_text(active_snapshot, encoding="utf-8")
+
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("新输入", text)
+            self.assertNotIn("旧未完成", text)
+
+    def test_new_pending_wins_if_stale_active_was_not_cleared_yet(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.begin_active_turn(user_query="旧未完成", turn_id="old_turn")
+            # 模拟 save_pending_user_message 写入成功后、clear_active_turn 执行前
+            # 进程退出：磁盘上同时存在新 pending 和旧 active。
+            store._write_json(store.active_dir / "pending_user.json", {
+                "ts": "2026-07-08T00:00:00+00:00",
+                "session_id": store.active_session_id,
+                "turn_id": "new_turn",
+                "user_query": "新输入",
+            })
+
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("新输入", text)
+            self.assertNotIn("旧未完成", text)
+
 
 class TestSessionIsolation(unittest.TestCase):
     def test_lists_creates_and_switches_isolated_sessions(self):

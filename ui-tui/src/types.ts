@@ -370,6 +370,12 @@ export interface RestoredHistoryMessage {
   role: "user" | "assistant" | "system" | string;
   content: string;
   kind?: string | null;
+  interrupted?: boolean;
+  tool?: {
+    name?: string;
+    call_id?: string;
+    is_error?: boolean;
+  } | null;
 }
 
 /** 后端估算的当前 active 会话上下文窗口占用。 */

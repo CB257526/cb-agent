@@ -35,6 +35,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -138,17 +139,30 @@ def _message_content_to_text(content: Any) -> str:
 def _history_message_to_payload(message: Message) -> Dict[str, Any]:
     """把内存 history 消息转成 JSON-RPC/TUI 恢复用的轻量结构。
 
-    这里故意只输出 role/content/kind 三个字段。跨会话切换恢复的是"用户看到的
-    对话记录 + 工作记录文本"，不是工具调用协议，因此不带 tool role，也不带
-    assistant.tool_calls。
+    跨会话切换恢复的是"用户看到的对话记录 + 工作记录文本"，不是工具调用协议，
+    因此不导出 assistant.tool_calls。tool 角色会压成短摘要，避免 UI 首屏直接
+    展示大段 stdout/stderr；模型上下文仍然使用内存里的原始 Message。
     """
     role = message.role.value if hasattr(message.role, "value") else str(message.role)
     metadata = message.metadata if isinstance(message.metadata, dict) else {}
-    return {
+    payload: Dict[str, Any] = {
         "role": role,
         "content": _message_content_to_text(message.content),
         "kind": metadata.get("kind"),
     }
+    if metadata.get("interrupted"):
+        payload["interrupted"] = True
+    if role == "tool":
+        tool_name = str(message.tool_name or "")
+        call_id = str(message.tool_call_id or "")
+        preview = _clip_compact_text(_message_content_to_text(message.content), 240)
+        label = tool_name or call_id or "tool"
+        payload["content"] = f"【工具完成】{label}" + (f": {preview}" if preview else "")
+        payload["tool"] = {
+            "name": tool_name,
+            "call_id": call_id,
+        }
+    return payload
 
 
 def _message_role_name(message: Message) -> str:
@@ -1125,6 +1139,7 @@ class AgentSession:
             request_content,
             explicit_skill_query,
         )
+        turn_id = uuid.uuid4().hex
         logger.info(
             "chat prepare: multimodal processed attachments=%s elapsed=%.2fs",
             len(multimodal_prompt.attachments),
@@ -1135,7 +1150,7 @@ class AgentSession:
                 # 通讯平台私聊会按“每条消息新建 AgentSession 对象”从磁盘恢复。
                 # 因此收到用户消息后先写 pending 记录：如果进程在 LLM 返回前崩溃，
                 # 下一次同一用户发消息时仍能从磁盘看到那条未完成输入。
-                self.session_store.save_pending_user_message(history_user_text)
+                self.session_store.save_pending_user_message(history_user_text, turn_id=turn_id)
             except Exception:
                 logger.exception("保存 pending 用户消息失败")
 
@@ -1241,6 +1256,24 @@ class AgentSession:
                 else None
             )
 
+        if self.session_store is not None:
+            try:
+                # pending_user.json 仍然负责“刚收到用户消息”的极早期兜底；
+                # active_turn.jsonl 从这里开始接管本轮运行中检查点，因为此时
+                # context_update 已由 _build_chat_messages 暂存，恢复后能重建
+                # 与本轮请求一致的 context/user 前缀。
+                context_message = (
+                    _make_context_update_message(self._pending_context_update_text)
+                    if self._pending_context_update_text else None
+                )
+                self.session_store.begin_active_turn(
+                    user_query=history_user_text,
+                    turn_id=turn_id,
+                    context_update_message=context_message,
+                )
+            except Exception:
+                logger.exception("开始 active turn 检查点失败")
+
         # 记录本轮初始消息（含 system/user/history）
         if self.message_logger is not None:
             try:
@@ -1312,6 +1345,7 @@ class AgentSession:
             final_answer,
             work_record,
             committed_turn_messages,
+            turn_id=turn_id,
         )
 
         # 本轮结束后再看一次跨轮 state/history。工具轨迹落盘和 state 合并可能让
@@ -2049,6 +2083,20 @@ class AgentSession:
                 # thinking 模式要求 reasoning_content 回传，否则下一轮 400
                 assistant_msg["reasoning_content"] = reasoning
             messages.append(assistant_msg)
+            if self.session_store is not None:
+                try:
+                    # 只在 LLM 完整返回 tool_calls 后记录规划；流式文本/reasoning
+                    # 增量不作为恢复边界。恢复时 store 还会按已完成工具过滤这里
+                    # 的 tool_calls，确保不会留下有声明无结果的半截调用。
+                    self.session_store.record_active_assistant_tool_calls(
+                        round_idx=round_idx,
+                        assistant_message=Message.create_assistant_message(
+                            input_text=answer or None,
+                            tool_calls=tool_calls,
+                        ),
+                    )
+                except Exception:
+                    logger.exception("记录 active assistant tool_calls 失败")
             self._emit_context_window_update(
                 reason="tool_calls_planned",
                 round_idx=round_idx,
@@ -2072,11 +2120,35 @@ class AgentSession:
             # token 透传给 executor：串行/并发模式下都在工具间做 cancel 检查
             # Plan Mode: 传入 PlanExecutionPolicy，在 executor 层硬拒绝写入工具。
             # execute 模式下 _plan_execution_policy() 返回 None，正常执行。
+            def _record_completed_tool_checkpoint(exec_result) -> None:
+                """单个工具完成后立即写运行中检查点。"""
+                if self.session_store is None:
+                    return
+                try:
+                    # 这里使用 exec_result.call_id，而不是外层 tool_calls 的 zip
+                    # 顺序。并行工具完成顺序不固定，call_id 才是稳定配对键。
+                    self.session_store.record_active_tool_completed(
+                        round_idx=round_idx,
+                        tool_message=Message.create_tool_message(
+                            tool_call_id=str(exec_result.call_id or ""),
+                            tool_name=str(exec_result.name),
+                            tool_output=(
+                                exec_result.result
+                                if isinstance(exec_result.result, str)
+                                else str(exec_result.result)
+                            ),
+                        ),
+                        is_error=exec_result.is_error,
+                    )
+                except Exception:
+                    logger.exception("记录 active tool 完成检查点失败")
+
             results = self.executor.execute(
                 tool_calls,
                 round_idx=round_idx,
                 cancel_token=token,
                 execution_policy=self._plan_execution_policy(),
+                result_callback=_record_completed_tool_checkpoint,
             )
             for call, exec_result in zip(tool_calls, results):
                 # 完整工具结果按 OpenAI tool calling 协议回灌给本轮 messages,
@@ -2084,16 +2156,18 @@ class AgentSession:
                 # 下一轮 _build_chat_messages 重新注入,模型继续看到原始结果。
                 # result_cap.py 已经在 executor 层对超大输出做过持久化截断,
                 # 这里不需要再次压缩。
-                messages.append({
+                tool_content = (
+                    exec_result.result
+                    if isinstance(exec_result.result, str)
+                    else str(exec_result.result)
+                )
+                tool_message = {
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
                     "name": exec_result.name,
-                    "content": (
-                        exec_result.result
-                        if isinstance(exec_result.result, str)
-                        else str(exec_result.result)
-                    ),
-                })
+                    "content": tool_content,
+                }
+                messages.append(tool_message)
                 # trace_collector 用于本轮末尾驱动 state.json 结构化字段更新
                 # (files_seen / files_modified / recent_commands 等)。
                 trace_collector.add_tool_result(
@@ -2504,6 +2578,8 @@ class AgentSession:
         final_answer: str,
         work_record,
         committed_messages: List[Message],
+        *,
+        turn_id: Optional[str] = None,
     ) -> None:
         """把本轮对话和工作记录写入项目级 session store。
 
@@ -2520,6 +2596,7 @@ class AgentSession:
                 final_answer=final_answer,
                 committed_messages=committed_messages,
                 work_record=work_record,
+                turn_id=turn_id,
             )
         except Exception:
             logger.exception("本地会话落盘失败")

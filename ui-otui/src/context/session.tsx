@@ -84,17 +84,20 @@ function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
   return history
     .filter((m) => m.content)
     .map((m) => {
+      const text = m.interrupted ? `上次中断前恢复 · ${m.content}` : m.content;
       if (
         m.kind === "work_record" ||
         m.kind === "compact_record" ||
+        m.role === "tool" ||
+        !!m.tool ||
         m.content.startsWith("【工作记录】") ||
         m.content.startsWith("【上下文压缩】")
       ) {
-        return { id: nextId(), role: "system", text: m.content } as ChatItem;
+        return { id: nextId(), role: "system", text } as ChatItem;
       }
-      if (m.role === "user") return { id: nextId(), role: "user", text: m.content } as ChatItem;
-      if (m.role === "assistant") return { id: nextId(), role: "assistant", text: m.content } as ChatItem;
-      return { id: nextId(), role: "system", text: m.content } as ChatItem;
+      if (m.role === "user") return { id: nextId(), role: "user", text } as ChatItem;
+      if (m.role === "assistant") return { id: nextId(), role: "assistant", text } as ChatItem;
+      return { id: nextId(), role: "system", text } as ChatItem;
     });
 }
 
