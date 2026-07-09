@@ -531,6 +531,41 @@ class TestFileRead(unittest.TestCase):
             self.assertIn("line6", res["content"])
             self.assertNotIn("line7", res["content"])
 
+    def test_char_range_reads_middle_of_long_single_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.txt"
+            marker = "MIDDLE"
+            prefix = "A" * 40000
+            suffix = "Z" * 40000
+            p.write_text(prefix + marker + suffix)
+
+            # 默认行模式只能返回超长单行的开头，因此中间标记不可见。
+            head_res = json.loads(FileReadTool().run({"path": str(p), "head": 1}))
+            self.assertTrue(head_res["truncated"])
+            self.assertNotIn(marker, head_res["content"])
+
+            # 字符范围可以精确定位超长单行的任意片段，避免永远只能看到开头。
+            start = len(prefix) + 1
+            end = start + len(marker) - 1
+            res = json.loads(FileReadTool().run({
+                "path": str(p), "start_char": start, "end_char": end,
+            }))
+            self.assertEqual(res["mode"], f"char_range-{start}-{end}")
+            self.assertEqual(res["char_range"], [start, end])
+            self.assertFalse(res["truncated"])
+            self.assertEqual(res["content"], marker)
+
+    def test_tail_keeps_end_when_single_line_is_truncated(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.txt"
+            marker = "TAIL_MARKER"
+            p.write_text(("A" * 40000) + marker)
+
+            # tail 模式关注尾部；即使只有一行且触发截断，也应该保留结尾内容。
+            res = json.loads(FileReadTool().run({"path": str(p), "tail": 1}))
+            self.assertTrue(res["truncated"])
+            self.assertIn(marker, res["content"])
+
     def test_nonexistent(self):
         res = json.loads(FileReadTool().run({"path": "/no/such/file"}))
         self.assertIn("error", res)

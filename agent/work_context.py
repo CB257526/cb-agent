@@ -440,7 +440,15 @@ def _summarize_arguments(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]
             summary["new_string_preview"] = _clip(arguments.get("new_string"), 160)
         return summary
     if name == "file_read":
-        keep = ("path", "head", "tail", "start_line", "end_line")
+        keep = (
+            "path",
+            "head",
+            "tail",
+            "start_line",
+            "end_line",
+            "start_char",
+            "end_char",
+        )
         return {k: _clip(arguments.get(k), 160) for k in keep if k in arguments}
     if name == "bash":
         keep = ("command", "cwd", "timeout", "background")

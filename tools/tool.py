@@ -19,7 +19,7 @@ class Tool(ABC):
         pass
 
     @abstractmethod
-    def validate_parameters(self,parameters: Dict[str, Any]) -> bool:
+    def validate_parameters(self,parameters: Dict[str, Any]) -> Any:
         """验证工具参数"""
         pass
 

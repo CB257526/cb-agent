@@ -119,7 +119,8 @@ def _build_truncated_payload(
         "hint": (
             f"完整内容已持久化（{total_chars} 字符 / {total_lines} 行）。"
             f"请用 file_read(path=\"{persisted_path}\", start_line=X, end_line=Y) "
-            "按需分段读取，不要一次性全量读取。"
+            "按行分段读取；如果是超长单行，用 start_char/end_char 按字符分段读取。"
+            "不要一次性全量读取。"
         ),
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -151,7 +152,7 @@ def cap_single_result(
     # 防循环：读取持久化文件的 file_read 结果，只做 inline 截断
     if _is_reading_persisted_result(tool_name, result):
         truncated = result[:MAX_SINGLE_RESULT_CHARS] + (
-            "\n...[已截断，请用 start_line/end_line 分段读取]"
+            "\n...[已截断，请用 start_line/end_line 或 start_char/end_char 分段读取]"
         )
         logger.info(
             "cap_single_result: 读取持久化文件的 file_read 结果已 inline 截断"
