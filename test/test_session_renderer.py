@@ -859,8 +859,16 @@ class TestAgentSessionBasic(unittest.TestCase):
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
             llm = FakeLLM([
-                {"answer": "", "tool_calls": [_tc("file_read", '{"path":"b.txt"}')]},
-                {"answer": "done", "tool_calls": []},
+                {
+                    "answer": "",
+                    "tool_calls": [_tc("file_read", '{"path":"b.txt"}')],
+                    "reasoning_content": "先读取文件",
+                },
+                {
+                    "answer": "done",
+                    "tool_calls": [],
+                    "reasoning_content": "根据读取结果回答",
+                },
             ])
             self.registry.execute_tool = MagicMock(return_value=json.dumps({
                 "path": "b.txt",
@@ -889,6 +897,12 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(roles, ["user", "user", "assistant", "tool", "assistant"])
             self.assertEqual((restored.history[0].metadata or {}).get("kind"), "context_update")
             self.assertEqual(str(restored.history[-1].content), "done")
+            assistant_messages = [
+                message for message in restored.history
+                if (message.role.value if hasattr(message.role, "value") else str(message.role)) == "assistant"
+            ]
+            self.assertEqual(assistant_messages[0].reasoning_content, "先读取文件")
+            self.assertEqual(assistant_messages[1].reasoning_content, "根据读取结果回答")
 
             restored.clear_history()
             self.assertEqual(restored.history, [])
@@ -970,6 +984,96 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             self.assertEqual([tc["id"] for tc in visible[1].tool_calls], ["call_first"])
             self.assertEqual(visible[2].tool_call_id, "call_first")
+
+    def test_final_answer_checkpoint_survives_transcript_commit_interruption(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            llm = FakeLLM([{
+                "answer": "已经展示给用户的回答",
+                "tool_calls": [],
+                "reasoning_content": "最终思考",
+            }], emit_text=True)
+            s = AgentSession(
+                llm=llm, registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s._persist_turn = MagicMock(side_effect=KeyboardInterrupt())
+
+            with self.assertRaises(KeyboardInterrupt):
+                s.chat("需要可靠恢复的回答")
+
+            restored = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+            visible = [
+                message for message in restored.history
+                if (message.metadata or {}).get("kind") != "context_update"
+            ]
+
+            self.assertEqual(
+                [m.role.value if hasattr(m.role, "value") else str(m.role) for m in visible],
+                ["user", "assistant"],
+            )
+            self.assertEqual(visible[-1].content, "已经展示给用户的回答")
+            self.assertEqual(visible[-1].reasoning_content, "最终思考")
+            self.assertTrue((visible[-1].metadata or {}).get("interrupted"))
+
+    def test_transcript_is_committed_before_memory_writeback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            s = AgentSession(
+                llm=FakeLLM([{"answer": "先提交的回答", "tool_calls": []}]),
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=self.bus,
+                ctx_enabled=False,
+                session_store=store,
+            )
+            s._auto_update_memory_and_knowledge = MagicMock(side_effect=KeyboardInterrupt())
+
+            with self.assertRaises(KeyboardInterrupt):
+                s.chat("提交顺序")
+
+            self.assertFalse((store.active_dir / "active_turn.jsonl").exists())
+            restored = LocalSessionStore(root).load_latest_history(max_messages=20)
+            restored_text = "\n".join(str(message.content) for message in restored)
+            self.assertEqual(restored_text.count("提交顺序"), 1)
+            self.assertEqual(restored_text.count("先提交的回答"), 1)
+
+    def test_active_tool_error_is_exported_as_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            call = _tc("file_read", call_id="call_error")
+            store.begin_active_turn(user_query="恢复失败工具")
+            store.record_active_assistant_tool_calls(
+                round_idx=1,
+                assistant_message=Message.create_assistant_message(tool_calls=[call]),
+            )
+            store.record_active_tool_completed(
+                round_idx=1,
+                tool_message=Message.create_tool_message(
+                    "call_error",
+                    "file_read",
+                    '{"error":"denied"}',
+                    is_error=True,
+                ),
+                is_error=True,
+            )
+
+            restored = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+            tool_payload = next(item for item in restored.export_history() if item.get("tool"))
+
+            self.assertIn("【工具失败】file_read", tool_payload["content"])
+            self.assertTrue(tool_payload["tool"]["is_error"])
 
     def test_agent_session_create_and_switch_keeps_histories_isolated(self):
         with tempfile.TemporaryDirectory() as td:

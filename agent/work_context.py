@@ -152,7 +152,9 @@ def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
     与旧的 _history_message_to_payload（仅返回 role/content/kind 的轻量 UI 视图）
     不同，这个 helper 用于 transcript.jsonl 与 compact.json 的持久化：
     - 保留 assistant.tool_calls（含 OpenAI function 字段）
+    - 保留 assistant.reasoning_content，兼容要求跨轮回传思考内容的模型
     - 保留 tool 消息的 tool_call_id 与 name
+    - 保留 tool 消息的本地错误状态，供恢复后的 UI 正确展示
     - 保留 metadata.kind 用于识别 compact_boundary
     这样跨轮恢复时可以原样把 tool_use + tool_result 块塞回 messages，让模型
     看到上一轮真实工具调用细节（CC 同款累积模式）。
@@ -165,10 +167,14 @@ def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
     payload["content"] = message.content
     if message.tool_calls:
         payload["tool_calls"] = message.tool_calls
+    if message.reasoning_content:
+        payload["reasoning_content"] = message.reasoning_content
     if message.tool_call_id:
         payload["tool_call_id"] = message.tool_call_id
     if message.tool_name:
         payload["tool_name"] = message.tool_name
+    if role == "tool":
+        payload["is_error"] = bool(message.is_error)
     kind = metadata.get("kind")
     if kind:
         payload["kind"] = str(kind)
@@ -188,8 +194,10 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
     content = payload.get("content")
     kind = payload.get("kind")
     tool_calls = payload.get("tool_calls")
+    reasoning_content = payload.get("reasoning_content")
     tool_call_id = payload.get("tool_call_id") or ""
     tool_name = payload.get("tool_name") or payload.get("name") or ""
+    is_error = bool(payload.get("is_error"))
 
     if role == "user":
         # user 消息可能是多模态 list，也可能是字符串。空内容跳过。
@@ -216,6 +224,7 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
             tool_call_id=str(tool_call_id),
             tool_name=str(tool_name),
             tool_output=str(content or ""),
+            is_error=is_error,
         )
     elif role == "assistant":
         # assistant 至少要有 content 或 tool_calls 之一才有意义。
@@ -225,6 +234,10 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
         msg = Message.create_assistant_message(
             input_text=text,
             tool_calls=tool_calls if isinstance(tool_calls, list) else None,
+            reasoning_content=(
+                str(reasoning_content)
+                if reasoning_content is not None else None
+            ),
         )
     else:
         return None
@@ -269,11 +282,11 @@ def _mark_interrupted_message(message: Message) -> Message:
 def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Message]:
     """把运行中检查点还原成一段协议合法的 history。
 
-    active_turn.jsonl 只记录未完成回合的安全边界：用户输入、assistant 规划出的
-    tool_calls、以及已经完成的 tool 结果。恢复时最重要的约束是 OpenAI tool
-    calling 协议合法性：每条 role=tool 前面必须有声明同一 tool_call_id 的
-    assistant.tool_calls。因此这里会主动丢弃没有完成结果的 tool_call，只恢复
-    “assistant 声明 + 对应 tool 结果”成对出现的部分。
+    active_turn.jsonl 记录未完成回合的安全边界：用户输入、assistant 规划出的
+    tool_calls、已经完成的 tool 结果，以及已经完整生成的最终回答。恢复工具轨迹
+    时最重要的约束是 OpenAI tool calling 协议合法性：每条 role=tool 前面必须
+    有声明同一 tool_call_id 的 assistant.tool_calls。因此这里会主动丢弃没有
+    完成结果的 tool_call，只恢复“assistant 声明 + 对应 tool 结果”成对出现的部分。
     """
     if not events:
         return []
@@ -322,7 +335,13 @@ def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Mess
         if not call_id:
             continue
         round_key = str(event.get("round_idx") or "")
-        completed_by_round.setdefault(round_key, {})[call_id] = tool_payload
+        restored_tool_payload = deepcopy(tool_payload)
+        # 兼容本提交早期格式：错误状态最初只写在事件顶层，没有放进 tool_payload。
+        restored_tool_payload["is_error"] = bool(
+            restored_tool_payload.get("is_error")
+            or event.get("is_error")
+        )
+        completed_by_round.setdefault(round_key, {})[call_id] = restored_tool_payload
 
     for event in scoped_events[1:]:
         if not isinstance(event, dict) or event.get("type") != "assistant_tool_calls":
@@ -361,6 +380,22 @@ def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Mess
             tool_message = _message_payload_to_message(completed.get(call_id, {}))
             if tool_message is not None:
                 out.append(_mark_interrupted_message(tool_message))
+
+    # 最终回答是本轮已经完整生成的安全边界。即使 transcript 尚未来得及提交，
+    # 重启后也应恢复用户已经看到的回答，而不是只留下一个未回答的 user 消息。
+    final_event = next(
+        (
+            event for event in reversed(scoped_events[1:])
+            if isinstance(event, dict) and event.get("type") == "assistant_final"
+        ),
+        None,
+    )
+    if isinstance(final_event, dict):
+        final_payload = final_event.get("assistant_payload")
+        if isinstance(final_payload, dict):
+            final_message = _message_payload_to_message(final_payload)
+            if final_message is not None:
+                out.append(_mark_interrupted_message(final_message))
 
     return out
 
@@ -1139,8 +1174,9 @@ class LocalSessionStore:
         """开始记录当前运行中的回合。
 
         active_turn.jsonl 的语义是“当前未完成的一轮”，所以新一轮开始时会重置
-        旧文件，只写入第一条 turn_started。后续 assistant_tool_calls 和
-        tool_completed 仍然按 JSONL 追加，保证工具完成边界可以及时 flush。
+        旧文件，只写入第一条 turn_started。后续 assistant_tool_calls、
+        tool_completed 和 assistant_final 仍然按 JSONL 追加，保证每个可恢复
+        边界都能及时写入文件对象。
         """
 
         self.ensure_active()
@@ -1185,6 +1221,23 @@ class LocalSessionStore:
             return
         self._append_active_turn_event({
             "type": "assistant_tool_calls",
+            "round_idx": int(round_idx),
+            "assistant_payload": payload,
+        })
+
+    def record_active_assistant_final(
+        self,
+        *,
+        round_idx: int,
+        assistant_message: Message,
+    ) -> None:
+        """记录已经完整生成、但尚未提交进 transcript 的最终回答。"""
+
+        payload = _message_to_persist_payload(assistant_message)
+        if not str(payload.get("content") or ""):
+            return
+        self._append_active_turn_event({
+            "type": "assistant_final",
             "round_idx": int(round_idx),
             "assistant_payload": payload,
         })

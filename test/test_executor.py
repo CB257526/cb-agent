@@ -258,6 +258,29 @@ class TestExecutorParallel(unittest.TestCase):
         ])
         self.assertEqual([r.call_id for r in results], ["1", "2", "3"])
 
+    def test_parallel_base_exception_still_checkpoints_successful_results(self):
+        """某个并行任务退出时，随后完成的成功任务仍必须触发结果回调。"""
+        checkpointed = []
+
+        def runner(name, args):
+            if name == "file_read":
+                time.sleep(0.01)
+                raise KeyboardInterrupt()
+            time.sleep(0.05)
+            return '{"ok":true}'
+
+        ex = ToolExecutor(runner, max_workers=2)
+        with self.assertRaises(KeyboardInterrupt):
+            ex.execute(
+                [
+                    _tc("file_read", call_id="call_exit"),
+                    _tc("glob", call_id="call_success"),
+                ],
+                result_callback=lambda result: checkpointed.append(result.call_id),
+            )
+
+        self.assertEqual(checkpointed, ["call_success"])
+
     def test_serial_when_mixed(self):
         """含 bash 时退回串行，证据：runner 没有并发执行。"""
 

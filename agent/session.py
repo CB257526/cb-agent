@@ -155,12 +155,15 @@ def _history_message_to_payload(message: Message) -> Dict[str, Any]:
     if role == "tool":
         tool_name = str(message.tool_name or "")
         call_id = str(message.tool_call_id or "")
+        is_error = bool(message.is_error)
         preview = _clip_compact_text(_message_content_to_text(message.content), 240)
         label = tool_name or call_id or "tool"
-        payload["content"] = f"【工具完成】{label}" + (f": {preview}" if preview else "")
+        status_label = "工具失败" if is_error else "工具完成"
+        payload["content"] = f"【{status_label}】{label}" + (f": {preview}" if preview else "")
         payload["tool"] = {
             "name": tool_name,
             "call_id": call_id,
+            "is_error": is_error,
         }
     return payload
 
@@ -1331,6 +1334,15 @@ class AgentSession:
             final_answer=final_answer,
             trace_collector=trace_collector,
         )
+        # transcript 是本轮对话恢复的事实来源，必须先于记忆/state 等旁路更新提交。
+        # 即使后续记忆写回期间进程退出，用户已经看到的最终回答也不会从历史中消失。
+        self._persist_turn(
+            history_user_text,
+            final_answer,
+            work_record,
+            committed_turn_messages,
+            turn_id=turn_id,
+        )
         # 自动记忆更新:现在只驱动 MEMORY.md 长期记忆(KnowledgeBase.capture_turn
         # 内按用户显式"请记住"类触发写入)。结构化知识页改由模型显式调用
         # knowledge_write 工具写入——原先依赖 work_record 文本的自动知识页捕获
@@ -1339,13 +1351,6 @@ class AgentSession:
         self._auto_update_memory_and_knowledge(
             user_query=history_user_text,
             final_answer=final_answer,
-        )
-        self._persist_turn(
-            history_user_text,
-            final_answer,
-            work_record,
-            committed_turn_messages,
-            turn_id=turn_id,
         )
 
         # 本轮结束后再看一次跨轮 state/history。工具轨迹落盘和 state 合并可能让
@@ -1902,18 +1907,48 @@ class AgentSession:
         # 压缩的是深拷贝副本，原始 messages 不丢工具调用细节。
         loop_compactions: List[Dict[str, Any]] = []
         max_rounds = self.max_tool_rounds
+
+        def _append_final_checkpoint(
+            answer: str,
+            *,
+            round_idx: int,
+            reasoning_content: Optional[str] = None,
+        ) -> None:
+            """把完整最终回答加入本轮协议消息，并立即写运行中检查点。"""
+            if not answer:
+                return
+            assistant_message = Message.create_assistant_message(
+                input_text=answer,
+                reasoning_content=reasoning_content,
+            )
+            messages.append(assistant_message.to_dict())
+            if self.session_store is None:
+                return
+            try:
+                self.session_store.record_active_assistant_final(
+                    round_idx=round_idx,
+                    assistant_message=assistant_message,
+                )
+            except Exception:
+                logger.exception("记录 active 最终回答检查点失败")
+
         for round_idx in range(1, max_rounds + 1):
             # 进入新一轮前先看 token
             if token.is_cancelled():
+                final_round_idx = round_idx - 1 if round_idx > 1 else 1
+                _append_final_checkpoint(
+                    partial_answer,
+                    round_idx=final_round_idx,
+                )
                 self.event_bus.emit(Cancelled(
                     where="session_loop", round_idx=round_idx,
                 ))
                 self.event_bus.emit(RoundEnd(
-                    round_idx=max(round_idx - 1, 1),
+                    round_idx=final_round_idx,
                     has_tool_calls=False, final=True,
                 ))
                 return (
-                    round_idx - 1 if round_idx > 1 else 1,
+                    final_round_idx,
                     partial_answer,
                     trace_collector,
                     loop_compactions,
@@ -1946,6 +1981,14 @@ class AgentSession:
                 used_tokens=request_tokens_est,
             )
             if request_tokens_est >= self._full_window_blocking_threshold():
+                overflow_answer = (
+                    partial_answer
+                    or "[上下文窗口已满] 工具循环中的请求过大，已停止本轮。"
+                )
+                _append_final_checkpoint(
+                    overflow_answer,
+                    round_idx=round_idx,
+                )
                 self.event_bus.emit(Error(
                     where="session",
                     message=(
@@ -1961,7 +2004,7 @@ class AgentSession:
                 ))
                 return (
                     round_idx,
-                    partial_answer or "[上下文窗口已满] 工具循环中的请求过大，已停止本轮。",
+                    overflow_answer,
                     trace_collector,
                     loop_compactions,
                 )
@@ -2026,6 +2069,7 @@ class AgentSession:
                     round_idx=round_idx,
                     plan_bus=plan_bus,
                 )
+                _append_final_checkpoint(final, round_idx=round_idx)
                 logger.info("round final without tools: round=%s answer_chars=%s", round_idx, len(final))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
@@ -2060,6 +2104,11 @@ class AgentSession:
 
             # 流式过程中被 cancel → 不再发起新一轮工具调用，直接收尾
             if token.is_cancelled():
+                _append_final_checkpoint(
+                    answer,
+                    round_idx=round_idx,
+                    reasoning_content=reasoning,
+                )
                 logger.info("round cancelled after llm stream: round=%s answer_chars=%s", round_idx, len(answer))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
@@ -2067,6 +2116,11 @@ class AgentSession:
                 return round_idx, answer, trace_collector, loop_compactions
 
             if not tool_calls:
+                _append_final_checkpoint(
+                    answer,
+                    round_idx=round_idx,
+                    reasoning_content=reasoning,
+                )
                 logger.info("round final: round=%s answer_chars=%s", round_idx, len(answer))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
@@ -2093,6 +2147,7 @@ class AgentSession:
                         assistant_message=Message.create_assistant_message(
                             input_text=answer or None,
                             tool_calls=tool_calls,
+                            reasoning_content=reasoning,
                         ),
                     )
                 except Exception:
@@ -2137,6 +2192,7 @@ class AgentSession:
                                 if isinstance(exec_result.result, str)
                                 else str(exec_result.result)
                             ),
+                            is_error=exec_result.is_error,
                         ),
                         is_error=exec_result.is_error,
                     )
@@ -2218,9 +2274,14 @@ class AgentSession:
             message=f"工具调用超过 {max_rounds} 轮，强制终止",
             round_idx=max_rounds,
         ))
+        max_rounds_answer = "（工具调用次数过多，已终止本轮）"
+        _append_final_checkpoint(
+            max_rounds_answer,
+            round_idx=max_rounds,
+        )
         return (
             max_rounds,
-            "（工具调用次数过多，已终止本轮）",
+            max_rounds_answer,
             trace_collector,
             loop_compactions,
         )
@@ -2293,6 +2354,10 @@ class AgentSession:
                 out.append(Message.create_assistant_message(
                     input_text=text,
                     tool_calls=tool_calls if isinstance(tool_calls, list) else None,
+                    reasoning_content=(
+                        str(raw.get("reasoning_content"))
+                        if raw.get("reasoning_content") is not None else None
+                    ),
                 ))
             elif role == "tool":
                 tool_call_id = raw.get("tool_call_id") or ""

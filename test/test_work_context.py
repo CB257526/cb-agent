@@ -241,6 +241,50 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertTrue((history[1].metadata or {}).get("interrupted"))
             self.assertTrue((history[2].metadata or {}).get("interrupted"))
 
+    def test_active_turn_restores_reasoning_final_answer_and_tool_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            tool_calls = [{
+                "id": "call_failed",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": "{}"},
+            }]
+            store.begin_active_turn(user_query="恢复完整协议字段")
+            store.record_active_assistant_tool_calls(
+                round_idx=1,
+                assistant_message=Message.create_assistant_message(
+                    tool_calls=tool_calls,
+                    reasoning_content="工具规划思考",
+                ),
+            )
+            # 模拟旧格式：错误状态只通过事件参数传入，tool Message 本身仍是默认 false。
+            store.record_active_tool_completed(
+                round_idx=1,
+                tool_message=_tool("call_failed", "file_read", '{"error":"denied"}'),
+                is_error=True,
+            )
+            store.record_active_assistant_final(
+                round_idx=2,
+                assistant_message=Message.create_assistant_message(
+                    "已恢复最终回答",
+                    reasoning_content="最终回答思考",
+                ),
+            )
+
+            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+
+            self.assertEqual(
+                [m.role.value if hasattr(m.role, "value") else str(m.role) for m in history],
+                ["user", "assistant", "tool", "assistant"],
+            )
+            self.assertEqual(history[1].reasoning_content, "工具规划思考")
+            self.assertEqual(history[1].to_dict()["reasoning_content"], "工具规划思考")
+            self.assertTrue(history[2].is_error)
+            self.assertEqual(history[3].content, "已恢复最终回答")
+            self.assertEqual(history[3].reasoning_content, "最终回答思考")
+            self.assertTrue((history[3].metadata or {}).get("interrupted"))
+
     def test_active_turn_partial_multi_tool_restores_only_completed_call(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"

@@ -347,13 +347,26 @@ class ToolExecutor:
                 ): i
                 for i, tc in enumerate(tool_calls)
             }
+            first_base_error: Optional[BaseException] = None
+            first_base_error_traceback = None
             for fut in as_completed(futs):
                 idx = futs[fut]
-                result = fut.result()
+                try:
+                    result = fut.result()
+                except BaseException as exc:
+                    # ThreadPoolExecutor 在退出 with 时本来就会等待全部任务结束。
+                    # 因此这里继续收集其它成功结果，不会额外延长当前异常路径，
+                    # 却能保证进程退出前把已经完成的工具检查点全部写下。
+                    if first_base_error is None:
+                        first_base_error = exc
+                        first_base_error_traceback = exc.__traceback__
+                    continue
                 results[idx] = result
                 # 并行模式下按完成顺序通知持久化层，但返回值仍按 tool_calls
                 # 原始顺序组装，保证后续 OpenAI tool 消息回灌顺序不变。
                 self._notify_result_callback(result_callback, result)
+            if first_base_error is not None:
+                raise first_base_error.with_traceback(first_base_error_traceback)
         # 这里不主动看 cancel_token：所有 future 已经 submit，让它们自然
         # 结束更安全；token 是否被 set 由 cb_agents / session 在外层处理
         return [r for r in results if r is not None]
