@@ -39,6 +39,13 @@ class DummyTool(Tool):
         return "ok"
 
 
+class ReconstructedTool(DummyTool):
+    """模拟无法深拷贝、只能调用无参构造器的扩展工具。"""
+
+    def __deepcopy__(self, _memo):
+        raise TypeError("not deepcopyable")
+
+
 class TestListToolsTool(unittest.TestCase):
     def test_uses_injected_registry(self) -> None:
         registry = ToolRegistry()
@@ -87,6 +94,18 @@ class TestListToolsTool(unittest.TestCase):
         output = child.execute_tool("list_tools", {})
         self.assertIn("safe_tool", output)
         self.assertNotIn("blocked_tool", output)
+
+    def test_clone_reconstruction_preserves_registered_name(self) -> None:
+        registry = ToolRegistry()
+        original = ReconstructedTool("custom_runtime_name")
+        registry.register_tool(original)
+
+        child = registry.clone_filtered(allow_names={"custom_runtime_name"})
+        cloned = child.get_tool("custom_runtime_name")
+
+        self.assertIsNotNone(cloned)
+        self.assertEqual(cloned.name, original.name)
+        self.assertEqual(cloned.description, original.description)
 
 
 if __name__ == "__main__":

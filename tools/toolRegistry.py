@@ -1,9 +1,14 @@
 """工具注册表 - HelloAgents原生工具系统"""
 
+import copy
+import logging
 import threading
 from typing import Optional, Any, Callable, Iterable
 from .tool import Tool
 from typing import List, Dict
+
+
+logger = logging.getLogger(__name__)
 
 class ToolRegistry:
     """
@@ -233,12 +238,15 @@ class ToolRegistry:
         allow_names: Optional[Iterable[str]] = None,
         deny_names: Optional[Iterable[str]] = None,
         event_bus: Any = None,
+        bash_session: Any = None,
+        bash_output_dir: Any = None,
     ) -> "ToolRegistry":
         """创建一个只包含指定工具的快照注册表。
 
         按 allow/deny 两组规则筛选工具，同时处理特殊工具（todo 需要 event_bus、
-        list_tools 需要引用自身）的依赖注入。返回的注册表不共享工具映射表；
-        除 todo/list_tools 等需要重新绑定的特殊工具外，普通工具实例会复用原实例。
+        list_tools 需要引用自身）的依赖注入。普通 Tool 优先调用专用克隆接口，
+        其次深拷贝或重新构造；无法安全克隆的工具会跳过，不把有状态实例直接共享
+        给多个子代理线程。
         """
         allow = set(allow_names) if allow_names is not None else None
         deny = set(deny_names or [])
@@ -269,6 +277,8 @@ class ToolRegistry:
                     from tools.tools.bash_tool import BashTool
 
                     cloned.register_tool(BashTool(
+                        session=bash_session,
+                        permission=getattr(tool, "_permission", None),
                         is_subagent=True,
                         skill_observer=getattr(tool, "_skill_observer", None),
                         dangerously_skip_permissions_provider=getattr(
@@ -281,11 +291,39 @@ class ToolRegistry:
                             "_dangerously_skip_permissions",
                             False,
                         )),
+                        output_dir=bash_output_dir,
                     ))
                     continue
                 except Exception:
                     pass
-            cloned.register_tool(tool)
+            cloned_tool = None
+            clone_for_subagent = getattr(tool, "clone_for_subagent", None)
+            if callable(clone_for_subagent):
+                try:
+                    cloned_tool = clone_for_subagent(event_bus=event_bus)
+                except TypeError:
+                    try:
+                        cloned_tool = clone_for_subagent()
+                    except Exception:
+                        logger.exception("工具专用子代理克隆失败: %s", tool.name)
+                except Exception:
+                    logger.exception("工具专用子代理克隆失败: %s", tool.name)
+            if cloned_tool is None:
+                try:
+                    # 深拷贝优先保留自定义工具的实例化名称、描述和配置，同时隔离
+                    # 可变状态；含锁或网络句柄的工具若无法深拷贝，再尝试重新构造。
+                    cloned_tool = copy.deepcopy(tool)
+                except Exception:
+                    try:
+                        cloned_tool = type(tool)()
+                    except Exception:
+                        logger.warning("跳过无法安全克隆的子代理工具: %s", tool.name)
+                        continue
+            # 重新构造可能回到类的默认名称；子注册表必须保持父注册表的公开契约，
+            # 否则角色 allowlist 中的名字会与实际 schema/执行入口不一致。
+            cloned_tool.name = tool.name
+            cloned_tool.description = tool.description
+            cloned.register_tool(cloned_tool)
 
         if "list_tools" in selected_tool_names:
             try:
@@ -298,6 +336,11 @@ class ToolRegistry:
             if allow is not None and name not in allow:
                 continue
             if name in deny:
+                continue
+            # 裸函数没有统一的状态克隆协议。只有显式声明线程安全的函数才允许进入
+            # 子代理，防止闭包捕获主会话状态后被多个线程并发修改。
+            if not bool(getattr(info["func"], "subagent_thread_safe", False)):
+                logger.warning("跳过未声明线程安全的子代理函数工具: %s", name)
                 continue
             cloned.register_function(name, info["description"], info["func"])
         return cloned

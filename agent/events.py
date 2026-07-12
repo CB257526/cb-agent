@@ -399,6 +399,8 @@ class SubagentStarted:
     task_id: Optional[str] = None       # 后台任务 ID（运行于后台时才有）
     run_in_background: bool = False     # 是否以后台任务方式运行
     parent_session_id: Optional[str] = None  # 父会话的 session_id
+    status: str = "running"             # queued / running
+    phase: str = "starting"             # queued / starting
     round_idx: int = 0
     timestamp: float = field(default_factory=_now)
     type: str = field(default="subagent_started", init=False)
@@ -415,7 +417,16 @@ class SubagentProgress:
     subagent_type: str         # 子代理的类型
     message: str               # 进度描述文本
     task_id: Optional[str] = None       # 绑定的后台任务 ID
+    parent_session_id: Optional[str] = None  # 归属父会话，用于传输层过滤跨会话事件
     status: str = "running"             # 当前状态（running / ...）
+    phase: str = "running"              # 更细的阶段（thinking / running_tool / ...）
+    event_seq: int = 0                  # 任务内单调递增事件序号，供增量读取和 UI 去重
+    tool_name: str = ""                 # 当前事件关联的工具名称
+    tool_call_id: str = ""              # 当前事件关联的工具调用 ID
+    arguments_preview: Dict[str, Any] = field(default_factory=dict)  # 已脱敏参数摘要
+    tool_uses: int = 0                  # 当前累计工具调用次数
+    active_tool_count: int = 0          # 当前仍在执行的工具数量
+    total_tokens: int = 0               # 当前累计 token 数
     round_idx: int = 0
     timestamp: float = field(default_factory=_now)
     type: str = field(default="subagent_progress", init=False)
@@ -434,6 +445,7 @@ class SubagentCompleted:
     status: str                # 结束状态：completed / failed / cancelled
     content: str = ""          # 子代理的最终回答文本
     task_id: Optional[str] = None       # 绑定的后台任务 ID
+    parent_session_id: Optional[str] = None  # 归属父会话，用于传输层过滤跨会话事件
     output_path: Optional[str] = None   # 输出文件路径（如有持久化）
     duration_seconds: float = 0.0       # 子代理执行总耗时
     rounds_used: int = 0                # 子代理使用的工具循环轮数

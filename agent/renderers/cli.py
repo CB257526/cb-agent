@@ -401,8 +401,9 @@ class CLIRenderer:
     def _on_subagent_started(self, e: SubagentStarted) -> None:
         with self._lock:
             bg = f" task={e.task_id}" if e.task_id else ""
+            state = "queued" if e.status == "queued" else "started"
             print(
-                f"{BLUE}{BOLD}subagent started{RESET} "
+                f"{BLUE}{BOLD}subagent {state}{RESET} "
                 f"type={e.subagent_type} id={e.subagent_id}{bg} "
                 f"{DIM}{e.description}{RESET}"
             )
@@ -410,8 +411,16 @@ class CLIRenderer:
     def _on_subagent_progress(self, e: SubagentProgress) -> None:
         with self._lock:
             task = f" task={e.task_id}" if e.task_id else ""
+            phase = f" phase={e.phase}" if e.phase else ""
+            stats = ""
+            if e.tool_uses or e.total_tokens or e.active_tool_count:
+                stats = (
+                    f" tools={e.tool_uses} active={e.active_tool_count} "
+                    f"tokens={e.total_tokens}"
+                )
             print(
-                f"  {DIM}{CYAN}subagent {e.subagent_id}{task}: {e.message}{RESET}"
+                f"  {DIM}{CYAN}subagent {e.subagent_id}{task}{phase}{stats}: "
+                f"{e.message}{RESET}"
             )
 
     def _on_subagent_completed(self, e: SubagentCompleted) -> None:

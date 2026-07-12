@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import time
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -47,6 +48,11 @@ DEFAULT_IGNORE_DIRS = frozenset(
         "dist",
         "build",
     }
+)
+
+_extra_ignore_dirs: ContextVar[frozenset[str]] = ContextVar(
+    "cbagent_local_search_extra_ignore_dirs",
+    default=frozenset(),
 )
 
 RG_TIMEOUT_SECONDS = 20.0
@@ -148,8 +154,25 @@ def _coerce_bool(value: Any, *, default: bool = False) -> bool:
     raise ValueError("必须是布尔值")
 
 
+def set_search_ignore_dirs(names: Iterable[str]) -> Token[frozenset[str]]:
+    """为当前 Agent 上下文追加搜索忽略目录，并传播到 ToolExecutor 线程。"""
+
+    additions = frozenset(str(name) for name in names if str(name))
+    return _extra_ignore_dirs.set(_extra_ignore_dirs.get() | additions)
+
+
+def reset_search_ignore_dirs(token: Token[frozenset[str]]) -> None:
+    """恢复进入当前 Agent 前的额外搜索忽略目录。"""
+
+    _extra_ignore_dirs.reset(token)
+
+
+def _effective_ignore_dirs() -> frozenset[str]:
+    return DEFAULT_IGNORE_DIRS | _extra_ignore_dirs.get()
+
+
 def _is_ignored_dir(name: str) -> bool:
-    return name in DEFAULT_IGNORE_DIRS
+    return name in _effective_ignore_dirs()
 
 
 def _iter_files(root: Path, *, include_hidden: bool = True) -> Iterable[Path]:
@@ -234,7 +257,7 @@ def _matches_any_glob(path: Path, base: Path, patterns: Sequence[str]) -> bool:
 
 def _rg_ignore_args() -> List[str]:
     args: List[str] = []
-    for name in sorted(DEFAULT_IGNORE_DIRS):
+    for name in sorted(_effective_ignore_dirs()):
         args.extend(["--glob", f"!{name}/**"])
         args.extend(["--glob", f"!**/{name}/**"])
     return args
@@ -325,7 +348,7 @@ def _glob_with_python(pattern: str, base: Path) -> List[Path]:
 
 def _glob_files(pattern: str, base: Path) -> Tuple[List[Path], str, Optional[str]]:
     lines, error, backend = _run_rg(
-        ["--files", "--hidden", *_rg_ignore_args(), "--glob", pattern],
+        ["--files", "--hidden", "--glob", pattern, *_rg_ignore_args()],
         base,
     )
     if lines is None:
@@ -624,7 +647,7 @@ class GrepTool(Tool):
         cwd = target_path.parent if target_path.is_file() else target_path
         target = target_path.name if target_path.is_file() else "."
 
-        args: List[str] = ["--hidden", "--max-columns", "500", *_rg_ignore_args()]
+        args: List[str] = ["--hidden", "--max-columns", "500"]
         if case_insensitive:
             args.append("-i")
         if multiline:
@@ -643,6 +666,9 @@ class GrepTool(Tool):
                 args.extend(["-C", str(context)])
         for item in glob_patterns:
             args.extend(["--glob", item])
+        # ripgrep 的 glob 规则按顺序覆盖；忽略项必须放在用户 include 之后，
+        # 否则 `**/*.py` 会重新把 node_modules/.cbagent 等目录纳入搜索。
+        args.extend(_rg_ignore_args())
         if pattern.startswith("-"):
             args.extend(["-e", pattern])
         else:
@@ -998,4 +1024,10 @@ class LsTool(Tool):
         return entries, total
 
 
-__all__ = ["GlobTool", "GrepTool", "LsTool"]
+__all__ = [
+    "GlobTool",
+    "GrepTool",
+    "LsTool",
+    "reset_search_ignore_dirs",
+    "set_search_ignore_dirs",
+]

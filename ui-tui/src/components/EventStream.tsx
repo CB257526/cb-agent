@@ -7,6 +7,7 @@ import { AskQuestionPanel } from "./AskQuestionPanel.js";
 import { TodoPanel } from "./TodoPanel.js";
 import { Markdown } from "./Markdown.js";
 import { theme } from "../theme.js";
+import { SubagentPanel } from "./SubagentPanel.js";
 
 /** 最多渲染的消息条数。超出时旧消息折叠，避免 React 全量调和导致终端抖动。 */
 const MAX_VISIBLE = 50;
@@ -145,6 +146,9 @@ function renderItem(
   }
   if (item.role === "tool") {
     return <ToolBlock item={item} />;
+  }
+  if (item.role === "subagent") {
+    return <SubagentPanel item={item} />;
   }
   if (item.role === "todo") {
     return <TodoPanel items={item.todoItems ?? []} />;

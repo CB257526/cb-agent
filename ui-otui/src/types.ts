@@ -140,6 +140,7 @@ export interface GatewayReady extends BaseEvent {
   /** 启动恢复后当前会话的上下文窗口估算。 */
   context_window?: ContextWindow | null;
   plan_state?: PlanState | null;
+  subagent_tasks?: SubagentTaskSnapshot[];
   permission_mode?: PermissionMode;
 }
 
@@ -289,6 +290,8 @@ export interface SubagentStarted extends BaseEvent {
   task_id?: string | null;
   run_in_background: boolean;
   parent_session_id?: string | null;
+  status?: string;
+  phase?: string;
 }
 
 export interface SubagentProgress extends BaseEvent {
@@ -297,7 +300,16 @@ export interface SubagentProgress extends BaseEvent {
   subagent_type: string;
   message: string;
   task_id?: string | null;
+  parent_session_id?: string | null;
   status: string;
+  phase: string;
+  event_seq: number;
+  tool_name?: string;
+  tool_call_id?: string;
+  arguments_preview?: Record<string, unknown>;
+  tool_uses?: number;
+  active_tool_count?: number;
+  total_tokens?: number;
 }
 
 export interface SubagentCompleted extends BaseEvent {
@@ -308,6 +320,7 @@ export interface SubagentCompleted extends BaseEvent {
   status: string;
   content: string;
   task_id?: string | null;
+  parent_session_id?: string | null;
   output_path?: string | null;
   duration_seconds: number;
   rounds_used: number;
@@ -441,6 +454,29 @@ export interface SessionPayload {
   history: RestoredHistoryMessage[];
   context_window?: ContextWindow | null;
   plan_state?: PlanState | null;
+  subagent_tasks?: SubagentTaskSnapshot[];
+}
+
+export interface SubagentTaskSnapshot {
+  id: string;
+  subagent_id: string;
+  subagent_type: string;
+  description: string;
+  status: string;
+  phase: string;
+  rounds_used?: number;
+  tool_uses?: number;
+  active_tool_count?: number;
+  total_tokens?: number;
+  event_seq?: number;
+  duration_seconds?: number | null;
+  output_path?: string;
+  result_preview?: string;
+  error?: string;
+  current_tool?: {
+    name?: string;
+    arguments?: Record<string, unknown>;
+  } | null;
 }
 
 /** session.compact 的返回形状。 */
@@ -504,7 +540,7 @@ export interface CacheStatsPayload {
   models: CacheStatsBucket[];
 }
 
-export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought" | "plan";
+export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought" | "plan" | "subagent";
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */
 export interface ChatItem {
   id: string;
@@ -533,6 +569,24 @@ export interface ChatItem {
   todoItems?: TodoItem[];
   planStatus?: PlanStatus;
   planRevision?: number | null;
+  // 子代理任务面板：同一个 taskId 的 started/progress/completed 事件原地更新。
+  subagentId?: string;
+  subagentType?: string;
+  subagentTaskId?: string;
+  subagentDescription?: string;
+  subagentStatus?: string;
+  subagentPhase?: string;
+  subagentMessage?: string;
+  subagentEventSeq?: number;
+  subagentToolName?: string;
+  subagentToolArgs?: Record<string, unknown>;
+  subagentToolUses?: number;
+  subagentActiveTools?: number;
+  subagentTokens?: number;
+  subagentRounds?: number;
+  subagentDuration?: number;
+  subagentOutputPath?: string;
+  subagentError?: boolean;
 }
 
 // ========== 浮层 Select 弹窗 ==========

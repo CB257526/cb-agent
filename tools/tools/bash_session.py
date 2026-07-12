@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Optional
 
@@ -193,16 +194,36 @@ class BashSession:
 
 _session_lock = threading.Lock()
 _session_instance: Optional[BashSession] = None
+_session_override: ContextVar[Optional[BashSession]] = ContextVar(
+    "cbagent_bash_session_override",
+    default=None,
+)
 
 
 def get_session() -> BashSession:
-    """获取进程内全局 BashSession。"""
+    """获取当前上下文的 BashSession；未绑定覆盖值时返回进程级会话。"""
+
+    override = _session_override.get()
+    if override is not None:
+        return override
     global _session_instance
     if _session_instance is None:
         with _session_lock:
             if _session_instance is None:
                 _session_instance = BashSession()
     return _session_instance
+
+
+def set_session_override(session: BashSession) -> Token[Optional[BashSession]]:
+    """为当前 Agent 上下文绑定独立 BashSession，并由 ToolExecutor 传播到工具线程。"""
+
+    return _session_override.set(session)
+
+
+def reset_session_override(token: Token[Optional[BashSession]]) -> None:
+    """恢复进入子代理运行前的 BashSession 上下文。"""
+
+    _session_override.reset(token)
 
 
 def reset_session(initial_cwd: Optional[str] = None) -> BashSession:

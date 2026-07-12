@@ -100,6 +100,20 @@ class Gateway:
     # ---------- agent → UI ----------
 
     def _on_event(self, event: Event) -> None:
+        # 后台子代理可以跨越父会话切换继续运行。事件总线是进程级共享的，传输层
+        # 必须按 parent_session_id 过滤，否则旧会话任务会出现在新会话 UI 中。
+        parent_session_id = getattr(event, "parent_session_id", None)
+        is_subagent_event = str(getattr(event, "type", "")).startswith("subagent_")
+        is_subagent_hook = getattr(event, "agent_scope", None) == "subagent"
+        if parent_session_id and (is_subagent_event or is_subagent_hook):
+            store = getattr(self.session, "session_store", None)
+            current_session_id = (
+                getattr(store, "active_session_id", None)
+                if store is not None
+                else getattr(self.session, "runtime_session_id", None)
+            )
+            if str(parent_session_id) != str(current_session_id or ""):
+                return
         msg = make_event_message(event)
         ok = self.transport.write(msg)
         if not ok:
@@ -264,7 +278,10 @@ class Gateway:
             # 如果当前卡在 OpenAI SDK 的 stream 网络读上，就可能一直等不到下一次检查。
             # 主动 close 活跃 stream 可以从 RPC 线程直接打断底层响应，避免 TUI 长时间 busy。
             try:
-                closed_streams = int(cancel_streams("gateway_session_cancel") or 0)
+                closed_streams = int(cancel_streams(
+                    "gateway_session_cancel",
+                    cancel_event=token.event,
+                ) or 0)
             except Exception:
                 logger.exception("failed to close active LLM streams on cancel")
         if rpc_id is not None:
@@ -859,6 +876,7 @@ class Gateway:
                 "history": session_payload.get("history", []),
                 "context_window": session_payload.get("context_window"),
                 "plan_state": session_payload.get("plan_state"),
+                "subagent_tasks": session_payload.get("subagent_tasks", []),
                 "permission_mode": self._current_permission_mode(),
             },
         })

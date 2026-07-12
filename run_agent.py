@@ -131,7 +131,7 @@ from agent.platforms.messages import ConversationKey  # 通讯平台会话标识
 from agent.renderers.cli import CLIRenderer         # CLI 渲染器，订阅 EventBus 事件并在终端显示
 from agent.message_logger import MessageLogger      # LLM messages 日志记录器，将原始对话保存到 JSONL 文件
 from agent.session import AgentSession              # 会话核心类：管理历史、驱动 chat 循环、调用 ContextBuilder
-from agent.subagents import SubagentRegistry, SubagentTaskRegistry  # 子代理注册表和任务注册表
+from subagent import SubagentRegistry, SubagentTaskManager  # 子代理角色注册表和任务管理器
 from agent.usage_metrics import UsageMetricsRecorder  # token 使用量和工具调用次数统计
 from agent.work_context import LocalSessionStore, TraceSummarizer  # 本地会话持久化存储 + 工具调用轨迹摘要
 
@@ -405,10 +405,14 @@ class AgentRunner:
         # ---- Step 4: 工具执行器（ToolExecutor）----
         # 用线程池并发执行工具调用。一个 chat 轮次中可能有多个工具被同时调用，
         # executor 负责调度并在完成后发出执行进度事件
-        self.subagent_registry = SubagentRegistry(WORKSPACE_ROOT)  # 子代理注册表
-        self.subagent_task_registry = SubagentTaskRegistry(
-            WORKSPACE_ROOT / ".cbagent" / "subagents"  # 子代理持久化目录
+        self.subagent_registry = SubagentRegistry(WORKSPACE_ROOT)  # 子代理角色注册表
+        self.subagent_task_manager = SubagentTaskManager(
+            WORKSPACE_ROOT / ".cbagent" / "subagents",  # 子代理持久化目录
+            max_workers=4,                               # 最多并行运行 4 个子代理
+            max_pending_tasks=32,                        # 包含排队任务的进程级上限
         )
+        # 兼容旧字段名；AgentSession 内部把它视为新的任务管理器使用。
+        self.subagent_task_registry = self.subagent_task_manager
 
         self.executor = ToolExecutor(
             runner=self.registry.execute_tool,  # 工具执行的实际函数
@@ -429,6 +433,10 @@ class AgentRunner:
                 WORKSPACE_ROOT / ".cbagent" / "sessions"  # 会话持久化目录
             ),
             message_logger_scope="main",  # 主会话的日志 scope
+        )
+        # 旧版任务快照没有 owner_session_id，只能在启动时一次性归入主会话。
+        self.subagent_task_manager.adopt_legacy_tasks(
+            self.session.current_runtime_session_id()
         )
 
         # ---- Step 5b: 依赖 session 状态的工具 ----
@@ -568,6 +576,7 @@ class AgentRunner:
             llm=self.llm,                              # 共享 LLM 客户端
             parent_registry=self.registry,             # 共享工具注册表
             parent_event_bus=self.event_bus,           # 共享事件总线
+            task_manager=self.subagent_task_manager,    # 唯一任务状态源
             hook_manager=self.hook_manager,            # 共享钩子管理器
             cwd=WORKSPACE_ROOT,                        # 工作目录
             ctx_enabled=self.ctx_enabled,              # 继承父会话的 ContextBuilder 开关
@@ -577,22 +586,20 @@ class AgentRunner:
             language="Chinese",                        # 子代理默认语言
             mcp_clients=None,                          # 暂不传递 MCP 客户端
             message_logger_factory=self._create_message_logger,  # 消息日志工厂函数
-            parent_session_id="main",                  # 父会话 ID
         )
 
         # 注册子代理任务管理工具
         self.registry.register_tool(AgentTaskTool(
             registry=self.subagent_registry,           # 子代理注册表
-            task_registry=self.subagent_task_registry,  # 子代理任务注册表
+            task_manager=self.subagent_task_manager,    # 子代理任务管理器
         ))
 
         # 注册子代理触发工具
         self.registry.register_tool(AgentTool(
             registry=self.subagent_registry,
-            task_registry=self.subagent_task_registry,
+            task_manager=self.subagent_task_manager,
             runner=runner,                              # SubagentRunner 实例
             hook_manager=self.hook_manager,
-            parent_session_id="main",
         ))
 
     # ============================== 会话创建与平台适配 ==============================
@@ -636,6 +643,7 @@ class AgentRunner:
             message_logger=self._create_message_logger(message_logger_scope),  # 消息日志
             hook_manager=self.hook_manager,                # 钩子管理器
             subagent_task_registry=getattr(self, "subagent_task_registry", None),  # 子代理任务注册表
+            runtime_session_id=f"runtime-{_safe_runtime_name(message_logger_scope)}",
         )
 
         # 把 Runner 级的运行态以回调形式挂到 session 上。
@@ -1308,6 +1316,18 @@ class AgentRunner:
             # 输入态下連续按两次 Ctrl-C 的兜底
             print()
             _info("再见")
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """有限等待并关闭归属于当前进程的后台子代理。"""
+
+        manager = getattr(self, "subagent_task_manager", None)
+        if manager is not None:
+            try:
+                manager.shutdown(timeout=2.0)
+            except Exception:
+                logger.exception("关闭子代理任务管理器失败")
 
     async def _run_async(self) -> None:
         """异步 REPL 主循环。
@@ -1387,7 +1407,10 @@ class AgentRunner:
             cancel_streams = getattr(self.llm, "cancel_active_streams", None)
             if callable(cancel_streams):
                 try:
-                    cancel_streams("cli_sigint")  # 关闭底层流式连接
+                    cancel_streams(
+                        "cli_sigint",
+                        cancel_event=token.event,
+                    )  # 只关闭当前回合对应的底层流式连接
                 except Exception:
                     logging.getLogger(__name__).exception("failed to close stream on Ctrl-C")
 
@@ -1816,7 +1839,10 @@ def main() -> None:
             transport=StdioTransport(stdin=sys.stdin, stdout=real_stdout),
             redirect_stdout_to_stderr=False,  # 上面已经手动切过了
         )
-        gw.serve_forever()  # 阻塞，直到 stdin 关闭
+        try:
+            gw.serve_forever()  # 阻塞，直到 stdin 关闭
+        finally:
+            runner.close()
         return
 
     # ===== QQ / NapCat 模式 =====
@@ -1842,7 +1868,10 @@ def main() -> None:
         )
         # QQ 模式没有 gateway_ready，主动触发 MCP 后台加载
         runner.start_mcp_background_loading()
-        adapter.serve_forever()  # 阻塞，运行 WebSocket 事件循环
+        try:
+            adapter.serve_forever()  # 阻塞，运行 WebSocket 事件循环
+        finally:
+            runner.close()
         return
 
     # ===== 微信 OC 模式 =====
@@ -1867,7 +1896,10 @@ def main() -> None:
             session_factory=runner.get_or_create_platform_session,
         )
         runner.start_mcp_background_loading()
-        adapter.serve_forever()  # 阻塞，运行 HTTP 长轮询
+        try:
+            adapter.serve_forever()  # 阻塞，运行 HTTP 长轮询
+        finally:
+            runner.close()
         return
 
     # ===== 默认 CLI 模式 =====

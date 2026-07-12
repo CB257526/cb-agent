@@ -20,7 +20,7 @@
 import React, { useEffect, useState, useCallback, useRef } from "react";
 import { Box, useApp, useInput } from "ink";
 import { Transport } from "./transport.js";
-import { AgentEvent, ChatItem, ContextWindow, PlanMode, PlanState, RestoredHistoryMessage, SessionPayload, SessionSummary } from "./types.js";
+import { AgentEvent, ChatItem, ContextWindow, PlanMode, PlanState, RestoredHistoryMessage, SessionPayload, SessionSummary, SubagentTaskSnapshot } from "./types.js";
 import { EventStream } from "./components/EventStream.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PromptInput } from "./components/PromptInput.js";
@@ -102,6 +102,31 @@ function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
       }
       return { id: nextId(), role: "system", text } as ChatItem;
     });
+}
+
+function subagentSnapshotsToItems(tasks: SubagentTaskSnapshot[] | undefined): ChatItem[] {
+  return (tasks ?? []).map((task) => ({
+    id: `subagent:${task.id}`,
+    role: "subagent",
+    text: task.error || task.result_preview || "",
+    subagentId: task.subagent_id,
+    subagentType: task.subagent_type,
+    subagentTaskId: task.id,
+    subagentDescription: task.description,
+    subagentStatus: task.status,
+    subagentPhase: task.phase,
+    subagentMessage: task.status === "queued" ? "任务已进入并行队列" : "已恢复任务状态",
+    subagentToolName: task.current_tool?.name,
+    subagentToolArgs: task.current_tool?.arguments,
+    subagentToolUses: task.tool_uses ?? 0,
+    subagentActiveTools: task.active_tool_count ?? 0,
+    subagentTokens: task.total_tokens ?? 0,
+    subagentEventSeq: task.event_seq ?? 0,
+    subagentRounds: task.rounds_used,
+    subagentDuration: task.duration_seconds ?? undefined,
+    subagentOutputPath: task.output_path,
+    subagentError: task.status === "failed" || task.status === "orphaned",
+  }));
 }
 
 function planStateToItem(state: PlanState | null | undefined): ChatItem | null {
@@ -301,6 +326,7 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
       const restored = restoredHistoryToItems(payload.history ?? []);
       const planItem = planStateToItem(payload.plan_state);
       if (planItem) restored.push(planItem);
+      restored.push(...subagentSnapshotsToItems(payload.subagent_tasks));
       if (notice) restored.push({ id: nextId(), role: "system", text: notice });
       return restored;
     });
@@ -395,7 +421,8 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
             const restored = restoredHistoryToItems((ev as any).history);
             const planItem = planStateToItem((ev as any).plan_state);
             if (planItem) restored.push(planItem);
-            if (restored.length > 0) setItems(restored);
+            restored.push(...subagentSnapshotsToItems((ev as any).subagent_tasks));
+            setItems(restored);
           }
           break;
 
@@ -570,6 +597,118 @@ export function App({ transport, clearScreen }: { transport: Transport; clearScr
               }
             }
             return prev;
+          });
+          break;
+        }
+
+        case "subagent_started": {
+          flushNow();
+          const e = ev as any;
+          const key = e.task_id ?? e.subagent_id;
+          const itemId = `subagent:${key}`;
+          setItems((prev) => {
+            const idx = prev.findIndex((item) => item.id === itemId);
+            const existing = idx >= 0 ? prev[idx] : undefined;
+            if (existing && ["completed", "failed", "cancelled", "orphaned"].includes(
+              existing.subagentStatus ?? "",
+            )) return prev;
+            const updated: ChatItem = {
+              ...existing,
+              id: itemId,
+              role: "subagent",
+              text: existing?.text ?? "",
+              subagentId: e.subagent_id,
+              subagentType: e.subagent_type,
+              subagentTaskId: e.task_id ?? undefined,
+              subagentDescription: e.description,
+              subagentStatus: e.status ?? "running",
+              subagentPhase: e.phase ?? "starting",
+              subagentMessage: e.status === "queued"
+                ? "任务已进入并行队列"
+                : e.run_in_background ? "后台任务已启动" : "前台任务已启动",
+              subagentToolUses: existing?.subagentToolUses ?? 0,
+              subagentActiveTools: existing?.subagentActiveTools ?? 0,
+              subagentTokens: existing?.subagentTokens ?? 0,
+            };
+            if (idx < 0) return [...prev, updated];
+            return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)];
+          });
+          break;
+        }
+
+        case "subagent_progress": {
+          flushNow();
+          const e = ev as any;
+          const key = e.task_id ?? e.subagent_id;
+          const itemId = `subagent:${key}`;
+          setItems((prev) => {
+            const idx = prev.findIndex((it) => it.id === itemId);
+            const base: ChatItem = idx >= 0 ? prev[idx] : {
+              id: itemId,
+              role: "subagent",
+              text: "",
+              subagentId: e.subagent_id,
+              subagentType: e.subagent_type,
+              subagentTaskId: e.task_id ?? undefined,
+            };
+            const eventSeq = Number(e.event_seq ?? 0);
+            if (eventSeq > 0 && eventSeq <= (base.subagentEventSeq ?? 0)) return prev;
+            const showCurrentTool = ["running_tool", "cancelling", "shutdown"].includes(e.phase)
+              && !!e.tool_name;
+            const updated: ChatItem = {
+              ...base,
+              subagentEventSeq: eventSeq || base.subagentEventSeq,
+              subagentStatus: e.status ?? base.subagentStatus ?? "running",
+              subagentPhase: e.phase ?? base.subagentPhase,
+              subagentMessage: e.message ?? base.subagentMessage,
+              subagentToolName: showCurrentTool
+                ? (e.tool_name || base.subagentToolName)
+                : undefined,
+              subagentToolArgs: showCurrentTool
+                ? (e.arguments_preview ?? base.subagentToolArgs)
+                : undefined,
+              subagentToolUses: e.tool_uses ?? base.subagentToolUses ?? 0,
+              subagentActiveTools: e.active_tool_count ?? base.subagentActiveTools ?? 0,
+              subagentTokens: e.total_tokens ?? base.subagentTokens ?? 0,
+            };
+            if (idx < 0) return [...prev, updated];
+            return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)];
+          });
+          break;
+        }
+
+        case "subagent_completed": {
+          flushNow();
+          const e = ev as any;
+          const key = e.task_id ?? e.subagent_id;
+          const itemId = `subagent:${key}`;
+          setItems((prev) => {
+            const idx = prev.findIndex((it) => it.id === itemId);
+            const base: ChatItem = idx >= 0 ? prev[idx] : {
+              id: itemId,
+              role: "subagent",
+              text: "",
+              subagentId: e.subagent_id,
+              subagentType: e.subagent_type,
+              subagentTaskId: e.task_id ?? undefined,
+              subagentDescription: e.description,
+            };
+            const updated: ChatItem = {
+              ...base,
+              text: e.content ?? "",
+              subagentStatus: e.status,
+              subagentPhase: e.status,
+              subagentMessage: e.is_error ? "任务未正常完成" : "任务已完成",
+              subagentToolName: undefined,
+              subagentToolArgs: undefined,
+              subagentActiveTools: 0,
+              subagentRounds: e.rounds_used,
+              subagentDuration: e.duration_seconds,
+              subagentOutputPath: e.output_path ?? undefined,
+              subagentError: e.status === "failed" || e.status === "orphaned" || e.status === "error",
+            };
+            if (idx < 0) return [...prev, updated];
+            return [...prev.slice(0, idx), updated, ...prev.slice(idx + 1)];
           });
           break;
         }

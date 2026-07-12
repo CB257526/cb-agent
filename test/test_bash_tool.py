@@ -721,9 +721,12 @@ class TestBashToolEndToEnd(unittest.TestCase):
         self.assertEqual(blocked["semantic"], "fatal")
 
         enabled = True
+        proc = MagicMock()
+        proc.communicate.return_value = ("", "")
+        proc.returncode = 0
         with patch(
-            "tools.tools.bash_tool.subprocess.run",
-            return_value=MagicMock(stdout="", stderr="", returncode=0),
+            "tools.tools.bash_tool.subprocess.Popen",
+            return_value=proc,
         ):
             allowed = json.loads(tool.run({"command": "rm -rf /"}))
         self.assertEqual(allowed["exit_code"], 0)
@@ -745,9 +748,29 @@ class TestBashToolEndToEnd(unittest.TestCase):
 
         self.assertIsNot(sub_bash, root_bash)
         self.assertTrue(getattr(sub_bash, "_is_subagent"))
+        self.assertIs(getattr(sub_bash, "_permission"), getattr(root_bash, "_permission"))
         self.assertFalse(sub_bash.dangerously_skip_permissions_enabled())
         enabled = True
         self.assertTrue(sub_bash.dangerously_skip_permissions_enabled())
+
+    def test_subagent_allows_readonly_but_denies_interactive_approval(self):
+        reset_session()
+        with tempfile.TemporaryDirectory() as td:
+            gate = PermissionGate(
+                store=PermissionStore(store_path=Path(td) / "permissions.json"),
+                strict=True,
+            )
+            tool = BashTool(permission=gate, is_subagent=True)
+
+            readonly = json.loads(tool.run({"command": "pwd", "cwd": td}))
+            denied = json.loads(tool.run({"command": "touch created.txt", "cwd": td}))
+
+            self.assertEqual(readonly["exit_code"], 0)
+            self.assertEqual(readonly["permission"]["decision"], "allow")
+            self.assertEqual(denied["exit_code"], -1)
+            self.assertEqual(denied["semantic"], "permission_denied")
+            self.assertIn("后台子代理不能代替用户确认", denied["stderr"])
+            self.assertFalse((Path(td) / "created.txt").exists())
 
 
 class TestBashPermissionTool(unittest.TestCase):

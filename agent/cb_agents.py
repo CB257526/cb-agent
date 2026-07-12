@@ -318,7 +318,9 @@ class CbAgentsLLM:
         # close stream，而不是被动等“下一个 chunk 到来”才检查 cancel_event。
         self._stream_lock = threading.Lock()
         self._stream_seq = 0
-        self._active_streams: Dict[int, Any] = {}
+        # 同一个 LLM 客户端会被主会话和多个子代理并发复用。除 stream 句柄外还要
+        # 记录对应的取消事件，避免取消一个会话时误关其它后台任务的网络流。
+        self._active_streams: Dict[int, tuple[Any, Optional[threading.Event]]] = {}
         # 轮询间隔越短，Ctrl-C 越灵敏；过短会让空转更频繁。0.2s 对 TUI 来说足够跟手。
         self._stream_poll_seconds = max(0.05, _env_float("LLM_STREAM_POLL_SECONDS", 0.2))
         # 模型长时间无 chunk 时只写诊断日志，不自动取消。这样既能定位“卡在哪”，
@@ -430,10 +432,15 @@ class CbAgentsLLM:
             self._stream_seq += 1
             return self._stream_seq
 
-    def _register_stream(self, stream_id: int, stream: Any) -> None:
+    def _register_stream(
+        self,
+        stream_id: int,
+        stream: Any,
+        cancel_event: Optional[threading.Event],
+    ) -> None:
         """登记当前活跃 stream；取消方会从这里拿到句柄并调用 close()。"""
         with self._stream_lock:
-            self._active_streams[stream_id] = stream
+            self._active_streams[stream_id] = (stream, cancel_event)
 
     def _unregister_stream(self, stream_id: int) -> None:
         """stream 正常结束或异常结束后移除登记，避免后续取消误关旧句柄。"""
@@ -460,14 +467,24 @@ class CbAgentsLLM:
             logger.exception("failed to close LLM stream %s; reason=%s", stream_id, reason)
             return False
 
-    def cancel_active_streams(self, reason: str = "cancel") -> int:
-        """主动关闭所有活跃 LLM stream，返回成功调用 close() 的数量。
+    def cancel_active_streams(
+        self,
+        reason: str = "cancel",
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> int:
+        """主动关闭匹配取消事件的 LLM stream，返回成功调用 close() 的数量。
 
         Gateway 的 session.cancel 和 CLI 的 Ctrl-C 都会走到这里。这样即使 SDK 正在
         阻塞等待下一个 stream chunk，取消请求也有机会从另一个线程打断底层连接。
+        未提供 cancel_event 时保留旧的“关闭全部”语义，仅供进程级紧急收尾使用。
         """
         with self._stream_lock:
-            streams = list(self._active_streams.items())
+            streams = [
+                (stream_id, stream)
+                for stream_id, (stream, owner_event) in self._active_streams.items()
+                if cancel_event is None or owner_event is cancel_event
+            ]
         closed = 0
         for stream_id, stream in streams:
             if self._close_stream(stream_id, stream, reason):
@@ -520,7 +537,7 @@ class CbAgentsLLM:
             response = None
             try:
                 response = self.client.chat.completions.create(**request_kwargs)
-                self._register_stream(stream_id, response)
+                self._register_stream(stream_id, response, cancel_event)
                 if stop_event.is_set():
                     self._close_stream(stream_id, response, "cancel_before_first_chunk")
                     return
@@ -570,9 +587,9 @@ class CbAgentsLLM:
                     stop_event.set()
                     next_permit.release()
                     with self._stream_lock:
-                        active_stream = self._active_streams.get(stream_id)
-                    if active_stream is not None:
-                        self._close_stream(stream_id, active_stream, "cancel_event")
+                        active_entry = self._active_streams.get(stream_id)
+                    if active_entry is not None:
+                        self._close_stream(stream_id, active_entry[0], "cancel_event")
                     logger.warning(
                         "LLM stream %s cancelled while waiting for provider response; round=%s",
                         stream_id,
@@ -614,9 +631,9 @@ class CbAgentsLLM:
                         stop_event.set()
                         next_permit.release()
                         with self._stream_lock:
-                            active_stream = self._active_streams.get(stream_id)
-                        if active_stream is not None:
-                            self._close_stream(stream_id, active_stream, "cancel_after_chunk")
+                            active_entry = self._active_streams.get(stream_id)
+                        if active_entry is not None:
+                            self._close_stream(stream_id, active_entry[0], "cancel_after_chunk")
                         logger.warning(
                             "LLM stream %s cancelled after chunk processing; round=%s",
                             stream_id,

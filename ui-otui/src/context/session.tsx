@@ -41,6 +41,7 @@ import type {
   PlanState,
   RestoredHistoryMessage,
   SessionPayload,
+  SubagentTaskSnapshot,
 } from "../types.js";
 
 const STDERR_RING_MAX = 200;
@@ -99,6 +100,31 @@ function restoredHistoryToItems(history: RestoredHistoryMessage[]): ChatItem[] {
       if (m.role === "assistant") return { id: nextId(), role: "assistant", text } as ChatItem;
       return { id: nextId(), role: "system", text } as ChatItem;
     });
+}
+
+function subagentSnapshotsToItems(tasks: SubagentTaskSnapshot[] | undefined): ChatItem[] {
+  return (tasks ?? []).map((task) => ({
+    id: `subagent:${task.id}`,
+    role: "subagent",
+    text: task.error || task.result_preview || "",
+    subagentId: task.subagent_id,
+    subagentType: task.subagent_type,
+    subagentTaskId: task.id,
+    subagentDescription: task.description,
+    subagentStatus: task.status,
+    subagentPhase: task.phase,
+    subagentMessage: task.status === "queued" ? "任务已进入并行队列" : "已恢复任务状态",
+    subagentToolName: task.current_tool?.name,
+    subagentToolArgs: task.current_tool?.arguments,
+    subagentToolUses: task.tool_uses ?? 0,
+    subagentActiveTools: task.active_tool_count ?? 0,
+    subagentTokens: task.total_tokens ?? 0,
+    subagentEventSeq: task.event_seq ?? 0,
+    subagentRounds: task.rounds_used,
+    subagentDuration: task.duration_seconds ?? undefined,
+    subagentOutputPath: task.output_path,
+    subagentError: task.status === "failed" || task.status === "orphaned",
+  }));
 }
 
 function planStateToItem(state: PlanState | null | undefined): ChatItem | null {
@@ -315,15 +341,16 @@ export function SessionProvider(props: ParentProps) {
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
         if (e.plan_state !== undefined) setState("planState", e.plan_state ?? null);
         if (e.permission_mode !== undefined) setState("permissionMode", e.permission_mode ?? "request_approval");
-        {
-          const notice = describeAutoCompact(e);
-          if (notice) appendSystem(notice);
-        }
         if (Array.isArray(e.history)) {
           const restored = restoredHistoryToItems(e.history);
           const planItem = planStateToItem(e.plan_state);
           if (planItem) restored.push(planItem);
-          if (restored.length > 0) setState("items", restored);
+          restored.push(...subagentSnapshotsToItems(e.subagent_tasks));
+          setState("items", restored);
+        }
+        {
+          const notice = describeAutoCompact(e);
+          if (notice) appendSystem(notice);
         }
         break;
 
@@ -461,6 +488,125 @@ export function SessionProvider(props: ParentProps) {
           }),
         );
         break;
+
+      case "subagent_started": {
+        sawOutput = true;
+        const key = e.task_id ?? e.subagent_id;
+        const itemId = `subagent:${key}`;
+        setState(
+          produce((s) => {
+            const existing = s.items.find((item) => item.id === itemId);
+            if (existing && ["completed", "failed", "cancelled", "orphaned"].includes(
+              existing.subagentStatus ?? "",
+            )) return;
+            if (existing) {
+              existing.subagentId = safeText(e.subagent_id);
+              existing.subagentType = safeText(e.subagent_type);
+              existing.subagentTaskId = e.task_id ? safeText(e.task_id) : undefined;
+              existing.subagentDescription = safeText(e.description);
+              existing.subagentStatus = safeText(e.status || "running");
+              existing.subagentPhase = safeText(e.phase || "starting");
+              existing.subagentMessage = e.status === "queued"
+                ? "任务已进入并行队列"
+                : e.run_in_background ? "后台任务已启动" : "前台任务已启动";
+              return;
+            }
+            s.items.push({
+              id: itemId,
+              role: "subagent",
+              text: "",
+              subagentId: safeText(e.subagent_id),
+              subagentType: safeText(e.subagent_type),
+              subagentTaskId: e.task_id ? safeText(e.task_id) : undefined,
+              subagentDescription: safeText(e.description),
+              subagentStatus: safeText(e.status || "running"),
+              subagentPhase: safeText(e.phase || "starting"),
+              subagentMessage: e.status === "queued"
+                ? "任务已进入并行队列"
+                : e.run_in_background ? "后台任务已启动" : "前台任务已启动",
+              subagentToolUses: 0,
+              subagentActiveTools: 0,
+              subagentTokens: 0,
+            });
+          }),
+        );
+        break;
+      }
+
+      case "subagent_progress": {
+        sawOutput = true;
+        const key = e.task_id ?? e.subagent_id;
+        const itemId = `subagent:${key}`;
+        setState(
+          produce((s) => {
+            let item = s.items.find((candidate) => candidate.id === itemId);
+            if (!item) {
+              item = {
+                id: itemId,
+                role: "subagent",
+                text: "",
+                subagentId: safeText(e.subagent_id),
+                subagentType: safeText(e.subagent_type),
+                subagentTaskId: e.task_id ? safeText(e.task_id) : undefined,
+              };
+              s.items.push(item);
+            }
+            const eventSeq = safeNumber(e.event_seq) ?? 0;
+            if (eventSeq > 0 && eventSeq <= (item.subagentEventSeq ?? 0)) return;
+            const showCurrentTool = ["running_tool", "cancelling", "shutdown"].includes(e.phase)
+              && !!e.tool_name;
+            item.subagentEventSeq = eventSeq || item.subagentEventSeq;
+            item.subagentStatus = safeText(e.status || item.subagentStatus || "running");
+            item.subagentPhase = safeText(e.phase || item.subagentPhase || "");
+            item.subagentMessage = safeText(e.message || item.subagentMessage || "");
+            item.subagentToolName = showCurrentTool
+              ? (e.tool_name ? safeText(e.tool_name) : item.subagentToolName)
+              : undefined;
+            item.subagentToolArgs = showCurrentTool
+              ? (e.arguments_preview ? safeRecord(e.arguments_preview) : item.subagentToolArgs)
+              : undefined;
+            item.subagentToolUses = safeNumber(e.tool_uses) ?? item.subagentToolUses ?? 0;
+            item.subagentActiveTools = safeNumber(e.active_tool_count) ?? item.subagentActiveTools ?? 0;
+            item.subagentTokens = safeNumber(e.total_tokens) ?? item.subagentTokens ?? 0;
+          }),
+        );
+        break;
+      }
+
+      case "subagent_completed": {
+        sawOutput = true;
+        const key = e.task_id ?? e.subagent_id;
+        const itemId = `subagent:${key}`;
+        setState(
+          produce((s) => {
+            let item = s.items.find((candidate) => candidate.id === itemId);
+            if (!item) {
+              item = {
+                id: itemId,
+                role: "subagent",
+                text: "",
+                subagentId: safeText(e.subagent_id),
+                subagentType: safeText(e.subagent_type),
+                subagentTaskId: e.task_id ? safeText(e.task_id) : undefined,
+                subagentDescription: safeText(e.description),
+              };
+              s.items.push(item);
+            }
+            item.text = safeText(e.content);
+            item.subagentStatus = safeText(e.status);
+            item.subagentPhase = safeText(e.status);
+            item.subagentMessage = e.is_error ? "任务未正常完成" : "任务已完成";
+            item.subagentToolName = undefined;
+            item.subagentToolArgs = undefined;
+            item.subagentActiveTools = 0;
+            item.subagentRounds = safeNumber(e.rounds_used) ?? 0;
+            item.subagentDuration = safeNumber(e.duration_seconds) ?? 0;
+            item.subagentOutputPath = e.output_path ? safeText(e.output_path) : undefined;
+            item.subagentError = e.status === "failed" || e.status === "orphaned" || e.status === "error";
+          }),
+        );
+        break;
+      }
 
       case "token_usage":
         setState("promptTokens", (p) => p + (safeNumber(e.prompt_tokens) ?? 0));
@@ -612,6 +758,7 @@ export function SessionProvider(props: ParentProps) {
     const restored = restoredHistoryToItems(payload.history ?? []);
     const planItem = planStateToItem(payload.plan_state);
     if (planItem) restored.push(planItem);
+    restored.push(...subagentSnapshotsToItems(payload.subagent_tasks));
     setState("items", restored);
     setState("session", payload.session ?? null);
     if (payload.plan_state !== undefined) setState("planState", payload.plan_state ?? null);

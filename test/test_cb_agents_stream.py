@@ -154,6 +154,26 @@ class TestUsageToDict(unittest.TestCase):
         })
 
 
+class TestScopedStreamCancellation(unittest.TestCase):
+    def test_cancel_only_closes_streams_owned_by_the_same_token(self):
+        llm = _make_llm()
+        first_event = threading.Event()
+        second_event = threading.Event()
+        first_stream = _BlockingStream()
+        second_stream = _BlockingStream()
+        llm._register_stream(1, first_stream, first_event)
+        llm._register_stream(2, second_stream, second_event)
+
+        closed = llm.cancel_active_streams(
+            "scoped-test",
+            cancel_event=first_event,
+        )
+
+        self.assertEqual(closed, 1)
+        self.assertTrue(first_stream.closed.is_set())
+        self.assertFalse(second_stream.closed.is_set())
+
+
 # ========== Function Calling 流式事件 ==========
 
 

@@ -393,6 +393,86 @@ class ToolExecutor:
 
     # ---------- 单条 ----------
 
+    def _execution_policy_denial(
+        self,
+        *,
+        execution_policy: Any,
+        name: str,
+        args: Dict[str, Any],
+        call_id: str,
+        round_idx: int,
+    ) -> Optional[ToolCallResult]:
+        """执行策略拒绝时构造完整协议结果；允许时返回 None。"""
+
+        try:
+            allowed, reason = execution_policy.check(name, args)
+        except Exception as e:  # noqa: BLE001
+            # 策略检查自身异常时保守拒绝，避免策略缺陷直接放大成越权执行。
+            logger.exception("execution policy failed: name=%s call_id=%s", name, call_id)
+            allowed, reason = False, f"execution policy error: {type(e).__name__}: {e}"
+        if allowed:
+            return None
+
+        result = execution_policy.denied_result(name, args, reason or "tool denied")
+        logger.warning(
+            "tool denied by execution policy: round=%s name=%s call_id=%s reason=%s",
+            round_idx,
+            name,
+            call_id,
+            reason,
+        )
+        if self._bus is not None:
+            self._bus.emit(ToolStart(
+                call_id=call_id, name=name, arguments=args,
+                round_idx=round_idx,
+            ))
+            self._bus.emit(ToolComplete(
+                call_id=call_id, name=name, result=result,
+                duration_seconds=0.0, is_error=True,
+                round_idx=round_idx,
+            ))
+        return ToolCallResult(
+            call_id=call_id,
+            name=name,
+            arguments=args,
+            result=result,
+            duration_seconds=0.0,
+            is_error=True,
+        )
+
+    def _platform_permission_denial(
+        self,
+        *,
+        name: str,
+        args: Dict[str, Any],
+        call_id: str,
+        round_idx: int,
+    ) -> Optional[ToolCallResult]:
+        """通讯平台权限拒绝时构造工具结果；允许时返回 None。"""
+
+        permission = check_platform_tool_permission(name, args)
+        if not permission.denied:
+            return None
+
+        result = permission_denied_payload(name, args, permission)
+        logger.warning(
+            "tool denied by platform permission: round=%s name=%s call_id=%s reason=%s",
+            round_idx,
+            name,
+            call_id,
+            permission.reason,
+        )
+        if self._bus is not None:
+            self._bus.emit(ToolComplete(
+                call_id=call_id, name=name, result=result,
+                duration_seconds=0.0, is_error=True,
+                round_idx=round_idx,
+            ))
+        return ToolCallResult(
+            call_id=call_id, name=name, arguments=args,
+            result=result, duration_seconds=0.0, is_error=True,
+        )
+
     def _run_one(
         self,
         tool_call: Dict[str, Any],
@@ -416,60 +496,24 @@ class ToolExecutor:
         # 策略拒绝时仍然 emit ToolStart + ToolComplete 事件，保证 UI 工具面板
         # 能正常展示"被拒绝"状态（is_error=True），而不是静默丢失工具调用记录。
         if execution_policy is not None:
-            try:
-                allowed, reason = execution_policy.check(name, args)
-            except Exception as e:  # noqa: BLE001
-                # 策略检查自身异常 → 保守拒绝，避免策略 bug 导致越权执行
-                logger.exception("execution policy failed: name=%s call_id=%s", name, call_id)
-                allowed, reason = False, f"execution policy error: {type(e).__name__}: {e}"
-            if not allowed:
-                result = execution_policy.denied_result(name, args, reason or "tool denied")
-                logger.warning(
-                    "tool denied by execution policy: round=%s name=%s call_id=%s reason=%s",
-                    round_idx,
-                    name,
-                    call_id,
-                    reason,
-                )
-                if self._bus is not None:
-                    self._bus.emit(ToolStart(
-                        call_id=call_id, name=name, arguments=args,
-                        round_idx=round_idx,
-                    ))
-                    self._bus.emit(ToolComplete(
-                        call_id=call_id, name=name, result=result,
-                        duration_seconds=0.0, is_error=True,
-                        round_idx=round_idx,
-                    ))
-                return ToolCallResult(
-                    call_id=call_id,
-                    name=name,
-                    arguments=args,
-                    result=result,
-                    duration_seconds=0.0,
-                    is_error=True,
-                )
+            denied = self._execution_policy_denial(
+                execution_policy=execution_policy,
+                name=name,
+                args=args,
+                call_id=call_id,
+                round_idx=round_idx,
+            )
+            if denied is not None:
+                return denied
 
-        permission = check_platform_tool_permission(name, args)
-        if permission.denied:
-            result = permission_denied_payload(name, args, permission)
-            logger.warning(
-                "tool denied by platform permission: round=%s name=%s call_id=%s reason=%s",
-                round_idx,
-                name,
-                call_id,
-                permission.reason,
-            )
-            if self._bus is not None:
-                self._bus.emit(ToolComplete(
-                    call_id=call_id, name=name, result=result,
-                    duration_seconds=0.0, is_error=True,
-                    round_idx=round_idx,
-                ))
-            return ToolCallResult(
-                call_id=call_id, name=name, arguments=args,
-                result=result, duration_seconds=0.0, is_error=True,
-            )
+        denied = self._platform_permission_denial(
+            name=name,
+            args=args,
+            call_id=call_id,
+            round_idx=round_idx,
+        )
+        if denied is not None:
+            return denied
 
         # PreToolUse hook：平台权限通过后、工具真正执行前的可配置拦截层。
         # 复用与平台权限同款的"拒绝即回灌结构化消息"模式；也可改写工具输入。
@@ -506,6 +550,26 @@ class ToolExecutor:
                     round_idx, name, call_id,
                 )
                 args = outcome.updated_input
+                # Hook 改写后得到的参数才是真正会交给工具的最终输入。角色策略和
+                # 通讯平台权限必须再校验一次，不能让改写绕过工作区或用户权限边界。
+                if execution_policy is not None:
+                    denied = self._execution_policy_denial(
+                        execution_policy=execution_policy,
+                        name=name,
+                        args=args,
+                        call_id=call_id,
+                        round_idx=round_idx,
+                    )
+                    if denied is not None:
+                        return denied
+                denied = self._platform_permission_denial(
+                    name=name,
+                    args=args,
+                    call_id=call_id,
+                    round_idx=round_idx,
+                )
+                if denied is not None:
+                    return denied
 
         if self._bus is not None:
             self._bus.emit(ToolStart(

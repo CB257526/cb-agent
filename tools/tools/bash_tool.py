@@ -160,6 +160,7 @@ class BashTool(Tool):
         skill_observer: Optional[Any] = None,
         dangerously_skip_permissions: bool = False,
         dangerously_skip_permissions_provider: Optional[Callable[[], bool]] = None,
+        output_dir: Optional[Path] = None,
     ):
         permission_note = (
             "当前进程已开启 --dangerously-skip-permissions，Bash 权限确认和高危命令拦截都会跳过。"
@@ -197,6 +198,8 @@ class BashTool(Tool):
         # 结果，作为最基本的审计线索。
         self._dangerously_skip_permissions = dangerously_skip_permissions
         self._dangerously_skip_permissions_provider = dangerously_skip_permissions_provider
+        # 子代理会注入任务专属目录，避免大输出落盘后被其它会话直接读取。
+        self._output_dir = Path(output_dir or default_output_dir()).resolve()
 
         self._last_command = ""
         self._last_elapsed = 0.0
@@ -318,9 +321,10 @@ class BashTool(Tool):
 
         warnings = check_warnings(command)
 
-        # 权限决策：所有命令都过 gate.evaluate
-        # - 子 agent 模式下永远 ALLOW（无人值守，没法弹窗，warnings 进字段透传给父 agent）
-        # - 主 agent 模式下：fatal 上游已拦；只读命令直接 ALLOW；warnings 或非只读 → 弹窗
+        # 权限决策：所有命令都过 gate.evaluate。
+        # - 子 agent 无法安全弹出交互审批；只读或已由父会话 allowlist 授权的命令
+        #   可以执行，原本需要 ASK 的命令保守拒绝并交回主 Agent 处理。
+        # - 主 agent：fatal 上游已拦；只读命令直接 ALLOW；warnings 或非只读 → 弹窗。
         gate_res = None
         permission_payload = None
         if dangerously_skip_permissions:
@@ -329,6 +333,36 @@ class BashTool(Tool):
                 command,
             )
             permission_payload = _dangerously_skipped_permission_dict()
+        elif self._is_subagent:
+            segments = parse_pipeline(command)
+            gate_res = self._permission.evaluate(
+                command, segments, warnings, self._session.cwd,
+            )
+            if gate_res.decision != Decision.ALLOW:
+                reason = gate_res.reason or "该命令需要父会话交互审批"
+                stderr = (
+                    "[子代理权限拒绝] 后台子代理不能代替用户确认命令："
+                    f"{reason}。请让主 Agent 执行或先配置明确 allowlist。"
+                )
+                logger.warning("bash: 子代理权限拒绝 — %s", reason)
+                return json.dumps({
+                    "stdout": "",
+                    "stderr": stderr,
+                    "exit_code": -1,
+                    "cwd": self._session.cwd,
+                    "interrupted": False,
+                    "timeout": False,
+                    "is_error": True,
+                    "semantic": "permission_denied",
+                    "background": False,
+                    "classification": classify_command(command),
+                    "permission_unavailable": True,
+                    "warnings": warnings,
+                    "permission": _gate_result_to_dict(gate_res),
+                    "session_cancelled": False,
+                    "__display__": _build_bash_display(error_override=stderr),
+                }, ensure_ascii=False)
+            permission_payload = _gate_result_to_dict(gate_res)
         elif not self._is_subagent:
             segments = parse_pipeline(command)
             gate_res = self._permission.evaluate(
@@ -482,7 +516,7 @@ class BashTool(Tool):
         processed = process_output(
             stdout or "",
             stderr or "",
-            output_dir=default_output_dir(),
+            output_dir=self._output_dir,
             task_id=task_id,
         )
 

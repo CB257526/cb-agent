@@ -34,8 +34,9 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+from agent.cancel import CancelToken
 from agent.event_bus import EventBus
-from agent.events import Cancelled, Done, TextDelta, ToolComplete, ToolStart
+from agent.events import Cancelled, Done, SubagentProgress, TextDelta, ToolComplete, ToolStart
 from agent.executor import ToolExecutor
 from agent.session import AgentSession
 from agent.transport import Gateway, StdioTransport, make_event_message, make_response
@@ -347,10 +348,12 @@ class TestGatewayDispatch(unittest.TestCase):
         # 至少有：ready / accept 响应 / text_delta / done
         types = [m.get("params", {}).get("type") for m in msgs if m.get("method") == "event"]
         self.assertIn("gateway_ready", types)
+
         self.assertIn("text_delta", types)
         self.assertIn("done", types)
         ready = [m for m in msgs if m.get("params", {}).get("type") == "gateway_ready"][0]
         self.assertIn("context_window", ready["params"])
+        self.assertIn("subagent_tasks", ready["params"])
         self.assertEqual(ready["params"]["context_window"]["scope"], "state+history")
         done = [m for m in msgs if m.get("params", {}).get("type") == "done"][0]
         self.assertIn("context_window", done["params"])
@@ -359,6 +362,59 @@ class TestGatewayDispatch(unittest.TestCase):
         accepts = [m for m in msgs if m.get("id") == "p1"]
         self.assertEqual(len(accepts), 1)
         self.assertEqual(accepts[0]["result"]["status"], "accepted")
+
+    def test_gateway_filters_subagent_events_from_other_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / "sessions")
+            session, bus = _make_session_for_gateway(FakeLLM([]), session_store=store)
+            current_id = store.active_session_id
+            out = io.StringIO()
+            transport = StdioTransport(stdin=io.StringIO(""), stdout=out)
+            gateway = Gateway(session=session, event_bus=bus, transport=transport)
+            try:
+                bus.emit(SubagentProgress(
+                    subagent_id="sub-old",
+                    subagent_type="explore",
+                    message="old",
+                    task_id="task-old",
+                    parent_session_id="session_20000101_000000_deadbeef",
+                ))
+                bus.emit(SubagentProgress(
+                    subagent_id="sub-current",
+                    subagent_type="explore",
+                    message="current",
+                    task_id="task-current",
+                    parent_session_id=current_id,
+                ))
+                messages = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+                self.assertEqual(len(messages), 1)
+                self.assertEqual(messages[0]["params"]["subagent_id"], "sub-current")
+            finally:
+                bus.unsubscribe(gateway._on_event)
+
+    def test_gateway_cancel_only_closes_streams_for_current_token(self):
+        llm = FakeLLM([])
+        llm.cancel_active_streams = MagicMock(return_value=1)
+        session, bus = _make_session_for_gateway(llm)
+        token = CancelToken()
+        session.current_cancel_token = token
+        out = io.StringIO()
+        gateway = Gateway(
+            session=session,
+            event_bus=bus,
+            transport=StdioTransport(stdin=io.StringIO(""), stdout=out),
+        )
+        try:
+            gateway._handle_cancel("cancel-1", {})
+            self.assertTrue(token.is_cancelled())
+            llm.cancel_active_streams.assert_called_once_with(
+                "gateway_session_cancel",
+                cancel_event=token.event,
+            )
+            response = json.loads(out.getvalue().strip())
+            self.assertEqual(response["result"]["closed_streams"], 1)
+        finally:
+            bus.unsubscribe(gateway._on_event)
 
     def test_gateway_ready_includes_active_turn_history(self):
         with tempfile.TemporaryDirectory() as td:

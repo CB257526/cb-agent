@@ -44,6 +44,14 @@ from agent.cancel import (
     set_current_cancel_token,
     reset_current_cancel_token,
 )
+from subagent.context import (
+    reset_current_parent_session_id,
+    set_current_parent_session_id,
+)
+from tools.tools.pending_images import (
+    reset_pending_image_buffer,
+    set_pending_image_buffer,
+)
 from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import (
@@ -391,6 +399,9 @@ class AgentSession:
         memory_writeback_enabled: bool = True,
         is_subagent: bool = False,
         subagent_task_registry: Optional[Any] = None,
+        runtime_session_id: Optional[str] = None,
+        tool_execution_policy: Optional[Any] = None,
+        runtime_message_provider: Optional[Callable[[], Any]] = None,
     ) -> None:
         """
         Args:
@@ -424,6 +435,12 @@ class AgentSession:
         self.memory_writeback_enabled = memory_writeback_enabled
         self.is_subagent = is_subagent
         self.subagent_task_registry = subagent_task_registry
+        # 无持久化会话（群聊、子代理）也需要稳定所有者 ID，供后台任务隔离使用。
+        self.runtime_session_id = runtime_session_id or f"runtime-{uuid.uuid4().hex[:12]}"
+        # 子代理角色权限等固定执行策略。Plan Mode 策略仍由主会话动态计算。
+        self.tool_execution_policy = tool_execution_policy
+        # 运行中补充消息提供器，子代理在每个模型轮次前从任务邮箱取新指令。
+        self.runtime_message_provider = runtime_message_provider
         # 可选 HookManager：在用户提交、会话开始、上下文压缩、收尾等生命周期点
         # 触发用户可配置的 hook。None 表示不启用 hooks（零回归）。
         self.hook_manager = hook_manager
@@ -498,7 +515,38 @@ class AgentSession:
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
             "plan_state": self.plan_state(),
+            "subagent_tasks": self._subagent_tasks_payload(),
         }
+
+    def current_runtime_session_id(self) -> str:
+        """返回当前会话用于后台任务所有权校验的稳定 ID。"""
+
+        if self.session_store is not None:
+            # /clear 后 active_session_id 为空。必须在进入新一轮工具调用前创建新
+            # 会话，否则这一轮启动的后台任务会错误归到 runtime 兜底 ID。
+            ensure_active = getattr(self.session_store, "ensure_active", None)
+            if callable(ensure_active):
+                ensure_active()
+            active = getattr(self.session_store, "active_session_id", None)
+            if active:
+                return str(active)
+        return self.runtime_session_id
+
+    def _subagent_tasks_payload(self) -> List[Dict[str, Any]]:
+        """返回当前会话的活动任务和最近完成任务，供 UI 切换后恢复面板。"""
+
+        manager = self.subagent_task_registry
+        if manager is None:
+            return []
+        try:
+            tasks = manager.list(self.current_runtime_session_id())
+        except Exception:
+            logger.exception("读取当前会话子代理任务失败")
+            return []
+        active = [task for task in tasks if not task.is_terminal()]
+        terminal = [task for task in tasks if task.is_terminal()][-10:]
+        selected = active + terminal
+        return [task.to_dict() for task in selected]
 
     def plan_state(self) -> Dict[str, Any]:
         """返回当前活跃会话的 Plan Mode 完整状态。
@@ -518,6 +566,10 @@ class AgentSession:
         - 上下文注入（_plan_context_text 注入 Plan Mode 指令）
         - 计划块解析（_PlanParsingEventBus 截获流式输出）
         """
+        if self.is_subagent:
+            # 子代理权限由角色定义和 SubagentExecutionPolicy 独立控制，不能继承
+            # 共享 fallback plan 目录，否则 Worker 会被父会话 Plan Mode 意外降权。
+            return "execute"
         mode = str(self.plan_store.load(include_content=False).get("mode") or "execute")
         return mode if mode in {"execute", "plan"} else "execute"
 
@@ -576,6 +628,7 @@ class AgentSession:
                 "history": [],
                 "context_window": self.context_window_usage(),
                 "plan_state": self.plan_state(),
+                "subagent_tasks": self._subagent_tasks_payload(),
             }
         summary = self.session_store.create_session()
         return {
@@ -583,6 +636,7 @@ class AgentSession:
             "history": [],
             "context_window": self.context_window_usage(),
             "plan_state": self.plan_state(),
+            "subagent_tasks": self._subagent_tasks_payload(),
         }
 
     def switch_session(self, session_id: str) -> Dict[str, Any]:
@@ -612,6 +666,7 @@ class AgentSession:
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
             "plan_state": self.plan_state(),
+            "subagent_tasks": self._subagent_tasks_payload(),
         }
 
     def compact_context(self) -> Dict[str, Any]:
@@ -730,6 +785,8 @@ class AgentSession:
         # 让工具内部 get_current_cancel_token() 拿到这个 token；
         # ToolExecutor 的并发分支会 copy_context 给 worker 用同一份 ContextVar
         ctx_token = set_current_cancel_token(token)
+        parent_ctx_token = set_current_parent_session_id(self.current_runtime_session_id())
+        image_ctx_token = set_pending_image_buffer()
         try:
             return self._chat_impl(
                 user_query,
@@ -738,6 +795,8 @@ class AgentSession:
                 persistent_user_text=persistent_user_text,
             )
         finally:
+            reset_pending_image_buffer(image_ctx_token)
+            reset_current_parent_session_id(parent_ctx_token)
             reset_current_cancel_token(ctx_token)
             self.current_cancel_token = None
 
@@ -1006,6 +1065,10 @@ class AgentSession:
            - pending/rejected/approved 状态的计划内容摘要
            - 拒绝反馈（如有）
         """
+        if self.is_subagent:
+            # 子代理没有独立的持久化会话，PlanStateStore 会回退到项目级目录。
+            # 这里必须在读取前退出，避免把父会话计划注入子代理上下文。
+            return ""
         state = self.plan_store.load(include_content=True)
         mode = str(state.get("mode") or "execute")
         state_text = self.plan_store.context_text()
@@ -1128,7 +1191,8 @@ class AgentSession:
         history_source_text = (
             str(persistent_user_text).strip()
             if persistent_user_text is not None
-            else user_query
+            # 运行时通知只服务本轮模型，不应伪装成用户原话写入 transcript/history。
+            else explicit_skill_query
         ) # 从持久化用户文本或用户查询中获取历史文本
         multimodal_prompt = process_multimodal_prompt(
             text=user_query,
@@ -1401,6 +1465,12 @@ class AgentSession:
         # 自动创建新 session,不会把旧上下文再恢复回来。
         # 同时清空 SystemPromptSectionCache 与 MemoryLoader memoize,让下一轮
         # 重读 CLAUDE.md / 重算 env_info(用户编辑了记忆文件后能立刻生效)。
+        owner_session_id = self.current_runtime_session_id()
+        if self.subagent_task_registry is not None:
+            try:
+                self.subagent_task_registry.cancel_owner(owner_session_id)
+            except Exception:
+                logger.exception("清理会话时取消子代理任务失败")
         self.history.clear()
         self._pending_context_update_text = ""
         # Plan Mode: clear 时同步清空 plan state 并广播 PlanModeChanged
@@ -1954,6 +2024,10 @@ class AgentSession:
                     loop_compactions,
                 )
 
+            # 后台子代理进度和子代理消息邮箱都在模型调用边界注入。这样主 Agent
+            # 不需要 wait，也能在继续工作的下一轮及时看到当前工具与完成结果。
+            self._inject_runtime_messages(messages)
+
             self.event_bus.emit(RoundStart(
                 round_idx=round_idx,
                 max_rounds=max_rounds,
@@ -2203,7 +2277,7 @@ class AgentSession:
                 tool_calls,
                 round_idx=round_idx,
                 cancel_token=token,
-                execution_policy=self._plan_execution_policy(),
+                execution_policy=self.tool_execution_policy or self._plan_execution_policy(),
                 result_callback=_record_completed_tool_checkpoint,
             )
             for call, exec_result in zip(tool_calls, results):
@@ -2461,6 +2535,10 @@ class AgentSession:
         implementation progress and decisions around the plan, but they do not
         need to copy the full Markdown plan into the boundary summary.
         """
+        if self.is_subagent:
+            # 自动压缩也不能读取项目级 fallback PlanState，否则长任务会在压缩时
+            # 意外继承父会话计划，破坏子代理的角色和上下文隔离。
+            return ""
         try:
             state = self.plan_store.load(include_content=True)
         except Exception:
@@ -2698,32 +2776,45 @@ class AgentSession:
             logger.exception("memory/knowledge auto-update failed")
 
     def _prepend_runtime_notifications(self, user_query: str) -> str:
-        user_query = self._prepend_background_notifications(user_query)
-        return self._prepend_subagent_notifications(user_query)
+        # Bash 后台任务沿用旧的一次性前缀；Subagent 增量只在真正 think 前消费，
+        # 避免 hook 拦截或预检失败时提前推进事件游标并丢失通知。
+        return self._prepend_background_notifications(user_query)
 
-    def _prepend_subagent_notifications(self, user_query: str) -> str:
-        registry = self.subagent_task_registry
-        if registry is None:
-            return user_query
-        try:
-            done = registry.drain_notifications()
-        except Exception:
-            logger.exception("drain subagent notifications failed")
-            return user_query
-        if not done:
-            return user_query
+    def _inject_runtime_messages(self, messages: List[Dict[str, Any]]) -> None:
+        """在每轮 think 前注入父任务进度或子任务邮箱消息。
 
-        lines = ["<system-reminder>", "[后台子 Agent 任务完成通知]"]
-        for task in done:
-            lines.append(
-                f"- task_id={task.id} subagent_type={task.subagent_type} "
-                f"status={task.status} output={task.output_path}"
-            )
-        lines.append(
-            "请在需要向用户汇报前使用 agent_task(action=output, task_id=...) 查看子任务摘要或完整输出。"
-        )
-        lines.append("</system-reminder>")
-        return "\n".join(lines) + "\n\n" + user_query
+        这些合成 user 消息只活在当前工具循环中，``_extract_protocol_messages``
+        不会把它们提交到跨轮 history，避免高频运行态永久污染会话。
+        """
+
+        parts: List[str] = []
+        if self.subagent_task_registry is not None:
+            try:
+                updates = self.subagent_task_registry.drain_parent_updates(
+                    self.current_runtime_session_id()
+                )
+                if updates:
+                    parts.append(updates)
+            except Exception:
+                logger.exception("注入子代理运行通知失败")
+        if self.runtime_message_provider is not None:
+            try:
+                provided = self.runtime_message_provider()
+                if isinstance(provided, str) and provided.strip():
+                    parts.append(provided.strip())
+                elif isinstance(provided, (list, tuple)):
+                    text_items = [str(item).strip() for item in provided if str(item).strip()]
+                    if text_items:
+                        parts.append(
+                            "[父 Agent 补充指令]\n" + "\n\n".join(text_items)
+                        )
+            except Exception:
+                logger.exception("读取运行中补充消息失败")
+        if parts:
+            messages.append({
+                "role": "user",
+                "content": "<runtime-update>\n" + "\n\n".join(parts) + "\n</runtime-update>",
+            })
 
     def _prepend_background_notifications(self, user_query: str) -> str:
         """每轮 chat 前 drain 后台任务通知，挂到 user_query 前作为 system reminder。

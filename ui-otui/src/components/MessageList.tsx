@@ -20,6 +20,7 @@ import { ReasoningBlock } from "./ReasoningBlock.js";
 import { TodoPanel } from "./TodoPanel.js";
 import { QuestionPanel } from "./QuestionPanel.js";
 import { AssistantMessage } from "./AssistantMessage.js";
+import { SubagentPanel } from "./SubagentPanel.js";
 import type { ChatItem } from "../types.js";
 
 const planSyntaxStyle = SyntaxStyle.create();
@@ -83,6 +84,10 @@ function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
 
       <Match when={item().role === "tool"}>
         <ToolBlock item={item()} />
+      </Match>
+
+      <Match when={item().role === "subagent"}>
+        <SubagentPanel item={item()} />
       </Match>
 
       <Match when={item().role === "todo"}>
