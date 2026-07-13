@@ -947,6 +947,59 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(sliced[1]["tool_calls"][0]["id"], "call_active")
             self.assertEqual(sliced[2]["tool_call_id"], "call_active")
 
+    def test_recovered_tool_checkpoint_survives_continue_and_second_restart(self):
+        """中断轮恢复后输入“继续”，再次重启仍应保留中断轮及新一轮。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            call = _tc("bash", '{"command":"python search_download.py"}', call_id="call_download")
+            store.begin_active_turn(
+                user_query="你刚才下载的图片全都是无效的，重新下载真实的产品图",
+                turn_id="turn_interrupted",
+            )
+            store.record_active_assistant_tool_calls(
+                round_idx=1,
+                assistant_message=Message.create_assistant_message(tool_calls=[call]),
+            )
+            store.record_active_tool_completed(
+                round_idx=1,
+                tool_message=Message.create_tool_message(
+                    tool_call_id="call_download",
+                    tool_name="bash",
+                    tool_output="已创建 search_download.py",
+                ),
+            )
+
+            resumed = AgentSession(
+                llm=FakeLLM([{"answer": "继续处理完成", "tool_calls": []}]),
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=self.bus,
+                ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+            resumed.chat("继续")
+
+            restarted = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+            visible = [
+                message for message in restarted.history
+                if (message.metadata or {}).get("kind") != "context_update"
+            ]
+            text = "\n".join(str(message.content) for message in visible)
+
+            self.assertEqual(text.count("你刚才下载的图片全都是无效的"), 1)
+            self.assertEqual(text.count("继续"), 2)  # 用户输入与最终回答各出现一次。
+            self.assertIn("已创建 search_download.py", text)
+            self.assertIn("继续处理完成", text)
+            self.assertTrue(any(
+                (message.metadata or {}).get("interrupted")
+                for message in visible
+            ))
+
     def test_completed_tool_checkpoint_survives_later_tool_process_exit(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"

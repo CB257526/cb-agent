@@ -178,6 +178,10 @@ def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
     kind = metadata.get("kind")
     if kind:
         payload["kind"] = str(kind)
+    # 中断标记需要跟随归档后的消息继续保留，否则 active_turn 一旦转存到
+    # transcript，UI 下次恢复时就无法区分正常完成轮和异常中断轮。
+    if metadata.get("interrupted"):
+        payload["interrupted"] = True
     return payload
 
 
@@ -242,8 +246,13 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
     else:
         return None
 
+    metadata: Dict[str, Any] = {}
     if kind:
-        msg.metadata = {"kind": str(kind)}
+        metadata["kind"] = str(kind)
+    if payload.get("interrupted"):
+        metadata["interrupted"] = True
+    if metadata:
+        msg.metadata = metadata
     return msg
 
 
@@ -1093,9 +1102,9 @@ class LocalSessionStore:
             messages.extend(_messages_from_transcript_item(item))
 
         # active_turn.jsonl 是 pending_user.json 的增强版：它除了用户输入，还能
-        # 保存已经完成的工具配对。恢复时同一 turn_id 的 active 优先；如果 pending
-        # 已经换成新的 turn_id，则说明新用户输入已经先落盘，不能再让旧 active
-        # 遮蔽它。
+        # 保存已经完成的工具配对。active 与 pending 属于同一 turn_id 时只恢复
+        # active；属于不同 turn_id 时二者是连续两轮，必须按“旧 active、新 pending”
+        # 的顺序同时恢复，不能用新输入覆盖尚未归档的中断轮。
         active_events = self._read_active_turn_events(self.active_dir)
         active_started = _active_turn_started_event(active_events)
         active_turn_id = str(active_started.get("turn_id") or "")
@@ -1109,26 +1118,16 @@ class LocalSessionStore:
             # transcript 已经包含这一轮时，active_turn 只是“提交后尚未来得及删除”的
             # 残留文件。恢复时必须跳过，否则同一轮会被展示/注入两次。
             active_messages = []
-        if (
-            active_messages
-            and isinstance(pending, dict)
-            and pending.get("user_query")
-            and pending_turn_id
-            and active_turn_id
-            and pending_turn_id != active_turn_id
-        ):
-            # save_pending_user_message 先写 pending、再清旧 active。若进程卡在这
-            # 两步之间退出，磁盘上会同时有“新 pending + 旧 active”。此时新
-            # pending 才是最后一次可见用户输入，恢复时要让它胜出。
-            active_messages = []
         if active_messages:
             messages.extend(active_messages)
-        else:
-            # 如果上一轮在收到用户消息后、生成最终回答前进程崩溃，pending_user.json
-            # 会留下那条未完成用户消息。恢复时把它放在尾部，确保“用户最后说了什么”
-            # 不会因为异常退出丢掉。正常完成的一轮会在 append_turn 后清除此文件。
-            if isinstance(pending, dict) and pending.get("user_query"):
-                messages.append(Message.create_user_message(str(pending.get("user_query") or "")))
+        # 如果 pending 与 active 是同一轮，active 已经包含 user，不能重复追加。
+        # turn_id 不同则 pending 是用户在恢复后发出的下一条消息，必须放在旧中断轮后。
+        if (
+            isinstance(pending, dict)
+            and pending.get("user_query")
+            and (not active_messages or pending_turn_id != active_turn_id)
+        ):
+            messages.append(Message.create_user_message(str(pending.get("user_query") or "")))
 
         if not messages:
             return []
@@ -1186,6 +1185,9 @@ class LocalSessionStore:
             or self._pending_turn_id_for_user(user_query)
             or self._new_turn_id()
         )
+        # 恢复后的中断轮可能仍只存在于 active_turn.jsonl。开始下一轮前必须先把
+        # 它归档进 transcript；直接用 "w" 覆盖会让用户输入和已完成工具永久丢失。
+        self._archive_replaced_active_turn(next_turn_id=resolved_turn_id)
         event: Dict[str, Any] = {
             "type": "turn_started",
             "ts": _now_iso(),
@@ -1202,6 +1204,61 @@ class LocalSessionStore:
         with path.open("w", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
             f.flush()
+
+    def _archive_replaced_active_turn(self, *, next_turn_id: str) -> None:
+        """把即将被新回合替换的运行中检查点归档到 transcript。
+
+        写入顺序刻意采用“先追加 transcript、再删除 active”：如果进程在两步
+        之间退出，load_latest_history 会按 turn_id 去重；如果追加尚未成功，旧
+        active 仍然保留，不会因为启动新回合而丢失。
+        """
+
+        events = self._read_active_turn_events(self.active_dir)
+        started = _active_turn_started_event(events)
+        active_turn_id = str(started.get("turn_id") or "")
+        if not active_turn_id or active_turn_id == str(next_turn_id or ""):
+            return
+
+        transcript_items = self._read_transcript_items(self.active_dir)
+        committed_turn_ids = {
+            str(item.get("turn_id"))
+            for item in transcript_items
+            if isinstance(item, dict) and item.get("turn_id")
+        }
+        if active_turn_id in committed_turn_ids:
+            self.clear_active_turn()
+            return
+
+        committed_messages = _messages_from_active_turn_events(events)
+        if not committed_messages:
+            # 无法还原的损坏检查点不能静默覆盖，让调用方保留 pending 并停止换轮。
+            raise RuntimeError("无法归档旧 active turn：检查点中没有可恢复消息")
+
+        user_query = str(started.get("user_query") or "")
+        final_answer = ""
+        for message in reversed(committed_messages):
+            role = message.role.value if hasattr(message.role, "value") else str(message.role)
+            if role == "assistant" and not message.tool_calls and message.content:
+                final_answer = str(message.content)
+                break
+
+        item = {
+            "ts": _now_iso(),
+            "turn_id": active_turn_id,
+            "user_query": user_query,
+            "final_answer": final_answer,
+            "messages": [_message_to_persist_payload(m) for m in committed_messages],
+            "trace_entries": [],
+            "interrupted": True,
+        }
+        with (self.active_dir / "transcript.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+
+        self._bump_turn(user_query=user_query)
+        self.save_state(self.state)
+        self._write_index()
+        self.clear_active_turn()
 
     def record_active_assistant_tool_calls(
         self,
@@ -1338,9 +1395,8 @@ class LocalSessionStore:
             "user_query": user_query,
         }
         self._write_json(self.active_dir / "pending_user.json", payload)
-        # pending_user.json 已经原子写入后再清旧 active。若进程在两步之间退出，
-        # load_latest_history 会用 turn_id 让新 pending 覆盖旧 active，不会丢输入。
-        self.clear_active_turn()
+        # 这里只保存最新输入，不清理旧 active。下一轮 begin_active_turn 会先归档
+        # 旧中断轮再创建新检查点；若进程在此刻退出，恢复逻辑会同时展示两轮。
 
     def clear_pending_user_message(self) -> None:
         """清理当前会话的 pending 用户消息。"""

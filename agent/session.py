@@ -452,10 +452,9 @@ class AgentSession:
         self.plan_store = PlanStateStore(session_store=self.session_store)
         if self.session_store is not None:
             try:
-                # 启动自动恢复最近会话:这里只恢复普通 user/assistant 消息和
-                # 【工作记录】assistant 消息,不恢复 role=tool,也不恢复
-                # assistant.tool_calls。tool 协议消息只在同一轮 tool loop 内合法,
-                # 跨进程/跨轮直接回灌会造成 tool_call_id 对不上的协议风险。
+                # 启动时恢复最近会话的完整协议历史。运行中断轮只恢复已经配对的
+                # assistant.tool_calls + role=tool，未完成调用会在存储层被过滤，
+                # 因此既能保留用户看到的工具现场，也不会制造孤儿工具消息。
                 self.history = self.session_store.load_latest_history()
             except Exception:
                 logger.exception("本地会话历史恢复失败,忽略")

@@ -380,7 +380,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertEqual(text.count("默认 id 问题"), 1)
             self.assertEqual(text.count("默认 id 回答"), 1)
 
-    def test_new_pending_clears_stale_active_turn(self):
+    def test_new_pending_preserves_stale_active_turn(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -388,13 +388,13 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
 
             store.save_pending_user_message("新输入", turn_id="new_turn")
 
-            self.assertFalse((store.active_dir / "active_turn.jsonl").exists())
+            self.assertTrue((store.active_dir / "active_turn.jsonl").exists())
             history = LocalSessionStore(root).load_latest_history(max_messages=20)
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("新输入", text)
-            self.assertNotIn("旧未完成", text)
+            self.assertIn("旧未完成", text)
 
-    def test_default_turn_id_pending_wins_over_stale_active(self):
+    def test_default_turn_id_pending_follows_stale_active(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -403,21 +403,20 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             active_snapshot = active_path.read_text(encoding="utf-8")
 
             store.save_pending_user_message("新输入")
-            # 模拟 pending 已写入、旧 active 尚未来得及删除时进程退出。
-            active_path.write_text(active_snapshot, encoding="utf-8")
+            # save_pending_user_message 不应删除旧检查点；这里额外确认内容没有变化。
+            self.assertEqual(active_path.read_text(encoding="utf-8"), active_snapshot)
 
             history = LocalSessionStore(root).load_latest_history(max_messages=20)
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("新输入", text)
-            self.assertNotIn("旧未完成", text)
+            self.assertIn("旧未完成", text)
 
-    def test_new_pending_wins_if_stale_active_was_not_cleared_yet(self):
+    def test_new_pending_and_stale_active_are_both_restored(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
             store.begin_active_turn(user_query="旧未完成", turn_id="old_turn")
-            # 模拟 save_pending_user_message 写入成功后、clear_active_turn 执行前
-            # 进程退出：磁盘上同时存在新 pending 和旧 active。
+            # 模拟新 pending 写入后、下一轮尚未开始时进程退出。
             store._write_json(store.active_dir / "pending_user.json", {
                 "ts": "2026-07-08T00:00:00+00:00",
                 "session_id": store.active_session_id,
@@ -428,7 +427,46 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             history = LocalSessionStore(root).load_latest_history(max_messages=20)
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("新输入", text)
-            self.assertNotIn("旧未完成", text)
+            self.assertIn("旧未完成", text)
+
+    def test_begin_new_turn_archives_recovered_active_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            tool_calls = [{
+                "id": "call_old",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": "{}"},
+            }]
+            store.begin_active_turn(user_query="图片下载失败，请重试", turn_id="old_turn")
+            store.record_active_assistant_tool_calls(
+                round_idx=1,
+                assistant_message=_assistant(tool_calls=tool_calls),
+            )
+            store.record_active_tool_completed(
+                round_idx=1,
+                tool_message=_tool("call_old", "file_read", "已重新获取图片"),
+            )
+
+            store.save_pending_user_message("继续", turn_id="new_turn")
+            store.begin_active_turn(user_query="继续", turn_id="new_turn")
+
+            transcript = (store.active_dir / "transcript.jsonl").read_text(encoding="utf-8")
+            self.assertIn("图片下载失败，请重试", transcript)
+            active = (store.active_dir / "active_turn.jsonl").read_text(encoding="utf-8")
+            self.assertIn("继续", active)
+            self.assertNotIn("图片下载失败，请重试", active)
+
+            restored = LocalSessionStore(root).load_latest_history(max_messages=20)
+            text = "\n".join(str(message.content) for message in restored)
+            self.assertIn("图片下载失败，请重试", text)
+            self.assertIn("已重新获取图片", text)
+            self.assertIn("继续", text)
+            interrupted = [
+                message for message in restored
+                if (message.metadata or {}).get("interrupted")
+            ]
+            self.assertGreaterEqual(len(interrupted), 3)
 
 
 class TestSessionIsolation(unittest.TestCase):
