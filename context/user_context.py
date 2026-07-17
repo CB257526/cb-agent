@@ -1,7 +1,5 @@
 """UserContext —— 运行环境快照(memoize 一次进程)。
 
-对应 claude-code/src/context.ts:getUserContext。
-
 UserContext 是 env_info Section 的数据源。session 切换 cwd 时调
 invalidate_user_context() 让快照失效。
 """

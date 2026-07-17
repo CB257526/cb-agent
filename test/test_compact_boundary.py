@@ -1,7 +1,7 @@
 """compact_boundary.py 单元测试。
 
 覆盖：
-1. boundary 消息构造（角色 system、kind=compact_boundary、前缀【上下文压缩】）
+1. boundary 消息构造（角色 user、kind=compact_boundary、前缀【上下文压缩】）
 2. find_last_compact_boundary_index 倒序查找
 3. 多 boundary 时取最后一个
 4. get_messages_after_compact_boundary 切片包含 boundary 本身
@@ -19,7 +19,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from agent.compact_boundary import (
+from context.compact import (
     COMPACT_BOUNDARY_KIND,
     COMPACT_BOUNDARY_PREFIX,
     find_last_compact_boundary_index,
@@ -42,7 +42,7 @@ class TestMakeCompactBoundary(unittest.TestCase):
     def test_message_role_kind_and_prefix(self):
         msg = make_compact_boundary_message("旧上下文摘要")
         role = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
-        self.assertEqual(role, "system")
+        self.assertEqual(role, "user")
         self.assertEqual(msg.metadata.get("kind"), COMPACT_BOUNDARY_KIND)
         # 前缀自动加上
         self.assertTrue(str(msg.content).startswith(COMPACT_BOUNDARY_PREFIX))

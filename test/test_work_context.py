@@ -25,7 +25,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from agent.compact_boundary import (
+from context.compact import (
     COMPACT_BOUNDARY_KIND,
     make_compact_boundary_message,
 )

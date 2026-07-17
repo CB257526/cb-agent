@@ -61,17 +61,18 @@ class SubagentRunner:
         self,
         *,
         llm: Any,
-        parent_registry: Any,
-        parent_event_bus: Any,
-        task_manager: SubagentTaskManager,
-        hook_manager: Any = None,
-        cwd: Path,
-        ctx_enabled: bool = True,
-        skill_manager: Any = None,
-        bash_prompt_provider: Any = None,
-        trace_summarizer: Any = None,
-        language: Optional[str] = "Chinese",
-        mcp_clients: Any = None,
+        parent_registry: Any, # 子代理注册器
+        parent_event_bus: Any, # 父会话事件总线
+        task_manager: SubagentTaskManager, # 子代理任务管理器
+        hook_manager: Any = None, #子代理钩子管理器
+        cwd: Path, # 工作目录
+        ctx_enabled: bool = True, # 是否启用上下文管理
+        skill_manager: Any = None, # 技能管理器
+        bash_prompt_provider: Any = None, # Bash 提示提供器
+        trace_summarizer: Any = None, # 跟踪总结器
+        language: Optional[str] = "Chinese", # 语言
+        mcp_clients: Any = None, # MCP 客户端
+        # 消息日志工厂函数
         message_logger_factory: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self.llm = llm
@@ -100,7 +101,9 @@ class SubagentRunner:
         start_context: str = "",
     ) -> Dict[str, Any]:
         started_at = time.perf_counter()
-        scoped_bus = ScopedEventBus(
+        # 创建子代理事件总线，用于隔离子代理事件与父会话事件
+        # 每次run就代表有一个新的子代理要创建运行，所以会为每个subagent创建一个eventbus
+        scoped_bus = ScopedEventBus( 
             self.parent_event_bus,
             subagent_id=task.subagent_id,
             subagent_type=definition.name,
@@ -110,16 +113,17 @@ class SubagentRunner:
             parent_session_id=task.owner_session_id,
             task_manager=self.task_manager,
         )
+        # 构建子代理提示词
         delegated_prompt = self._build_child_prompt(
             description=description,
             prompt=prompt,
             start_context=start_context,
         )
-        status = "completed"
-        content = ""
+        status = "completed" # 子代理状态，默认完成
+        content = "" # 子代理回答，可能为空
         bash_session_token = None
-        search_ignore_token = None
-        message_logger = None
+        search_ignore_token = None # 搜索忽略目录令牌
+        message_logger = None # 消息日志记录器
         try:
             child_hook_manager = None
             if self.hook_manager is not None:
@@ -140,11 +144,12 @@ class SubagentRunner:
             task_runtime_dir = (
                 self.cwd / ".cbagent" / "subagent_tool_results" / task.id
             ).resolve()
+            # 克隆父注册器，创建子代理工具注册器
             clone_method = self.parent_registry.clone_filtered
             clone_kwargs: Dict[str, Any] = {
-                "allow_names": definition.tools,
-                "deny_names": SUBAGENT_HARD_DENY,
-                "event_bus": scoped_bus,
+                "allow_names": definition.tools, # 允许的工具名称
+                "deny_names": SUBAGENT_HARD_DENY, # 拒绝的工具名称
+                "event_bus": scoped_bus, # 子代理事件总线
             }
             try:
                 parameters = inspect.signature(clone_method).parameters
@@ -161,6 +166,7 @@ class SubagentRunner:
                 pass
             clone_session_token = set_session_override(child_bash_session)
             try:
+                # 根据参数创建子代理的工具注册器
                 child_registry = clone_method(**clone_kwargs)
             finally:
                 reset_session_override(clone_session_token)
@@ -171,11 +177,13 @@ class SubagentRunner:
                 child_bash = get_child_tool("bash")
                 if child_bash is not None and hasattr(child_bash, "_output_dir"):
                     child_bash._output_dir = (task_runtime_dir / "bash_outputs").resolve()
+            # 
             execution_policy = SubagentExecutionPolicy(
-                definition,
-                self.cwd,
-                allowed_internal_paths=(task_runtime_dir,),
+                definition, # 子代理定义
+                self.cwd, # 子代理工作目录
+                allowed_internal_paths=(task_runtime_dir,), # 允许的内部路径
             )
+            # 创建子代理工具执行器
             child_executor = ToolExecutor(
                 runner=child_registry.execute_tool,
                 event_bus=scoped_bus,
@@ -193,29 +201,30 @@ class SubagentRunner:
                     logger.exception("创建子代理消息日志失败")
 
             child_session = AgentSession(
-                llm=self.llm,
-                registry=child_registry,
-                executor=child_executor,
-                event_bus=scoped_bus,
+                llm=self.llm, # 子代理 LLM
+                registry=child_registry, # 子代理工具注册器
+                executor=child_executor, # 子代理工具执行器
+                event_bus=scoped_bus, # 子代理事件总线
                 memory_loader=MemoryLoader(cwd=self.cwd) if self.ctx_enabled else None,
                 # SkillManager 可以提供技能索引，但角色权限仍会在执行器层拦截越权工具。
                 skill_manager=self.skill_manager,
-                bash_prompt_provider=self.bash_prompt_provider,
-                ctx_enabled=self.ctx_enabled,
+                bash_prompt_provider=self.bash_prompt_provider, 
+                ctx_enabled=self.ctx_enabled, 
                 history_window=8,
                 messages_snapshot_hook=None,
                 session_store=None,
-                trace_summarizer=self.trace_summarizer,
+                trace_summarizer=self.trace_summarizer, # 子代理跟踪总结器
                 message_logger=message_logger,
                 language=self.language,
-                mcp_clients=self.mcp_clients,
-                hook_manager=child_hook_manager,
-                system_prompt_addendum=definition.system_prompt,
-                max_tool_rounds=definition.max_turns,
+                mcp_clients=self.mcp_clients, # 子代理 MCP 客户端
+                hook_manager=child_hook_manager, # 子代理钩子管理器
+                system_prompt_addendum=definition.system_prompt, 
+                max_tool_rounds=definition.max_turns, # 子代理最大工具轮数
                 memory_writeback_enabled=False,
                 is_subagent=True,
                 runtime_session_id=f"{task.owner_session_id}:{task.id}",
-                tool_execution_policy=execution_policy,
+                tool_execution_policy=execution_policy, # 子代理工具执行策略
+                # 子代理运行时消息提供器
                 runtime_message_provider=lambda: self.task_manager.drain_messages(task.id),
             )
 
@@ -481,7 +490,7 @@ class AgentTool(Tool):
         requested_type = str(parameters.get("subagent_type") or DEFAULT_SUBAGENT_TYPE).strip()
         run_in_background = _bool(parameters.get("run_in_background", True))
         subagent_id = f"subagent_{uuid.uuid4().hex[:8]}"
-
+        # 触发 SubagentStart hook，允许用户修改委派参数或阻止运行。
         start = self._fire_start_hook(
             owner_session_id=owner_session_id,
             subagent_id=subagent_id,
@@ -490,6 +499,7 @@ class AgentTool(Tool):
             prompt=prompt,
             run_in_background=run_in_background,
         )
+        # 如果 SubagentStart hook 阻止运行，返回原始参数，不允许运行。
         if start.get("blocked"):
             return _json({
                 "status": "blocked",
@@ -497,10 +507,10 @@ class AgentTool(Tool):
                 "subagent_type": requested_type,
                 "error": start.get("reason") or "SubagentStart hook 已阻止运行",
             })
-        description = str(start["description"])
-        prompt = str(start["prompt"])
+        description = str(start["description"]) # 
+        prompt = str(start["prompt"]) #
         run_in_background = bool(start["run_in_background"])
-        start_context = str(start.get("additional_context") or "")
+        start_context = str(start.get("additional_context") or "") # 补充上下文
         try:
             # 允许用户在进程运行期间新增或调整 .cbagent/agents/*.md。
             self._registry.refresh()
@@ -509,13 +519,14 @@ class AgentTool(Tool):
             return _json({"status": "failed", "error": str(exc), "subagent_id": subagent_id})
 
         def target(task: SubagentTask, token: CancelToken) -> Dict[str, Any]:
+            """运行子代理任务。"""
             return self._runner.run(
                 task=task,
-                definition=definition,
+                definition=definition, # 类型
                 description=description,
                 prompt=prompt,
                 cancel_token=token,
-                start_context=start_context,
+                start_context=start_context, # 补充上下文
             )
 
         if run_in_background:
@@ -562,6 +573,7 @@ class AgentTool(Tool):
         prompt: str,
         run_in_background: bool,
     ) -> Dict[str, Any]:
+        """触发 SubagentStart hook，允许用户修改委派参数或阻止运行。"""
         payload = {
             "description": description,
             "prompt": prompt,
@@ -569,6 +581,7 @@ class AgentTool(Tool):
             "run_in_background": run_in_background,
         }
         if self._hook_manager is None or not self._hook_manager.has_event("SubagentStart"):
+            # 没有注册 SubagentStart hook 时，直接返回原始参数，允许运行。
             return {**payload, "blocked": False, "additional_context": ""}
         manager = self._hook_manager.with_context(
             agent_scope="root",
@@ -578,9 +591,12 @@ class AgentTool(Tool):
             task_id=None,
             run_in_background=run_in_background,
         )
+        # 触发 SubagentStart hook，允许用户修改委派参数或阻止运行。
         outcome = manager.fire("SubagentStart", payload, matcher_value=subagent_type)
+        # 如果 SubagentStart hook 阻止运行，返回原始参数，不允许运行。
         if outcome.blocked or outcome.stop:
             return {**payload, "blocked": True, "reason": outcome.block_reason}
+        # 如果 SubagentStart hook 返回更新后的参数，返回更新后的参数，允许运行。
         updated = outcome.updated_input if isinstance(outcome.updated_input, dict) else {}
         return {
             "description": str(updated.get("description", description)),
@@ -606,7 +622,7 @@ class AgentTaskTool(Tool):
 
     def get_parameters(self) -> List[ToolParameter]:
         return [
-            ToolParameter(name="action", type="string", description="任务管理操作。", required=True),
+            ToolParameter(name="action", type="string", description="任务管理操作。可选值及用途：list_agents=列出已注册的子代理类型与加载错误；list=列出当前会话下所有子代理任务；inspect=非阻塞查询任务的实时事件流与工具进度；output=读取任务的最终输出内容；wait=阻塞等待一个或多个任务完成；message=向运行中的任务投递补充指令；cancel=取消任务；kill=cancel 的兼容别名。", required=True),
             ToolParameter(name="task_id", type="string", description="单个任务 ID。", required=False),
             ToolParameter(name="task_ids", type="array", description="wait 可同时等待的任务 ID。", required=False),
             ToolParameter(name="timeout", type="number", description="wait 超时秒数。", required=False, default=30),
@@ -615,53 +631,66 @@ class AgentTaskTool(Tool):
             ToolParameter(name="message", type="string", description="message 操作投递的补充指令。", required=False),
         ]
 
-    def validate_parameters(self, parameters: Dict[str, Any]) -> bool:
+    def validate_parameters(self, parameters: Dict[str, Any]) -> Optional[str]:
+        """校验参数。返回 None 表示通过；否则返回具体的错误描述。"""
         if not isinstance(parameters, dict):
-            return False
+            return "参数必须是 JSON 对象"
+
         action = parameters.get("action")
         allowed = {"list_agents", "list", "inspect", "output", "wait", "message", "cancel", "kill"}
-        if not isinstance(action, str) or action not in allowed:
-            return False
-        task_id = parameters.get("task_id")
-        if action in {"inspect", "output", "message", "cancel", "kill"} and (
-            not isinstance(task_id, str) or not task_id.strip()
-        ):
-            return False
-        message = parameters.get("message")
-        if action == "message" and (
-            not isinstance(message, str) or not message.strip()
-        ):
-            return False
+        if action is None:
+            return "缺少必填参数 action"
+        if not isinstance(action, str):
+            return f"action 必须是字符串，实际类型: {type(action).__name__}"
+        if action not in allowed:
+            return f"action 非法: {action!r}，可选值: {', '.join(sorted(allowed))}"
+
+        if action in {"inspect", "output", "message", "cancel", "kill"}:
+            task_id = parameters.get("task_id")
+            if not isinstance(task_id, str) or not task_id.strip():
+                return f"action={action} 必须提供非空的 task_id 字符串"
+
+        if action == "message":
+            message = parameters.get("message")
+            if not isinstance(message, str) or not message.strip():
+                return "action=message 必须提供非空的 message 字符串"
+
         if action == "wait":
             task_ids = parameters.get("task_ids")
             if task_ids is not None and not isinstance(task_ids, list):
-                return False
+                return "task_ids 必须是字符串数组"
+            task_id = parameters.get("task_id")
             if not (isinstance(task_id, str) and task_id.strip()) and not task_ids:
-                return False
+                return "action=wait 至少需要提供 task_id 或 task_ids 之一"
+
         for numeric_name in ("timeout", "cursor", "limit"):
             value = parameters.get(numeric_name)
             if value is not None and not isinstance(value, (int, float)):
-                return False
-        return True
+                return f"{numeric_name} 必须是数字（int 或 float），实际类型: {type(value).__name__}"
+
+        return None
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        if not self.validate_parameters(parameters):
-            return _json({"error": "agent_task 参数无效"})
+        error = self.validate_parameters(parameters)
+        if error is not None:
+            return _json({"error": error})
         owner_session_id = _owner_session_id()
         action = str(parameters.get("action"))
-
+        # 列出已注册的子代理类型与加载错误
         if action == "list_agents":
             self._registry.refresh()
             return _json({
                 "agents": [definition.public_dict() for definition in self._registry.list()],
                 "definition_errors": self._registry.errors(),
             })
+        # 列出当前会话下所有子代理任务
         if action == "list":
             return _json({
                 "tasks": [task.to_dict() for task in self._task_manager.list(owner_session_id)]
             })
 
         task_id = str(parameters.get("task_id") or "")
+        # 非阻塞查询任务的实时事件流与工具进度
         if action == "inspect":
             data = self._task_manager.inspect(
                 task_id,

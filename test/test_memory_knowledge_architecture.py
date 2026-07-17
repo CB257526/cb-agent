@@ -13,9 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from memory.embedding import refresh_embedder
 from context.memory.knowledge import KnowledgeBase
 from context.memory.loader import MemoryLoader
-from context.sections.dynamic_sections import memory_section
-from context.sections.cache import SystemPromptSectionCache
-from context.sections.registry import resolve_system_prompt_sections
+from context.sections.dynamic_sections import memory_sections
 
 
 def test_memory_loader_loads_global_project_and_short_term_layers(
@@ -148,8 +146,7 @@ def test_memory_section_includes_structured_knowledge_context(tmp_path: Path):
             return "Knowledge hit: layered memory context"
 
     loader = FakeMemoryLoader()
-    section = memory_section(loader, query="memory architecture")
-    out = asyncio.run(resolve_system_prompt_sections([section], SystemPromptSectionCache()))
+    out = asyncio.run(memory_sections(loader, query="memory architecture"))
 
-    assert "Knowledge hit: layered memory context" in out[0]
-    assert loader.reset_reasons == ["memory_section_realtime_reload"]
+    assert out == [("knowledge", "# Retrieved knowledge\nKnowledge hit: layered memory context")]
+    assert loader.reset_reasons == ["memory_sections_realtime_reload"]

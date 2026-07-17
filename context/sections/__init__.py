@@ -1,26 +1,23 @@
-"""Section 子模块。
+"""静态与动态提示词文本函数。"""
 
-对应 claude-code/src/constants/systemPromptSections.ts + 静态/动态段实现。
-"""
-
-from .cache import (
-    SystemPromptSectionCache,
-    clear_system_prompt_sections,
-    get_system_prompt_section_cache,
-)
-from .registry import (
-    DANGEROUS_uncached_system_prompt_section,
-    SystemPromptSection,
-    resolve_system_prompt_sections,
-    system_prompt_section,
+from .dynamic_sections import (
+    current_time_section,
+    env_info_section,
+    language_section,
+    mcp_instructions_section,
+    memory_section,
+    memory_sections,
+    session_guidance_section,
+    token_budget_section,
 )
 
 __all__ = [
-    "DANGEROUS_uncached_system_prompt_section",
-    "SystemPromptSection",
-    "SystemPromptSectionCache",
-    "clear_system_prompt_sections",
-    "get_system_prompt_section_cache",
-    "resolve_system_prompt_sections",
-    "system_prompt_section",
+    "current_time_section",
+    "env_info_section",
+    "language_section",
+    "mcp_instructions_section",
+    "memory_section",
+    "memory_sections",
+    "session_guidance_section",
+    "token_budget_section",
 ]

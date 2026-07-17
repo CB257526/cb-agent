@@ -12,9 +12,9 @@ cb-agent 当前不主动 escalate,但保留常量供 session/compact 模块引�
 
 from __future__ import annotations
 
-CAPPED_DEFAULT_MAX_TOKENS = 8_000
-ESCALATED_MAX_TOKENS = 64_000
-COMPACT_MAX_OUTPUT_TOKENS = 20_000
+CAPPED_DEFAULT_MAX_TOKENS = 8_000  # 默认输出预留(slot 友好,8K)
+ESCALATED_MAX_TOKENS = 64_000  # 触顶后自动升级 (64K)
+COMPACT_MAX_OUTPUT_TOKENS = 20_000  # 压缩摘要请求专用上限 (20K)
 
 
 def get_max_output_tokens_for_model(

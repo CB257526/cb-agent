@@ -340,7 +340,70 @@ class SubagentTaskManager:
     # ---------- 子会话事件与实时快照 ----------
 
     def record_child_event(self, task_id: str, event: Any) -> Optional[Dict[str, Any]]:
-        """把子会话事件归一成任务进度并持久化。"""
+        """把子会话事件归一成任务进度并持久化。
+
+        这是子代理 AgentSession 在执行过程中**唯一**的进度上报入口：
+        ScopedEventBus 收到子代理发出的事件后会回调到这里，由本方法
+        完成"事件 → 任务状态更新 + 事件流持久化"的全部工作。
+
+        Args:
+            task_id: 子代理任务 ID（即 SubagentTask.id，对应 agent_task
+                工具的 task_id）。若该任务不存在或已进入终态（completed
+                / failed / cancelled / orphaned），则忽略事件并返回 None。
+            event: 子会话产出的事件对象，支持以下类型：
+
+                * ``RoundStart``   - 一轮 LLM 调用开始
+                * ``RoundEnd``     - 一轮 LLM 调用结束
+                * ``ToolStart``    - 工具调用开始
+                * ``ToolComplete`` - 工具调用结束
+                * ``TokenUsage``   - 本轮 token 消耗
+                * ``Error``        - 运行期错误（不一定是终态）
+                * ``Cancelled``    - 取消流程开始
+                * ``Done``         - 子代理最终回答已生成
+
+                未识别的类型会被静默忽略，返回 None。
+
+        Returns:
+            归一化后的事件字典（已分配 ``event_seq``），可由
+            :meth:`inspect` 通过 cursor 拉取；任务不存在/已终态或事件
+            类型不识别时返回 None。
+
+        各事件对任务状态的影响（与 ``cancel_requested`` 联动）：
+
+        ============== =============================================================
+        事件            状态/字段变化
+        ============== =============================================================
+        RoundStart     status=running/cancelling，phase=thinking/cancelling，
+                       current_round = event.round_idx
+        RoundEnd       phase = cancelling | tool_results_ready (有工具调用)
+                       | finishing (无工具调用)
+        ToolStart      status=waiting_tool/cancelling，phase=running_tool，
+                       记录 current_tool_name/call_id/arguments/started_at，
+                       写入 active_tool_calls，tool_uses += 1
+        ToolComplete   从 active_tool_calls 移除该 call，更新
+                       last_tool_name/status/duration；若有其他活跃工具
+                       则把 current_tool_* 切到最新的那个，否则回到
+                       running/thinking 并清空 current_tool_*
+        TokenUsage     total_tokens += event.total_tokens
+        Error          phase = error（注意：不一定终止 AgentSession，
+                       最终 status 由 runner 返回值决定）
+        Cancelled      status = cancelling，phase = cancelling
+        Done           rounds_used = event.rounds_used
+        ============== =============================================================
+
+        线程安全：
+            整个方法体在 :attr:`_lock`（manager 级互斥锁）下执行；进入
+            后会进一步在 :meth:`_record_event_locked` 里加 ``task.lock``
+            （任务级可重入锁），保证任务查找、状态更新、事件序号分配
+            对并发事件是原子的。
+
+        副作用：
+            * 改写 ``task`` 的 ``status`` / ``phase`` / ``current_*`` /
+              ``last_*`` / ``event_seq`` / ``heartbeat_at`` 等字段；
+            * 通过 :meth:`_record_event_locked` 增量追加到
+              ``task.events_path``（JSONL 格式），供父进程 inspect 拉取；
+            * 触发 ScopedEventBus 转发到父总线，UI 端可实时显示进度。
+        """
 
         with self._lock:
             task = self._tasks.get(task_id)

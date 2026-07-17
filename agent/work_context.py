@@ -48,12 +48,6 @@ TRACE_SUMMARIZE_TOKENS = 800
 # 否则工作记录本身会挤占后续对话窗口。
 WORK_RECORD_LIMIT = 600
 
-# ``【上下文压缩】`` 是 /compact 主动生成的跨轮摘要。它比单轮工作记录承载
-# 的信息更多，需要覆盖一段会话的任务目标、已知事实、已读/已改文件和待办；
-# 但它仍然会进入 prompt，所以这里给一个硬上限，避免 compact 本身变成新的
-# 上下文负担。
-COMPACT_RECORD_LIMIT = 1200
-
 # state.json 中滚动摘要和单文件摘要的上限。state 会作为 P1 State 注入，
 # 优先级高于普通历史，所以必须保持紧凑。
 ROLLING_SUMMARY_LIMIT = 2000
@@ -178,6 +172,14 @@ def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
     kind = metadata.get("kind")
     if kind:
         payload["kind"] = str(kind)
+    context_fingerprints = metadata.get("context_fingerprints")
+    if isinstance(context_fingerprints, dict):
+        # 指纹基线必须跟随 context update 一起落盘，重启后才能继续做增量 diff。
+        payload["context_fingerprints"] = {
+            str(name): str(fingerprint)
+            for name, fingerprint in context_fingerprints.items()
+            if name and fingerprint
+        }
     # 中断标记需要跟随归档后的消息继续保留，否则 active_turn 一旦转存到
     # transcript，UI 下次恢复时就无法区分正常完成轮和异常中断轮。
     if metadata.get("interrupted"):
@@ -213,7 +215,9 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
             text = str(content or "")
             if not text:
                 return None
-            msg = Message.create_user_message(text)
+            # 字符串 user 消息必须按字符串原样恢复，不能转换成多模态 text 数组。
+            # 否则重启前后语义虽相同，请求 JSON 前缀却不再逐字一致。
+            msg = Message(role=MessageRole.USER, content=text)
     elif role == "system":
         text = str(content or "")
         if not text:
@@ -249,6 +253,14 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
     metadata: Dict[str, Any] = {}
     if kind:
         metadata["kind"] = str(kind)
+    context_fingerprints = payload.get("context_fingerprints")
+    if isinstance(context_fingerprints, dict):
+        # 空字典也是有效基线，表示上一轮显式删除了全部动态 section。
+        metadata["context_fingerprints"] = {
+            str(name): str(fingerprint)
+            for name, fingerprint in context_fingerprints.items()
+            if name and fingerprint
+        }
     if payload.get("interrupted"):
         metadata["interrupted"] = True
     if metadata:
@@ -1443,7 +1455,9 @@ class LocalSessionStore:
         compact = {
             "ts": ts,
             "session_id": self.active_session_id,
-            "summary": _clip(summary, COMPACT_RECORD_LIMIT),
+            # summary 已由 AgentSession 按 8K token 上限裁剪，这里必须完整保存。
+            # compact.json 是恢复锚点，不能再做字符级二次截断。
+            "summary": str(summary or ""),
             "transcript_offset": self._count_transcript_turns(self.active_dir),
             "history": history_payload,
             "before_messages": before_messages,
@@ -1460,9 +1474,8 @@ class LocalSessionStore:
 
             state = self.state if isinstance(self.state, dict) else self._new_state()
             state["updated_at"] = ts
-            # The compact summary is restored through compact.json/history as the
-            # compact_record anchor. Keeping the same text in rolling_summary would
-            # inject it again through SessionState on the next turn.
+            # 完整摘要通过 compact.json/history 的 boundary 恢复；state 只保留一份
+            # 短审计预览，避免 SessionState 在下一轮重复注入完整摘要。
             state["last_compact_summary"] = _clip(summary, ROLLING_SUMMARY_LIMIT)
             state["rolling_summary"] = ""
             state["compacted_at"] = ts
@@ -1779,7 +1792,6 @@ class LocalSessionStore:
 
 
 __all__ = [
-    "COMPACT_RECORD_LIMIT",
     "LocalSessionStore",
     "RuleTraceSummarizer",
     "TraceCollector",

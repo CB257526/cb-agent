@@ -1,46 +1,34 @@
-"""CompactBoundary —— 消息列表中的"压缩边界"标记。
-
-对应 claude-code 中 CompactBoundary marker 的概念。
-
-设计要点:
-- 不引入新 role,复用 Message.metadata["kind"]="compact_boundary"。
-  LLM 看到的是普通 role=user 含 summary 的消息,不知元角色。
-- 物理位置 = 压缩点。位置之前的消息已被 summary 替代;之后的是保留尾段。
-- find_last_compact_boundary 取最后一次压缩点;auto_compact 每次都基于
-  这个点之后的消息计算 token,不重复压缩已压缩段。
-- 与 work_context.make_compact_record_message 的关系:后者本身就是"压缩
-  记录消息",make_compact_boundary_message 是它的标准化版本,前者保留为
-  薄 wrapper(整合点见 work_context.py 修改)。
-"""
+"""Compact boundary 的唯一实现。"""
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 from core.message import Message, MessageRole
 
 
 COMPACT_BOUNDARY_KIND = "compact_boundary"
+COMPACT_BOUNDARY_PREFIX = "【上下文压缩】"
 
 
 def make_compact_boundary_message(
-    *,
     summary: str,
+    *,
     tokens_before: int = 0,
     tokens_after: int = 0,
     reason: str = "",
 ) -> Message:
-    """生成一条 role=user, kind=compact_boundary 的标记消息。
+    """生成模型可见的 user-role compact 摘要消息。
 
-    summary 会被 LLM 当作普通 user 消息读到。tokens_before/after/reason
-    只写在 metadata,LLM 不可见,仅供 TUI/日志使用。
-
-    role 选 user 而非 assistant: 让模型把摘要当作"用户告诉我已经发生过的事
-    实",不会误以为是自己说过的话(避免 self-conditioning 偏差)。
+    Chat Completions 兼容服务对第二条 system 消息的处理不一致，因此摘要使用 user
+    角色，并通过 metadata 标记本地语义。摘要是 replacement history 的第一条消息。
     """
+    content = (summary or "").strip()
+    if not content.startswith(COMPACT_BOUNDARY_PREFIX):
+        content = COMPACT_BOUNDARY_PREFIX + content
     return Message(
         role=MessageRole.USER,
-        content=summary,
+        content=content,
         metadata={
             "kind": COMPACT_BOUNDARY_KIND,
             "tokens_before": int(tokens_before),
@@ -51,35 +39,42 @@ def make_compact_boundary_message(
 
 
 def is_compact_boundary(message: Message) -> bool:
-    meta = message.metadata if isinstance(message.metadata, dict) else None
-    if not meta:
-        return False
-    return str(meta.get("kind") or "") == COMPACT_BOUNDARY_KIND
+    """判断消息是否为 compact boundary，兼容旧 system-role boundary。"""
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return str(metadata.get("kind") or "") == COMPACT_BOUNDARY_KIND
+
+
+def find_last_compact_boundary_index(messages: Sequence[Message]) -> int:
+    """返回最后一个 compact boundary 下标；不存在时返回 -1。"""
+    for index in range(len(messages) - 1, -1, -1):
+        if is_compact_boundary(messages[index]):
+            return index
+    return -1
 
 
 def find_last_compact_boundary(messages: Sequence[Message]) -> Optional[int]:
-    """返回最后一条 compact_boundary 消息的下标;无则 None。"""
-    for i in range(len(messages) - 1, -1, -1):
-        if is_compact_boundary(messages[i]):
-            return i
-    return None
+    """兼容旧 Optional 下标接口。"""
+    index = find_last_compact_boundary_index(messages)
+    return None if index < 0 else index
 
 
-def messages_after_last_boundary(messages: Sequence[Message]) -> List[Message]:
-    """返回最后一次压缩点之后的消息(含边界自身)。
+def get_messages_after_compact_boundary(messages: Sequence[Message]) -> list[Message]:
+    """返回最后一个 boundary 及其后的 active history。"""
+    index = find_last_compact_boundary_index(messages)
+    return list(messages if index < 0 else messages[index:])
 
-    无边界时返回原列表的浅拷贝。auto_compact 用这个判断"自上次压缩以来
-    新累积了多少 token"。
-    """
-    idx = find_last_compact_boundary(messages)
-    if idx is None:
-        return list(messages)
-    return list(messages[idx:])
+
+def messages_after_last_boundary(messages: Sequence[Message]) -> list[Message]:
+    """兼容旧命名。"""
+    return get_messages_after_compact_boundary(messages)
 
 
 __all__ = [
     "COMPACT_BOUNDARY_KIND",
+    "COMPACT_BOUNDARY_PREFIX",
     "find_last_compact_boundary",
+    "find_last_compact_boundary_index",
+    "get_messages_after_compact_boundary",
     "is_compact_boundary",
     "make_compact_boundary_message",
     "messages_after_last_boundary",

@@ -503,7 +503,7 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
             from core.message import Message
-            from agent.compact_boundary import make_compact_boundary_message
+            from context.compact import make_compact_boundary_message
             # 灌一段很长的早期 history(会被 compact 切掉)
             s.history.append(Message.create_user_message("早期问题 " + "A" * 3000))
             s.history.append(Message.create_assistant_message("早期回答 " + "B" * 3000))
@@ -543,7 +543,7 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
             from core.message import Message
-            from agent.compact_boundary import make_compact_boundary_message
+            from context.compact import make_compact_boundary_message
 
             # 构造：boundary 锚点 + 6 条尾部消息，history_window=3 也不截断
             s.history.append(make_compact_boundary_message("ANCHOR_SUMMARY"))
@@ -615,7 +615,8 @@ class TestAgentSessionBasic(unittest.TestCase):
 
                 # 本轮落进 history 的 context_update 不应包含 plan 文本。
                 history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
-                self.assertEqual(history_dump.count(unique), 1)  # 仅来自上面模拟的旧历史
+                # 旧格式 plan 段保留审计，新格式再追加一次具名 plan section。
+                self.assertEqual(history_dump.count(unique), 2)
 
                 s.chat("second")
                 second_request = json.dumps(llm.calls[1]["messages"], ensure_ascii=False)
@@ -823,7 +824,10 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
 
-            answer = s.chat("start")
+            # 本用例只验证 tool-loop 副本压缩；关闭回合结束后的 replacement compact，
+            # 避免它按设计移除原始中间工具链而干扰断言。
+            with patch.object(s, "_maybe_auto_compact_history", return_value=None):
+                answer = s.chat("start")
 
             # 最终回答正确
             self.assertEqual(answer, "done")
@@ -1159,10 +1163,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertNotIn("第二会话问题", restored)
             self.assertEqual(store.active_session_id, first_id)
 
-    def test_compact_context_appends_boundary_and_slices_next_turn(self):
-        """compact_context 在 history 末尾追加 compact_boundary;下一轮发给 LLM
-        的请求只包含 boundary 之后(含 boundary)的消息,boundary 之前的旧消息
-        留在 history 用于审计但不再注入 prompt。"""
+    def test_compact_context_replaces_history_and_retains_latest_turn(self):
+        """compact_context 替换 active history，并保留最新完整回合。"""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -1177,20 +1179,22 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             s.chat("旧问题一")
             s.chat("旧问题二")
-            self.assertEqual(len(s.history), 6)
+            self.assertEqual(len(s.history), 5)
             self.assertEqual(len(s.export_history()), 4)
 
-            payload = s.compact_context()
-            # boundary 追加后 history 长度 +1
-            self.assertEqual(payload["before_messages"], 6)
-            self.assertEqual(payload["after_messages"], 7)
+            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+                payload = s.compact_context()
+            self.assertEqual(payload["before_messages"], 5)
+            self.assertEqual(payload["after_messages"], 3)
             self.assertTrue(payload["persisted"])
             self.assertIn("【上下文压缩】", payload["summary"])
-            # 末尾是新插入的 boundary
+            # replacement history 的第一条是 boundary，后面是最新回合首尾消息。
             self.assertEqual(
-                (s.history[-1].metadata or {}).get("kind"),
+                (s.history[0].metadata or {}).get("kind"),
                 "compact_boundary",
             )
+            self.assertIn("旧问题二", str(s.history[1].content))
+            self.assertIn("旧回答二", str(s.history[2].content))
             self.assertTrue((store.active_dir / "compact.json").exists())
             self.assertTrue((store.active_dir / "compactions.jsonl").exists())
             self.assertTrue((store.active_dir / "transcript.jsonl").exists())
@@ -1204,9 +1208,15 @@ class TestAgentSessionBasic(unittest.TestCase):
                 m for m in next_turn_messages
                 if m.get("role") in {"user", "assistant"}
             ]
-            joined = "\n".join(str(m.get("content")) for m in raw_user_assistant)
-            self.assertNotIn("旧回答一", joined)
-            self.assertNotIn("旧回答二", joined)
+            # 旧回答一只允许出现在摘要 boundary 中，不再作为独立 assistant 消息保留。
+            self.assertFalse(any(
+                m.get("role") == "assistant" and m.get("content") == "旧回答一"
+                for m in raw_user_assistant
+            ))
+            self.assertTrue(any(
+                m.get("role") == "assistant" and m.get("content") == "旧回答二"
+                for m in raw_user_assistant
+            ))
 
     def test_compact_context_does_not_mutate_history_when_persist_fails(self):
         """compact 快照落盘失败时，内存 history 仍保持原样。"""
@@ -1229,13 +1239,14 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             store.save_compaction = fail_save_compaction  # type: ignore[method-assign]
 
-            with self.assertRaises(OSError):
-                s.compact_context()
+            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+                with self.assertRaises(OSError):
+                    s.compact_context()
 
             self.assertEqual(s.export_history(), before)
 
     def test_compact_context_resets_memory_loader_cache(self):
-        """手动 compact 复用通用 compact_now，并清理 MemoryLoader cache。"""
+        """手动 compact 完成 replacement history 后清理 MemoryLoader cache。"""
         class FakeMemoryLoader:
             def __init__(self):
                 self.reasons: List[str] = []
@@ -1258,7 +1269,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             s.chat("旧问题一")
             s.chat("旧问题二")
 
-            s.compact_context()
+            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+                s.compact_context()
 
             self.assertIn("user_compact", loader.reasons)
 
@@ -1270,7 +1282,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
         messages = llm.calls[0]["messages"]
         self.assertEqual(messages[0]["role"], "system")
-        self.assertNotIn("# Current time", messages[0]["content"])
+        self.assertNotIn("# Current date", messages[0]["content"])
         self.assertNotIn("# Environment", messages[0]["content"])
         self.assertNotIn("Available tools:", messages[0]["content"])
 
@@ -1279,7 +1291,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             if m.get("role") == "user" and "<context-update>" in str(m.get("content", ""))
         ]
         self.assertEqual(len(context_messages), 1)
-        self.assertIn("# Current time", context_messages[0]["content"])
+        self.assertIn("# Current date", context_messages[0]["content"])
         self.assertIn("# Environment", context_messages[0]["content"])
         self.assertIn("Available tools: bash, file_read.", context_messages[0]["content"])
 
@@ -1298,14 +1310,25 @@ class TestAgentSessionBasic(unittest.TestCase):
         s.chat("second question")
         second_request = llm.calls[1]["messages"]
 
-        self.assertEqual(second_request[0], first_request[0])
-        self.assertEqual(second_request[1], first_request[1])
-        self.assertEqual(second_request[2], first_request[2])
+        self.assertEqual(second_request[:len(first_request)], first_request)
         self.assertEqual(second_request[3]["role"], "assistant")
         self.assertEqual(second_request[3]["content"], "first answer")
-        self.assertIn("<context-update>", second_request[-2]["content"])
         self.assertEqual(second_request[-1]["role"], "user")
         self.assertEqual(second_request[-1]["content"], "second question")
+        self.assertEqual(llm.calls[1]["tools"], llm.calls[0]["tools"])
+
+    def test_tools_schema_is_sorted_before_every_request(self):
+        llm = FakeLLM([{"answer": "ok", "tool_calls": []}])
+        self.registry.get_tools_description_openai_schema = MagicMock(return_value=[
+            {"type": "function", "function": {"name": "z_tool", "parameters": {}}},
+            {"type": "function", "function": {"name": "a_tool", "parameters": {}}},
+        ])
+        s = self._make_session(llm)
+
+        s.chat("hello")
+
+        names = [item["function"]["name"] for item in llm.calls[0]["tools"]]
+        self.assertEqual(names, ["a_tool", "z_tool"])
 
     def test_chat_history_appended_correctly(self):
         llm = FakeLLM([{"answer": "好的", "tool_calls": []}])

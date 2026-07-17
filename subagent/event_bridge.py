@@ -29,15 +29,15 @@ class ScopedEventBus:
 
     def __init__(
         self,
-        parent_bus: EventBus,
+        parent_bus: EventBus, # 父会话事件总线
         *,
-        subagent_id: str,
-        subagent_type: str,
-        description: str,
-        task_id: Optional[str] = None,
-        run_in_background: bool = False,
-        parent_session_id: Optional[str] = None,
-        task_manager: Optional[SubagentTaskManager] = None,
+        subagent_id: str, # 子代理 ID
+        subagent_type: str, # 子代理类型
+        description: str, # 子代理描述
+        task_id: Optional[str] = None, # 任务 ID
+        run_in_background: bool = False, # 是否在后台运行
+        parent_session_id: Optional[str] = None, # 父会话 ID
+        task_manager: Optional[SubagentTaskManager] = None, # 子代理任务管理器
     ) -> None:
         self.parent_bus = parent_bus
         self.subagent_id = subagent_id
@@ -47,9 +47,9 @@ class ScopedEventBus:
         self.run_in_background = run_in_background
         self.parent_session_id = parent_session_id
         self.task_manager = task_manager
-        self.final_answer = ""
-        self.rounds_used = 0
-        self.cancelled = False
+        self.final_answer = ""  # 最终回答，可能为空
+        self.rounds_used = 0  # 已用轮数，可能为空
+        self.cancelled = False  # 是否被取消
 
     def emit(self, event: Any) -> None:
         # Hook 事件已经包含 agent_scope/subagent_id，直接转发给前端即可。
@@ -72,7 +72,9 @@ class ScopedEventBus:
         if managed_task:
             return
 
+        # 将子代理事件转换为父代理进度事件（SubagentProgress）。
         progress = self._to_progress(event, None)
+        # 只有当转换成功时才转发给父会话事件总线。供前端消费
         if progress is not None:
             self.parent_bus.emit(progress)
 
@@ -88,9 +90,11 @@ class ScopedEventBus:
 
     @property
     def subscriber_count(self) -> int:
+        """查看当前子代理事件总线的订阅者数量。"""
         return 0
 
     def _to_progress(self, event: Any, payload: Optional[dict[str, Any]]) -> Optional[SubagentProgress]:
+        """将子代理事件转换为父代理进度事件。"""
         if payload is None:
             payload = _fallback_progress_payload(event)
         if payload is None:

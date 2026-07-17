@@ -552,20 +552,22 @@ class TestGatewayDispatch(unittest.TestCase):
                 ],
             )
 
-            msgs = self._run_gateway_with_msgs(
-                FakeLLM([]),
-                [json.dumps({"jsonrpc": "2.0", "id": "cp1", "method": "session.compact"})],
-                wait_for=2,
-                session_store=store,
-            )
+            # 默认 64K 下这段小历史应 no-op；测试通过收紧预算验证 RPC 的
+            # replacement history 路径，而不是重新引入“手动 compact 必须压缩”。
+            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+                msgs = self._run_gateway_with_msgs(
+                    FakeLLM([]),
+                    [json.dumps({"jsonrpc": "2.0", "id": "cp1", "method": "session.compact"})],
+                    wait_for=2,
+                    session_store=store,
+                )
 
             replies = [m for m in msgs if m.get("id") == "cp1"]
             self.assertEqual(len(replies), 1)
             result = replies[0]["result"]
             self.assertIn("【上下文压缩】", result["summary"])
-            # CC 模式: compact 在 history 末尾追加 boundary,after = before + 1。
-            # boundary 之前的旧消息保留用于审计,但下一轮发给 LLM 时会被切掉。
-            self.assertEqual(result["after_messages"], result["before_messages"] + 1)
+            self.assertLess(result["after_messages"], result["before_messages"])
+            self.assertFalse(result["no_op"])
             self.assertIn("context_window", result)
             self.assertGreater(result["context_window"]["used_tokens"], 0)
             self.assertTrue(result["persisted"])

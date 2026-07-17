@@ -23,12 +23,18 @@ _ENCODING_NAME = "cl100k_base"
 
 
 @functools.lru_cache(maxsize=1)
-def _get_encoding() -> "tiktoken.Encoding":
-    """全局共享 tiktoken 编码器,进程内只初始化一次。
+def _get_encoding() -> Optional["tiktoken.Encoding"]:
+    """全局共享 tiktoken 编码器，并缓存离线初始化失败。
 
     性能关键路径:每次重建编码器冷启 50-100ms,循环里调几十次会拖慢上层流程。
+    某些 tiktoken 安装会在首次加载时联网下载编码文件；离线失败后返回 None，
+    让本进程后续统一走字符估算，避免每次计数都重复发起网络请求。
     """
-    return tiktoken.get_encoding(_ENCODING_NAME)
+    try:
+        return tiktoken.get_encoding(_ENCODING_NAME)
+    except Exception as exc:
+        logger.warning("token 编码器初始化失败,本进程改用字符估算: %s", exc)
+        return None
 
 
 def count_tokens(text: str, model_name: Optional[str] = None) -> int:  # noqa: ARG001
@@ -40,8 +46,11 @@ def count_tokens(text: str, model_name: Optional[str] = None) -> int:  # noqa: A
     del model_name
     if not text:
         return 0
+    encoding = _get_encoding()
+    if encoding is None:
+        return max(1, len(text) // 4)
     try:
-        return len(_get_encoding().encode(text))
+        return len(encoding.encode(text))
     except Exception as e:
         logger.warning("token 计数失败,降级为字符估算: %s", e)
         return max(1, len(text) // 4)
@@ -55,8 +64,11 @@ def tokenize_for_relevance(text: str) -> FrozenSet[int]:
     """
     if not text:
         return frozenset()
+    encoding = _get_encoding()
+    if encoding is None:
+        return frozenset()
     try:
-        return frozenset(_get_encoding().encode(text))
+        return frozenset(encoding.encode(text))
     except Exception:
         return frozenset()
 

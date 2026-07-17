@@ -56,13 +56,16 @@ def _is_already_cleared(content: Any) -> bool:
         return False
 
 
-def apply_microcompact(messages: List[Dict[str, Any]]) -> int:
+def apply_microcompact(messages: List[Dict[str, Any]], *, force: bool = False) -> int:
     """原地 LRU 替换最旧的 tool_result content。返回被清理的条数。
 
     扫描策略：
     1. 收集所有 role=tool 消息的下标（按 messages 中出现顺序）；
     2. 跳过已被清理过的；
     3. 若剩余原文条数 > KEEP_RECENT，把"最旧 (剩余 - KEEP_RECENT)"条替换为占位。
+
+    force=True 表示上层已经检测到 token 压力，此时不等待固定条数阈值，只要旧工具
+    结果多于保留数量就立即清理。默认路径仍保持原来的条数阈值语义。
 
     被替换的消息保留 tool_call_id / name / role，只有 content 被换。这是 OpenAI
     协议合法性的最低要求：assistant.tool_calls 与对应 role=tool 的配对依赖
@@ -81,7 +84,9 @@ def apply_microcompact(messages: List[Dict[str, Any]]) -> int:
             continue
         tool_indices.append(idx)
 
-    if len(tool_indices) < MICROCOMPACT_THRESHOLD:
+    if not force and len(tool_indices) < MICROCOMPACT_THRESHOLD:
+        return 0
+    if force and len(tool_indices) <= MICROCOMPACT_KEEP_RECENT:
         return 0
 
     # 需要清理的数量 = 总条数 - KEEP_RECENT

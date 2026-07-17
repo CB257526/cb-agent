@@ -1,34 +1,35 @@
-"""compact 子模块 —— 自动 / 用户触发上下文压缩。"""
+"""上下文压缩的 boundary 与 replacement history 选择。"""
 
-from .auto_compact import (
-    AutoCompactResult,
-    DEFAULT_KEEP_RECENT,
-    DEFAULT_THRESHOLD_PCT,
-    maybe_auto_compact,
-)
 from .boundary import (
     COMPACT_BOUNDARY_KIND,
+    COMPACT_BOUNDARY_PREFIX,
     find_last_compact_boundary,
+    find_last_compact_boundary_index,
+    get_messages_after_compact_boundary,
     is_compact_boundary,
     make_compact_boundary_message,
     messages_after_last_boundary,
 )
-from .compact import compact_now
-from .session_memory_compact import try_session_memory_summary
-from .summarizer import RuleBasedSummarizer, Summarizer
+from .history import (
+    CompactionSelection,
+    DEFAULT_RETAINED_MESSAGE_TOKENS,
+    estimate_messages_tokens,
+    has_meaningful_summary_source,
+    select_compaction_history,
+)
 
 __all__ = [
-    "AutoCompactResult",
     "COMPACT_BOUNDARY_KIND",
-    "DEFAULT_KEEP_RECENT",
-    "DEFAULT_THRESHOLD_PCT",
-    "RuleBasedSummarizer",
-    "Summarizer",
-    "compact_now",
+    "COMPACT_BOUNDARY_PREFIX",
+    "CompactionSelection",
+    "DEFAULT_RETAINED_MESSAGE_TOKENS",
+    "estimate_messages_tokens",
     "find_last_compact_boundary",
+    "find_last_compact_boundary_index",
+    "get_messages_after_compact_boundary",
+    "has_meaningful_summary_source",
     "is_compact_boundary",
     "make_compact_boundary_message",
-    "maybe_auto_compact",
     "messages_after_last_boundary",
-    "try_session_memory_summary",
+    "select_compaction_history",
 ]

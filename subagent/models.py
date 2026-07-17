@@ -93,44 +93,65 @@ class SubagentDefinition:
 class SubagentTask:
     """子代理任务的可持久化状态和进程内控制句柄。"""
 
-    id: str 
-    subagent_id: str
-    subagent_type: str
-    owner_session_id: str
-    description: str
-    prompt: str
-    output_path: str
-    snapshot_path: str
-    events_path: str
-    started_at: str
-    run_in_background: bool = True
-    status: str = "queued"
-    phase: str = "queued"
-    result: str = ""
-    error: str = ""
-    rounds_used: int = 0
-    tool_uses: int = 0
-    total_tokens: int = 0
-    current_round: int = 0
-    current_tool_name: str = ""
-    current_tool_call_id: str = ""
-    current_tool_arguments: Dict[str, Any] = field(default_factory=dict)
-    current_tool_started_at: Optional[str] = None
-    active_tool_calls: Dict[str, Dict[str, Any]] = field(default_factory=dict, repr=False)
-    last_tool_name: str = ""
-    last_tool_status: str = ""
-    last_tool_duration: float = 0.0
-    updated_at: str = field(default_factory=utc_now)
-    finished_at: Optional[str] = None
-    heartbeat_at: str = field(default_factory=utc_now)
-    event_seq: int = 0
-    parent_cursor: int = 0
-    cancel_requested: bool = False
-    recent_events: List[Dict[str, Any]] = field(default_factory=list)
-    inbox: List[str] = field(default_factory=list)
-    cancel_token: CancelToken = field(default_factory=CancelToken, repr=False)
-    future: Any = field(default=None, repr=False)
-    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    # —— 标识与归属 ——
+    id: str                              # 任务唯一标识符
+    subagent_id: str                     # 子代理实例 ID
+    subagent_type: str                   # 子代理类型（如 general-purpose、claude 等）
+    owner_session_id: str                # 所属父会话 ID
+
+    # —— 任务定义 ——
+    description: str                     # 任务简述
+    prompt: str                          # 发送给子代理的完整提示词
+    output_path: str                     # 最终输出文件路径（父进程读取结果用）
+    snapshot_path: str                   # 快照文件路径（状态持久化用）
+    events_path: str                     # 事件流文件路径（增量追加，供父进程轮询）
+
+    # —— 生命周期 ——
+    started_at: str                      # 任务启动时间（ISO 8601）
+    run_in_background: bool = True       # 是否后台运行（True=异步，False=同步阻塞）
+    status: str = "queued"               # 当前状态：queued / running / completed / failed / cancelled
+    phase: str = "queued"                # 当前阶段：queued / thinking / tool_call / finalizing
+
+    # —— 结果 ——
+    result: str = ""                     # 任务成功时的最终文本输出
+    error: str = ""                      # 任务失败时的错误信息
+
+    # —— 使用统计 ——
+    rounds_used: int = 0                 # 已消耗的 LLM 对话轮数
+    tool_uses: int = 0                   # 累计工具调用次数
+    total_tokens: int = 0                # 累计消耗 token 数（prompt + completion）
+
+    # —— 当前轮次与进行中的工具调用 ——
+    current_round: int = 0               # 当前轮次编号（从 0 起）
+    current_tool_name: str = ""          # 当前正在执行的工具名称
+    current_tool_call_id: str = ""       # 当前工具调用的唯一 ID（来自 LLM 响应）
+    current_tool_arguments: Dict[str, Any] = field(default_factory=dict)  # 当前工具调用的参数
+    current_tool_started_at: Optional[str] = None                          # 当前工具开始执行的时间戳
+    active_tool_calls: Dict[str, Dict[str, Any]] = field(default_factory=dict, repr=False)  # 活跃的工具调用映射（tool_call_id → 调用详情），不在 repr 中展示
+
+    # —— 上一次工具调用记录 ——
+    last_tool_name: str = ""             # 上一个完成的工具名称
+    last_tool_status: str = ""           # 上一个工具的执行状态（success / error）
+    last_tool_duration: float = 0.0      # 上一个工具的执行耗时（秒）
+
+    # —— 时间戳 ——
+    updated_at: str = field(default_factory=utc_now)     # 最后更新时间（每次状态变更时刷新）
+    finished_at: Optional[str] = None                     # 任务完成时间（进入终态时设置）
+    heartbeat_at: str = field(default_factory=utc_now)    # 心跳时间（用于父进程检测存活）
+
+    # —— 事件与同步 ——
+    event_seq: int = 0                   # 事件序列号（单调递增，父进程按此顺序消费）
+    parent_cursor: int = 0               # 父会话事件游标（父进程已读取到的位置）
+    cancel_requested: bool = False       # 是否已被请求取消
+
+    # —— 事件缓冲与通信 ——
+    recent_events: List[Dict[str, Any]] = field(default_factory=list)  # 近期事件环形缓冲区
+    inbox: List[str] = field(default_factory=list)                     # 消息收件箱（用于跨代理 SendMessage）
+
+    # —— 进程内控制句柄（不持久化，repr=False） ——
+    cancel_token: CancelToken = field(default_factory=CancelToken, repr=False)        # 取消令牌，用于安全中断运行中的任务
+    future: Any = field(default=None, repr=False)                                      # 异步 Future 对象（后台运行时持有 asyncio.Task / concurrent.futures.Future）
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)         # 可重入锁，保证多线程读写状态安全
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_TASK_STATES
