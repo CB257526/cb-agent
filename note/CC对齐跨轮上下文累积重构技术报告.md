@@ -1,5 +1,7 @@
 # 跨轮上下文管理重构技术报告 —— 转向 Claude Code 原始消息累积模式
 
+> 2026-07-17 更新：本文记录的是当时的历史实现。文中 local microcompact 已从运行时和测试中移除；当前工具循环保持 append-only，体积控制只依赖工具结果入口硬截断与正式 compact，避免改写请求中段破坏 provider prefix cache。
+
 ## 概述
 
 本次重构将 cb-agent 的跨轮上下文管理策略从"每轮强制 trace 摘要 + work_record 文本注入"
