@@ -365,7 +365,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             tool_msgs = [m for m in round2_msgs if m.get("role") == "tool"]
             self.assertEqual(len(tool_msgs), 1)
             self.assertEqual(tool_msgs[0].get("tool_call_id"), call_id)
-            # 结果原样回灌(result_cap 不会触发，因为 < 50k)
+            # 结果原样回灌（result_cap 不会触发，因为低于 10K token/40K bytes）
             self.assertIn(huge_content, tool_msgs[0].get("content", ""))
         finally:
             if original is None:
@@ -768,32 +768,15 @@ class TestAgentSessionBasic(unittest.TestCase):
                 for m in next_turn_messages
             ))
 
-    def test_loop_microcompact_only_compacts_llm_request_copy(self):
-        """验证 tool loop 中的 microcompact 只压缩 LLM 请求副本，不碰原始 history。
-
-        场景：10 轮 file_read 工具调用，每轮返回 1500 个 "word "，累计大量
-        tool_result 内容。到第 11 轮（最终回答轮）时，发给 LLM 的请求会触发
-        microcompact。
-
-        核心断言（三点验证）：
-        1. **LLM 请求副本被压缩**：最后一轮发给 LLM 的 messages 中，存在 role=tool
-           且 content 包含 '"cleared": true' 的消息 —— 旧 tool_result 被替换为
-           占位符。
-        2. **原始 history 完好无损**：self.history 中 tool 消息的 content 仍然包含
-           原始长文本（long_content），没有被压缩破坏。
-        3. **压缩事件被记录**：Done.auto_compact.events 中存在 reason="tool_loop"
-           且 compressed_tool_messages > 0 的审计条目。
-
-        如果 microcompact 错误地修改了原始 messages 而非副本，断言 2 会失败；
-        如果 microcompact 根本没触发，断言 1 和 3 会失败。
-        """
+    def test_tool_loop_is_append_only_without_clearing_old_tool_results(self):
+        """验证连续工具轮次只追加消息，不改写已经发送过的工具结果。"""
         original = ConstantLLM.llm_dict.get("fake")
         try:
             ConstantLLM.llm_dict["fake"] = {
                 "is_tool": True, "is_reasoning": False,
-                "image_ability": False, "max_tokens": 20000,
+                "image_ability": False, "max_tokens": 100000,
             }
-            # 10 轮工具调用 + 1 轮最终回答
+            # 10 轮工具调用加 1 轮最终回答，累计量足以覆盖旧压缩路径的触发场景。
             tool_rounds = [
                 {"answer": "", "tool_calls": [_tc("file_read", "{}", call_id=f"call_{i}")]}
                 for i in range(10)
@@ -809,34 +792,39 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
 
-            # 本用例只验证 tool-loop 副本压缩；关闭回合结束后的 replacement compact，
-            # 避免它按设计移除原始中间工具链而干扰断言。
+            # 关闭回合结束后的正式 compact，避免它按设计替换跨轮历史，确保本用例
+            # 只观察工具循环内部的追加行为。
             with patch.object(s, "_maybe_auto_compact_history", return_value=None):
                 answer = s.chat("start")
 
-            # 最终回答正确
             self.assertEqual(answer, "done")
-            # 断言 1：LLM 最终请求中存在被 microcompact 清除的 tool 消息
+
+            # 每次后续请求都必须保留此前请求中的完整消息内容，且只能在尾部增长。
+            for previous_call, current_call in zip(llm.calls, llm.calls[1:]):
+                previous_messages = previous_call["messages"]
+                current_messages = current_call["messages"]
+                self.assertEqual(
+                    current_messages[:len(previous_messages)],
+                    previous_messages,
+                )
+
             final_request = llm.calls[-1]["messages"]
-            cleared_tool_messages = [
-                m for m in final_request
-                if m.get("role") == "tool" and '"cleared": true' in str(m.get("content"))
-            ]
-            self.assertGreaterEqual(len(cleared_tool_messages), 1)
-            # 断言 2：self.history 中 tool 消息的原始内容完整保留
+            tool_messages = [m for m in final_request if m.get("role") == "tool"]
+            self.assertEqual(len(tool_messages), 10)
+            self.assertTrue(all(long_content in str(m.get("content")) for m in tool_messages))
+            self.assertFalse(any('"cleared": true' in str(m.get("content")) for m in tool_messages))
+
+            # 工具循环结束后提交到 history 的结果也必须保持完整。
             self.assertTrue(any(
                 (m.role.value if hasattr(m.role, "value") else str(m.role)) == "tool"
                 and long_content in str(m.content)
                 for m in s.history
             ))
-            # 断言 3：压缩事件被正确记录到 Done.auto_compact
+
+            # Done 中不再产生工具循环局部压缩事件。
             dones = [e for e in self.events if isinstance(e, Done)]
             events = (dones[-1].auto_compact or {}).get("events", [])
-            self.assertTrue(any(
-                item.get("reason") == "tool_loop"
-                and item.get("compressed_tool_messages", 0) > 0
-                for item in events
-            ))
+            self.assertFalse(any(item.get("reason") == "tool_loop" for item in events))
         finally:
             if original is None:
                 ConstantLLM.llm_dict.pop("fake", None)

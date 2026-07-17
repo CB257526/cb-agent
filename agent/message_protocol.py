@@ -46,7 +46,7 @@ def _role_of(message: Any) -> str:
 def drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> int:
     """原地丢弃孤儿 tool 消息(dict 版)。返回被丢弃的条数。
 
-    用于 _build_chat_messages:active history 切片后、microcompact 之前调用,
+    用于 _build_chat_messages 的 active history 切片之后、请求发送之前调用，
     保证发给 LLM 的请求体里每条 role=tool 都能在前文找到声明它 tool_call_id
     的 assistant.tool_calls。
     """

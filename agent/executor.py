@@ -276,7 +276,9 @@ class ToolExecutor:
                 result_callback,
             )
 
-        # 批量总量上限检查：单轮所有 tool results 总字符超限时从最长的开始持久化
+        # 批量总量上限是 cb-agent 在单条 Codex 风格 cap 之外的额外兜底。
+        # 此时 results 尚未返回给 AgentSession，也从未追加进发给模型的 messages，
+        # 因此这里只规范化本轮新结果，不会改写已发送前缀或破坏 provider cache。
         # result_callback 已经在单个工具完成时通知过一次；这里如果批量 cap 又改写
         # 了结果，需要用同一个 call_id 再通知一次，让 active_turn 中的最终结果与
         # 后续回灌给模型的 messages 保持一致。
@@ -393,6 +395,19 @@ class ToolExecutor:
 
     # ---------- 单条 ----------
 
+    def _cap_model_visible_result(self, result: Any, *, call_id: str, name: str) -> str:
+        """在结果进入事件、检查点或消息历史前执行统一模型可见上限。"""
+        rendered = _stringify_tool_result(result)
+        capped, persisted = cap_single_result(
+            rendered, call_id, name, self._persist_dir,
+        )
+        if persisted:
+            logger.info(
+                "tool result persisted: name=%s call_id=%s dir=%s",
+                name, call_id, self._persist_dir,
+            )
+        return capped
+
     def _execution_policy_denial(
         self,
         *,
@@ -413,7 +428,11 @@ class ToolExecutor:
         if allowed:
             return None
 
-        result = execution_policy.denied_result(name, args, reason or "tool denied")
+        result = self._cap_model_visible_result(
+            execution_policy.denied_result(name, args, reason or "tool denied"),
+            call_id=call_id,
+            name=name,
+        )
         logger.warning(
             "tool denied by execution policy: round=%s name=%s call_id=%s reason=%s",
             round_idx,
@@ -454,7 +473,11 @@ class ToolExecutor:
         if not permission.denied:
             return None
 
-        result = permission_denied_payload(name, args, permission)
+        result = self._cap_model_visible_result(
+            permission_denied_payload(name, args, permission),
+            call_id=call_id,
+            name=name,
+        )
         logger.warning(
             "tool denied by platform permission: round=%s name=%s call_id=%s reason=%s",
             round_idx,
@@ -529,7 +552,11 @@ class ToolExecutor:
                 round_idx=round_idx,
             )
             if outcome.blocked:
-                result = _hook_blocked_payload(name, args, outcome.block_reason)
+                result = self._cap_model_visible_result(
+                    _hook_blocked_payload(name, args, outcome.block_reason),
+                    call_id=call_id,
+                    name=name,
+                )
                 logger.warning(
                     "tool blocked by PreToolUse hook: round=%s name=%s call_id=%s reason=%s",
                     round_idx, name, call_id, outcome.block_reason,
@@ -622,16 +649,9 @@ class ToolExecutor:
             len(result) if isinstance(result, str) else len(str(result)),
         )
 
-        # 统一结果上限：超过 MAX_SINGLE_RESULT_CHARS 时持久化到磁盘
-        if not is_error:
-            result, persisted = cap_single_result(
-                result, call_id, name, self._persist_dir,
-            )
-            if persisted:
-                logger.info(
-                    "tool result persisted: name=%s call_id=%s dir=%s",
-                    name, call_id, self._persist_dir,
-                )
+        # 成功和异常结果都必须经过统一 10K token 上限。异常文本同样可能携带
+        # 超长 stderr 或第三方响应，不能绕过模型上下文的最终安全边界。
+        result = self._cap_model_visible_result(result, call_id=call_id, name=name)
 
         if self._bus is not None:
             self._bus.emit(ToolComplete(

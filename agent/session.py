@@ -84,7 +84,6 @@ from core.message import Message, MessageRole
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
 from agent.message_protocol import drop_orphan_tool_messages
-from agent.microcompact import apply_microcompact
 from agent.work_context import (
     LocalSessionStore,
     RuleTraceSummarizer,
@@ -2007,63 +2006,6 @@ class AgentSession:
 
     # ---------- 工具循环 ----------
 
-    def _prepare_loop_messages_for_llm(
-        self,
-        messages: List[Dict[str, Any]],
-        tools_schema: Optional[List[Dict[str, Any]]],
-        round_idx: int,
-    ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        """为工具循环的每一轮准备发给 LLM 的请求体，必要时仅压缩 LLM 副本。
-
-        核心设计原则：**压缩的是副本，原始 messages 不动**。
-
-        工具循环中 messages 会累积越来越多的 assistant(tool_calls) + role=tool
-        消息。当累积量超过触发阈值时，直接发给 LLM 可能导致上下文超窗。
-
-        解决方案：
-        1. deepcopy 一份 messages 作为 llm_messages（浅拷贝不够，因为 dict
-           内部嵌套的 content/list 会被 microcompact 原地修改）。
-        2. 对 llm_messages 执行 microcompact：将旧的、重复的 tool_result 替换为
-           {"cleared": true} 占位符，只保留最近几次工具结果原文。
-        3. 原始 messages 保持不变 → 工具循环结束时 _chat_impl 从中提取完整的
-           tool_calls + tool_result 原始消息 commit 到 self.history → 跨轮恢复
-           时模型仍能看到完整工具调用细节。
-        4. 压缩事件记录到返回值中，最终汇总进 Done.auto_compact.events，
-           供 TUI 调试面板展示。
-
-        Returns:
-            (llm_messages, compaction_event | None)
-            - llm_messages: 发给 LLM 的消息列表（可能是压缩后的副本或原始引用）
-            - compaction_event: 压缩审计事件，未触发压缩时为 None
-        """
-        before_tokens = self._estimate_request_tokens(messages, tools_schema)
-        trigger_tokens = self._auto_compact_trigger_tokens()
-        # 未达触发阈值 → 直接返回原始 messages，零开销
-        if before_tokens < trigger_tokens:
-            return messages, None
-
-        # 深拷贝后压缩，保证原始 messages 不受影响
-        llm_messages = copy.deepcopy(messages)
-        # microcompact 将旧的 tool_result 替换为轻量占位符，
-        # 返回被压缩的消息条数；0 表示没有可压缩的内容
-        # 已经由 token 压力触发时允许提前清理，不必机械等待第 10 条工具结果出现。
-        cleared = apply_microcompact(llm_messages, force=True)
-        if cleared <= 0:
-            return messages, None
-
-        after_tokens = self._estimate_request_tokens(llm_messages, tools_schema)
-        return llm_messages, {
-            "reason": "tool_loop",
-            "round_idx": round_idx,
-            "before_tokens": before_tokens,
-            "after_tokens": after_tokens,
-            "budget_tokens": self._context_budget_tokens(),
-            "trigger_tokens": trigger_tokens,
-            "request_tokens": before_tokens,
-            "compressed_tool_messages": cleared,
-            "persisted": False,  # loop 内压缩不落盘，只活在当轮
-        }
-
     def _tool_loop(
         self,
         messages: List[Dict[str, Any]],
@@ -2087,11 +2029,9 @@ class AgentSession:
         # 本轮 messages 在循环结束后会被 _chat_impl 提取协议消息 commit 到
         # self.history,跨轮恢复时模型直接看到原始 tool_calls + tool_result。
         trace_collector = TraceCollector()
-        # Loop 内只压缩发给 LLM 的请求副本，保留原始 messages 用于 history
-        # commit 和 transcript 审计。事件会汇总进 Done.auto_compact。
-        # 这是 CC 对齐的关键设计：旧的 loop_compactions 为空列表只是兼容占位，
-        # 现在真正使用 —— 每轮 think 前检查是否需要 microcompact，
-        # 压缩的是深拷贝副本，原始 messages 不丢工具调用细节。
+        # 工具循环只向 messages 尾部追加协议消息，不改写已经发送过的旧工具结果。
+        # 返回空事件列表是为了保持 _tool_loop 的既有返回契约；窗口压力统一交给
+        # 回合前预检、回合后自动 compact 和这里的硬阻断检查处理。
         loop_compactions: List[Dict[str, Any]] = []
         max_rounds = self.max_tool_rounds
 
@@ -2149,25 +2089,14 @@ class AgentSession:
                 round_idx=round_idx,
                 max_rounds=max_rounds,
             ))
-            # 每轮 think 前准备 LLM 请求副本：如果累计 token 超过触发阈值，
-            # 对副本执行 microcompact（压缩旧 tool_result），原始 messages 不动。
-            # 返回的 llm_messages 可能是副本（已压缩）或原始引用（未达阈值）。
-            llm_messages, loop_compaction = self._prepare_loop_messages_for_llm(
-                messages,
-                tools_schema,
-                round_idx,
-            )
-            if loop_compaction is not None:
-                loop_compactions.append(loop_compaction)
-                logger.info("loop microcompact before think: %s", loop_compaction)
-            # 即使用 microcompact 压缩后，仍需检查压缩后的请求是否仍然过大。
-            # 如果连压缩后都超过 blocking 阈值，说明本轮的上下文已经无法安全
-            # 发送给 LLM，直接终止工具循环并返回友好提示。
-            request_tokens_est = self._estimate_request_tokens(llm_messages, tools_schema)
+            # 直接使用追加式消息列表，确保连续工具轮次的请求前缀保持字节稳定。
+            # 若当前请求已接近完整窗口，则停止本轮并提示正式 compact，不在循环
+            # 中间替换任何旧消息内容。
+            request_tokens_est = self._estimate_request_tokens(messages, tools_schema)
             self._emit_context_window_update(
                 reason="round_start",
                 round_idx=round_idx,
-                messages=llm_messages,
+                messages=messages,
                 tools_schema=tools_schema,
                 used_tokens=request_tokens_est,
             )
@@ -2202,13 +2131,13 @@ class AgentSession:
             logger.info(
                 "round start: round=%s messages=%s request_tokens_est=%s",
                 round_idx,
-                len(llm_messages),
+                len(messages),
                 request_tokens_est,
             )
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        llm_messages,
+                        messages,
                         tools=tools_schema,
                         label=f"第 {round_idx} 轮 think 前",
                     )
@@ -2220,7 +2149,7 @@ class AgentSession:
             # 文本自动路由为 PlanDelta 事件，块外文本继续走正常 TextDelta。
             plan_bus = _PlanParsingEventBus(self) if self.collaboration_mode() == "plan" else None
             result = self.llm.think(
-                llm_messages,
+                messages,
                 tools=tools_schema,
                 event_bus=plan_bus if plan_bus is not None else self.event_bus,
                 cancel_event=token.event,
@@ -2231,7 +2160,7 @@ class AgentSession:
                 plan_bus.finish(round_idx)
             if self.message_logger is not None:
                 try:
-                    logged_messages = list(llm_messages)
+                    logged_messages = list(messages)
                     assistant_payload = _llm_result_to_assistant_payload(result)
                     if assistant_payload is not None:
                         logged_messages.append(assistant_payload)

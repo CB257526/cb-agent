@@ -40,6 +40,7 @@ from agent.executor import (
     READ_ONLY_IF_ACTION, READ_ONLY_TOOLS,
     ToolCallResult, ToolExecutor, should_parallelize,
 )
+from agent.result_cap import MAX_SINGLE_RESULT_BYTES
 from agent.plan_policy import PlanExecutionPolicy
 from agent.platforms.context import (
     reset_current_platform_conversation,
@@ -177,6 +178,21 @@ class TestExecutorSerial(unittest.TestCase):
 
         completes = [e for e in self.events if isinstance(e, ToolComplete)]
         self.assertTrue(completes[0].is_error)
+
+    def test_runner_large_exception_is_capped_before_event_and_history(self):
+        """超长异常结果也必须在 ToolComplete 发出前经过统一结果上限。"""
+        def runner(name, args):
+            raise RuntimeError("x" * (MAX_SINGLE_RESULT_BYTES + 1000))
+
+        with tempfile.TemporaryDirectory() as td:
+            ex = ToolExecutor(runner, self.bus, persist_dir=Path(td) / "tool_results")
+            results = ex.execute([_tc("bash", call_id="call_large_error")], round_idx=1)
+
+        self.assertTrue(results[0].is_error)
+        payload = json.loads(results[0].result)
+        self.assertTrue(payload["truncated"])
+        completes = [e for e in self.events if isinstance(e, ToolComplete)]
+        self.assertEqual(completes[0].result, results[0].result)
 
     def test_plan_policy_denial_emits_protocol_events_without_runner(self):
         """验证 PlanExecutionPolicy 拒绝时不调用 runner，且 emit 完整协议事件。

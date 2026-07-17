@@ -2,9 +2,9 @@
 
 覆盖场景：
 1. 单条结果 < 上限 → 不截断
-2. 单条结果 > 上限 → 持久化 + preview 替换
+2. 单条结果超过 token 或字节上限 → 持久化 + preview 替换
 3. 工具已自行持久化（output_file）→ 不重复持久化，复用路径
-4. file_read 读取持久化文件 → 防循环，只 inline 截断
+4. file_read 超限 → 保持结构化分页信息，只截断 content
 5. 批量总量 > 上限 → 从最长开始逐条持久化
 6. 持久化文件正确写入且内容可读
 """
@@ -16,17 +16,19 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from unittest.mock import patch
 
 from agent.result_cap import (
-    MAX_BATCH_RESULT_CHARS,
-    MAX_SINGLE_RESULT_CHARS,
-    PERSIST_DIR_MARKER,
+    MAX_BATCH_RESULT_BYTES,
+    MAX_BATCH_RESULT_TOKENS,
+    MAX_SINGLE_RESULT_BYTES,
+    MAX_SINGLE_RESULT_TOKENS,
     PREVIEW_HEAD_CHARS,
     PREVIEW_TAIL_CHARS,
     cap_batch_results,
     cap_single_result,
 )
+from context.budget.tokens import count_tokens
 
 
 @dataclass
@@ -54,17 +56,18 @@ class TestCapSingleResult(unittest.TestCase):
         self.assertFalse(persisted)
 
     def test_at_limit_no_truncation(self):
-        """刚好等于上限时不截断。"""
-        result = "a" * MAX_SINGLE_RESULT_CHARS
-        capped, persisted = cap_single_result(
-            result, "call_002", "grep", self.persist_dir,
-        )
+        """刚好等于 token 上限且未超过字节兜底时不截断。"""
+        result = "a" * MAX_SINGLE_RESULT_TOKENS
+        with patch("agent.result_cap.count_tokens", side_effect=lambda text: len(text)):
+            capped, persisted = cap_single_result(
+                result, "call_002", "grep", self.persist_dir,
+            )
         self.assertEqual(capped, result)
         self.assertFalse(persisted)
 
     def test_over_limit_persists_and_replaces(self):
-        """超限时持久化到磁盘并替换为 preview payload。"""
-        result = "b" * (MAX_SINGLE_RESULT_CHARS + 5000)
+        """超过字节兜底上限时持久化到磁盘并替换为 preview payload。"""
+        result = "b" * (MAX_SINGLE_RESULT_BYTES + 5000)
         capped, persisted = cap_single_result(
             result, "call_003", "bash", self.persist_dir,
         )
@@ -75,6 +78,8 @@ class TestCapSingleResult(unittest.TestCase):
         self.assertTrue(payload["truncated"])
         self.assertEqual(payload["tool_name"], "bash")
         self.assertEqual(payload["total_chars"], len(result))
+        self.assertIn("total_tokens", payload)
+        self.assertEqual(payload["total_bytes"], len(result.encode("utf-8")))
         self.assertIn("preview_head", payload)
         self.assertIn("preview_tail", payload)
         self.assertIn("persisted_path", payload)
@@ -92,7 +97,7 @@ class TestCapSingleResult(unittest.TestCase):
         existing_path = "/tmp/fake_output.log"
         tool_result = json.dumps({
             "exit_code": 0,
-            "stdout": "x" * (MAX_SINGLE_RESULT_CHARS + 1000),
+            "stdout": "x" * (MAX_SINGLE_RESULT_BYTES + 1000),
             "output_file": existing_path,
             "output_truncated": True,
         }, ensure_ascii=False)
@@ -109,11 +114,13 @@ class TestCapSingleResult(unittest.TestCase):
         self.assertEqual(payload["persisted_path"], existing_path)
 
     def test_file_read_persisted_result_no_double_persist(self):
-        """file_read 读取 tool_results/ 下的文件时，只 inline 截断不持久化。"""
+        """file_read 超限时保持 JSON 与分页元数据，不复制原始文件。"""
         # 模拟 file_read 返回 JSON，path 指向 tool_results/
-        fake_content = "c" * (MAX_SINGLE_RESULT_CHARS + 2000)
+        fake_content = "测" * (MAX_SINGLE_RESULT_TOKENS + 2000)
+        persisted_path = "/project/.cbagent/tool_results/call_prev.txt"
         tool_result = json.dumps({
-            "path": f"/project/.cbagent/{PERSIST_DIR_MARKER}call_prev.txt",
+            "path": persisted_path,
+            "mode": "range-1-999",
             "content": fake_content,
             "total_lines": 999,
             "truncated": False,
@@ -122,23 +129,40 @@ class TestCapSingleResult(unittest.TestCase):
         capped, persisted = cap_single_result(
             tool_result, "call_005", "file_read", self.persist_dir,
         )
-        # 不应持久化
         self.assertFalse(persisted)
-        # 应做 inline 截断
-        self.assertIn("已截断", capped)
-        self.assertIn("start_line/end_line", capped)
-        # 长度应在上限附近
-        self.assertLessEqual(
-            len(capped),
-            MAX_SINGLE_RESULT_CHARS + 100,  # 加上截断提示的长度
-        )
+        payload = json.loads(capped)
+        self.assertEqual(payload["path"], persisted_path)
+        self.assertTrue(payload["truncated"])
+        self.assertTrue(payload["result_cap_truncated"])
+        self.assertIn("start_line/end_line", payload["content"])
+        self.assertLessEqual(len(capped.encode("utf-8")), MAX_SINGLE_RESULT_BYTES)
+
+    def test_token_limit_triggers_before_byte_fallback(self):
+        """token 密集文本即使未到 40K bytes，也必须按 10K token 上限处理。"""
+        result = "x" * (MAX_SINGLE_RESULT_TOKENS + 1)
+        with patch("agent.result_cap.count_tokens", side_effect=lambda text: len(text)):
+            capped, persisted = cap_single_result(
+                result, "call_token_dense", "search", self.persist_dir,
+            )
+        self.assertTrue(persisted)
+        self.assertTrue(json.loads(capped)["truncated"])
+
+    def test_byte_fallback_triggers_when_token_estimate_is_small(self):
+        """token 估算偏小时，40K bytes 硬兜底仍能阻止超长结果进入上下文。"""
+        result = " " * (MAX_SINGLE_RESULT_BYTES + 1)
+        with patch("agent.result_cap.count_tokens", return_value=1):
+            capped, persisted = cap_single_result(
+                result, "call_byte_fallback", "search", self.persist_dir,
+            )
+        self.assertTrue(persisted)
+        self.assertTrue(json.loads(capped)["truncated"])
 
     def test_preview_head_tail_content(self):
         """验证 preview 头尾内容正确。"""
         # 构造有辨识度的内容
         head_marker = "HEAD_START_" + "h" * PREVIEW_HEAD_CHARS
         tail_marker = "t" * PREVIEW_TAIL_CHARS + "_TAIL_END"
-        middle = "m" * (MAX_SINGLE_RESULT_CHARS + 10000)
+        middle = "m" * (MAX_SINGLE_RESULT_BYTES + 10000)
         result = head_marker + middle + tail_marker
 
         capped, persisted = cap_single_result(
@@ -173,9 +197,10 @@ class TestCapBatchResults(unittest.TestCase):
 
     def test_over_batch_limit_truncates_longest_first(self):
         """批量总量超限时从最长的开始截断。"""
-        # 制造总量刚好超 200k 的场景
+        # 制造总量超过 160K bytes 批量兜底的场景
         # 4 个结果，其中一个特别长
-        short_result = "s" * 30_000  # 30k
+        # 空格序列占用 30K bytes 但 token 很少，便于单独验证字节批量兜底的处理顺序。
+        short_result = " " * 30_000  # 30K bytes
         long_result = "L" * 120_000  # 120k
         results = [
             FakeToolCallResult(call_id="c1", name="bash", result=long_result),
@@ -183,7 +208,7 @@ class TestCapBatchResults(unittest.TestCase):
             FakeToolCallResult(call_id="c3", name="grep", result=short_result),
             FakeToolCallResult(call_id="c4", name="grep", result=short_result),
         ]
-        # 总量 = 120k + 30k*3 = 210k > 200k
+        # 总量 = 120k + 30k*3 = 210k > 160k
 
         cap_batch_results(results, self.persist_dir)
 
@@ -196,6 +221,10 @@ class TestCapBatchResults(unittest.TestCase):
         self.assertEqual(results[1].result, short_result)
         self.assertEqual(results[2].result, short_result)
         self.assertEqual(results[3].result, short_result)
+        remaining_tokens = sum(count_tokens(r.result) for r in results)
+        remaining_bytes = sum(len(r.result.encode("utf-8")) for r in results)
+        self.assertLessEqual(remaining_tokens, MAX_BATCH_RESULT_TOKENS)
+        self.assertLessEqual(remaining_bytes, MAX_BATCH_RESULT_BYTES)
 
     def test_already_truncated_skipped(self):
         """已经被 cap_single_result 处理过的结果不会被二次截断。"""
@@ -227,7 +256,7 @@ class TestCapBatchResults(unittest.TestCase):
             FakeToolCallResult(call_id="c1", name="bash", result=big_result),
             FakeToolCallResult(call_id="c2", name="bash", result=big_result),
         ]
-        # 总量 300k > 200k
+        # 总量 300k > 批量预算
 
         cap_batch_results(results, self.persist_dir)
 
