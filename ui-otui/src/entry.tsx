@@ -8,7 +8,6 @@
  *   3. createCliRenderer（exitOnCtrlC=false，App 自己接管 Ctrl-C）
  *   4. render(App)，把 transport 注入
  *
- * python 路径解析逻辑沿用旧 ui-tui/entry.tsx。
  */
 
 import { render } from "@opentui/solid";
@@ -17,7 +16,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { App } from "./app.js";
-import { Transport } from "./transport.js";
+import { parseBackendArgs, Transport } from "./transport.js";
 import { win32DisableProcessedInput, win32InstallCtrlCGuard } from "./terminal-win32.js";
 import { appendOtuiDiagnostic, installProcessDiagnostics } from "./diagnostics.js";
 
@@ -47,11 +46,13 @@ async function main() {
   const workspaceCwd = resolve(process.env.CBAGENT_WORKSPACE || projectRoot);
   installProcessDiagnostics(workspaceCwd);
   const python = resolvePython(projectRoot);
+  const backendArgs = parseBackendArgs(process.argv.slice(2));
 
   const transport = new Transport({
     python,
     agentRoot: projectRoot,
     workspaceCwd,
+    backendArgs,
   });
 
   const renderer = await createCliRenderer({

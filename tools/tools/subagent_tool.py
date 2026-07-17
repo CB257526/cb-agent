@@ -211,7 +211,6 @@ class SubagentRunner:
                 bash_prompt_provider=self.bash_prompt_provider, 
                 ctx_enabled=self.ctx_enabled, 
                 history_window=8,
-                messages_snapshot_hook=None,
                 session_store=None,
                 trace_summarizer=self.trace_summarizer, # 子代理跟踪总结器
                 message_logger=message_logger,

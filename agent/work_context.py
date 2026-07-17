@@ -941,7 +941,7 @@ class LocalSessionStore:
     def current_session_summary(self) -> Optional[Dict[str, Any]]:
         """返回当前 active session 的摘要；没有 active 时返回 None。
 
-        摘要是给 CLI/TUI/RPC 展示用的轻量对象，不包含 transcript 正文，
+        摘要是给前端/RPC 展示用的轻量对象，不包含 transcript 正文，
         也不包含完整工具输出。这样前端可以安全列出会话，而不会把历史文件内容
         一股脑重新读进 UI 或网络协议。
         """

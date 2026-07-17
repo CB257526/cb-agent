@@ -1,6 +1,6 @@
 """通讯平台工具权限策略。
 
-这一层专门处理“多人 IM 入口是谁在让 agent 调工具”的问题。TUI/CLI 是本机交互，
+这一层专门处理“多人 IM 入口是谁在让 agent 调工具”的问题。OTUI 是本机交互，
 继续沿用原来的 Bash 权限弹窗和文件工具保护；QQ/NapCat 这类入口可能面对群友或
 普通好友，因此必须在工具真正执行前做一层硬拦截，避免他们通过模型间接执行写文件、
 回滚代码、发送项目文件等敏感操作。
@@ -105,7 +105,7 @@ def check_platform_tool_permission(
 
     ``conversation`` / ``sender_id`` 默认来自 ContextVar，通讯平台适配器在每次 inbound
     运行前都会绑定它们；后续新增平台只要也设置这两个上下文，就能复用本策略。
-    没有通讯平台上下文时认为是本地 CLI/TUI，不额外拦截。
+    没有通讯平台上下文时认为是本地 OTUI，不额外拦截。
     """
 
     conversation = conversation if conversation is not None else get_current_platform_conversation()

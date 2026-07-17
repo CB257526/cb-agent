@@ -406,7 +406,7 @@ class BashTool(Tool):
                     }, ensure_ascii=False)
                 # 用户已经明确拒绝本次 bash 执行时，应结束当前 agent 回合，而不是
                 # 让模型在下一轮继续尝试同一个受限能力。这里通过当前 CancelToken
-                # 走统一取消路径，CLI/TUI/QQ 都会收到 Cancelled 事件并释放 busy。
+                # 走统一取消路径，OTUI/QQ/微信都会收到 Cancelled 事件并释放 busy。
                 token = get_current_cancel_token()
                 if token is not None:
                     token.cancel()

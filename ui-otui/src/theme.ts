@@ -1,8 +1,7 @@
 /**
  * cb-agent OTUI 暗色主题。
  *
- * 在旧 ui-tui/theme.ts 的语义命名基础上，补齐 OpenTUI 需要的实心背景色
- * （background / backgroundPanel / backgroundElement）以及边框激活色。
+ * 使用语义化命名，并补齐 OpenTUI 需要的实心背景色与边框激活色。
  * OpenTUI 的 box/text 走 truecolor，统一用 hex 字面量。
  *
  * 命名遵循语义而非字面颜色：用 theme.success 而不是 "green"，将来调色或加

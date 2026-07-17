@@ -350,7 +350,7 @@ class Gateway:
             return
         try:
             # 查询时顺手触发一次后台加载：正常 TUI 启动路径会在 gateway_ready 后
-            # 已经触发；这个兜底主要服务 CLI/测试或未来自定义 Gateway 装配。
+            # 已经触发；这个兜底主要服务测试或未来自定义 Gateway 装配。
             starter = getattr(self.session, "mcp_background_loader", None)
             if callable(starter):
                 status = starter()

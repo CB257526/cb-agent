@@ -22,19 +22,73 @@ import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { AgentEvent, CacheStatsPayload, CompactPayload, MCPStatusPayload, ModelListPayload, ModelSwitchPayload, PermissionMode, PlanMode, PlanState, PromptAttachmentInput, SessionPayload, SessionSummary } from "./types.js";
 import { appendOtuiDiagnostic } from "./diagnostics.js";
 
-export function buildRunAgentArgs(agentRoot: string, env: NodeJS.ProcessEnv = process.env): string[] {
+export function parseBackendArgs(rawArgs: string[]): string[] {
+  const accepted: string[] = [];
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const arg = rawArgs[index];
+    if (["--no-mcp", "--no-ctx", "--dangerously-skip-permissions"].includes(arg)) {
+      accepted.push(arg);
+      continue;
+    }
+    if (arg.startsWith("--memory-system=")) {
+      const value = arg.slice("--memory-system=".length);
+      if (!["light", "full", "off"].includes(value)) {
+        throw new Error(`不支持的记忆系统: ${value}`);
+      }
+      accepted.push(arg);
+      continue;
+    }
+    if (arg === "--memory-system") {
+      const value = rawArgs[index + 1];
+      if (!["light", "full", "off"].includes(value)) {
+        throw new Error("--memory-system 需要 light、full 或 off");
+      }
+      accepted.push(arg, value);
+      index += 1;
+      continue;
+    }
+    throw new Error(`OTUI 不支持启动参数: ${arg}`);
+  }
+  return accepted;
+}
+
+export function buildRunAgentArgs(
+  agentRoot: string,
+  env: NodeJS.ProcessEnv = process.env,
+  backendArgs: string[] = [],
+): string[] {
   const args = [
     join(agentRoot, "run_agent.py"),
     "--transport",
     "jsonrpc",
-    "--memory-system",
-    "light",
   ];
-  if (isTruthyEnv(env.CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS)) {
+  if (!backendArgs.some((arg) => arg === "--memory-system" || arg.startsWith("--memory-system="))) {
+    args.push("--memory-system", "light");
+  }
+  args.push(...backendArgs);
+  if (
+    isTruthyEnv(env.CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS)
+    && !backendArgs.includes("--dangerously-skip-permissions")
+  ) {
     args.push("--dangerously-skip-permissions");
   }
   return args;
 }
+
+export function buildBackendEnv(
+  env: NodeJS.ProcessEnv,
+  backendArgs: string[] = [],
+): NodeJS.ProcessEnv {
+  const memorySystemIndex = backendArgs.indexOf("--memory-system");
+  const enablesFullMemory = backendArgs.includes("--memory-system=full")
+    || (memorySystemIndex >= 0 && backendArgs[memorySystemIndex + 1] === "full");
+  if (!enablesFullMemory) return { ...env };
+  return {
+    ...env,
+    CBAGENT_ENABLE_FULL_MEMORY: "1",
+  };
+}
+
 export const STDERR_UI_LINE_MAX = 4000;
 
 export function defaultGatewayLogPath(cwd: string, now = Date.now()): string {
@@ -61,7 +115,7 @@ function pathWithPythonDir(python: string, env: NodeJS.ProcessEnv): string | und
 export interface TransportOptions {
   /** Python 解释器路径。默认环境变量 CB_AGENT_PYTHON 或 "python"。 */
   python?: string;
-  /** cb-agent 安装目录，用于定位 run_agent.py。默认 ../（ui-tui 的父目录）。 */
+  /** cb-agent 安装目录，用于定位 run_agent.py。默认使用当前目录的父目录。 */
   agentRoot?: string;
   /** 用户工作目录。Python 子进程从这里启动，项目级 .cbagent 状态也写到这里。 */
   workspaceCwd?: string;
@@ -69,6 +123,8 @@ export interface TransportOptions {
   cwd?: string;
   /** 额外环境变量 */
   env?: NodeJS.ProcessEnv;
+  /** 传给 Python JSON-RPC 后端的受支持启动参数。 */
+  backendArgs?: string[];
   /** stderr 日志路径。默认 .cbagent/logs/system/gateway-<ts>.log */
   stderrLog?: string;
 }
@@ -107,16 +163,18 @@ export class Transport extends EventEmitter {
     const logsDir = join(workspaceCwd, ".cbagent", "logs", "system");
     mkdirSync(logsDir, { recursive: true });
     this.stderrLogPath = opts.stderrLog ?? defaultGatewayLogPath(workspaceCwd);
-    const childEnv: NodeJS.ProcessEnv = {
+    const childEnv: NodeJS.ProcessEnv = buildBackendEnv({
       ...process.env,
       ...opts.env,
+    }, opts.backendArgs);
+    Object.assign(childEnv, {
       CBAGENT_APP_ROOT: agentRoot,
       CBAGENT_WORKSPACE: workspaceCwd,
       PYTHONIOENCODING: "utf-8",
-    };
+    });
     childEnv.PATH = pathWithPythonDir(python, childEnv);
 
-    this.proc = spawn(python, buildRunAgentArgs(agentRoot, childEnv), {
+    this.proc = spawn(python, buildRunAgentArgs(agentRoot, childEnv, opts.backendArgs), {
       cwd: workspaceCwd,
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -185,9 +243,8 @@ export class Transport extends EventEmitter {
       let line = this.stderrBuf.slice(0, nl);
       this.stderrBuf = this.stderrBuf.slice(nl + 1);
       if (line.endsWith("\r")) line = line.slice(0, -1);
-      // stderr 原文已经在调用 handleStderr 前写入日志文件；这里 emit 给 TUI 的只是
-      // 实时面板预览。超长 messages dump / JSON 行如果完整进入 React state，会让
-      // Ink 反复重绘大字符串，表现为终端卡死和 VS Code 内存飙升，所以只截断 UI 副本。
+      // stderr 原文已经在调用 handleStderr 前写入日志文件；这里发给 OTUI 的只是
+      // 实时面板预览。超长日志如果完整进入前端状态会造成渲染压力，所以只截断预览副本。
       this.emit("stderr", clipStderrForUi(line));
     }
   }

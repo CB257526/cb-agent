@@ -313,7 +313,7 @@ class CbAgentsLLM:
         self.base_url = baseUrl
         self.api_key = apiKey
         self._client_lock = threading.RLock()
-        # 当前正在读取的 OpenAI stream 句柄表。取消请求来自 Gateway/TUI 或 CLI signal
+        # 当前正在读取的 OpenAI stream 句柄表。取消请求来自 Gateway 或通讯平台。
         # 线程，而真正读 chunk 的代码在 chat worker 里；保存句柄后，取消方就能主动
         # close stream，而不是被动等“下一个 chunk 到来”才检查 cancel_event。
         self._stream_lock = threading.Lock()
@@ -475,7 +475,7 @@ class CbAgentsLLM:
     ) -> int:
         """主动关闭匹配取消事件的 LLM stream，返回成功调用 close() 的数量。
 
-        Gateway 的 session.cancel 和 CLI 的 Ctrl-C 都会走到这里。这样即使 SDK 正在
+        Gateway 的 session.cancel 会走到这里。这样即使 SDK 正在
         阻塞等待下一个 stream chunk，取消请求也有机会从另一个线程打断底层连接。
         未提供 cancel_event 时保留旧的“关闭全部”语义，仅供进程级紧急收尾使用。
         """

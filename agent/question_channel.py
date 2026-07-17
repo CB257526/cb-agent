@@ -2,7 +2,7 @@
 
 目的：把 ask_user_question_tool 的"emit 事件 + 阻塞等答"的协作模式抽出来，
 让其他工具（典型的是 bash_permission 的权限弹框）也能复用同一条 UI 路径，
-不再在工具内自己 print + input()——那条路在 TUI 模式下 stdin 被前端接管，
+不再在工具内自己 print + input()——OTUI 模式下 stdin 是 JSON-RPC 协议通道，
 会失败成 permission_unavailable。
 
 给消费方两种调用方式：

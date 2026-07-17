@@ -2,7 +2,7 @@
  * TransportProvider：持有唯一的 Transport 实例（spawn 出的 Python 进程 + JSON-RPC），
  * 通过 Solid context 暴露给组件树。
  *
- * Transport 本身与框架无关（node:child_process + EventEmitter），从旧 ui-tui 原样复用。
+ * Transport 本身与框架无关，负责管理 Python 子进程和 JSON-RPC 事件。
  * 这里只负责：在 Provider 卸载时 close()，并把实例透传下去供 SessionProvider 订阅事件、
  * 供 Prompt/命令调用 RPC 方法。
  */

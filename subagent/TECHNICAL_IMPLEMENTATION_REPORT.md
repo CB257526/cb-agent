@@ -6,7 +6,7 @@
 >
 > 分析基线：上述提交后的当前项目代码
 >
-> 适用范围：`subagent/` 核心包、子代理工具装配、会话集成、权限执行、事件传输及 CLI/TUI 展示
+> 适用范围：`subagent/` 核心包、子代理工具装配、会话集成、权限执行、事件传输及 OTUI 展示
 
 ## 1. 报告摘要
 
@@ -32,8 +32,7 @@
   不会自动重放可能具有副作用的操作。
 - 保留 `agent.subagents` 旧导入路径和 `SubagentTaskRegistry` 旧名称，降低插件和用户脚本迁移成本。
 
-核心提交共涉及 44 个文件，统计为 7007 行新增、903 行删除。改动覆盖后端、测试、CLI、
-`ui-tui` 和 `ui-otui`，因此它是一项跨运行时、协议层和界面的完整能力升级。
+核心提交覆盖后端、测试和 OTUI，因此它是一项跨运行时、协议层和界面的完整能力升级。
 
 ## 2. 原实现的主要问题
 
@@ -59,7 +58,7 @@
 ### 3.1 设计目标
 
 - **真正并行**：多个独立 Subagent 可以同时执行，超过并发上限时有界排队。
-- **持续可观察**：主 Agent、CLI 和 TUI 可以看到任务当前阶段及工具调用，而不只看到终态。
+- **持续可观察**：主 Agent 和 OTUI 可以看到任务当前阶段及工具调用，而不只看到终态。
 - **异步优先**：后台启动为默认行为，`wait` 只作为真正的数据依赖屏障。
 - **职责明确**：不同角色拥有独立提示词、工具集和最大轮次。
 - **执行层授权**：模型即使生成越权工具调用，也不能绕过角色策略。
@@ -111,9 +110,8 @@ flowchart TD
     Manager --> ResultFile[最终 result.txt]
     Manager --> ParentBus[父 EventBus]
 
-    ParentBus --> CLI[CLI Renderer]
     ParentBus --> Gateway[Gateway 会话过滤]
-    Gateway --> TUI[ui-tui / ui-otui]
+    Gateway --> OTUI[ui-otui]
 
     Manager --> RuntimeUpdate[增量 runtime-update]
     RuntimeUpdate --> Root
@@ -150,7 +148,7 @@ flowchart TD
 | `tools/tools/local_search.py` | 使用上下文隔离的额外忽略目录，子代理默认忽略 `.cbagent` |
 | `tools/tools/pending_images.py` | 为每次 `AgentSession.chat` 提供独立线程安全图片缓冲 |
 | `agent/subagents.py` | 旧导入路径和 `SubagentTaskRegistry` 兼容层 |
-| `ui-tui`、`ui-otui` | 按 `task_id` 聚合展示状态、阶段、工具、Token 和最终结果 |
+| `ui-otui` | 按 `task_id` 聚合展示状态、阶段、工具、Token 和最终结果 |
 
 ## 6. 核心数据模型
 
@@ -882,19 +880,9 @@ Hook 执行后会重新刷新角色注册表并查找最终角色，因此 Hook 
 - Token 累计数；
 - 当前模型轮次。
 
-### 18.2 CLI
+### 18.2 OTUI
 
-CLI 渲染器会显示：
-
-- 任务 queued/started；
-- 每次进度消息；
-- 当前阶段；
-- 工具、活跃工具数和 Token；
-- 最终状态、轮次、耗时和输出文件路径。
-
-### 18.3 TUI
-
-`ui-tui` 和 `ui-otui` 都按 `task_id` 聚合同一任务的生命周期，不会为每个工具事件创建一张新卡片。
+`ui-otui` 按 `task_id` 聚合同一任务的生命周期，不会为每个工具事件创建一张新卡片。
 面板展示：
 
 - 角色和状态；
@@ -905,7 +893,7 @@ CLI 渲染器会显示：
 - 工具数、活跃数、Token、轮次和耗时；
 - 最终文本和结果文件路径。
 
-### 18.4 事件去重
+### 18.3 事件去重
 
 受管理任务只由 `SubagentTaskManager` 的统一监听器向父事件总线广播。`ScopedEventBus` 不再同时
 直接广播同一进度，从源头避免重复面板和重复完成事件。
@@ -946,7 +934,7 @@ Subagent 专项测试覆盖了：
 - 子代理不继承 Plan Mode；
 - Bash、搜索、图片和消息日志隔离；
 - Gateway 跨会话事件过滤；
-- TUI 任务恢复和面板聚合；
+- OTUI 任务恢复和面板聚合；
 - 旧注册表 API 兼容。
 
 ### 20.2 实现阶段验证记录
@@ -955,8 +943,7 @@ Subagent 专项测试覆盖了：
 
 - Subagent 及关联专项：224 个测试通过，另有 3 个子测试通过。
 - 后端测试执行中共有 625 个测试通过。
-- `ui-tui`：78 个测试通过。
-- `ui-tui` 和 `ui-otui` 的 `npx tsc --noEmit` 均通过。
+- `ui-otui` 的 TypeScript 检查通过。
 - Python `compileall` 通过。
 - `git diff --check` 通过。
 

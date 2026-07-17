@@ -1,48 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-cb-agent REPL 入口（Stage 3 拆分版），即程序的"总装配车间"和"交互主循环"。
+"""cb-agent 后端入口与依赖装配模块。
 
-==================== 如何运行 ====================
-    cd c:/Users/cb135/Desktop/cbAgent/cb-agent
-    ../venv/python.exe run_agent.py
-
-    也可以用 --transport 参数切换到 gateway 模式（供外部 UI 调用）、QQ 模式、
-    或微信 OC 模式。
-
-==================== 架构职责拆分 ====================
-    AgentRunner (本文件)
-      ├── 启动期：装配 LLM / ToolRegistry / Executor / EventBus / Builder / Skill
-      │    本文件负责把各个子系统（LLM、工具、事件、渲染、记忆、MCP）拼在一起，
-      │    确保它们之间正确的引用关系和启动顺序。
-      ├── 创建 AgentSession（纯逻辑，无 print）
-      │    AgentSession 管理会话历史、工具调用循环、上下文构建器。它不知道也不关心
-      │    输出是去了终端、WebSocket 还是 JSON-RPC。
-      ├── 创建 CLIRenderer 并 attach 到 EventBus（订阅事件 → stdout）
-      │    CLIRenderer 把 EventBus 上的 StreamingText、ToolCall、Thought 等事件
-      │    渲染成终端输出。gateway 模式下不挂 CLIRenderer，由 transport 转发事件。
-      └── REPL：input → session.chat → 落历史 + slash 命令
-            简单的 while 循环，读取用户输入，调用 session.chat_async 处理，
-            处理斜杠命令。
-
-==================== Stage 3 做了什么 ====================
-  跟 Stage 2（所有逻辑挤在一个文件）的差别：
-    - 所有运行时输出（流式正文、工具调用、Thought、todo/bash 面板）都搬到了
-      [agent/renderers/cli.py]
-    - 会话主循环搬到了 [agent/session.py]
-    - 本文件只剩"装配 + REPL 输入循环 + slash 命令"
-
-==================== 可用斜杠命令 ====================
-    /help       打印帮助
-    /tools      列出所有已注册工具
-    /skills     列出所有 Skill
-    /history    查看当前会话历史
-    /sessions   列出本项目的本地会话
-    /new        新建并切换到空白会话
-    /switch ID  切换到指定会话
-    /clear      清空会话历史
-    /ctx on|off 开关 ContextBuilder（默认 on）
-    /msg on|off 开关每轮 messages dump（默认 on）
-    /quit       退出
+本文件只负责创建 AgentSession 及其依赖，并通过 JSON-RPC、QQ 或微信适配器暴露
+能力。终端交互由 ``ui-otui`` 统一负责，后端不再包含独立的 CLI REPL 或渲染器。
 """
 
 # ==== Python 版本兼容 ====
@@ -50,18 +10,14 @@ from __future__ import annotations  # 使类型注解支持延迟求值，避免
 
 # ==== 标准库导入（按功能分组） ====
 import argparse    # 命令行参数解析器，本文件用它处理 --transport、--no-mcp 等参数
-import asyncio     # 异步事件循环，本文件用于 REPL 主循环和 chat_async 调用
-import json        # JSON 序列化/反序列化，用于 messages dump、状态快照、配置读取
 import logging     # Python 标准日志模块，本文件用于记录启动过程和运行时事件
 import os          # 操作系统接口，获取环境变量、路径操作
 import re          # 正则表达式，本文件用于将平台 ID 过滤为安全的目录名
-import signal      # Unix 信号处理，本文件用于 Ctrl-C 中断当前回答但不退出进程
 import sys         # 系统接口，本文件用于 stdout/stderr 重定向和 sys.path 注入
 import threading   # 线程模块，本文件用于 MCP 后台连接线程和异步 chat 线程
 import time        # 时间处理，本文件用于时间戳和 MCP 连接耗时度量
-import traceback   # 异常堆栈打印，本文件在 chat 异常时输出完整错误栈
 from pathlib import Path       # 现代路径操作，跨平台路径拼接和存在性检查
-from typing import Any, Dict, List  # 类型标注支持
+from typing import Any, Dict  # 类型标注支持
 
 # ========== 工作目录与 Python 路径初始化 ==========
 
@@ -115,12 +71,12 @@ logger = logging.getLogger(__name__)
 
 # ========== 核心模块导入（分散导入，精确控制加载时机） ==========
 # 注意：部分模块有重量级依赖（如 embedding、向量数据库、fastmcp 等），
-# 分散导入可以避免在 light 模式或 CLI 模式下加载不必要的重量级依赖。
+# 分散导入可以避免在 light 模式下加载不必要的重量级依赖。
 
 # --- 通信与事件系统 ---
 from agent.cb_agents import CbAgentsLLM    # LLM 客户端封装：流式聊天补全、Function Calling、Reasoning 内容
 from agent.event_bus import EventBus       # 发布-订阅事件总线，解耦各模块间的通信
-from agent.events import Done, MCPStatus   # 系统事件类型：Done 表示一轮 chat 完成，MCPStatus 表示 MCP 状态变化
+from agent.events import MCPStatus         # MCP 后台连接状态事件
 
 # --- 钩子系统（预处理/后处理工具调用） ---
 from agent.hooks import HookManager, load_hooks_config  # Hook 管理器及其配置加载函数
@@ -128,7 +84,6 @@ from agent.hooks import HookManager, load_hooks_config  # Hook 管理器及其�
 # --- 执行引擎 ---
 from agent.executor import ToolExecutor            # 工具调用线程池调度器，并发执行 LLM 发起的工具调用
 from agent.platforms.messages import ConversationKey  # 通讯平台会话标识结构体（platform + kind + id）
-from agent.renderers.cli import CLIRenderer         # CLI 渲染器，订阅 EventBus 事件并在终端显示
 from agent.message_logger import MessageLogger      # LLM messages 日志记录器，将原始对话保存到 JSONL 文件
 from agent.session import AgentSession              # 会话核心类：管理历史、驱动 chat 循环、调用 ContextBuilder
 from subagent import SubagentRegistry, SubagentTaskManager  # 子代理角色注册表和任务管理器
@@ -195,10 +150,8 @@ except Exception:
 # 初始化 Bash 工作会话，确保后续所有 bash 工具调用默认在 WORKSPACE_ROOT 下执行
 reset_session(str(WORKSPACE_ROOT))
 
-# ========== 启动期文本输出辅助函数 ==========
-# 这些函数仅在 AgentRunner.__init__ 启动时使用，向终端展示初始化进度。
-# 运行时输出（流式文字、工具调用、Thought 等）已经搬到 CLIRenderer，
-# 不经过这里的 _info/_err 打印。
+# ========== 启动期诊断输出辅助函数 ==========
+# JSON-RPC 模式会把这些诊断统一重定向到 stderr，避免污染 stdout 协议通道。
 
 
 def _hr(char: str = "─", width: int = 60) -> str:
@@ -244,7 +197,7 @@ def _safe_runtime_name(value: str) -> str:
 def _truthy_env(value: str | None) -> bool:
     """将环境变量字符串解析为布尔值。
 
-    用于 Docker/systemd/TUI 等不便直接追加命令行参数的环境。
+    用于 Docker、systemd 或 OTUI 等不便直接追加命令行参数的环境。
     例如 Docker Compose 中设置 CBAGENT_DANGEROUSLY_SKIP_PERMISSIONS=true，
     等价于命令行参数 --dangerously-skip-permissions。
     """
@@ -254,35 +207,31 @@ def _truthy_env(value: str | None) -> bool:
 
 # ========== AgentRunner 类：总装配车间 ==========
 #
-# AgentRunner 是 cb-agent 的入口类。在其 __init__ 中依次创建并连线各子系统：
+# AgentRunner 是 cb-agent 的后端装配类。在其 __init__ 中依次创建并连线各子系统：
 #   LLM → EventBus → ToolRegistry → SkillManager → HookManager → ToolExecutor
-#   → AgentSession → CLIRenderer
+#   → AgentSession
 #
-# __init__ 完成后即可调用 .run() 进入交互式 REPL，或由 Gateway/QQ/微信适配器
-# 直接使用 .session 属性驱动会话。
+# __init__ 完成后，由 Gateway/QQ/微信适配器直接使用 .session 属性驱动会话。
 #
-# 设计原则：运行时输出不在这里渲染，而是通过 EventBus 发给 CLIRenderer（CLI 模式）
-# 或 transport 层（Gateway/QQ/微信模式）。AgentRunner 不直接 print 运行时内容。
+# 设计原则：运行时输出不在这里渲染，而是通过 EventBus 交给 transport 层。
 
 
 class AgentRunner:
-    """装配所有依赖、运行 REPL 的顶级类。
+    """装配后端运行所需全部依赖的顶级类。
 
     职责：
     1. 创建并连接所有子系统（LLM、工具注册表、工具调度器、事件总线、上下文构建器、
        Skill 管理器、Hook 管理器、MCP 连接器、记忆系统等）
     2. 创建 AgentSession（纯逻辑，不关心输出目的地）
-    3. 创建 CLIRenderer 并挂到 EventBus（CLI 模式）
-    4. 提供 REPL 循环（_run_async）和斜杠命令处理（_handle_command）
+    3. 向 Gateway 与通讯平台适配器暴露会话和运行态回调
     """
 
     def __init__(
         self,
         use_mcp: bool = True,                     # True=启用 MCP 工具（若依赖未安装自动降级）
         ctx_enabled: bool = True,                 # True=启用 ContextBuilder（GSSC 上下文构建管线）
-        attach_cli_renderer: bool = True,          # True=在 EventBus 上挂 CLIRenderer
         memory_system: str = "light",             # "light"=Markdown 记忆|"full"=RAG+向量|"off"=关闭
-        communication_platform: str | None = None, # None=CLI/TUI|"qq"=QQ/NapCat|"wechat"=微信OC
+        communication_platform: str | None = None, # None=OTUI/JSON-RPC|"qq"=QQ/NapCat|"wechat"=微信OC
         dangerously_skip_permissions: bool = False,# True=跳过所有 Bash 权限确认和高危命令拦截
     ) -> None:
 
@@ -317,40 +266,22 @@ class AgentRunner:
         # 记录启动参数到日志，方便事后排查问题
         logger.info(
             "AgentRunner init: use_mcp=%s has_mcp=%s ctx_enabled=%s "
-            "attach_cli_renderer=%s memory_system=%s "
+            "memory_system=%s "
             "communication_platform=%s dangerously_skip_permissions=%s log_level=%s",
-            use_mcp, _HAS_MCP, ctx_enabled, attach_cli_renderer,
+            use_mcp, _HAS_MCP, ctx_enabled,
             memory_system, communication_platform, dangerously_skip_permissions,
             self.logging_settings.verbosity,
         )
 
-        # ===== 消息转储（dump）开关 =====
-        # CLI 模式下默认开启，开发者可用 /msg on|off 查看原始 LLM 上下文。
-        # TUI/JSON-RPC 模式下 stderr 被前端实时收集，默认 dump 完整 system prompt
-        # 和工具 schema 会令前端和 React 渲染承压，因此默认关闭。
-        self.dump_messages = bool(attach_cli_renderer)
-
-        # 保存 CLI 渲染器的附加标志
-        self._attach_cli_renderer = attach_cli_renderer
-
         # ===== 记忆系统初始化 =====
         # 初始化 light 模式的 Markdown 记忆目录结构（若目录不存在则建好）
         self._md_memory_provider = self._create_markdown_memory_provider()
-
-        # ===== CLI 附件队列 =====
-        # CLI 模式下 /attach <path> 添加的文件暂存在这里，下一轮 chat 时随 prompt 一起发送。
-        # TUI 模式下附件通过 JSON-RPC attachments 字段传递，不走此队列。
-        self.pending_attachments: List[Dict[str, Any]] = []
 
         # ===== MCP 状态管理 =====
         self._mcp_lock = threading.RLock()          # MCP 状态锁，保护 _mcp_status 的线程安全读写
         self._mcp_thread: threading.Thread | None = None  # MCP 后台连接线程引用
         self._mcp_started = False                   # MCP 后台连接是否已启动（幂等保护）
         self._mcp_status: Dict[str, Any] = self._initial_mcp_status()  # MCP 状态快照初值
-
-        # ===== 消息转储增量游标 =====
-        # 记录上次 messages dump 时已发送的消息条数，下次只打印新增部分
-        self._dump_seen_count = 0
 
         # ==================== 正式启动装配流程 ====================
         _section("初始化 cb-agent")
@@ -365,9 +296,9 @@ class AgentRunner:
 
         # ---- Step 2: 事件总线（EventBus） ----
         # EventBus 是全局的发布-订阅事件通道，所有模块通过它解耦通信：
-        #   - StreamingTextEvent  → CLIRenderer 显示流式文字
-        #   - ThoughtEvent        → CLIRenderer 显示思考过程
-        #   - ToolCallEvent       → CLIRenderer 显示工具调用
+        #   - StreamingTextEvent  → 前端显示流式文字
+        #   - ThoughtEvent        → 前端显示思考过程
+        #   - ToolCallEvent       → 前端显示工具调用
         # 必须在工具注册前创建，因为 TodoTool 等工具在构造时就要订阅事件
         self.event_bus = EventBus()
 
@@ -453,28 +384,14 @@ class AgentRunner:
 
         # ---- Step 5c: 全局 PermissionGate 注入 ----
         # 给 Bash 权限门禁（PermissionGate）装上 QuestionChannel，
-        # 使权限确认弹框走事件总线渲染（UI），而非走 stdin 等待输入。
-        # 这在 TUI/微信/QQ 模式下至关重要——那些模式下 stdin 被前端接管，
-        # 走 stdin 会永久阻塞进程
+        # 使权限确认弹框走事件总线渲染，而非走 stdin 等待输入。
+        # OTUI、微信和 QQ 都不会提供后端交互式 stdin，走 stdin 会永久阻塞进程。
         from agent.question_channel import QuestionChannel
         from tools.tools.bash_permission import get_permission_gate
         get_permission_gate().question_channel = QuestionChannel(
             self.session.question_registry,
             self.event_bus,
         )
-
-        # ---- Step 6: CLI 渲染器 ----
-        # CLI 模式下，CLIRenderer 订阅 EventBus 事件并渲染为终端输出。
-        # Gateway/QQ/微信模式下不挂 CLIRenderer，事件由 transport 层转发
-        if self._attach_cli_renderer:
-            self.renderer = CLIRenderer(self.event_bus)
-            self.renderer.attach()
-        else:
-            self.renderer = None  # 非 CLI 模式不需要
-
-        # 订阅 Done 事件，REPL 循环可从中获取 final_answer / rounds_used
-        self._last_done: Done | None = None
-        self.event_bus.subscribe(self._on_done, Done)
 
         # ==================== 启动完成总结 ====================
         _section("就绪")
@@ -498,9 +415,6 @@ class AgentRunner:
         # 若危险模式开启，给出醒目提示
         if self.dangerously_skip_permissions:
             _info("Bash 权限: 危险跳过模式已开启，所有 Bash 命令将不再弹窗或拦截")
-
-        # 显示消息转储状态（默认开启，可用 /msg off 关闭）
-        _info(f"messages dump: {'开启' if self.dump_messages else '关闭'} (用 /msg off 关闭)")
 
         # 空行分隔启动信息与后续用户输入
         print()
@@ -535,7 +449,7 @@ class AgentRunner:
     def _create_message_logger(self, scope: str) -> MessageLogger | None:
         """按作用域创建一个 LLM messages 日志记录器。
 
-        CLI/TUI 只有一个主会话，scope 固定为 "main"。
+        OTUI/JSON-RPC 只有一个主会话，scope 固定为 "main"。
         QQ/微信等通讯平台有多个会话并发（群聊+私聊），把会话标识放入文件名，
         方便排查时按群/用户快速定位。
 
@@ -637,7 +551,6 @@ class AgentRunner:
             skill_manager=self._skill_manager,             # Skill 管理器
             bash_prompt_provider=self._memory_prompt_provider,  # Bash 提示提供器
             ctx_enabled=self.ctx_enabled,                  # ContextBuilder 开关
-            messages_snapshot_hook=self._on_messages_snapshot,  # 消息快照回调
             session_store=session_store,                   # 会话持久化存储
             trace_summarizer=self._trace_summarizer,       # 轨迹摘要器
             message_logger=self._create_message_logger(message_logger_scope),  # 消息日志
@@ -1065,7 +978,7 @@ class AgentRunner:
     def _emit_mcp_status(self) -> None:
         """将当前 MCP 状态快照通过 EventBus 广播。
 
-        CLIRenderer/前端订阅 MCPStatus 事件后实时更新 MCP 状态面板。
+        前端订阅 MCPStatus 事件后实时更新 MCP 状态面板。
         事件发送失败仅记日志，不中断后台加载流程。
         """
         snapshot = self.mcp_status()
@@ -1240,7 +1153,7 @@ class AgentRunner:
         self._emit_mcp_status()
 
     def _format_mcp_status_line(self, status: Dict[str, Any]) -> str:
-        """生成 CLI 启动摘要中一行简洁的 MCP 状态文本。
+        """生成启动诊断中一行简洁的 MCP 状态文本。
 
         示例输出：
         - "ready (2/3 connected, 1 failed)"
@@ -1255,69 +1168,7 @@ class AgentRunner:
             return f"{state} ({connected}/{total} connected, {failed} failed)"
         return str(status.get("error") or state)
 
-    # ============================== 回调/钩子函数 ==============================
-
-    def _on_messages_snapshot(self, messages: List[Dict[str, Any]], round_idx: int) -> None:
-        """每轮 LLM think 之前的回调：增量打印 messages dump。
-
-        配合 self.dump_messages 开关（/msg on|off）使用。
-        每次只打印本轮新增的消息（_dump_seen_count -> 末尾），避免重复输出。
-        开发者可追踪 prompt 随轮次的变化。
-        """
-        if not self.dump_messages:  # dump 关闭则跳过
-            return
-
-        seen = self._dump_seen_count          # 已打印过的消息数
-        new_msgs = messages[seen:]            # 本轮新增的消息
-        total = len(messages)
-
-        if not new_msgs:
-            print(f"\n---- messages dump (round {round_idx}, 共 {total} 条，本轮新增 0) ----")
-            print("---- end dump ----")
-            return
-
-        print(
-            f"\n---- messages dump (round {round_idx}, 共 {total} 条，"
-            f"本轮新增 {len(new_msgs)}，索引 [{seen}, {total - 1}]) ----"
-        )
-        try:
-            # 尝试用 JSON 格式化输出
-            print(json.dumps(new_msgs, ensure_ascii=False, indent=2, default=str))
-        except Exception:
-            # JSON 序列化失败时 fallback 到 repr
-            for i, msg in enumerate(new_msgs, start=seen):
-                print(f"[{i}] {msg!r}")
-
-        print("---- end dump ----")
-        self._dump_seen_count = total  # 更新游标
-
-    def _on_done(self, e: Done) -> None:
-        """Done 事件回调：将事件保存到 _last_done，供 REPL 后续访问。"""
-        self._last_done = e
-
-    # ============================== REPL 主循环 ==============================
-    #
-    # REPL 使用 asyncio 而非 sync，原因：
-    # - sync 下 input() 阻塞主线程，Ctrl-C 的 KeyboardInterrupt 直接抛出到
-    #   input 外面，无法区分"用户想退出"和"用户想中断当前回答"
-    # - async 下 input() 用 asyncio.to_thread 跑在线程池，主 loop 监听 signal。
-    #   chat 执行期间收到 SIGINT 时调 token.cancel() + 关闭流式连接，
-    #   chat 自然收尾后 await 返回
-
-    def run(self) -> None:
-        """同步 REPL 入口。内部包装 asyncio.run()。
-
-        外部调用者只需 runner.run()。Gateway/QQ/微信模式不经过此方法，
-        它们直接使用 runner.session 和 runner.event_bus。
-        """
-        try:
-            asyncio.run(self._run_async())   # 启动异步主循环
-        except KeyboardInterrupt:
-            # 输入态下連续按两次 Ctrl-C 的兜底
-            print()
-            _info("再见")
-        finally:
-            self.close()
+    # ============================== 生命周期管理 ==============================
 
     def close(self) -> None:
         """有限等待并关闭归属于当前进程的后台子代理。"""
@@ -1329,438 +1180,17 @@ class AgentRunner:
             except Exception:
                 logger.exception("关闭子代理任务管理器失败")
 
-    async def _run_async(self) -> None:
-        """异步 REPL 主循环。
-
-        流程：
-        1. 显示欢迎/提示信息
-        2. 触发 MCP 后台加载（CLI 模式无 gateway_ready 事件，需要主动触发）
-        3. 循环：读取用户输入 → 斜杠命令处理 → 或普通 chat 执行
-        """
-        _section("交互模式")
-        print(
-            "输入问题与我对话，输入 /help 看命令，/quit 退出。\n"
-            "对话进行中按 Ctrl-C 中断当前回答（不退出进程）；"
-            "空闲时按 Ctrl-C 或 /quit 退出。\n"
-        )
-        # 主动启动 MCP 后台连接（daemon 线程，不影响用户立即输入）
-        self.start_mcp_background_loading()
-
-        while True:
-            try:
-                # asyncio.to_thread 把阻塞的 input() 放到线程池执行
-                user_input = (await asyncio.to_thread(input, "you > ")).strip()
-            except EOFError:
-                # 用户按 Ctrl-D 或管道关闭
-                print()
-                _info("再见")
-                return
-            except KeyboardInterrupt:
-                # 输入态下按 Ctrl-C → 退出
-                print()
-                _info("再见")
-                return
-
-            if not user_input:
-                continue  # 空输入跳过
-
-            if user_input.startswith("/"):
-                if self._handle_command(user_input):
-                    continue  # 命令处理完成，继续循环
-                else:
-                    return  # /quit 或 /exit 返回 False，退出 REPL
-
-            # ===== 普通用户输入 → 执行 chat =====
-            self._dump_seen_count = 0  # 重置增量 dump 游标，本轮从全量开始
-            attachments = list(self.pending_attachments)  # 取出待发送附件
-            ok = await self._run_chat(user_input, attachments=attachments)
-            if ok and attachments:
-                self.pending_attachments.clear()  # 发送成功后清空附件队列
-
-    async def _run_chat(
-        self,
-        user_input: str,
-        attachments: List[Dict[str, Any]] | None = None,
-    ) -> bool:
-        """执行一次 chat 对话，期间安装临时 SIGINT handler 实现"中断而不退出"。
-
-        Ctrl-C 处理链路：
-        1. 安装临时 _on_sigint handler 替换默认 KeyboardInterrupt 行为
-        2. 调用 session.chat_async() 开始异步对话
-        3. 若用户在 chat 中按 Ctrl-C：
-           a. token.cancel() 标记取消
-           b. 调用 llm.cancel_active_streams() 关闭底层 HTTP 连接
-        4. chat_async 感知取消标记后安全收尾返回
-        5. 恢复原始 SIGINT handler
-
-        注意：仅 token.cancel() 不够——若 SDK 正阻塞等待 stream chunk，
-        必须等到 provider 再吐数据才能停下。同步关闭流式连接可让 Ctrl-C 立即生效。
-        """
-        from agent.cancel import CancelToken  # 取消令牌
-
-        token = CancelToken()  # 创建取消令牌
-        prev_handler = signal.getsignal(signal.SIGINT)  # 保存当前 handler
-
-        def _on_sigint(_signum, _frame):
-            """SIGINT 处理函数：取消当前 chat。"""
-            token.cancel()  # 设置取消标记
-            cancel_streams = getattr(self.llm, "cancel_active_streams", None)
-            if callable(cancel_streams):
-                try:
-                    cancel_streams(
-                        "cli_sigint",
-                        cancel_event=token.event,
-                    )  # 只关闭当前回合对应的底层流式连接
-                except Exception:
-                    logging.getLogger(__name__).exception("failed to close stream on Ctrl-C")
-
-        try:
-            signal.signal(signal.SIGINT, _on_sigint)  # 安装临时 handler
-        except (ValueError, OSError):
-            # 某些环境（非主线程、WSL 无控制台）signal.signal 失败
-            # 此时退化到无 Ctrl-C 中断能力
-            prev_handler = None
-
-        try:
-            await self.session.chat_async(
-                user_input,
-                cancel_token=token,
-                attachments=attachments or [],
-            )
-            return True  # 正常完成
-        except Exception as e:
-            _err(f"本轮对话异常: {e}")
-            traceback.print_exc()  # 打印完整异常栈
-            return False           # 异常返回
-        finally:
-            if prev_handler is not None:
-                try:
-                    signal.signal(signal.SIGINT, prev_handler)  # 恢复原有 handler
-                except (ValueError, OSError):
-                    pass
-
-    # ============================== 斜杠命令分派 ==============================
-
-    def _handle_command(self, line: str) -> bool:
-        """解析并执行斜杠命令。返回 True 继续 REPL，False 退出。
-
-        命令格式：/cmd [arg]
-        - raw_arg：保留用户原文，用于 /switch 等需要完整 ID 的命令
-        - arg_lower：转小写，用于 on/off 等固定关键字匹配
-        """
-        parts = line.split(maxsplit=1)
-        cmd = parts[0].lower()                       # 命令名
-        raw_arg = parts[1].strip() if len(parts) > 1 else ""   # 原始参数
-        arg_lower = raw_arg.lower()                  # 小写参数
-
-        # ---- /quit 或 /exit：退出程序 ----
-        if cmd in ("/quit", "/exit"):
-            _info("再见")
-            return False
-
-        # ---- /help：打印帮助信息 ----
-        if cmd == "/help":
-            print(
-                "\n可用命令：\n"
-                "  /help        打印帮助\n"
-                "  /tools       列出所有已注册工具\n"
-                "  /mcp         查看 MCP 后台连接状态\n"
-                "  /attach PATH 添加图片、音频或文档附件到下一轮\n"
-                "  /attachments 查看待发送附件队列\n"
-                "  /detach N|all 移除待发送附件\n"
-                "  /skills      列出所有 Skill\n"
-                "  /skill NAME  手动加载指定 Skill\n"
-                "  /history     查看当前会话历史\n"
-                "  /sessions    列出本项目的本地会话\n"
-                "  /new         新建并切换到空白会话\n"
-                "  /switch ID   切换到指定会话\n"
-                "  /clear       清空会话历史\n"
-                "  /ctx on|off  开关 ContextBuilder (当前: "
-                + ("on" if self.session.ctx_enabled else "off")
-                + ")\n"
-                "  /msg on|off  开关每轮 messages dump (当前: "
-                + ("on" if self.dump_messages else "off")
-                + ")\n"
-                "  /quit        退出\n"
-            )
-
-        # ---- /tools：列出所有已注册工具 ----
-        elif cmd == "/tools":
-            names = self.registry.list_tools()
-            print(f"\n已注册 {len(names)} 个工具：")
-            for n in names:
-                tool = self.registry.get_tool(n)
-                desc = tool.description if tool else ""
-                print(f"  - {n}: {desc[:80]}")  # 只显示前 80 个字符
-            print()
-
-        # ---- /mcp：查看 MCP 连接状态 ----
-        elif cmd == "/mcp":
-            # start_mcp_background_loading 是幂等的：未启动则启动，已启动则返回当前状态
-            status = self.start_mcp_background_loading()
-            print(f"\nMCP 状态: {self._format_mcp_status_line(status)}")
-            servers = status.get("servers") or []
-            if not servers:
-                reason = status.get("error")
-                if reason:
-                    print(f"  - {reason}")
-            for item in servers:
-                name = item.get("name", "unknown")
-                state = item.get("status", "unknown")
-                tools_count = item.get("tools_count", 0)
-                elapsed = item.get("elapsed_seconds", 0)
-                error = item.get("error")
-                tail = f", tools={tools_count}" if tools_count else ""
-                if elapsed:
-                    tail += f", {elapsed}s"
-                if error:
-                    tail += f", error={error}"
-                print(f"  - {name}: {state}{tail}")
-            print()
-
-        # ---- /attach：添加附件 ----
-        elif cmd == "/attach":
-            self._handle_attach_command(raw_arg)
-
-        # ---- /attachments：查看附件队列 ----
-        elif cmd == "/attachments":
-            self._print_pending_attachments()
-
-        # ---- /detach：移除附件 ----
-        elif cmd == "/detach":
-            self._handle_detach_command(raw_arg)
-
-        # ---- /skills：列出所有 Skill ----
-        elif cmd == "/skills":
-            skills = self._skill_manager.list_skills()
-            print(f"\n已发现 {len(skills)} 个 Skill：")
-            for s in skills:
-                print(f"  - {s.name}: {(s.description or '')[:80]}")
-            print()
-
-        # ---- /skill：加载指定 Skill ----
-        elif cmd == "/skill":
-            self._handle_skill_command(raw_arg)
-
-        # ---- /history：查看当前会话历史 ----
-        elif cmd == "/history":
-            history = self.session.history
-            print(f"\n会话历史 ({len(history)} 条)：")
-            for i, m in enumerate(history, 1):
-                role = m.role.value if hasattr(m.role, "value") else str(m.role)
-                content = m.content if isinstance(m.content, str) else json.dumps(
-                    m.content, ensure_ascii=False
-                )
-                preview = (content or "")[:120]  # 截取前120字符预览
-                print(f"  {i:2d}. [{role}] {preview}")
-            print()
-
-        # ---- /sessions：列出所有本地会话 ----
-        elif cmd == "/sessions":
-            # 只展示元数据摘要（session_id/turn_count/updated_at），不读 transcript
-            sessions = self.session.list_sessions()
-            if not sessions:
-                _info("当前项目还没有本地会话")
-                return True
-            print(f"\n本地会话 ({len(sessions)} 个)：")
-            for item in sessions:
-                mark = "*" if item.get("is_active") else " "     # 当前活跃会话加 *
-                sid = item.get("session_id", "")
-                turns = item.get("turn_count", 0)
-                updated = str(item.get("updated_at") or "")[:19]
-                preview = item.get("active_task") or item.get("rolling_summary") or "（空会话）"
-                print(f" {mark} {sid}  turns={turns}  updated={updated}")
-                print(f"     {str(preview)[:100]}")
-            print("\n用 /switch <session_id> 切换；用 /new 新建空白会话。")
-
-        # ---- /new：新建空白会话 ----
-        elif cmd == "/new":
-            payload = self.session.create_session()
-            session_info = payload.get("session") if isinstance(payload, dict) else None
-            sid = session_info.get("session_id") if isinstance(session_info, dict) else "（未启用本地存储）"
-            _info(f"已新建并切换到会话 {sid}")
-
-        # ---- /switch：切换到指定会话 ----
-        elif cmd == "/switch":
-            if not raw_arg:
-                _info("用法: /switch <session_id>")
-                return True
-            try:
-                payload = self.session.switch_session(raw_arg)
-            except Exception as e:
-                _err(f"切换会话失败: {e}")
-                return True
-            session_info = payload.get("session") if isinstance(payload, dict) else None
-            sid = session_info.get("session_id") if isinstance(session_info, dict) else raw_arg
-            restored = payload.get("history") if isinstance(payload, dict) else []
-            _info(f"已切换到会话 {sid}，恢复 history {len(restored)} 条")
-
-        # ---- /clear：清空会话 ----
-        elif cmd == "/clear":
-            # 同时清理内存 history + 本地持久化文件
-            self.session.clear_history()
-            _info("会话历史与本地会话记录已删除")
-
-        # ---- /ctx：切换 ContextBuilder ----
-        elif cmd == "/ctx":
-            if arg_lower in ("on", "off"):
-                self.session.ctx_enabled = arg_lower == "on"
-                _info(f"ContextBuilder = {arg_lower}")
-            else:
-                _info(f"用法: /ctx on|off  (当前: {'on' if self.session.ctx_enabled else 'off'})")
-
-        # ---- /msg：切换 messages dump ----
-        elif cmd == "/msg":
-            if arg_lower in ("on", "off"):
-                self.dump_messages = arg_lower == "on"
-                _info(f"messages dump = {arg_lower}")
-            else:
-                _info(f"用法: /msg on|off  (当前: {'on' if self.dump_messages else 'off'})")
-
-        # ---- 未知命令 → 尝试按 Skill 名称匹配 ----
-        else:
-            if self._handle_named_skill_command(cmd, raw_arg):
-                return True
-            _err(f"未知命令 {cmd}，/help 查看可用命令")
-
-        return True  # 默认返回 True 继续 REPL
-
-    # ============================== 附件管理 ==============================
-
-    def _handle_attach_command(self, raw_arg: str) -> None:
-        """/attach <path>：将本地文件加入 CLI 待发送附件队列。
-
-        这里只做路径存在性检查，不调用 OCR/ASR/格式识别。
-        真正的格式验证、大小限制、媒体类型判断由 agent.multimodal_input 统一处理。
-        """
-        raw_path = raw_arg.strip().strip('"').strip("'")  # 去掉用户输入的引号
-        if not raw_path:
-            _info("用法: /attach <path>")
-            return
-
-        path = Path(raw_path)
-        if path.is_absolute():
-            resolved = path
-        else:
-            # 相对路径基于 Bash 会话的当前工作目录
-            try:
-                from tools.tools.bash_session import get_session
-                base_dir = Path(get_session().cwd)
-            except Exception:
-                base_dir = Path.cwd()
-            resolved = base_dir / path
-
-        if not resolved.exists() or not resolved.is_file():
-            _err(f"附件文件不存在或不是普通文件: {resolved}")
-            return
-
-        self.pending_attachments.append({
-            "path": str(resolved.resolve()),
-            "source": "direct",
-        })
-        _info(f"已添加附件 #{len(self.pending_attachments)}: {resolved.name} ({resolved.stat().st_size} bytes)")
-
-    def _print_pending_attachments(self) -> None:
-        """打印 CLI 附件队列中的所有待发送附件。"""
-        if not self.pending_attachments:
-            _info("当前没有待发送附件。使用 /attach <path> 添加图片、音频或文档。")
-            return
-        print("\n待发送附件：")
-        for index, item in enumerate(self.pending_attachments, start=1):
-            path = Path(str(item.get("path") or ""))
-            size = path.stat().st_size if path.exists() else 0
-            print(f"  {index}. {path.name}  {size} bytes  {path}")
-        print()
-
-    def _handle_detach_command(self, raw_arg: str) -> None:
-        """/detach <index|all>：从附件队列移除文件。"""
-        arg = raw_arg.strip().lower()
-        if not arg:
-            _info("用法: /detach <index|all>")
-            return
-
-        if arg == "all":
-            count = len(self.pending_attachments)
-            self.pending_attachments.clear()
-            _info(f"已清空 {count} 个待发送附件。")
-            return
-
-        try:
-            index = int(arg)
-        except ValueError:
-            _info("用法: /detach <index|all>")
-            return
-
-        if index < 1 or index > len(self.pending_attachments):
-            _err(f"附件序号超出范围: {index}")
-            return
-
-        removed = self.pending_attachments.pop(index - 1)
-        _info(f"已移除附件: {Path(str(removed.get('path') or '')).name}")
-
-    # ============================== Skill 命令 ==============================
-
-    def _handle_named_skill_command(self, cmd: str, raw_arg: str) -> bool:
-        """处理 /<skill_name> 格式的直接触发的 Skill 命令（如 /pdf）。
-
-        当斜杠后的名称匹配某个 Skill 名时加载并输出该 Skill 的内容。
-        不匹配则返回 False，由调用方报"未知命令"。
-        """
-        if not cmd.startswith("/") or len(cmd) <= 1:
-            return False
-        skill_name = cmd[1:]  # 去掉前导 "/"
-        skill = self._skill_manager.get_skill(skill_name)
-        if skill is None:
-            return False
-        self._print_skill_content(skill_name, raw_arg)
-        return True
-
-    def _handle_skill_command(self, raw_arg: str) -> None:
-        """处理 /skill NAME [args]：手动加载并打印指定 Skill 的内容。
-
-        用法：
-          /skill         — 显示可用 Skill 列表
-          /skill NAME    — 加载指定 Skill
-          /skill NAME x  — 加载并传递参数
-        """
-        if not raw_arg:
-            print("\n" + self._skill_manager.format_skill_list() + "\n")
-            return
-        parts = raw_arg.split(maxsplit=1)
-        skill_name = parts[0].strip()
-        args = parts[1].strip() if len(parts) > 1 else ""
-        self._print_skill_content(skill_name, args)
-
-    def _print_skill_content(self, skill_name: str, args: str = "") -> None:
-        """加载 Skill 内容并打印到终端。
-
-        用户显式触发时直接加载 SKILL.md 正文；Skill 不再声明 user_invocable
-        或模型专用执行工具。
-        """
-        # 先检查文件系统是否有新增/修改的 Skill（热加载）
-        self._skill_manager.check_for_changes()
-
-        skill = self._skill_manager.get_skill(skill_name)
-        if skill is None:
-            available = ", ".join(s.name for s in self._skill_manager.list_skills())
-            _err(f"未找到 Skill '{skill_name}'。可用 Skill: {available}")
-            return
-
-        content = self._skill_manager.load_skill_content(skill.name, args)
-        print(f"\n{content}\n")
-
 
 # ========== 程序入口函数 main() ==========
 
 
 def main() -> None:
-    """命令行入口。解析参数后根据 --transport 选择不同的运行模式。"""
+    """解析启动参数并运行指定的后端传输模式。"""
 
     # 创建参数解析器
     parser = argparse.ArgumentParser(
         prog="cb-agent",
-        description="cb-agent 命令行入口。默认进 CLI 交互；"
-                    "--transport jsonrpc 给外部 UI 用，"
+        description="cb-agent 后端入口。默认启动 JSON-RPC 网关供 OTUI 使用；"
                     "--transport qq 接 NapCat，"
                     "--transport wechat 接个人微信 OC。",
     )
@@ -1768,9 +1198,9 @@ def main() -> None:
     # --transport 参数：选择通信模式
     parser.add_argument(
         "--transport",
-        choices=["cli", "jsonrpc", "qq", "wechat"],
-        default="cli",
-        help="cli=REPL 直接打印；jsonrpc=stdio NDJSON 网关模式；"
+        choices=["jsonrpc", "qq", "wechat"],
+        default="jsonrpc",
+        help="jsonrpc=OTUI 使用的 stdio NDJSON 网关模式；"
              "qq=NapCat/OneBot 反向 WebSocket；wechat=个人微信 OC 长轮询",
     )
 
@@ -1818,7 +1248,7 @@ def main() -> None:
     )
 
     # ===== JSON-RPC Gateway 模式 =====
-    # 供外部 TUI/Web 通过 stdin/stdout NDJSON 协议驱动 agent。
+    # 供 OTUI 或其他外部前端通过 stdin/stdout NDJSON 协议驱动 agent。
     # stdout 用于写 JSON-RPC 响应，启动期 print 被重定向到 stderr。
     if args.transport == "jsonrpc":
         real_stdout = sys.stdout          # 保存真正的 stdout
@@ -1827,7 +1257,6 @@ def main() -> None:
         runner = AgentRunner(
             use_mcp=use_mcp,
             ctx_enabled=ctx_enabled,
-            attach_cli_renderer=False,    # 不挂 CLI 渲染器，由 Gateway 转发事件
             memory_system=memory_system,
             dangerously_skip_permissions=dangerously_skip_permissions,
         )
@@ -1853,7 +1282,6 @@ def main() -> None:
         runner = AgentRunner(
             use_mcp=use_mcp,
             ctx_enabled=ctx_enabled,
-            attach_cli_renderer=False,    # 避免终端和 QQ 同时输出
             memory_system=memory_system,
             communication_platform="qq",  # 注入 QQ 专用工具和 system prompt
             dangerously_skip_permissions=dangerously_skip_permissions,
@@ -1882,7 +1310,6 @@ def main() -> None:
         runner = AgentRunner(
             use_mcp=use_mcp,
             ctx_enabled=ctx_enabled,
-            attach_cli_renderer=False,    # 不挂 CLI 渲染器
             memory_system=memory_system,
             communication_platform="wechat",
             dangerously_skip_permissions=dangerously_skip_permissions,
@@ -1901,17 +1328,6 @@ def main() -> None:
         finally:
             runner.close()
         return
-
-    # ===== 默认 CLI 模式 =====
-    # 标准终端交互模式：挂 CLI 渲染器，显示启动信息，进入 REPL。
-    runner = AgentRunner(
-        use_mcp=use_mcp,
-        ctx_enabled=ctx_enabled,
-        memory_system=memory_system,
-        dangerously_skip_permissions=dangerously_skip_permissions,
-    )
-    runner.run()  # 进入 REPL 循环
-
 
 # ===== 程序入口点 =====
 if __name__ == "__main__":

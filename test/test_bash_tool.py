@@ -352,7 +352,7 @@ class TestPermission(unittest.TestCase):
 
 
 class TestPermissionPromptChannel(unittest.TestCase):
-    """prompt_user 优先走 question_channel，没 channel 也没 TTY 才返回 permission_unavailable。"""
+    """prompt_user 通过 question_channel 获取权限决策。"""
 
     def _gate(self, channel=None):
         from tools.tools.bash_permission import PermissionGate, PermissionStore
@@ -363,14 +363,10 @@ class TestPermissionPromptChannel(unittest.TestCase):
             question_channel=channel,
         )
 
-    def test_no_channel_no_tty_returns_unavailable(self):
-        """无 channel + 非 TTY → DENY + permission_unavailable=True（旧行为兜底）。"""
-        from unittest.mock import patch
+    def test_no_channel_returns_unavailable(self):
+        """没有问询通道时拒绝执行并标记权限不可用。"""
         gate = self._gate(channel=None)
-        # 强制 stdin 视为非 TTY，避免 unittest 模式下意外进入 input() 阻塞
-        with patch("sys.stdin") as fake_stdin:
-            fake_stdin.isatty.return_value = False
-            res = gate.prompt_user("python build.py", "python", "非只读", "/x")
+        res = gate.prompt_user("python build.py", "python", "非只读", "/x")
         self.assertEqual(res.decision, Decision.DENY)
         self.assertTrue(res.permission_unavailable)
 
@@ -434,19 +430,15 @@ class TestPermissionPromptChannel(unittest.TestCase):
         self.assertEqual(res.decision, Decision.DENY)
         self.assertFalse(res.permission_unavailable)
 
-    def test_channel_exception_falls_back(self):
-        """channel.ask 抛异常 → 不应让用户的 bash 直接挂掉，要降级 TTY 或 unavailable。"""
-        from unittest.mock import patch
+    def test_channel_exception_returns_unavailable(self):
+        """channel.ask 抛异常时拒绝命令，并标记权限不可用。"""
 
         class BrokenChannel:
             def ask(self, *_a, **_kw):
                 raise RuntimeError("boom")
 
         gate = self._gate(channel=BrokenChannel())
-        with patch("sys.stdin") as fake_stdin:
-            fake_stdin.isatty.return_value = False
-            res = gate.prompt_user("python build.py", "python", "非只读", "/x")
-        # 测试环境无 TTY，最终落到 unavailable
+        res = gate.prompt_user("python build.py", "python", "非只读", "/x")
         self.assertEqual(res.decision, Decision.DENY)
         self.assertTrue(res.permission_unavailable)
 

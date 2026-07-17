@@ -1,7 +1,7 @@
 """Agent 事件类型集合
 
 cb-agent 的事件流系统：所有从 AgentSession / LLMStream / ToolExecutor 流出的
-"消息"统一表达为 dataclass 事件，再经 EventBus 派发给订阅者（CLI / TUI / Web）。
+"消息"统一表达为 dataclass 事件，再经 EventBus 派发给订阅者（OTUI / 通讯平台 / Web）。
 
 设计原则：
 - 事件是**只读快照**，订阅者不要回写
@@ -266,7 +266,7 @@ class MCPStatus:
     """MCP 后台加载状态快照。
 
     MCP 服务器可能需要启动外部进程、下载 npm 包或连接远端服务，不能再阻塞 agent
-    启动关键路径。这个事件只用于 UI/CLI 展示“正在连接/已连接/失败”，不进入
+    启动关键路径。这个事件只用于前端展示“正在连接/已连接/失败”，不进入
     会话 history，也不参与下一轮 prompt，避免把运行时状态污染成长期上下文。
     """
     status: str                         # disabled / loading / ready / error

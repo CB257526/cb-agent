@@ -1,5 +1,5 @@
 # cb-agent core 依赖
-# 跑通 REPL（agent + context + tools 原生工具 + MCP）所需的最小集合
+# 运行 agent 后端、OTUI 网关、原生工具与 MCP 所需的最小集合
 # 不含本地 embedding、多模态、向量库、图库、PDF skill、外部搜索
 #
 # 安装方式：
@@ -16,7 +16,6 @@ python-dotenv>=1.0
 tiktoken>=0.7
 fastmcp>=2.0
 requests>=2.31
-colorama>=0.4.6
 pyyaml>=6.0
 bashlex>=0.18
 websockets>=13.0

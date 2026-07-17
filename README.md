@@ -13,7 +13,7 @@
 
 <p align="center">
   🧠 <b>零向量依赖即开即用</b> · 🚀 <b>Section/Boundary 静态缓存命中拉满</b><br>
-  📱 <b>QQ / 微信 / TUI / CLI 全平台制霸</b> · 🧩 <b>MCP / Skills / Hooks / Plan Mode 随便扩展</b>
+  📱 <b>OTUI / QQ / 微信多入口交互</b> · 🧩 <b>MCP / Skills / Hooks / Plan Mode 随便扩展</b>
 </p>
 
 ---
@@ -109,7 +109,7 @@ bun start
 | 🧠 旧向量记忆/RAG | 可选 `--memory-system full`，Episodic/Semantic/Working 三层全开 |
 | 🔀 多会话隔离 | 新建 / 切换 / 清理，不同会话 history/state 互不打扰 |
 | 🎨 多模态输入 | 图片直接发给多模态模型 / 纯文本模型自动 OCR；音频直接 ASR |
-| 🖥️ TUI / OTUI | Ink/React 版 + OpenTUI+Solid.js 重构版，**颜值在线** |
+| 🖥️ OTUI | OpenTUI + Solid.js 终端界面，支持工具卡片、会话切换与状态面板 |
 | 💬 QQ / NapCat | OneBot V11 反向 WebSocket，群聊私聊隔离，敏感权限门禁 (｀・ω・´) |
 | 💬 微信 OC | HTTP 长轮询，扫码登录嗖嗖快，CDN 媒体上传 |
 | 🔌 MCP | 读 `mcp.json` 起 MCP server，工具自动展开 |
@@ -149,8 +149,8 @@ bun start
 | 文档 | 里面有什么 |
 |---|---|
 | [📖 项目介绍](docs/项目介绍.md) | 项目定位、架构图、完整能力表、平台展示图片 |
-| [📦 部署与配置](docs/部署与配置.md) | 环境准备、安装（light/full）、.env 配置、CLI/TUI/OTUI/QQ/微信/Linux 启动 |
-| [🔧 功能详解](docs/功能详解.md) | 记忆系统（light/full/off）、会话 & compact、工具系统、MCP、Skills、CLI 命令 |
+| [📦 部署与配置](docs/部署与配置.md) | 环境准备、安装（light/full）、.env 配置、OTUI/QQ/微信/Linux 启动 |
+| [🔧 功能详解](docs/功能详解.md) | 记忆系统（light/full/off）、会话 & compact、工具系统、MCP、Skills、OTUI 命令 |
 | [🧑‍💻 开发指南](docs/开发指南.md) | 项目结构、五大子系统、缓存命中设计、Hooks、Plan Mode、测试命令、技术报告、FAQ |
 
 ---

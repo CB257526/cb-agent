@@ -139,20 +139,20 @@ def check_python(results: list[Check]) -> None:
     if configured:
         path = Path(configured).expanduser()
         if path.exists():
-            add(results, "OK", "TUI Python 路径", f"CB_AGENT_PYTHON 已指向存在的解释器: {path}")
+            add(results, "OK", "OTUI Python 路径", f"CB_AGENT_PYTHON 已指向存在的解释器: {path}")
         else:
-            add(results, "FAIL", "TUI Python 路径", f"CB_AGENT_PYTHON 指向的文件不存在: {path}")
+            add(results, "FAIL", "OTUI Python 路径", f"CB_AGENT_PYTHON 指向的文件不存在: {path}")
     else:
         expected = PROJECT_ROOT.parent / "venv" / "bin" / "python"
         if expected.exists():
-            add(results, "OK", "TUI Python 路径", f"发现推荐虚拟环境解释器: {expected}")
+            add(results, "OK", "OTUI Python 路径", f"发现推荐虚拟环境解释器: {expected}")
         else:
             add(
                 results,
                 "WARN",
-                "TUI Python 路径",
+                "OTUI Python 路径",
                 "未设置 CB_AGENT_PYTHON，且没有发现 ../venv/bin/python。",
-                "Linux 上 TUI 会兜底 python3；服务器部署建议显式 export CB_AGENT_PYTHON=/path/to/venv/bin/python。",
+                "Linux 上 OTUI 会兜底 python3；服务器部署建议显式 export CB_AGENT_PYTHON=/path/to/venv/bin/python。",
             )
 
 
@@ -183,8 +183,9 @@ def check_commands(results: list[Check]) -> None:
     for command, required, note in [
         ("bash", True, "BashTool 和后台任务依赖 bash。"),
         ("rg", False, "local grep/glob 会优先使用 rg；缺失时会降级到 Python 遍历，速度较慢。"),
-        ("node", False, "TUI 和 npx MCP server 需要 Node.js。"),
-        ("npm", False, "TUI 安装依赖需要 npm。"),
+        ("bun", False, "OTUI 安装和运行需要 Bun。"),
+        ("node", False, "部分 npx MCP server 需要 Node.js。"),
+        ("npm", False, "npx MCP server 通常随 npm 安装。"),
         ("npx", False, "mcp.json 里的 amap/playwright/tavily MCP 默认通过 npx 启动。"),
     ]:
         if command_exists(command):
@@ -237,7 +238,7 @@ def check_mcp(results: list[Check]) -> None:
 
 
 def check_clipboard(results: list[Check]) -> None:
-    """检查 TUI 剪贴板图片粘贴的 Linux 桌面依赖。"""
+    """检查 OTUI 剪贴板图片粘贴的 Linux 桌面依赖。"""
 
     if platform.system() != "Linux":
         return

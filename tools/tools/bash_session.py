@@ -11,7 +11,7 @@ preventCwdChanges。
 
 设计取舍：
 - 不持久化 env / aliases / shell function（要 pexpect，价值低）
-- cwd 不写盘（会话态，REPL 退出即销毁）
+- cwd 不写盘（仅在当前后端进程生命周期内保留）
 - compose 的命令对 PowerShell / cmd / bash 各发一份等价模板
 """
 

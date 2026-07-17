@@ -10,8 +10,7 @@ The shared venv lives one level up at `../venv`. Always run Python through it:
 
 ```bash
 # from cb-agent/
-../venv/Scripts/python.exe run_agent.py     # Windows (this repo's host)
-../venv/bin/python run_agent.py             # POSIX
+cbagent                                      # Launch OTUI from the current workspace
 ```
 
 `pyproject.toml` excludes `test*`, `venv*`, `外部代码*`, `note*` from the installed package — when adding new top-level dirs, decide whether they should ship with the package and update the exclude list accordingly.
@@ -22,11 +21,11 @@ Run all from inside `cb-agent/`:
 
 ```bash
 # Install (two tiers — see README "依赖按场景分两档")
-pip install -r requirements.txt && pip install -e .          # core (REPL only)
+pip install -r requirements.txt && pip install -e .          # core backend + OTUI gateway
 pip install -r requirements-full.txt && pip install -e ".[full]"  # full (RAG, vector/graph stores, PDF, web search)
 
-# REPL entrypoint — wires ContextBuilder + tools + MCP + skills
-../venv/Scripts/python.exe run_agent.py
+# OTUI entrypoint — wires the JSON-RPC backend automatically
+cbagent
 
 # Pytest-style unit tests (currently only context module)
 ../venv/Scripts/python.exe -m pytest test/ -q
@@ -41,7 +40,7 @@ pip install -r requirements-full.txt && pip install -e ".[full]"  # full (RAG, v
 ../venv/Scripts/python.exe test.py                  # ad-hoc end-to-end smoke
 ```
 
-REPL slash commands (defined in `run_agent.py`): `/help`, `/tools`, `/skills`, `/history`, `/clear`, `/ctx on|off`, `/msg on|off`, `/quit`.
+OTUI slash commands are defined in `ui-otui/src/commands.ts`; `run_agent.py` only exposes backend transports.
 
 ## Configuration
 
@@ -65,7 +64,7 @@ user input → ContextBuilder (GSSC) → CbAgentsLLM.think (streaming FC)
 ### The five subsystems and how they wire together
 
 1. **`agent/cb_agents.py` — `CbAgentsLLM`**
-   OpenAI-compatible client. The interesting method is `_think_with_Function_Calling`: under `stream=True` it accumulates `delta.tool_calls` **by `index`** (both `name` and `arguments` arrive as multi-chunk fragments), and surfaces `delta.reasoning_content` separately so the REPL can render a `▸ Thought for X.Xs` block. If you touch streaming, preserve this fragment-reassembly logic — DeepSeek thinking models depend on it.
+   OpenAI-compatible client. The interesting method is `_think_with_Function_Calling`: under `stream=True` it accumulates `delta.tool_calls` **by `index`** (both `name` and `arguments` arrive as multi-chunk fragments), and surfaces `delta.reasoning_content` separately so OTUI can render the reasoning block. If you touch streaming, preserve this fragment-reassembly logic — DeepSeek thinking models depend on it.
 
 2. **`context/builder.py` — `ContextBuilder` (GSSC pipeline)**
    Gather → Select (relevance + recency + MMR) → Structure (priority-bucketed sections `[Role & Policies]` / `[State]` / `[Evidence]` / `[Context]`) → Compress (drop whole packets, never split sections). Has both sync `build()` and async `abuild()` (the latter uses `asyncio.gather + to_thread` to parallelize memory/RAG retrieval). Read [`context/README.md`](context/README.md) before changing priorities or section templates.
@@ -86,7 +85,7 @@ user input → ContextBuilder (GSSC) → CbAgentsLLM.think (streaming FC)
 
 ### The tool-calling loop (`run_agent.py:AgentRunner`)
 
-`MAX_TOOL_ROUNDS = 8`. Each round: call `llm.think(messages, tools=registry.openai_schema)`, append assistant message (with `tool_calls`), execute every tool call, append each result as a `role="tool"` message, repeat until the model returns no more `tool_calls`. When `/msg on`, each round prints **only the newly appended messages** so you can watch prompt assembly without log spam. Hitting `MAX_TOOL_ROUNDS` is a hard stop, not a warning.
+Each round calls `llm.think(messages, tools=registry.openai_schema)`, appends the assistant message and tool results, then repeats until the model returns no more `tool_calls`. Hitting `MAX_TOOL_ROUNDS` is a hard stop, not a warning.
 
 ### Tool vs MCP vs Skill — the boundary
 

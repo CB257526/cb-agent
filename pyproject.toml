@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 
-# core：跑通 REPL（agent + context + tools 原生工具 + MCP）所需的最小集合
+# core：运行 agent 后端、OTUI 网关、原生工具与 MCP 所需的最小集合
 # 不包含本地 embedding、多模态、向量库、图库、PDF skill、外部搜索的依赖
 dependencies = [
     "numpy>=1.26",
@@ -20,7 +20,6 @@ dependencies = [
     "tiktoken>=0.7",
     "fastmcp>=2.0",
     "requests>=2.31",
-    "colorama>=0.4.6",        # Windows 终端 ANSI 兜底
     "pyyaml>=6.0",            # Skill SKILL.md frontmatter
     "bashlex>=0.18",          # BashTool 命令 AST 解析（POSIX shell）
     "websockets>=13.0",       # QQ/NapCat OneBot 反向 WebSocket（使用 websockets.asyncio API）

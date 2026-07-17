@@ -1,12 +1,6 @@
-"""交互式命令权限模块
+"""交互式命令权限模块。
 
-参考 Claude Code 的 bashPermissions.ts + readOnlyValidation.ts，但适配
-cb-agent 的同步 REPL 架构：
-
-cb-agent 没有前端弹窗，REPL 是同步 input() 阻塞循环，工具调用同样
-全程同步（run_agent.py:_chat_once → registry.execute_tool → BashTool.run）。
-所以"权限确认"直接在 BashTool.run 内部用 stdin 阻塞实现：
-打印多选框、读 input()、解析选择、视情况追加 allowlist。
+权限确认通过 QuestionChannel 发到 OTUI 或通讯平台，工具线程同步等待前端答复。
 
 三档决策（PermissionGate.evaluate）：
 - DENY: check_fatal 命中
@@ -20,14 +14,13 @@ cb-agent 没有前端弹窗，REPL 是同步 input() 阻塞循环，工具调用
 - [4] 拒绝
 
 allowlist 持久化到 ./.cbagent/permissions.json（项目级，跟着 cwd 走）。
-非 TTY 环境（管道/重定向 stdin、CI）→ 直接拒绝并标 permission_unavailable。
+问询通道缺失或异常时直接拒绝，并标记 permission_unavailable。
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -318,7 +311,7 @@ class GateResult:
     decision: Decision
     reason: str = ""
     matched_rule: Optional[Rule] = None
-    permission_unavailable: bool = False  # 非 TTY 时为 True
+    permission_unavailable: bool = False  # 问询通道不可用时为 True
     user_feedback: str = ""  # 用户通过 Other 给出的替代操作建议；不等同于授权
 
 
@@ -340,8 +333,7 @@ class PermissionGate:
     ):
         self.store = store or PermissionStore()
         self.strict = strict
-        # 问询通道：UI 模式下用它通过 AskUserQuestion 事件向前端弹框；
-        # 没注入时降级到 stdin 弹窗，stdin 也不可用时返回 permission_unavailable
+        # 问询通道通过 AskUserQuestion 事件向前端弹框；未注入时拒绝敏感命令。
         self.question_channel = question_channel
 
     def evaluate(
@@ -400,29 +392,19 @@ class PermissionGate:
         reason: str,
         cwd: str,
     ) -> GateResult:
-        """问用户。优先级：
-        1. question_channel（UI 弹框，跨线程同步等待）
-        2. stdin TTY（CLI 模式 input()）
-        3. 都不可用 → permission_unavailable=True，返回 DENY
-        """
-        # 1) UI 通道
+        """通过 question_channel 询问用户；通道不可用时拒绝执行。"""
         if self.question_channel is not None:
             try:
                 return self._prompt_via_channel(command, prefix, reason, cwd)
-            except Exception as e:  # 通道异常退回 stdin / 不可用，避免吞掉用户操作
+            except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning(
-                    "permission: question_channel 失败，降级到 stdin: %s", e,
+                    "permission: question_channel 失败，拒绝本次命令: %s", e,
                 )
 
-        # 2) stdin TTY
-        if sys.stdin and sys.stdin.isatty():
-            return self._prompt_via_stdin(command, prefix, reason, cwd)
-
-        # 3) 不可用
         return GateResult(
             Decision.DENY,
-            reason="无可用终端确认权限",
+            reason="无可用前端确认权限",
             permission_unavailable=True,
         )
 
@@ -479,43 +461,6 @@ class PermissionGate:
             rule = self.store.add_rule(prefix, "global")
             return GateResult(Decision.ALLOW, reason="已加入全局 allowlist", matched_rule=rule)
         return GateResult(Decision.DENY, reason="用户拒绝")
-
-    def _prompt_via_stdin(
-        self,
-        command: str,
-        prefix: str,
-        reason: str,
-        cwd: str,
-    ) -> GateResult:
-        """REPL 同步弹窗，阻塞 stdin。"""
-        bar = "─" * 12
-        print(f"\n{bar} 需要确认执行 {bar}", flush=True)
-        print(f"命令：{command}", flush=True)
-        print(f"原因：{reason}", flush=True)
-        print(f"工作目录：{cwd}", flush=True)
-        print("", flush=True)
-        print(f'  [1] 允许这一次', flush=True)
-        print(f'  [2] 总是允许 "{prefix}" 在此目录', flush=True)
-        print(f'  [3] 总是允许 "{prefix}" 在所有目录', flush=True)
-        print(f"  [4] 拒绝", flush=True)
-
-        try:
-            answer = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return GateResult(Decision.DENY, reason="用户取消")
-
-        if answer == "1":
-            return GateResult(Decision.ALLOW, reason="本次允许")
-        if answer == "2":
-            rule = self.store.add_rule(prefix, "cwd", cwd)
-            return GateResult(Decision.ALLOW, reason="已加入项目级 allowlist", matched_rule=rule)
-        if answer == "3":
-            rule = self.store.add_rule(prefix, "global")
-            return GateResult(Decision.ALLOW, reason="已加入全局 allowlist", matched_rule=rule)
-        # 包括 "4" 和任何不合法输入：拒绝
-        return GateResult(Decision.DENY, reason="用户拒绝")
-
 
 # ========== 全局单例 ==========
 

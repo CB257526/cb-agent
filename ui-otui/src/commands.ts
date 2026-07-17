@@ -1,8 +1,7 @@
 /**
  * cb-agent / 命令注册表（OTUI 版）。
  *
- * 从旧 ui-tui/commands.ts 移植，去掉 React 的 Dispatch/SetStateAction 依赖，改用面向
- * 新 SessionProvider 的 CommandCtx。
+ * 命令通过面向能力的 CommandCtx 调用会话状态和传输层。
  *
  * 每个命令是纯函数，拿到 ctx（transport + 状态操作）后做副作用。SlashCommandPicker
  * 从这里读 name/description；用户选中或回车完整输入时调 handler。

@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "bun src/entry.tsx",
-    "dev": "bun --watch src/entry.tsx"
+    "dev": "bun --watch src/entry.tsx",
+    "test": "bun test"
   },
   "dependencies": {
     "@opentui/core": "0.3.4",

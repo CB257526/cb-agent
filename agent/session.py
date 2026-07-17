@@ -2,10 +2,10 @@
 
 Stage 3 拆出来的"中间层"。它把 Stage 1+2 的 EventBus / ToolExecutor 跟原来
 AgentRunner 的会话主流程组合起来，但**不直接做任何输出**——所有"现在发生了什么"
-都经 EventBus 派发，留给前端（CLIRenderer / TextualApp / FastAPI）订阅渲染。
+都经 EventBus 派发，留给 OTUI、通讯平台或其他前端订阅渲染。
 
 跟原 AgentRunner 的差别：
-- _chat_once → chat()：返回 final_answer，让 REPL 决定怎么展示
+- _chat_once → chat()：返回 final_answer，让调用方决定怎么展示
 - _tool_loop：继续在这里，但每轮 think 传 event_bus，工具循环的 RoundStart /
   RoundEnd / Error / Done 也都经 bus 而非 print
 - _build_system_instructions / _prepend_background_notifications：纯字符串
@@ -14,8 +14,8 @@ AgentRunner 的会话主流程组合起来，但**不直接做任何输出**—�
 
 不在这里:
 - 启动期 _section/_info：装配阶段的输出，仍由 run_agent.py 主入口打
-- /xxx 斜杠命令：CLI 专属功能，REPL 那边处理
-- 渲染逻辑（颜色 / 面板）：CLIRenderer 那边
+- /xxx 斜杠命令：由具体前端处理
+- 渲染逻辑（颜色 / 面板）：由具体前端处理
 
 上下文工程模块对接 (Claude Code 对齐重构):
 - 旧 ContextBuilder/ContextPacket 已删除,改为 Chat Completions 专用构造:
@@ -453,7 +453,6 @@ class AgentSession:
         bash_prompt_provider=None,
         ctx_enabled: bool = True,  #控制整个 GSSC 上下文构建管线是否启用
         history_window: int = 12,  # Legacy debug knob; active history is no longer window-trimmed.
-        messages_snapshot_hook=None, #每轮 LLM 调用前把完整的消息列表导出给开发者查看
         session_store: Optional[LocalSessionStore] = None,
         trace_summarizer: Optional[TraceSummarizer] = None,
         message_logger: Optional[MessageLogger] = None,
@@ -473,9 +472,6 @@ class AgentSession:
         Args:
             tool_execution_policy: 工具执行策略。默认 None,按顺序执行。
             system_prompt_addendum: 可选系统提示词补充。用于调整模型行为。
-            messages_snapshot_hook: 可选回调 (messages, round_idx) -> None,
-                每轮 think 前调用一次。给 CLI dump 调试用,不属于事件流(事件
-                是结构化的;dump 是面向开发者的"看原始上下文"调试通道)。
             message_logger: 可选消息日志记录器。非 None 时,在每次 LLM 调用前后
                 将完整 messages 列表写入独立日志文件,包含所有 role 的消息全文。
             memory_loader: 多级 Markdown/CLAUDE.md 加载器。为 None 时动态
@@ -492,7 +488,6 @@ class AgentSession:
         # Legacy debug knob. Active history is now restored and sent in full;
         # overflow is handled by compact, not by silently trimming messages.
         self.history_window = history_window
-        self.messages_snapshot_hook = messages_snapshot_hook
         self.session_store = session_store
         self.trace_summarizer = trace_summarizer
         self.message_logger = message_logger
@@ -531,7 +526,7 @@ class AgentSession:
         # 新格式从最近一条 context update 的 metadata 恢复 section 基线；旧会话
         # 没有该字段时保持空字典，下一轮会完整注入一次并自动升级。
         self._context_fingerprints = _context_fingerprints_from_history(self.history)
-        # 当前正在跑的 chat 的 cancel token;REPL 收 Ctrl-C 时调它的 .cancel()
+        # 当前正在跑的 chat 的 cancel token；前端取消 RPC 会调用它的 .cancel()
         # 没在 chat 中时为 None
         self.current_cancel_token: Optional[CancelToken] = None
         # AskUserQuestionTool 用:工具线程 register+wait,gateway 在 RPC 里
@@ -541,7 +536,7 @@ class AgentSession:
         # 因此这里暴露两个可选回调槽位:
         # - mcp_status_provider:只读当前连接快照;
         # - mcp_background_loader:幂等启动后台连接并返回快照。
-        # 这两个状态只服务 UI/CLI 展示,不写入 history,也不参与 system prompt。
+        # 这两个状态只服务前端展示，不写入 history，也不参与 system prompt。
         self.mcp_status_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self.mcp_background_loader: Optional[Callable[[], Dict[str, Any]]] = None
         logger.info(
@@ -863,8 +858,7 @@ class AgentSession:
               - 进入新一轮 think 之前会 abort 整个循环
             没传则新建一个空 token——chat 内部自己用，不会被外部触发。
 
-        中断后 chat() 仍正常返回（不抛 KeyboardInterrupt），让 REPL 平稳回到
-        输入态。Cancelled 事件已通过 event_bus 通知前端"被中断了"。
+        中断后 chat() 仍正常返回，Cancelled 事件会通过 event_bus 通知前端。
         """
         token = cancel_token if cancel_token is not None else CancelToken()
         self.current_cancel_token = token
@@ -2211,13 +2205,6 @@ class AgentSession:
                 len(llm_messages),
                 request_tokens_est,
             )
-            if self.messages_snapshot_hook is not None:
-                try:
-                    # CLI 的 /msg dump 是落到终端/日志的调试视图，只展示脱敏副本。
-                    self.messages_snapshot_hook(sanitize_multimodal_payload(llm_messages), round_idx)
-                except Exception:
-                    logger.exception("messages_snapshot_hook 抛异常，已吞")
-
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(

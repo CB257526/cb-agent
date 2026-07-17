@@ -391,7 +391,7 @@ class PlatformEventRenderer:
     def _current_conversation(self) -> Optional[ConversationKey]:
         # QQ/微信这类通讯平台可能同时处理多个会话。并发路径下，AgentSession
         # 会通过 ContextVar 绑定当前 ConversationKey；没有绑定时再回退到
-        # begin_run/end_run 维护的串行 active 会话，兼容现有单测和 CLI 风格调用。
+        # begin_run/end_run 维护串行 active 会话，兼容现有单测和同步调用路径。
         current = get_current_platform_conversation()
         if current is not None:
             return current

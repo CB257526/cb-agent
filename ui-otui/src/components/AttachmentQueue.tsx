@@ -1,7 +1,7 @@
 /**
  * AttachmentQueue：待发送附件队列（OTUI 版）。
  *
- * 从旧 ui-tui 移植，渲染换成 OpenTUI 的 box/text。队列非空时显示在 Prompt 上方，
+ * 使用 OpenTUI 的 box/text 渲染。队列非空时显示在 Prompt 上方，
  * 提示用户下一条消息会带哪些文件。发送成功后由 session 的 onResponse 清空。
  */
 

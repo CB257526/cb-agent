@@ -6,7 +6,6 @@
 - 完成通知通过 drain_notifications() 拉，给 AgentRunner 在每轮 think 前注入 system message
 - 跨平台杀进程：Windows CTRL_BREAK_EVENT → 2s 后 taskkill /T /F；POSIX SIGTERM → 2s 后 SIGKILL
 
-不做：异步 stdin 推送（cb-agent REPL 是同步阻塞 input，无法被中断打断）
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """线程安全事件总线
 
 负责把 LLMStream / ToolExecutor / AgentSession 发出的事件分发到所有订阅者
-（CLIRenderer / TextualApp / FastAPI handler / 测试钩子等）。
+（OTUI Gateway / 通讯平台适配器 / 测试钩子等）。
 
 设计契约：
 - **同步发布**：emit(event) 在调用线程同步遍历所有订阅者。订阅者要做"重活"

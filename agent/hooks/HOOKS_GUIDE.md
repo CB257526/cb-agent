@@ -11,7 +11,7 @@ cb-agent 已有 EventBus（`agent/event_bus.py`），但它是**单向广播**�
 
 - **控制流走 HookManager**：收集 hook 的决策，影响工具/会话行为
 - **可见性走 EventBus**：hook 运行时 HookManager 反过来 emit `HookStarted` /
-  `HookCompleted`，让 CLI/TUI 能看到 hook 在跑、是否拦截
+  `HookCompleted`，让 OTUI 能看到 hook 在跑、是否拦截
 
 无 `hooks.json` 配置时，hooks 完全关闭，agent 行为与未引入该功能时一致。
 

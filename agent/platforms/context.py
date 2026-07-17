@@ -1,6 +1,6 @@
 """通讯平台运行上下文。
 
-同一个 EventBus 会被 CLI/TUI/QQ 共用。QQ 模式如果允许多个群聊或私聊并发运行，
+同一个 EventBus 会被 OTUI/QQ/微信共用。QQ 模式如果允许多个群聊或私聊并发运行，
 事件本身又没有携带会话 ID，就必须借助 ContextVar 记录“当前这次 chat 属于哪个
 通讯会话”。ToolExecutor 会复制 contextvars 到工具线程，因此工具事件也能沿用同
 一个 ConversationKey。
@@ -31,7 +31,7 @@ def set_current_platform_conversation(conversation: Optional[ConversationKey]) -
 
 
 def get_current_platform_conversation() -> Optional[ConversationKey]:
-    """读取当前执行流所属的通讯软件会话；普通 CLI/TUI 模式返回 None。"""
+    """读取当前执行流所属的通讯软件会话；本地 OTUI 模式返回 None。"""
 
     return _current_conversation.get()
 

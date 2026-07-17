@@ -8,7 +8,7 @@
  * call_id 完成，这里只负责渲染。
  *
  * 纯函数辅助（summarizeArgs/formatArgsFull/extractDisplay/extractDiff/truncate）
- * 从旧 ui-tui/ToolBlock.tsx 移植，逻辑不变。
+ * 统一处理参数、输出和差异文本。
  */
 
 import { createSignal, For, Show } from "solid-js";

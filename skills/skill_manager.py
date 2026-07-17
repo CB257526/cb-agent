@@ -383,7 +383,7 @@ class SkillManager:
     def get_skill(self, name: str) -> Optional[Skill]:
         """按正式 name 精确获取 Skill。
 
-        这里不做 plain-name 兜底，避免 /foo 这类 UI/CLI 命令在有多个 namespace
+        这里不做 plain-name 兜底，避免 /foo 这类前端命令在有多个 namespace
         Skill 时误命中。需要显式触发解析时使用 resolve_mention。
         """
 
@@ -391,7 +391,7 @@ class SkillManager:
         return self._skills.get(name)
 
     def format_skill_list(self) -> str:
-        """供 CLI/TUI 展示的中文 Skill 列表，不直接进入模型上下文。"""
+        """供 OTUI 展示的中文 Skill 列表，不直接进入模型上下文。"""
 
         skills = self.list_skills()
         if not skills:

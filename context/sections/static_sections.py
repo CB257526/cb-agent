@@ -12,7 +12,7 @@ Chat Completions 请求的首条稳定 system message 中。
 
 不在这里:
 - CLAUDE.md / env_info / mcp_instructions —— 它们是动态段(见 dynamic_sections.py)
-- 当前启用工具列表 —— 工具集合会随 CLI/TUI/QQ、memory_system、MCP 变化,放在
+- 当前启用工具列表 —— 工具集合会随 OTUI/QQ/微信、memory_system、MCP 变化,放在
   dynamic session_guidance 中，避免污染未来 provider prompt cache 的静态前缀
 - 工具列表的具体 schema —— 那是 LLM API 的 tools 字段,不进 system prompt
 """

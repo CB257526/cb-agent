@@ -1,4 +1,4 @@
-"""Stage 4 单测：CancelToken 集成 + chat_async + MarkdownAccumulator。
+"""Stage 4 单测：CancelToken 集成与 chat_async。
 
 CancelToken 路径：
 - AgentSession 在 think 之前看到 token.cancelled → 直接收尾，不再 think
@@ -9,8 +9,6 @@ chat_async：
 - 跑通基本 chat
 - 外部 await 期间，cancel_token.cancel() 能让 chat 返回
 
-MarkdownAccumulator：
-- 普通段落、代码块未闭合不切、闭合后切、flush 行为
 """
 
 from __future__ import annotations
@@ -39,7 +37,6 @@ from agent.cancel import CancelToken
 from agent.event_bus import EventBus
 from agent.events import Cancelled, Done, RoundEnd, RoundStart
 from agent.executor import ToolExecutor, should_parallelize
-from agent.renderers.markdown import MarkdownAccumulator
 from agent.session import AgentSession
 
 
@@ -281,65 +278,6 @@ class TestChatAsync(unittest.TestCase):
         ans = asyncio.run(main())
         # ans 可能是空串；关键是不卡住、不抛
         self.assertIsInstance(ans, str)
-
-
-# ========== MarkdownAccumulator ==========
-
-
-class TestMarkdownAccumulator(unittest.TestCase):
-
-    def test_empty_feed(self):
-        acc = MarkdownAccumulator()
-        self.assertEqual(acc.feed(""), "")
-        self.assertEqual(acc.full, "")
-
-    def test_no_paragraph_break_no_emit(self):
-        acc = MarkdownAccumulator()
-        self.assertEqual(acc.feed("hello "), "")
-        self.assertEqual(acc.feed("world"), "")
-        self.assertEqual(acc.pending, "hello world")
-
-    def test_paragraph_break_emits(self):
-        acc = MarkdownAccumulator()
-        acc.feed("para1\n\n")
-        # 第一段已稳定
-        self.assertEqual(acc.stable, "para1\n\n")
-        # 后面来一行不切，等下个 \n\n
-        out = acc.feed("para2 still typing")
-        self.assertEqual(out, "")
-        out = acc.feed("\n\nmore")
-        self.assertEqual(out, "para2 still typing\n\n")
-
-    def test_unclosed_code_block_not_split(self):
-        """fence 未闭合 → 全部 pending，不切。"""
-        acc = MarkdownAccumulator()
-        out = acc.feed("intro\n\n```python\nprint(1)\n")
-        # 即使前面有 \n\n，但末尾在 fence 里 → 整段 pending
-        self.assertEqual(out, "")
-        self.assertEqual(acc.pending, "intro\n\n```python\nprint(1)\n")
-
-    def test_closed_code_block_then_paragraph_emits(self):
-        acc = MarkdownAccumulator()
-        acc.feed("```python\nprint(1)\n```\n\nafter")
-        # 注意这里 stable 的判定：fence 数偶数（闭合），最后一个 \n\n 在 ``` 后
-        self.assertTrue(acc.stable.endswith("\n\n"))
-        self.assertEqual(acc.pending, "after")
-
-    def test_flush_emits_pending(self):
-        acc = MarkdownAccumulator()
-        acc.feed("not yet stable")
-        out = acc.flush()
-        self.assertEqual(out, "not yet stable")
-        # flush 之后再 feed 直出
-        self.assertEqual(acc.feed(" tail"), " tail")
-
-    def test_reset(self):
-        acc = MarkdownAccumulator()
-        acc.feed("aaa\n\n")
-        acc.reset()
-        self.assertEqual(acc.full, "")
-        self.assertEqual(acc.feed("xx"), "")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

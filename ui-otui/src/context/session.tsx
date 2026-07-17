@@ -1,16 +1,13 @@
 /**
  * SessionProvider：全局会话状态 + AgentEvent → 状态 reducer。
  *
- * 取代旧 ui-tui App.tsx 里几十个 useState + 自适应节流逻辑。核心简化：
- *
- *   旧实现要靠 adaptiveDelay/scheduleFlush（60→200ms 节流）和 windowing（只渲染 50 条）
- *   来压制 Ink "每次流式 chunk 都全树重渲 → 终端抖动 + 滚轮跳顶" 的缺陷。
+ * 集中管理会话状态，避免主组件维护大量分散状态。核心简化：
  *
  *   OpenTUI 的 <scrollbox> 有真实独立视口（滚动状态与终端 scrollback 解耦），
  *   Solid 的 createStore 又是细粒度更新（只重绘变化的那条 item）。两者叠加后，
  *   流式高频 text_delta 直接 setStore 追加即可，无需任何节流/窗口化。
  *
- * 事件映射规则沿用旧实现语义（见各 case 注释）。
+ * 事件映射规则见各 case 注释。
  */
 
 import {

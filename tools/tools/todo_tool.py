@@ -158,12 +158,12 @@ class TodoTool(Tool):
             )
         )
         self.store = TodoStore()
-        # 普通 CLI/TUI 沿用 self.store；通讯软件模式下，TodoTool 实例仍是全局共享的，
+        # 本地 OTUI 沿用 self.store；通讯软件模式下，TodoTool 实例仍是全局共享的，
         # 因此必须按 ConversationKey 分配独立 TodoStore，避免 A 群的任务列表串到 B 群。
         self._platform_stores: Dict[str, TodoStore] = {}
         self._platform_stores_lock = threading.Lock()
         # 可选事件总线：写入后 emit TodoListUpdated 让 UI 单独渲染面板。
-        # None 时不发事件（旧 CLI / 单测路径），保持原行为。
+        # None 时不发事件，兼容不绑定 EventBus 的单测路径。
         self._bus = event_bus
 
     def _current_store(self) -> TodoStore:
@@ -171,7 +171,7 @@ class TodoTool(Tool):
 
         QQ/微信等通讯平台会通过 ContextVar 绑定当前会话。ToolExecutor 会把这个
         ContextVar 复制到工具线程，所以 todo 工具可以在不改工具参数的情况下实现
-        “每个群/好友一份任务列表”。普通 CLI/TUI 没有绑定会话时继续使用默认 store。
+        “每个群/好友一份任务列表”。本地 OTUI 没有绑定平台会话时继续使用默认 store。
         """
 
         conversation = get_current_platform_conversation()
