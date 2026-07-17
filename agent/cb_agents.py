@@ -304,6 +304,8 @@ class CbAgentsLLM:
         self.current_model_key: Optional[str] = configured_choice.key if configured_choice is not None else None
 
         self.model = env_model or (configured_choice.model_id if configured_choice is not None else None)
+        self.max_output_tokens = ConstantLLM.model_max_output_tokens(self.model)
+        self.output_token_param = ConstantLLM.output_token_param(self.model)
         apiKey = apiKey or (configured_choice.api_key if configured_choice is not None else None) or os.getenv("LLM_API_KEY")
         baseUrl = baseUrl or (configured_choice.base_url if configured_choice is not None else None) or os.getenv("LLM_BASE_URL")
         timeout = timeout or int(os.getenv("LLM_TIMEOUT", 60))
@@ -377,6 +379,8 @@ class CbAgentsLLM:
                 "base_url": self.base_url,
                 "is_tool": self.is_Function_Calling,
                 "max_tokens": ConstantLLM.model_max_tokens(self.model),
+                "max_output_tokens": self.max_output_tokens,
+                "output_token_param": self.output_token_param,
                 "image_ability": ConstantLLM.resolve_image_ability(self.model, default=False),
                 "is_reasoning": ConstantLLM.resolve_is_reasoning(self.model, default=False),
             },
@@ -405,6 +409,9 @@ class CbAgentsLLM:
             self.base_url = base_url
             self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
             self.is_Function_Calling = self._is_able_Function_Calling()
+            # 环境变量仍保持最高优先级，模型切换不能绕过 MAX_OUTPUT_TOKENS 覆盖。
+            self.max_output_tokens = ConstantLLM.model_max_output_tokens(choice.model_id)
+            self.output_token_param = choice.output_token_param
             self._publish_current_model_env()
 
         logger.info(
@@ -423,6 +430,8 @@ class CbAgentsLLM:
             "is_tool": self.is_Function_Calling,
             "is_reasoning": ConstantLLM.resolve_is_reasoning(choice.model_id, default=False),
             "max_tokens": ConstantLLM.model_max_tokens(choice.model_id),
+            "max_output_tokens": self.max_output_tokens,
+            "output_token_param": self.output_token_param,
             "image_ability": ConstantLLM.resolve_image_ability(choice.model_id, default=False),
         }
 
@@ -431,6 +440,12 @@ class CbAgentsLLM:
         with self._stream_lock:
             self._stream_seq += 1
             return self._stream_seq
+
+    def _apply_output_token_limit(self, request_kwargs: Dict[str, Any]) -> None:
+        """按当前 provider 配置把输出上限写入请求参数。"""
+        if self.output_token_param == "none":
+            return
+        request_kwargs[self.output_token_param] = int(self.max_output_tokens)
 
     def _register_stream(
         self,
@@ -776,6 +791,7 @@ class CbAgentsLLM:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        self._apply_output_token_limit(request_kwargs)
 
         # 使用可取消的流式读取器，而不是直接在当前线程阻塞迭代 SDK stream。
         # 这样 Ctrl-C/session.cancel 在 provider 长时间不吐 chunk 时也能及时生效。
@@ -892,6 +908,7 @@ class CbAgentsLLM:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        self._apply_output_token_limit(request_kwargs)
 
         # 控制可见正文的打印：只有真正开始吐 content 时才打 "assistant > " 前缀
         printed_prefix = False

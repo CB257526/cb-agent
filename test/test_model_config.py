@@ -19,7 +19,7 @@ class TestModelConfigManager(unittest.TestCase):
     def setUp(self) -> None:
         self._saved_env = {
             key: os.environ.get(key)
-            for key in ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "IMAGE_ABILITY", "CBAGENT_MODEL_CONFIG")
+            for key in ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "MAX_OUTPUT_TOKENS", "IMAGE_ABILITY", "CBAGENT_MODEL_CONFIG")
         }
         for key in self._saved_env:
             os.environ.pop(key, None)
@@ -47,6 +47,8 @@ class TestModelConfigManager(unittest.TestCase):
                             "is_tool": True,
                             "is_reasoning": True,
                             "max_tokens": 1000000,
+                            "max_output_tokens": 32000,
+                            "output_token_param": "max_completion_tokens",
                             "image_ability": True,
                         },
                     },
@@ -61,6 +63,8 @@ class TestModelConfigManager(unittest.TestCase):
         self.assertTrue(ConstantLLM.resolve_is_tool("kimi-k2.7-code"))
         self.assertTrue(ConstantLLM.resolve_image_ability("kimi-k2.7-code"))
         self.assertEqual(ConstantLLM.model_max_tokens("kimi-k2.7-code"), 1000000)
+        self.assertEqual(choice.max_output_tokens, 32000)
+        self.assertEqual(choice.output_token_param, "max_completion_tokens")
 
     def test_duplicate_provider_names_get_unique_keys(self) -> None:
         manager = ModelConfigManager.from_provider_dicts(Path("models.json"), [

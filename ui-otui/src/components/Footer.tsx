@@ -11,12 +11,8 @@ import { createMemo, Show } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import { Spinner } from "./Spinner.js";
-
-function formatTokenCount(tokens: number): string {
-  if (!Number.isFinite(tokens) || tokens <= 0) return "0";
-  if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
-  return `${Math.round(tokens)}`;
-}
+import { useTerminalDimensions } from "@opentui/solid";
+import { formatContextTokenCount, formatTokenCount } from "../tokenDisplay.js";
 
 function formatPercent(percent: number): string {
   if (!Number.isFinite(percent) || percent <= 0) return "0%";
@@ -34,15 +30,15 @@ function shortSessionId(sessionId: string): string {
 export function Footer() {
   const theme = useTheme();
   const { state } = useSession();
+  const dimensions = useTerminalDimensions();
 
-  const totalK = () =>
-    (Math.max(0, state.promptTokens + state.completionTokens - state.cachedPromptTokens) / 1000).toFixed(1);
   const ctxUsed = () => state.contextWindow?.used_tokens ?? 0;
-  const ctxMax = () => state.contextWindow?.max_tokens ?? 8000;
+  const ctxMax = () => state.contextWindow?.full_window_tokens ?? state.contextWindow?.max_tokens ?? 8000;
   const ctxPercent = () => state.contextWindow?.percent ?? 0;
+  const compactLayout = () => dimensions().width < 110;
   const ctxColor = createMemo(() => {
     const p = ctxPercent();
-    const trigger = state.contextWindow?.auto_compact_trigger_percent ?? 80;
+    const trigger = state.contextWindow?.auto_compact_trigger_percent ?? 90;
     return p >= trigger ? theme.error : p >= 65 ? theme.warning : theme.success;
   });
   const mcpConnected = () => state.mcp?.connected ?? 0;
@@ -70,7 +66,7 @@ export function Footer() {
           <span style={{ fg: state.permissionMode === "full_access" ? theme.error : theme.textMuted }}>
             {"  "}{permissionLabel()}
           </span>
-          <Show when={state.session}>
+          <Show when={state.session && !compactLayout()}>
             <span style={{ fg: theme.textMuted }}> · {shortSessionId(state.session!.session_id)}</span>
           </Show>
         </text>
@@ -78,10 +74,14 @@ export function Footer() {
 
       <box flexDirection="row" flexShrink={0}>
         <text fg={theme.textMuted}>
-          Context {formatTokenCount(ctxUsed())}/{formatTokenCount(ctxMax())}{" "}
+          Context {formatContextTokenCount(ctxUsed(), state.contextWindow?.source)}/{formatTokenCount(ctxMax())}{" "}
           <span style={{ fg: ctxColor() }}>{formatPercent(ctxPercent())}</span>
-          {"  "}usage {totalK()}k
-          <Show when={state.round > 0}>
+          {"  "}Input {formatTokenCount(state.promptTokens)}
+          <Show when={!compactLayout() && state.cachedPromptTokens > 0}>
+            <span style={{ fg: theme.textMuted }}> (Cached {formatTokenCount(state.cachedPromptTokens)})</span>
+          </Show>
+          {"  "}Output {formatTokenCount(state.completionTokens)}
+          <Show when={state.round > 0 && !compactLayout()}>
             <span style={{ fg: theme.textMuted }}>{`  round ${state.round}/${state.maxRounds}`}</span>
           </Show>
         </text>

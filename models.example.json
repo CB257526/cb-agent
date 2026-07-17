@@ -12,6 +12,8 @@
           "is_tool": true,
           "is_reasoning": true,
           "max_tokens": 1000000,
+          "max_output_tokens": 16000,
+          "output_token_param": "max_tokens",
           "image_ability": true
         }
       }

@@ -29,7 +29,7 @@ from constant.llm.constant_llm import (
 
 
 # 解析层读的所有 env 键,每个用例前后清干净,避免相互污染。
-_ENV_KEYS = ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "IMAGE_ABILITY",
+_ENV_KEYS = ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "MAX_OUTPUT_TOKENS", "IMAGE_ABILITY",
              "CB_AGENT_MAX_CONTEXT_TOKENS")
 
 
@@ -128,9 +128,17 @@ class TestModelMaxTokens(_EnvSandbox):
 
     def test_context_window_tokens_respects_env(self):
         os.environ["MAX_TOKENS"] = "1M"
-        # 80% 安全比例
-        expected = int(1024 * 1024 * ConstantLLM.CONTEXT_USAGE_RATIO)
-        self.assertEqual(ConstantLLM.context_window_tokens("anything"), expected)
+        os.environ["MAX_OUTPUT_TOKENS"] = "16K"
+        limits = ConstantLLM.context_limits("anything")
+        self.assertEqual(limits["full_window_tokens"], 1024 * 1024)
+        self.assertEqual(limits["max_output_tokens"], 16 * 1024)
+        self.assertEqual(limits["estimation_margin_tokens"], 16_000)
+        self.assertEqual(limits["hard_limit_tokens"], 1024 * 1024 - 16 * 1024)
+        self.assertEqual(ConstantLLM.context_window_tokens("anything"), limits["soft_limit_tokens"])
+
+    def test_max_output_env_over_registry(self):
+        os.environ["MAX_OUTPUT_TOKENS"] = "8K"
+        self.assertEqual(ConstantLLM.model_max_output_tokens("deepseek-v4-flash"), 8 * 1024)
 
 
 class TestWindowReusesEnv(_EnvSandbox):

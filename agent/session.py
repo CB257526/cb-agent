@@ -34,7 +34,9 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -57,7 +59,7 @@ from agent.cb_agents import CbAgentsLLM
 from agent.event_bus import EventBus
 from agent.events import (
     BackgroundNotification, Cancelled, ContextWindowUpdated, Done, Error, PlanApproved, PlanDelta,
-    PlanModeChanged, PlanReady, PlanRejected, PlanStart, RoundEnd, RoundStart, TextDelta,
+    PlanModeChanged, PlanReady, PlanRejected, PlanStart, RoundEnd, RoundStart, TextDelta, TokenUsage,
 )
 from agent.executor import ToolExecutor
 from agent.message_logger import MessageLogger
@@ -488,6 +490,13 @@ class AgentSession:
         # overflow is handled by compact, not by silently trimming messages.
         self.history_window = history_window
         self.session_store = session_store
+        # provider usage 到达时用 round_idx 找回同一请求的原始估算，既用于 Context
+        # 精确刷新，也用于按 provider/model 校准本地 tokenizer 的系统性偏差。
+        self._request_token_estimates: Dict[int, int] = {}
+        self._token_calibration: Dict[str, float] = {}
+        self._calibration_samples: Dict[str, int] = {}
+        if not is_subagent:
+            self.event_bus.subscribe(self._on_token_usage, TokenUsage)
         self.trace_summarizer = trace_summarizer
         self.message_logger = message_logger
         self.language = language
@@ -579,6 +588,7 @@ class AgentSession:
             "session": summary,
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
+            "usage": self._session_usage_payload(),
             "plan_state": self.plan_state(),
             "subagent_tasks": self._subagent_tasks_payload(),
         }
@@ -612,6 +622,67 @@ class AgentSession:
         terminal = [task for task in tasks if task.is_terminal()][-10:]
         selected = active + terminal
         return [task.to_dict() for task in selected]
+
+    def _session_usage_payload(self) -> Dict[str, Any]:
+        """返回当前主会话累计 Usage；无持久化 store 时返回进程内零值。"""
+        if self.session_store is None:
+            return {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_prompt_tokens": 0,
+                "cache_miss_tokens": 0,
+                "requests": 0,
+            }
+        return self.session_store.load_usage()
+
+    def _calibration_key(self) -> str:
+        """生成 provider/model 级校准键，避免切换中转站后沿用错误比例。"""
+        base_url = str(getattr(self.llm, "base_url", "") or "")
+        model = str(getattr(self.llm, "model", "") or "")
+        return f"{base_url}|{model}"
+
+    def _calibration_ratio(self) -> float:
+        """读取当前 provider/model 的估算校准系数。"""
+        key = self._calibration_key()
+        if key not in self._token_calibration and self.session_store is not None:
+            stored = self.session_store.load_token_calibration(key)
+            if stored is not None:
+                self._token_calibration[key] = min(1.25, max(0.75, stored))
+        return self._token_calibration.get(key, 1.0)
+
+    def _calibrated_request_tokens(self, raw_tokens: int) -> int:
+        """用有界校准系数修正本地 tokenizer 的系统性偏差。"""
+        return max(0, int(math.ceil(max(0, raw_tokens) * self._calibration_ratio())))
+
+    def _on_token_usage(self, event: TokenUsage) -> None:
+        """持久化单次 Usage，并用 provider 实际输入量校准 Context 估算。"""
+        if self.session_store is not None:
+            self.session_store.add_token_usage(event)
+
+        raw = self._request_token_estimates.pop(int(event.round_idx or 0), None)
+        actual = max(0, int(event.prompt_tokens or 0))
+        if raw and actual:
+            key = self._calibration_key()
+            sample = min(1.25, max(0.75, actual / raw))
+            previous = self._calibration_ratio()
+            samples = self._calibration_samples.get(key, 0) + 1
+            ratio = sample if samples == 1 and key not in self._token_calibration else previous * 0.8 + sample * 0.2
+            self._token_calibration[key] = ratio
+            self._calibration_samples[key] = samples
+            if self.session_store is not None:
+                self.session_store.save_token_calibration(key, ratio, samples)
+
+        if actual:
+            self.event_bus.emit(ContextWindowUpdated(
+                context_window=self._context_window_payload(
+                    used_tokens=actual,
+                    raw_estimated_tokens=raw if raw is not None else actual,
+                    source="provider",
+                    scope="current_request",
+                ),
+                reason="provider_usage",
+                round_idx=int(event.round_idx or 0),
+            ))
 
     def plan_state(self) -> Dict[str, Any]:
         """返回当前活跃会话的 Plan Mode 完整状态。
@@ -694,6 +765,7 @@ class AgentSession:
                 "session": None,
                 "history": [],
                 "context_window": self.context_window_usage(),
+                "usage": self._session_usage_payload(),
                 "plan_state": self.plan_state(),
                 "subagent_tasks": self._subagent_tasks_payload(),
             }
@@ -702,6 +774,7 @@ class AgentSession:
             "session": summary,
             "history": [],
             "context_window": self.context_window_usage(),
+            "usage": self._session_usage_payload(),
             "plan_state": self.plan_state(),
             "subagent_tasks": self._subagent_tasks_payload(),
         }
@@ -730,17 +803,24 @@ class AgentSession:
             "session": summary,
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
+            "usage": self._session_usage_payload(),
             "plan_state": self.plan_state(),
             "subagent_tasks": self._subagent_tasks_payload(),
         }
 
-    def compact_context(self) -> Dict[str, Any]:
+    def compact_context(
+        self,
+        *,
+        source_history: Optional[Sequence[Message]] = None,
+        reason: str = "user_compact",
+    ) -> Dict[str, Any]:
         """把 active history 替换为“摘要 + 最近完整回合”。
 
         transcript.jsonl 保留 compact 前审计记录；内存 history 与 compact.json 只保存
         replacement history。摘要预算与 64K 原始尾部预算相互独立。
         """
-        before_messages = len(self.history)
+        compact_source = list(source_history) if source_history is not None else list(self.history)
+        before_messages = len(compact_source)
         state_text = self._session_state_text()
         if before_messages == 0 and not state_text:
             return {
@@ -755,7 +835,7 @@ class AgentSession:
                 "no_op": True,
             }
 
-        active_history = get_messages_after_compact_boundary(self.history)
+        active_history = get_messages_after_compact_boundary(compact_source)
         # 计算可以保留的原始消息的最大值
         retained_budget = min(
             COMPACT_RETAINED_MESSAGE_TOKENS, #64k
@@ -790,7 +870,7 @@ class AgentSession:
         )
         boundary = make_compact_boundary_message(
             summary,
-            reason="replacement_history",
+            reason=reason,
         )
         replacement_history = [boundary, *selection.retained_messages]
         after_messages = len(replacement_history)
@@ -820,7 +900,7 @@ class AgentSession:
         self._context_fingerprints = {}
         if self.memory_loader is not None:
             try:
-                self.memory_loader.reset_cache(reason="user_compact")
+                self.memory_loader.reset_cache(reason=reason)
             except Exception:
                 logger.exception("MemoryLoader 缓存清理失败")
 
@@ -947,28 +1027,11 @@ class AgentSession:
         # Plan Mode 工具过滤：plan 模式下只暴露只读工具
         enabled_tools = frozenset(self._enabled_tools_for_prompt())
 
-        def _run(coro):
-            """同步上下文里调 async 的辅助闭包。
-
-            session.chat() 是 sync 方法(由 cb_agents 的 OpenAI SDK 流式同步
-            迭代器决定),所以每轮需新建 event loop 跑 async 的 prompt 组装。
-            优先 asyncio.run(coro) —— 它只在无已有 loop 时成功。如果已经在
-            event loop 里(罕见,工具内调时),改用 new_event_loop() 绕过冲突。
-            """
-            try:
-                return asyncio.run(coro)
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                try:
-                    return loop.run_until_complete(coro)
-                finally:
-                    loop.close()
-
         # 第一步: 确定性静态 system prompt 段(不参与动态解析)
         static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
         # 第二步：生成具名运行时上下文块，session 会按内容指纹只追加变化项。
         try:
-            dynamic_sections = _run(
+            dynamic_sections = self._run_context_coro(
                 get_dynamic_context_sections(
                     enabled_tools=enabled_tools,
                     model=getattr(self.llm, "model", "") or "",
@@ -1055,6 +1118,52 @@ class AgentSession:
         # [final] 当前用户输入
         messages.append({"role": "user", "content": user_content})
         return messages
+
+    @staticmethod
+    def _run_context_coro(coro):
+        """在同步 session 主链路中执行动态上下文的异步组装。"""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        # 当前线程已有运行中的 loop 时，不能再嵌套 run_until_complete。使用短线程
+        # 执行独立 loop，既保持同步接口，也保证传入 coroutine 一定被等待或抛错。
+        result: Dict[str, Any] = {}
+
+        def _worker() -> None:
+            try:
+                result["value"] = asyncio.run(coro)
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        worker = threading.Thread(target=_worker, name="cbagent-context-builder", daemon=True)
+        worker.start()
+        worker.join()
+        error = result.get("error")
+        if error is not None:
+            raise error
+        return result.get("value")
+
+    def _baseline_dynamic_sections(self, enabled_tools: frozenset[str]) -> List[tuple[str, str]]:
+        """读取不依赖下一条用户输入的动态 sections，供空闲态 Context 估算。"""
+        try:
+            sections = self._run_context_coro(
+                get_dynamic_context_sections(
+                    enabled_tools=enabled_tools,
+                    model=getattr(self.llm, "model", "") or "",
+                    cwd=Path.cwd(),
+                    memory_loader=self.memory_loader if self.ctx_enabled else None,
+                    mcp_clients=self.mcp_clients,
+                    skill_commands=[],
+                    language=self.language,
+                    memory_query="",
+                )
+            )
+        except Exception:
+            logger.exception("空闲态动态上下文构建失败")
+            sections = []
+        return list(sections)
 
     def _sliced_history_dicts(self) -> List[Dict[str, Any]]:
         """Return the full active history after the latest compact boundary."""
@@ -1393,8 +1502,8 @@ class AgentSession:
         )
 
         # 预检完整请求体，而不只看 state/history。原因是工具 schema、系统提示、
-        # Skill 列表和当前用户输入也会占用真实模型窗口；如果这里达到或超过 80%
-        # 安全窗口，就先 compact 当前跨轮 history/state，再重建 messages，让
+        # Skill 列表和当前用户输入也会占用真实模型窗口；如果这里达到动态 soft limit，
+        # 就先 compact 当前跨轮 history/state，再重建 messages，让
         # 本轮第一次 think 就使用压缩后的上下文。
         preflight = self._maybe_auto_compact_preflight(
             user_query=user_query,
@@ -1474,10 +1583,25 @@ class AgentSession:
         # (含 tool_calls)/role=tool/最终 assistant，commit 到 history 时只取这之后
         # 新增的部分，避免把 system / state user / 历史轮次重复推回。
         commit_offset = len(messages)
+        committed_context_text = self._pending_context_update_text
+        committed_context_fingerprints = dict(self._pending_context_fingerprints)
+        turn_prefix_messages: List[Message] = []
+        if committed_context_text:
+            turn_prefix_messages.append(_make_context_update_message(
+                committed_context_text,
+                committed_context_fingerprints,
+            ))
+        turn_prefix_messages.append(Message(role=MessageRole.USER, content=history_user_text))
+        loop_state: Dict[str, Any] = {
+            "commit_offset": commit_offset,
+            "history_replaced": False,
+            "audit_protocol": [],
+            "turn_prefix_messages": turn_prefix_messages,
+        }
 
         #工具调用次数，最终回答，工具轨迹，本轮压缩事件
         rounds_used, final_answer, trace_collector, loop_compactions = self._tool_loop(
-            messages, tools_schema, token,
+            messages, tools_schema, token, loop_state=loop_state,
         )
         auto_compactions.extend(loop_compactions)
 
@@ -1488,19 +1612,16 @@ class AgentSession:
         # 注意 history 里第一条仍是用户原始输入的 text 形态(不带多模态 base64),
         # 跨轮 image_url/data URI 不进 history 以免撑爆 token 估算和 transcript。
         history_commit_start = len(self.history)
-        committed_context_text = self._pending_context_update_text
-        committed_context_fingerprints = dict(self._pending_context_fingerprints)
         # context_update 在用户消息之前写入 history。
         # 顺序是: [...旧 history] → ctx_update(本轮环境) → user(本轮输入) → tool loop messages
         # 下一轮 _build_chat_messages 的 _sliced_history_dicts() 会按同样顺序读出,
         # 保证前缀 [system] + [ctx_update(N-1)] + [user(N-1)] 完全不变 → 缓存命中。
-        if committed_context_text:
-            self.history.append(_make_context_update_message(
-                committed_context_text,
-                committed_context_fingerprints,
-            ))
-        self.history.append(Message(role=MessageRole.USER, content=history_user_text))
-        new_protocol_messages = self._extract_protocol_messages(messages, commit_offset)
+        if not loop_state["history_replaced"]:
+            self.history.extend(turn_prefix_messages)
+        new_protocol_messages = self._extract_protocol_messages(
+            messages,
+            int(loop_state["commit_offset"]),
+        )
         if new_protocol_messages:
             self.history.extend(new_protocol_messages)
         # 兜底:如果工具循环结束时 final_answer 没作为最后一条 assistant 进入
@@ -1508,7 +1629,20 @@ class AgentSession:
         # 仍然能看到本轮的最终输出。
         if final_answer and not self._history_tail_is_final_answer(final_answer):
             self.history.append(Message.create_assistant_message(final_answer))
-        committed_turn_messages = list(self.history[history_commit_start:])
+        if loop_state["history_replaced"]:
+            # replacement history 已包含当前回合的一部分，transcript 仍要保存完整原链。
+            committed_turn_messages = [
+                *turn_prefix_messages,
+                *list(loop_state["audit_protocol"]),
+                *new_protocol_messages,
+            ]
+            if final_answer and not self._messages_tail_is_final_answer(
+                committed_turn_messages,
+                final_answer,
+            ):
+                committed_turn_messages.append(Message.create_assistant_message(final_answer))
+        else:
+            committed_turn_messages = list(self.history[history_commit_start:])
 
         # trace_collector 来自本轮工具循环,只服务 state.json 结构化字段提取
         # (files_seen / files_modified / recent_commands / decisions / pending)。
@@ -1527,6 +1661,17 @@ class AgentSession:
             committed_turn_messages,
             turn_id=turn_id,
         )
+        if loop_state["history_replaced"] and self.session_store is not None:
+            try:
+                from agent.work_context import _message_to_persist_payload
+                self.session_store.align_compaction_transcript_offset(
+                    history_payload=[
+                        _message_to_persist_payload(message)
+                        for message in self.history
+                    ],
+                )
+            except Exception:
+                logger.exception("对齐 mid-turn compact 的 transcript offset 失败")
         # 只有当前回合已经进入 history/transcript 后才推进指纹基线。删除全部 section
         # 时指纹字典为空，但 committed_context_text 仍能明确表示这次更新有效。
         if committed_context_text:
@@ -1629,85 +1774,107 @@ class AgentSession:
         return ConstantLLM.model_max_tokens(getattr(self.llm, "model", None))
 
     def _context_budget_tokens(self) -> int:
-        """返回 agent 实际可使用的上下文窗口，默认是模型窗口的 80%。
+        """返回动态 soft limit，兼容旧内部方法名。"""
+        return self._context_limits()["soft_limit_tokens"]
 
-        这个值同时服务三个地方：
-        - TUI 底部 Context 指标的分母；
-        - 自动 compact 的触发阈值；
-        - 估算当前工具循环 messages 是否需要压缩。
+    def _context_limits(self) -> Dict[str, int]:
+        """返回当前模型统一的完整窗口与 soft/hard 边界。"""
+        return ConstantLLM.context_limits(getattr(self.llm, "model", None))
 
-        保留 20% 不使用，是为了给模型输出、provider 额外包装和 token 估算误差
-        留缓冲，避免显示“刚好没满”但真实 API 请求已经超窗。
-        """
-        return ConstantLLM.context_window_tokens(getattr(self.llm, "model", None))
+    def _baseline_request_parts(self) -> tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+        """构造空闲态下一次请求的无副作用基线，不虚构用户输入。"""
+        enabled_tools = frozenset(self._enabled_tools_for_prompt())
+        static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
+        static_system = "\n\n".join(p.strip() for p in static_parts if p and p.strip())
+        if self.system_prompt_addendum.strip():
+            static_system = (
+                f"{static_system}\n\n{self.system_prompt_addendum.strip()}"
+                if static_system else self.system_prompt_addendum.strip()
+            )
+        messages: List[Dict[str, Any]] = []
+        if static_system:
+            messages.append({"role": "system", "content": static_system})
+        messages.extend(self._sliced_history_dicts())
+
+        # state/plan 只有相对已提交指纹发生变化时才额外计入。这样当前状态已经存在于
+        # context_update 历史时不会被重复计算，同时仍能反映尚未提交的状态变化。
+        pending_sections: List[tuple[str, str]] = []
+        for name, text in self._baseline_dynamic_sections(enabled_tools):
+            normalized = str(text or "").strip()
+            if normalized and self._context_fingerprints.get(name) != _context_text_fingerprint(normalized):
+                pending_sections.append((name, normalized))
+        plan_context = self._plan_context_text()
+        if plan_context and self._context_fingerprints.get("plan") != _context_text_fingerprint(plan_context.strip()):
+            pending_sections.append(("plan", plan_context.strip()))
+        state_text = self._session_state_text()
+        state_section = (
+            "[Local SessionState]\n"
+            "The following is rolling local work state for continuity; "
+            "it is not the user's latest instruction.\n\n" + state_text
+        ) if state_text else ""
+        if state_section and self._context_fingerprints.get("session_state") != _context_text_fingerprint(state_section):
+            pending_sections.append(("session_state", state_section))
+        if pending_sections:
+            messages.append({
+                "role": "user",
+                "content": _format_context_update_text(_format_context_sections(pending_sections, [])),
+            })
+
+        tools_schema = self._stable_tools_schema(
+            self._filter_tools_schema_for_plan_mode(
+                self.registry.get_tools_description_openai_schema()
+                if self.llm.is_Function_Calling else None
+            )
+        )
+        return messages, tools_schema
 
     def _dynamic_context_text(self) -> str:
-        """渲染会被跨轮注入的动态上下文文本，用于估算和自动 compact。
-
-        它只统计 state/history，不统计固定 system prompt、工具 schema 和当前用户
-        输入。因此这个结果适合回答“这段会话记忆本身占了多少窗口”；完整请求是否
-        超阈值则由 _estimate_request_tokens() 另外计算。
-
-        关键:history 部分复用 _sliced_history_dicts(),与真正发给 LLM 的口径
-        完全一致——同样经过 boundary 切片 + window 截断 + 孤儿清理,并且序列化
-        整条 OpenAI dict(含 assistant.tool_calls 的 arguments 和 role=tool 的
-        content)。重构后 history 里大量消息是纯工具调用(content=None),如果像
-        旧逻辑那样按"有正文才计入"过滤,会把 file_write/bash 等工具参数整段漏算,
-        导致 TUI 的 Context% 系统性偏低;不走切片还会让 /compact 后百分比不降反升。
-        """
-        parts: List[str] = []
-        state_text = self._session_state_text()
-        if state_text:
-            parts.append("[State]\n" + state_text)
-
-        # Plan Mode 上下文也纳入 token 估算，避免 Context% 偏低
-        plan_context = self._plan_context_text()
-        if plan_context:
-            parts.append("[Plan]\n" + plan_context)
-
-        history_dicts = self._sliced_history_dicts()
-        if history_dicts:
-            try:
-                history_text = json.dumps(history_dicts, ensure_ascii=False, default=str)
-            except Exception:
-                history_text = str(history_dicts)
-            parts.append("[Context]\n" + history_text)
-        return "\n\n".join(parts)
+        """兼容调试调用，返回与空闲态完整请求基线一致的序列化文本。"""
+        messages, tools_schema = self._baseline_request_parts()
+        return json.dumps(
+            {"messages": messages, "tools": tools_schema or []},
+            ensure_ascii=False,
+            default=str,
+        )
 
     def context_window_usage(self) -> Dict[str, Any]:
-        """估算当前会话动态上下文占用，用于 TUI 的 Context 指标。
+        """估算空闲态下一次完整请求的基线占用。"""
+        messages, tools_schema = self._baseline_request_parts()
+        raw = self._estimate_request_tokens(messages, tools_schema)
+        return self._context_window_payload(
+            used_tokens=self._calibrated_request_tokens(raw),
+            raw_estimated_tokens=raw,
+            source="estimate",
+            scope="next_request_baseline",
+        )
 
-        这个指标回答的是“当前 active 会话已有多少内容会继续挤占后续上下文窗口”，
-        不是 OpenAI usage 里的“已经消耗了多少 token”。因此它只统计动态部分：
-
-        - 本地滚动 state，也就是已读/已改文件、最近命令、compact 摘要等；
-        - 当前恢复进内存的 history，包括普通 user/assistant、工作记录和 compact 记录。
-
-        固定系统提示、工具 schema、Skill 列表以及下一条尚未提交的用户输入不计入。
-        这样空会话会接近 0%，切换会话和 /compact 后的变化也更直观。分母使用
-        ``constant_llm.py`` 中当前模型 max_tokens 的 80%，与自动 compact 阈值一致。
-        """
-        model_max_tokens = self._model_max_tokens()
-        max_tokens = self._context_budget_tokens()
-        # 自动 compact 的触发阈值（token 数），与 preflight 三级阈值使用同一口径。
-        # 这里暴露给 TUI 状态栏，让用户看到「Context% 到达多少会触发自动压缩」。
-        trigger_tokens = self._auto_compact_trigger_tokens()
-        text = self._dynamic_context_text()
-        used_tokens = count_tokens(text) if text else 0
-        percent = min(100.0, (used_tokens / max_tokens) * 100.0)
+    def _context_window_payload(
+        self,
+        *,
+        used_tokens: int,
+        raw_estimated_tokens: int,
+        source: str,
+        scope: str,
+    ) -> Dict[str, Any]:
+        """统一生成前后端 ContextWindow 结构。"""
+        limits = self._context_limits()
+        full_window = limits["full_window_tokens"]
+        used = max(0, int(used_tokens))
         return {
-            "used_tokens": used_tokens,
-            "max_tokens": max_tokens,
-            "remaining_tokens": max(0, max_tokens - used_tokens),
-            "percent": round(percent, 1),
-            "source": "estimate",
-            "scope": "state+history",
-            "model_max_tokens": model_max_tokens,
-            "threshold_ratio": ConstantLLM.CONTEXT_USAGE_RATIO,
-            # TUI 状态栏用：告诉用户自动 compact 会在多少 token / 百分之多少时触发
-            "auto_compact_trigger_tokens": trigger_tokens,
+            "used_tokens": used,
+            "max_tokens": full_window,
+            "full_window_tokens": full_window,
+            "remaining_tokens": max(0, full_window - used),
+            "percent": round(min(100.0, used / full_window * 100.0), 1),
+            "source": source,
+            "scope": scope,
+            "model_max_tokens": full_window,
+            "raw_estimated_tokens": max(0, int(raw_estimated_tokens)),
+            "calibration_ratio": round(self._calibration_ratio(), 4),
+            **limits,
+            "auto_compact_trigger_tokens": limits["soft_limit_tokens"],
             "auto_compact_trigger_percent": round(
-                (trigger_tokens / max_tokens) * 100.0,
+                limits["soft_limit_tokens"] / full_window * 100.0,
                 1,
             ),
         }
@@ -1744,30 +1911,17 @@ class AgentSession:
         used_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         """估算当前工具循环请求体占用，用于 UI 实时刷新 Context 指标。"""
-        model_max_tokens = self._model_max_tokens()
-        max_tokens = self._context_budget_tokens()
-        trigger_tokens = self._auto_compact_trigger_tokens()
-        used = (
+        raw = (
             used_tokens
             if used_tokens is not None
             else self._estimate_request_tokens(messages, tools_schema)
         )
-        percent = min(100.0, (used / max_tokens) * 100.0)
-        return {
-            "used_tokens": used,
-            "max_tokens": max_tokens,
-            "remaining_tokens": max(0, max_tokens - used),
-            "percent": round(percent, 1),
-            "source": "estimate",
-            "scope": "current_request",
-            "model_max_tokens": model_max_tokens,
-            "threshold_ratio": ConstantLLM.CONTEXT_USAGE_RATIO,
-            "auto_compact_trigger_tokens": trigger_tokens,
-            "auto_compact_trigger_percent": round(
-                (trigger_tokens / max_tokens) * 100.0,
-                1,
-            ),
-        }
+        return self._context_window_payload(
+            used_tokens=self._calibrated_request_tokens(raw),
+            raw_estimated_tokens=raw,
+            source="estimate",
+            scope="current_request",
+        )
 
     def _emit_context_window_update(
         self,
@@ -1826,55 +1980,15 @@ class AgentSession:
             return [*request_content, {"type": "text", "text": skill_context}]
         return request_content
 
-    # ---------- 三级阈值常量 ----------
-
-    # 预测性 compact 时,假设本轮还会增长这么多 tokens(LLM 输出 + 一次工具调用
-    # 返回)。CC 公式:min(maxOutput, 20k) + 15k。我们没有动态 maxOutput 字段,
-    # 直接取保守上限 20k。
-    PREDICTIVE_GROWTH_OUTPUT_BUDGET = 20_000
-    PREDICTIVE_GROWTH_TOOL_BUDGET = 15_000
-
-    # blocking 阈值：autocompact 失败/关闭后，窗口剩余 ≤ 这个值就拒绝继续。
-    # 注意：这个常量只用作 _full_window_blocking_threshold() 的上限参考，
-    # 实际 blocking 阈值会取 min(BLOCKING_LIMIT_BUFFER, full_window // 5)，
-    # 避免在极小测试窗口上误杀。
-    BLOCKING_LIMIT_BUFFER = 3_000
-    # Kept for compatibility with UI payloads. Compact now triggers at the
-    # configured context budget, not at an earlier percentage.
-    AUTOCOMPACT_TRIGGER_RATIO = ConstantLLM.CONTEXT_USAGE_RATIO
-
-    def _estimate_max_turn_growth(self) -> int:
-        """估算本轮请求至此之后还可能增长的 token 数。
-
-        包含两部分:
-        - 模型最终输出占用(粗略上限 20k);
-        - 一次工具调用返回(粗略上限 15k,涵盖 file_read 等大输出)。
-
-        这个值用于 predictive autocompact:如果当前请求 + 估算增长 > 状态栏
-        显示的自动 compact 触发阈值,就提前触发 compact,而不是等到 API 返回
-        413 才被动处理。
-        """
-        return self.PREDICTIVE_GROWTH_OUTPUT_BUDGET + self.PREDICTIVE_GROWTH_TOOL_BUDGET
+    # ---------- 动态上下文阈值 ----------
 
     def _auto_compact_trigger_tokens(self) -> int:
         """返回自动 compact 的触发阈值（token 数）。"""
         return max(1, self._context_budget_tokens())
 
     def _full_window_blocking_threshold(self) -> int:
-        """返回阻塞阈值：当请求 token 数 ≥ 此值时拒绝继续。
-
-        设计要点：
-        - 对于正常大小的窗口（≥15k），reserve = BLOCKING_LIMIT_BUFFER = 3000，
-          即窗口剩余不足 3000 token 时触发 blocking。
-        - 对于极小窗口（测试用 fake 模型窗口可能只有 700），直接减 3000 会变成
-          负数导致误杀。此时取 full_window // 5 作为 reserve，保证至少保留 20%
-          的窗口空间，避免假阳性。
-        - 返回值至少为 1，防止边界情况下的除零或负值。
-        """
-        full_window = self._model_max_tokens()
-        # reserve 取固定上限和动态比例的较小值，兼顾正常窗口和极小测试窗口
-        reserve = min(self.BLOCKING_LIMIT_BUFFER, max(1, full_window // 5))
-        return max(1, full_window - reserve)
+        """返回硬阻断阈值，即完整窗口扣除真实输出预留。"""
+        return self._context_limits()["hard_limit_tokens"]
 
     def _auto_compact_history(
         self,
@@ -1920,7 +2034,7 @@ class AgentSession:
             )
 
         try:
-            payload = self.compact_context()
+            payload = self.compact_context(reason=reason)
         except Exception:
             logger.exception("自动上下文 compact 失败")
             return None
@@ -1947,7 +2061,7 @@ class AgentSession:
         reason: str,
         round_idx: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        """当跨轮 state/history 达到或超过 80% 安全窗口时自动 compact。"""
+        """当跨轮完整请求基线达到动态 soft limit 时自动 compact。"""
         return self._auto_compact_history(reason=reason, round_idx=round_idx, force=False)
 
     def _maybe_auto_compact_preflight(
@@ -1960,7 +2074,8 @@ class AgentSession:
     ) -> Optional[Dict[str, Any]]:
         """Compact only when the full active-history request exceeds budget."""
         del user_query, system_instructions  # 估算直接读 messages
-        request_tokens = self._estimate_request_tokens(messages, tools_schema)
+        raw_request_tokens = self._estimate_request_tokens(messages, tools_schema)
+        request_tokens = self._calibrated_request_tokens(raw_request_tokens)
         full_window = self._model_max_tokens()
         budget_tokens = self._context_budget_tokens()
 
@@ -1971,7 +2086,7 @@ class AgentSession:
             reason="preflight_context_overflow",
             round_idx=0,
             force=True,
-            request_tokens=request_tokens,
+                request_tokens=request_tokens,
         )
         if event is not None:
             event["full_window"] = full_window
@@ -1981,8 +2096,8 @@ class AgentSession:
         blocking_threshold = self._full_window_blocking_threshold()
         if request_tokens >= blocking_threshold:
             logger.error(
-                "blocking limit reached: request=%s window=%s buffer=%s",
-                request_tokens, full_window, self.BLOCKING_LIMIT_BUFFER,
+                "blocking limit reached: request=%s window=%s hard_limit=%s",
+                request_tokens, full_window, blocking_threshold,
             )
             self.event_bus.emit(Error(
                 where="session",
@@ -2004,6 +2119,61 @@ class AgentSession:
 
         return None
 
+    def _mid_turn_compact(
+        self,
+        messages: List[Dict[str, Any]],
+        tools_schema: Optional[List[Dict[str, Any]]],
+        loop_state: Dict[str, Any],
+        *,
+        round_idx: int,
+        request_tokens: int,
+    ) -> Optional[Dict[str, Any]]:
+        """把已提交 history 与当前 in-flight 工具链一起做正式 compact。"""
+        offset = int(loop_state["commit_offset"])
+        inflight = self._extract_inflight_messages(messages, offset)
+        if loop_state["history_replaced"]:
+            source_history = [*self.history, *inflight]
+        else:
+            source_history = [
+                *self.history,
+                *list(loop_state["turn_prefix_messages"]),
+                *inflight,
+            ]
+        before_messages = len(source_history)
+        try:
+            payload = self.compact_context(
+                source_history=source_history,
+                reason="mid_turn",
+            )
+        except Exception:
+            logger.exception("工具循环 mid-turn compact 失败")
+            return None
+        if payload.get("no_op"):
+            return None
+
+        # 只有 compact 成功后才推进审计偏移，防止失败重试时丢失原始协议消息。
+        loop_state["audit_protocol"].extend(inflight)
+        loop_state["history_replaced"] = True
+        system_messages = [
+            message for message in messages
+            if isinstance(message, dict) and message.get("role") == "system"
+        ][:1]
+        messages[:] = [*system_messages, *self._sliced_history_dicts()]
+        loop_state["commit_offset"] = len(messages)
+        after_raw = self._estimate_request_tokens(messages, tools_schema)
+        return {
+            "reason": "mid_turn",
+            "round_idx": round_idx,
+            "before_messages": before_messages,
+            "after_messages": len(self.history),
+            "before_tokens": request_tokens,
+            "after_tokens": self._calibrated_request_tokens(after_raw),
+            "raw_after_tokens": after_raw,
+            "soft_limit_tokens": self._context_limits()["soft_limit_tokens"],
+            "hard_limit_tokens": self._context_limits()["hard_limit_tokens"],
+            "persisted": bool(payload.get("persisted")),
+        }
+
     # ---------- 工具循环 ----------
 
     def _tool_loop(
@@ -2011,6 +2181,8 @@ class AgentSession:
         messages: List[Dict[str, Any]],
         tools_schema: Optional[List[Dict[str, Any]]],
         token: CancelToken,
+        *,
+        loop_state: Dict[str, Any],
     ) -> tuple[int, str, TraceCollector, List[Dict[str, Any]]]:
         """工具调用主循环。返回 (rounds_used, final_answer, trace_collector, auto_compactions)。
 
@@ -2093,6 +2265,7 @@ class AgentSession:
             # 若当前请求已接近完整窗口，则停止本轮并提示正式 compact，不在循环
             # 中间替换任何旧消息内容。
             request_tokens_est = self._estimate_request_tokens(messages, tools_schema)
+            calibrated_tokens = self._calibrated_request_tokens(request_tokens_est)
             self._emit_context_window_update(
                 reason="round_start",
                 round_idx=round_idx,
@@ -2100,7 +2273,26 @@ class AgentSession:
                 tools_schema=tools_schema,
                 used_tokens=request_tokens_est,
             )
-            if request_tokens_est >= self._full_window_blocking_threshold():
+            if calibrated_tokens >= self._auto_compact_trigger_tokens():
+                compact_event = self._mid_turn_compact(
+                    messages,
+                    tools_schema,
+                    loop_state,
+                    round_idx=round_idx,
+                    request_tokens=calibrated_tokens,
+                )
+                if compact_event is not None:
+                    loop_compactions.append(compact_event)
+                    request_tokens_est = self._estimate_request_tokens(messages, tools_schema)
+                    calibrated_tokens = self._calibrated_request_tokens(request_tokens_est)
+                    self._emit_context_window_update(
+                        reason="mid_turn_compact",
+                        round_idx=round_idx,
+                        messages=messages,
+                        tools_schema=tools_schema,
+                        used_tokens=request_tokens_est,
+                    )
+            if calibrated_tokens >= self._full_window_blocking_threshold():
                 overflow_answer = (
                     partial_answer
                     or "[上下文窗口已满] 工具循环中的请求过大，已停止本轮。"
@@ -2113,7 +2305,7 @@ class AgentSession:
                     where="session",
                     message=(
                         f"context window would overflow in tool loop "
-                        f"(request {request_tokens_est} tokens)"
+                        f"(request {calibrated_tokens} tokens)"
                     ),
                     round_idx=round_idx,
                 ))
@@ -2129,10 +2321,11 @@ class AgentSession:
                     loop_compactions,
                 )
             logger.info(
-                "round start: round=%s messages=%s request_tokens_est=%s",
+                "round start: round=%s messages=%s request_tokens_est=%s calibrated_tokens=%s",
                 round_idx,
                 len(messages),
                 request_tokens_est,
+                calibrated_tokens,
             )
             if self.message_logger is not None:
                 try:
@@ -2148,6 +2341,7 @@ class AgentSession:
             # 这样 LLM 的流式输出 TextDelta 会被实时解析，<proposed_plan> 块内的
             # 文本自动路由为 PlanDelta 事件，块外文本继续走正常 TextDelta。
             plan_bus = _PlanParsingEventBus(self) if self.collaboration_mode() == "plan" else None
+            self._request_token_estimates[round_idx] = request_tokens_est
             result = self.llm.think(
                 messages,
                 tools=tools_schema,
@@ -2486,6 +2680,54 @@ class AgentSession:
                     tool_output=str(content or ""),
                 ))
         return out
+
+    def _extract_inflight_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        offset: int,
+    ) -> List[Message]:
+        """提取当前回合尚未进入 history 的 user/assistant/tool 消息。"""
+        out: List[Message] = []
+        for raw in messages[offset:]:
+            if not isinstance(raw, dict):
+                continue
+            role = raw.get("role")
+            if role == "user":
+                out.append(Message(role=MessageRole.USER, content=raw.get("content")))
+            elif role == "assistant":
+                content = raw.get("content")
+                tool_calls = raw.get("tool_calls")
+                if not content and not tool_calls:
+                    continue
+                out.append(Message.create_assistant_message(
+                    input_text=content if isinstance(content, str) else None,
+                    tool_calls=tool_calls if isinstance(tool_calls, list) else None,
+                    reasoning_content=(
+                        str(raw.get("reasoning_content"))
+                        if raw.get("reasoning_content") is not None else None
+                    ),
+                ))
+            elif role == "tool" and raw.get("tool_call_id"):
+                out.append(Message.create_tool_message(
+                    tool_call_id=str(raw.get("tool_call_id") or ""),
+                    tool_name=str(raw.get("name") or raw.get("tool_name") or ""),
+                    tool_output=str(raw.get("content") or ""),
+                ))
+        return out
+
+    @staticmethod
+    def _messages_tail_is_final_answer(messages: Sequence[Message], final_answer: str) -> bool:
+        """判断任意消息序列末尾是否已经包含最终 assistant 回答。"""
+        if not messages:
+            return False
+        last = messages[-1]
+        role = last.role.value if hasattr(last.role, "value") else str(last.role)
+        return (
+            role == "assistant"
+            and not last.tool_calls
+            and isinstance(last.content, str)
+            and last.content == final_answer
+        )
 
     def _history_tail_is_final_answer(self, final_answer: str) -> bool:
         """判断 history 末尾是否已经是本轮最终 assistant 回答。

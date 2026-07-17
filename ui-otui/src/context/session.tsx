@@ -59,6 +59,8 @@ export interface SessionState {
   promptTokens: number;
   completionTokens: number;
   cachedPromptTokens: number;
+  cacheMissTokens: number;
+  usageRequests: number;
   contextWindow: ContextWindow | null;
   round: number;
   maxRounds: number;
@@ -248,6 +250,8 @@ export function SessionProvider(props: ParentProps) {
     promptTokens: 0,
     completionTokens: 0,
     cachedPromptTokens: 0,
+    cacheMissTokens: 0,
+    usageRequests: 0,
     contextWindow: null,
     round: 0,
     maxRounds: 0,
@@ -336,6 +340,13 @@ export function SessionProvider(props: ParentProps) {
         setState("model", e.model ?? "unknown");
         setState("session", e.session ?? null);
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
+        if (e.usage !== undefined) {
+          setState("promptTokens", safeNumber(e.usage?.prompt_tokens) ?? 0);
+          setState("completionTokens", safeNumber(e.usage?.completion_tokens) ?? 0);
+          setState("cachedPromptTokens", safeNumber(e.usage?.cached_prompt_tokens) ?? 0);
+          setState("cacheMissTokens", safeNumber(e.usage?.cache_miss_tokens) ?? 0);
+          setState("usageRequests", safeNumber(e.usage?.requests) ?? 0);
+        }
         if (e.plan_state !== undefined) setState("planState", e.plan_state ?? null);
         if (e.permission_mode !== undefined) setState("permissionMode", e.permission_mode ?? "request_approval");
         if (Array.isArray(e.history)) {
@@ -609,6 +620,11 @@ export function SessionProvider(props: ParentProps) {
         setState("promptTokens", (p) => p + (safeNumber(e.prompt_tokens) ?? 0));
         setState("completionTokens", (c) => c + (safeNumber(e.completion_tokens) ?? 0));
         setState("cachedPromptTokens", (c) => c + (safeNumber(e.cached_prompt_tokens ?? e.prompt_cache_hit_tokens) ?? 0));
+        setState("cacheMissTokens", (c) => c + (
+          safeNumber(e.prompt_cache_miss_tokens)
+          ?? Math.max(0, (safeNumber(e.prompt_tokens) ?? 0) - (safeNumber(e.cached_prompt_tokens ?? e.prompt_cache_hit_tokens) ?? 0))
+        ));
+        setState("usageRequests", (r) => r + 1);
         break;
 
       case "todo_list_updated":
@@ -760,9 +776,11 @@ export function SessionProvider(props: ParentProps) {
     setState("session", payload.session ?? null);
     if (payload.plan_state !== undefined) setState("planState", payload.plan_state ?? null);
     streamingPlanId = null;
-    setState("promptTokens", 0);
-    setState("completionTokens", 0);
-    setState("cachedPromptTokens", 0);
+    setState("promptTokens", safeNumber(payload.usage?.prompt_tokens) ?? 0);
+    setState("completionTokens", safeNumber(payload.usage?.completion_tokens) ?? 0);
+    setState("cachedPromptTokens", safeNumber(payload.usage?.cached_prompt_tokens) ?? 0);
+    setState("cacheMissTokens", safeNumber(payload.usage?.cache_miss_tokens) ?? 0);
+    setState("usageRequests", safeNumber(payload.usage?.requests) ?? 0);
     if (payload.context_window !== undefined) setState("contextWindow", payload.context_window ?? null);
     // 切会话即结束上一会话的流式态，清空 round / busy，防止残留动效
     setState("busy", false);

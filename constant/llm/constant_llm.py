@@ -55,6 +55,7 @@ class ConstantLLM:
     ENV_IS_TOOL = "IS_TOOL"
     ENV_IS_REASONING = "IS_REASONING"
     ENV_MAX_TOKENS = "MAX_TOKENS"
+    ENV_MAX_OUTPUT_TOKENS = "MAX_OUTPUT_TOKENS"
     ENV_IMAGE_ABILITY = "IMAGE_ABILITY"
 
     # 当模型没有在 llm_dict 中登记 max_tokens 时使用的兜底窗口。
@@ -62,11 +63,10 @@ class ConstantLLM:
     # 缺失 max_tokens 时用它兜底，避免一条配置缺失就让状态栏与自动 compact
     # 整体失效。真实模型应在 llm_dict 显式登记，不要依赖这个兜底。
     DEFAULT_MAX_TOKENS = 128000
-
-    # agent 实际用于构造 prompt 和触发自动 compact 的安全比例。
-    # 用户确认希望“取模型上下文长度的 80% 作为上下文”，剩余 20% 留给模型输出、
-    # provider 侧额外开销以及 token 估算误差；后端与 TUI 都复用这个比例。
-    CONTEXT_USAGE_RATIO = 0.8
+    # 未配置模型输出上限时使用 16K。完整窗口与输出上限必须分开建模，否则大窗口
+    # 模型会因为固定百分比长期闲置大量上下文，或者在输出阶段没有足够空间。
+    DEFAULT_MAX_OUTPUT_TOKENS = 16_000
+    VALID_OUTPUT_TOKEN_PARAMS = frozenset({"max_tokens", "max_completion_tokens", "none"})
 
     # 模型能力登记表。每个条目三个运行时字段会被真正消费：
     #   is_tool        -> cb_agents._is_able_Function_Calling，决定是否走 FC 代码路径
@@ -249,24 +249,53 @@ class ConstantLLM:
         return max(max_tokens, 1) if max_tokens > 0 else fallback
 
     @classmethod
-    def context_window_tokens(
-        cls,
-        model: str | None,
-        ratio: float | None = None,
-        default: int | None = None,
-    ) -> int:
-        """返回 agent 可安全使用的上下文预算。
-
-        分子来自模型真实窗口，分母使用 ``CONTEXT_USAGE_RATIO``，默认是 80%。
-        自动 compact 的触发阈值、TUI 底部 Context 指标以及启动时的
-        ContextBuilder 配置都应该使用这个值，避免“显示没满但请求已超窗”或
-        “显示很满但后端还不压缩”的错位。
-        """
-        max_tokens = cls.model_max_tokens(model, default=default)
-        safe_ratio = cls.CONTEXT_USAGE_RATIO if ratio is None else ratio
+    def model_max_output_tokens(cls, model: str | None, default: int | None = None) -> int:
+        """读取单次模型输出上限，并保证它小于完整上下文窗口。"""
+        fallback = int(default or cls.DEFAULT_MAX_OUTPUT_TOKENS)
+        env_val = _parse_token_count_env(os.getenv(cls.ENV_MAX_OUTPUT_TOKENS))
+        reg = cls._registry_field(model, "max_output_tokens")
         try:
-            safe_ratio = float(safe_ratio)
-        except Exception:
-            safe_ratio = cls.CONTEXT_USAGE_RATIO
-        safe_ratio = min(max(safe_ratio, 0.01), 1.0)
-        return max(1, int(max_tokens * safe_ratio))
+            configured = env_val if env_val is not None else reg
+            value = int(configured if configured is not None else fallback)
+        except (TypeError, ValueError):
+            value = fallback
+        full_window = cls.model_max_tokens(model)
+        if env_val is None and reg is None:
+            # fake model 与本地小模型常用几千 token 窗口；未显式配置时按 20% 收缩，
+            # 避免默认 16K 把整个输入区间吃光。正常窗口仍保持 16K 默认值。
+            value = min(value, max(1, full_window // 5))
+        return min(max(value, 1), max(1, full_window - 1))
+
+    @classmethod
+    def output_token_param(cls, model: str | None) -> str:
+        """返回 OpenAI-compatible 请求使用的输出上限参数名。"""
+        raw = str(cls._registry_field(model, "output_token_param") or "max_tokens").strip().lower()
+        return raw if raw in cls.VALID_OUTPUT_TOKEN_PARAMS else "max_tokens"
+
+    @classmethod
+    def context_limits(cls, model: str | None) -> dict[str, int]:
+        """计算完整窗口、输出预留、估算余量以及 soft/hard 边界。"""
+        full_window = cls.model_max_tokens(model)
+        max_output = cls.model_max_output_tokens(model)
+        hard_limit = max(1, full_window - max_output)
+        margin = min(16_000, max(2_000, int(full_window * 0.02)))
+        # 极小测试窗口无法容纳 2K 固定余量，此时仍保留至少 1 token 的软区间。
+        margin = min(margin, max(0, hard_limit // 5), max(0, hard_limit - 1))
+        return {
+            "full_window_tokens": full_window,
+            "max_output_tokens": max_output,
+            "estimation_margin_tokens": margin,
+            "soft_limit_tokens": max(1, hard_limit - margin),
+            "hard_limit_tokens": hard_limit,
+        }
+
+    @classmethod
+    def context_window_tokens(cls, model: str | None, default: int | None = None) -> int:
+        """兼容旧调用方，返回动态 soft limit，不再使用固定窗口百分比。"""
+        if default is not None and not model:
+            full_window = max(1, int(default))
+            output = min(cls.DEFAULT_MAX_OUTPUT_TOKENS, max(1, full_window - 1))
+            hard_limit = max(1, full_window - output)
+            margin = min(16_000, max(2_000, int(full_window * 0.02)), max(0, hard_limit - 1))
+            return max(1, hard_limit - margin)
+        return cls.context_limits(model)["soft_limit_tokens"]

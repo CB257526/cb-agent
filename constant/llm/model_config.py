@@ -84,6 +84,8 @@ class ModelChoice:
     is_tool: bool
     is_reasoning: bool
     max_tokens: int
+    max_output_tokens: int
+    output_token_param: str
     image_ability: bool
 
     def capability_config(self) -> Dict[str, Any]:
@@ -91,6 +93,8 @@ class ModelChoice:
             "is_tool": self.is_tool,
             "is_reasoning": self.is_reasoning,
             "max_tokens": self.max_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "output_token_param": self.output_token_param,
             "image_ability": self.image_ability,
         }
 
@@ -104,6 +108,8 @@ class ModelChoice:
             "is_tool": self.is_tool,
             "is_reasoning": self.is_reasoning,
             "max_tokens": self.max_tokens,
+            "max_output_tokens": self.max_output_tokens,
+            "output_token_param": self.output_token_param,
             "image_ability": self.image_ability,
             "base_url": self.base_url,
         }
@@ -287,6 +293,19 @@ def _build_choice(provider: ModelProvider, model_id: str, model_data: Dict[str, 
         or _as_token_count(registered.get("max_tokens") if isinstance(registered, dict) else None)
         or ConstantLLM.DEFAULT_MAX_TOKENS
     )
+    max_output_tokens = (
+        _as_token_count(model_data.get("max_output_tokens"))
+        or _as_token_count(registered.get("max_output_tokens") if isinstance(registered, dict) else None)
+        or ConstantLLM.DEFAULT_MAX_OUTPUT_TOKENS
+    )
+    max_output_tokens = min(max_output_tokens, max(1, max_tokens - 1))
+    output_token_param = str(
+        model_data.get("output_token_param")
+        or (registered.get("output_token_param") if isinstance(registered, dict) else None)
+        or "max_tokens"
+    ).strip().lower()
+    if output_token_param not in ConstantLLM.VALID_OUTPUT_TOKEN_PARAMS:
+        output_token_param = "max_tokens"
     key = f"{provider.key}:{model_id}" if provider.key else f"{index}:{model_id}"
     return ModelChoice(
         key=key,
@@ -299,6 +318,8 @@ def _build_choice(provider: ModelProvider, model_id: str, model_data: Dict[str, 
         is_tool=True if is_tool is None else bool(is_tool),
         is_reasoning=False if is_reasoning is None else bool(is_reasoning),
         max_tokens=max_tokens,
+        max_output_tokens=max_output_tokens,
+        output_token_param=output_token_param,
         image_ability=False if image_ability is None else bool(image_ability),
     )
 

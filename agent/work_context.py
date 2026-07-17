@@ -1017,8 +1017,76 @@ class LocalSessionStore:
         self.state = self._new_state()
         self.active_dir.mkdir(parents=True, exist_ok=True)
         self._write_json(self.active_dir / "state.json", self.state)
+        self._write_json(self.active_dir / "usage.json", self._empty_usage())
         self._write_index()
         return self._session_summary_from_dir(self.active_dir)
+
+    @staticmethod
+    def _empty_usage() -> Dict[str, Any]:
+        """返回新会话的累计用量初始值。"""
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_prompt_tokens": 0,
+            "cache_miss_tokens": 0,
+            "requests": 0,
+            "updated_at": _now_iso(),
+        }
+
+    def load_usage(self) -> Dict[str, Any]:
+        """读取当前会话累计用量；旧会话缺文件时按零值兼容。"""
+        if not self.active_session_id:
+            return self._empty_usage()
+        raw = self._read_json(self.active_dir / "usage.json", {})
+        usage = self._empty_usage()
+        if isinstance(raw, dict):
+            for key in ("prompt_tokens", "completion_tokens", "cached_prompt_tokens", "cache_miss_tokens", "requests"):
+                usage[key] = max(0, int(raw.get(key) or 0))
+            usage["updated_at"] = str(raw.get("updated_at") or usage["updated_at"])
+        return usage
+
+    def add_token_usage(self, event: Any) -> Dict[str, Any]:
+        """把一次 provider usage 原子累加到当前会话。"""
+        self.ensure_active()
+        usage = self.load_usage()
+        prompt = max(0, int(getattr(event, "prompt_tokens", 0) or 0))
+        completion = max(0, int(getattr(event, "completion_tokens", 0) or 0))
+        cached = max(0, int(
+            getattr(event, "cached_prompt_tokens", None)
+            or getattr(event, "prompt_cache_hit_tokens", None)
+            or 0
+        ))
+        explicit_miss = getattr(event, "prompt_cache_miss_tokens", None)
+        miss = max(0, int(explicit_miss if explicit_miss is not None else max(0, prompt - cached)))
+        usage["prompt_tokens"] += prompt
+        usage["completion_tokens"] += completion
+        usage["cached_prompt_tokens"] += min(cached, prompt) if prompt else cached
+        usage["cache_miss_tokens"] += miss
+        usage["requests"] += 1
+        usage["updated_at"] = _now_iso()
+        self._write_json(self.active_dir / "usage.json", usage)
+        return usage
+
+    def load_token_calibration(self, key: str) -> Optional[float]:
+        """读取项目级 provider/model 估算校准系数。"""
+        raw = self._read_json(self.root / "token-calibration.json", {})
+        item = raw.get(key) if isinstance(raw, dict) else None
+        try:
+            return float((item or {}).get("ratio")) if isinstance(item, dict) else None
+        except (TypeError, ValueError):
+            return None
+
+    def save_token_calibration(self, key: str, ratio: float, samples: int) -> None:
+        """持久化项目级 provider/model 估算校准系数。"""
+        path = self.root / "token-calibration.json"
+        raw = self._read_json(path, {})
+        data = raw if isinstance(raw, dict) else {}
+        data[key] = {
+            "ratio": round(float(ratio), 6),
+            "samples": max(1, int(samples)),
+            "updated_at": _now_iso(),
+        }
+        self._write_json(path, data)
 
     def switch_session(self, session_id: str) -> Dict[str, Any]:
         """切换 active session，并返回切换后的摘要。
@@ -1502,6 +1570,28 @@ class LocalSessionStore:
                 except Exception:
                     logger.exception("failed to roll back compact snapshot file %s", path)
             raise
+
+    def align_compaction_transcript_offset(
+        self,
+        *,
+        history_payload: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """把最近 compact 锚点推进到当前 transcript 末尾并刷新 replacement history。
+
+        mid-turn compact 发生时本轮 transcript 尚未提交；回合提交成功后必须推进
+        offset，否则下次恢复会把已经包含在 replacement history 的本轮再追加一次。
+        """
+        if not self.active_session_id:
+            return
+        path = self.active_dir / "compact.json"
+        compact = self._read_json(path, {})
+        if not isinstance(compact, dict) or not compact:
+            return
+        compact["transcript_offset"] = self._count_transcript_turns(self.active_dir)
+        if history_payload is not None:
+            compact["history"] = history_payload
+            compact["after_messages"] = len(history_payload)
+        self._write_json(path, compact)
 
     def _read_transcript_items(self, session_dir: Path) -> List[Dict[str, Any]]:
         """读取 transcript.jsonl 为结构化行列表。

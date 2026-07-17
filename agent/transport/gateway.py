@@ -875,6 +875,7 @@ class Gateway:
                 "session": session_payload.get("session"),
                 "history": session_payload.get("history", []),
                 "context_window": session_payload.get("context_window"),
+                "usage": session_payload.get("usage"),
                 "plan_state": session_payload.get("plan_state"),
                 "subagent_tasks": session_payload.get("subagent_tasks", []),
                 "permission_mode": self._current_permission_mode(),

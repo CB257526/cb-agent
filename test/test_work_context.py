@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -550,6 +551,40 @@ class TestCompactBoundaryPersistence(unittest.TestCase):
             # boundary 之前的旧消息不再注入
             self.assertNotIn("旧一", text)
             self.assertNotIn("老答一", text)
+
+
+class TestSessionUsagePersistence(unittest.TestCase):
+    def test_usage_is_accumulated_and_isolated_by_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            first_id = store.active_session_id
+            store.add_token_usage(SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=20,
+                cached_prompt_tokens=70,
+                prompt_cache_hit_tokens=None,
+                prompt_cache_miss_tokens=None,
+            ))
+            usage = store.load_usage()
+            self.assertEqual(usage["prompt_tokens"], 100)
+            self.assertEqual(usage["cached_prompt_tokens"], 70)
+            self.assertEqual(usage["cache_miss_tokens"], 30)
+            self.assertEqual(usage["completion_tokens"], 20)
+            self.assertEqual(usage["requests"], 1)
+
+            second = store.create_session()
+            self.assertEqual(store.load_usage()["requests"], 0)
+            store.switch_session(first_id)  # type: ignore[arg-type]
+            self.assertEqual(store.load_usage()["requests"], 1)
+            self.assertNotEqual(second["session_id"], first_id)
+
+    def test_old_session_without_usage_file_defaults_to_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            (store.active_dir / "usage.json").unlink()
+            self.assertEqual(store.load_usage()["prompt_tokens"], 0)
+            self.assertEqual(store.load_usage()["requests"], 0)
 
 
 if __name__ == "__main__":

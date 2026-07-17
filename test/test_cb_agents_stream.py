@@ -71,6 +71,8 @@ def _make_llm() -> CbAgentsLLM:
     """绕开 __init__ 校验，构造一个最小可用的 LLM 实例。"""
     llm = CbAgentsLLM.__new__(CbAgentsLLM)
     llm.model = "test-model"
+    llm.max_output_tokens = 16000
+    llm.output_token_param = "max_tokens"
     llm.is_Function_Calling = True  # 子类用例可覆盖
     llm.client = SimpleNamespace()  # 不会被实际调用
     # _iter_chat_stream 依赖这些运行时字段；真实实例由 __init__ 设置，测试里
@@ -192,6 +194,37 @@ class TestThinkWithFunctionCallingEvents(unittest.TestCase):
                 completions=SimpleNamespace(create=fake_create),
             ),
         )
+
+    def test_output_limit_uses_configured_parameter(self):
+        captured = {}
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return iter([])
+
+        self.llm.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)),
+        )
+        self.llm.output_token_param = "max_completion_tokens"
+        self.llm.max_output_tokens = 1234
+        self.llm._think_with_Function_Calling(messages=[], event_bus=self.bus, round_idx=1)
+        self.assertEqual(captured["max_completion_tokens"], 1234)
+        self.assertNotIn("max_tokens", captured)
+
+    def test_output_limit_can_be_disabled(self):
+        captured = {}
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return iter([])
+
+        self.llm.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)),
+        )
+        self.llm.output_token_param = "none"
+        self.llm._think_with_Function_Calling(messages=[], event_bus=self.bus, round_idx=1)
+        self.assertNotIn("max_tokens", captured)
+        self.assertNotIn("max_completion_tokens", captured)
 
     def test_text_delta_events(self):
         self._stream([

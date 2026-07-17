@@ -137,6 +137,7 @@ export interface GatewayReady extends BaseEvent {
   session?: SessionSummary | null;
   /** 后端启动时从 active session 恢复出的普通 history。 */
   history?: RestoredHistoryMessage[];
+  usage?: SessionUsage;
   /** 启动恢复后当前会话的上下文窗口估算。 */
   context_window?: ContextWindow | null;
   plan_state?: PlanState | null;
@@ -413,18 +414,32 @@ export interface RestoredHistoryMessage {
 /** 后端估算的当前 active 会话上下文窗口占用。 */
 export interface ContextWindow {
   used_tokens: number;
-  /** agent 实际使用的安全窗口，默认是模型 max_tokens 的 80%。 */
+  /** 模型声明的完整上下文窗口。 */
   max_tokens: number;
+  full_window_tokens?: number;
   remaining_tokens?: number;
   percent: number;
-  /** 模型声明的完整上下文窗口，来自 constant/llm/constant_llm.py。 */
   model_max_tokens?: number;
-  /** max_tokens 相对 model_max_tokens 的比例，默认 0.8。 */
-  threshold_ratio?: number;
+  max_output_tokens?: number;
+  estimation_margin_tokens?: number;
+  soft_limit_tokens?: number;
+  hard_limit_tokens?: number;
+  raw_estimated_tokens?: number;
+  calibration_ratio?: number;
   auto_compact_trigger_tokens?: number;
   auto_compact_trigger_percent?: number;
   source?: string;
   scope?: string;
+}
+
+/** 当前主会话跨请求累计的 provider Usage。 */
+export interface SessionUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_prompt_tokens: number;
+  cache_miss_tokens: number;
+  requests: number;
+  updated_at?: string;
 }
 
 /** 自动 compact 的单次审计事件。字段保持宽松，便于后端演进。 */
@@ -453,6 +468,7 @@ export interface SessionPayload {
   session: SessionSummary | null;
   history: RestoredHistoryMessage[];
   context_window?: ContextWindow | null;
+  usage?: SessionUsage;
   plan_state?: PlanState | null;
   subagent_tasks?: SubagentTaskSnapshot[];
 }
@@ -497,6 +513,8 @@ export interface ModelChoice {
   is_tool?: boolean;
   is_reasoning?: boolean;
   max_tokens?: number;
+  max_output_tokens?: number;
+  output_token_param?: "max_tokens" | "max_completion_tokens" | "none";
   image_ability?: boolean;
   base_url?: string;
 }
@@ -510,6 +528,8 @@ export interface ModelListPayload {
     is_tool?: boolean;
     is_reasoning?: boolean;
     max_tokens?: number;
+    max_output_tokens?: number;
+    output_token_param?: "max_tokens" | "max_completion_tokens" | "none";
     image_ability?: boolean;
   };
   config_path?: string | null;

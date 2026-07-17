@@ -354,7 +354,8 @@ class TestGatewayDispatch(unittest.TestCase):
         ready = [m for m in msgs if m.get("params", {}).get("type") == "gateway_ready"][0]
         self.assertIn("context_window", ready["params"])
         self.assertIn("subagent_tasks", ready["params"])
-        self.assertEqual(ready["params"]["context_window"]["scope"], "state+history")
+        self.assertEqual(ready["params"]["context_window"]["scope"], "next_request_baseline")
+        self.assertIn("usage", ready["params"])
         done = [m for m in msgs if m.get("params", {}).get("type") == "done"][0]
         self.assertIn("context_window", done["params"])
         self.assertGreater(done["params"]["context_window"]["used_tokens"], 0)

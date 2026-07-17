@@ -31,7 +31,8 @@ if sys.platform == "win32":
 from agent.cancel import get_current_cancel_token
 from agent.event_bus import EventBus, collect_all
 from agent.events import (
-    Cancelled, Done, Error, ReasoningDelta, RoundEnd, RoundStart, TextDelta,
+    Cancelled, ContextWindowUpdated, Done, Error, ReasoningDelta, RoundEnd, RoundStart,
+    TextDelta, TokenUsage,
 )
 from agent.executor import ToolExecutor
 from agent.session import AgentSession
@@ -94,7 +95,7 @@ def _tc(name: str, args: str = "{}", call_id: str = "") -> dict:
 # 这些值（如 MAX_TOKENS=1024K、IMAGE_ABILITY=False）灌进了 os.environ，
 # 会盖掉测试用 llm_dict monkeypatch 的窗口/视觉能力。测试期间清掉它们，
 # 让用例只受 llm_dict monkeypatch 控制。
-_CAPABILITY_ENV_KEYS = ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "IMAGE_ABILITY")
+_CAPABILITY_ENV_KEYS = ("IS_TOOL", "IS_REASONING", "MAX_TOKENS", "MAX_OUTPUT_TOKENS", "IMAGE_ABILITY")
 
 
 def _isolate_capability_env(test_case: unittest.TestCase) -> None:
@@ -154,10 +155,10 @@ class TestAgentSessionBasic(unittest.TestCase):
         self.assertEqual(dones[0].rounds_used, 1)
         self.assertIsInstance(dones[0].context_window, dict)
         self.assertGreater(dones[0].context_window["used_tokens"], 0)
-        self.assertEqual(dones[0].context_window["scope"], "state+history")
+        self.assertEqual(dones[0].context_window["scope"], "next_request_baseline")
 
-    def test_context_window_uses_model_config_at_eighty_percent(self):
-        """Context 指标使用 constant_llm.py 里的模型窗口，并取 80% 作为安全预算。"""
+    def test_context_window_uses_dynamic_limits_and_full_window_denominator(self):
+        """Context 分母使用完整窗口，并单独暴露动态 soft/hard limit。"""
         original = ConstantLLM.llm_dict.get("fake")
         ConstantLLM.llm_dict["fake"] = {
             "is_tool": True,
@@ -170,14 +171,45 @@ class TestAgentSessionBasic(unittest.TestCase):
             s = self._make_session(llm)
             s.chat("q")
             usage = s.context_window_usage()
-            self.assertEqual(usage["model_max_tokens"], 1000)
-            self.assertEqual(usage["max_tokens"], 800)
-            self.assertEqual(usage["threshold_ratio"], 0.8)
+            self.assertEqual(usage["full_window_tokens"], 1000)
+            self.assertEqual(usage["max_tokens"], 1000)
+            self.assertEqual(usage["max_output_tokens"], 200)
+            self.assertEqual(usage["hard_limit_tokens"], 800)
+            self.assertEqual(usage["soft_limit_tokens"], 640)
         finally:
             if original is None:
                 ConstantLLM.llm_dict.pop("fake", None)
             else:
                 ConstantLLM.llm_dict["fake"] = original
+
+    def test_provider_usage_updates_context_calibration_and_session_usage(self):
+        """provider 实际 usage 覆盖展示值，并持久化当前会话累计量。"""
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            s = self._make_session(
+                FakeLLM([]),
+                session_store=store,
+            )
+            s._request_token_estimates[1] = 120
+
+            self.bus.emit(TokenUsage(
+                prompt_tokens=100,
+                completion_tokens=5,
+                total_tokens=105,
+                cached_prompt_tokens=80,
+                model="fake",
+                round_idx=1,
+            ))
+
+            usage = s.current_session_payload()["usage"]
+            self.assertEqual(usage["prompt_tokens"], 100)
+            self.assertEqual(usage["cached_prompt_tokens"], 80)
+            self.assertEqual(usage["completion_tokens"], 5)
+            updates = [event for event in self.events if isinstance(event, ContextWindowUpdated)]
+            self.assertEqual(updates[-1].context_window["used_tokens"], 100)
+            self.assertEqual(updates[-1].context_window["raw_estimated_tokens"], 120)
+            self.assertEqual(updates[-1].context_window["source"], "provider")
+            self.assertAlmostEqual(updates[-1].context_window["calibration_ratio"], 100 / 120, places=3)
 
     def test_image_capable_model_sends_image_but_history_keeps_summary(self):
         """支持视觉的模型当前轮收到 image_url，但跨轮 history 不保存 data URI。"""
@@ -643,8 +675,8 @@ class TestAgentSessionBasic(unittest.TestCase):
     def test_preflight_auto_compact_when_full_request_exceeds_budget(self):
         """验证 preflight 只在完整请求超过安全上下文预算时触发 compact。
 
-        场景：模型窗口 20000，context_budget = 16000（80%），
-        注入 16500 × "word " 让 request_tokens 超过 context_budget，然后发 chat。
+        场景：模型窗口 20000，默认输出预留 4000，动态 soft limit 为 12800，
+        注入 16500 × "word " 让 request_tokens 超过 soft limit，然后发 chat。
 
         预期行为：
         - chat 正常返回 "ok"（compact 成功释放空间后继续）
@@ -825,6 +857,61 @@ class TestAgentSessionBasic(unittest.TestCase):
             dones = [e for e in self.events if isinstance(e, Done)]
             events = (dones[-1].auto_compact or {}).get("events", [])
             self.assertFalse(any(item.get("reason") == "tool_loop" for item in events))
+        finally:
+            if original is None:
+                ConstantLLM.llm_dict.pop("fake", None)
+            else:
+                ConstantLLM.llm_dict["fake"] = original
+
+    def test_mid_turn_compact_rebuilds_request_and_continues(self):
+        """工具结果把请求推过 soft limit 后执行正式 compact，并继续得到最终回答。"""
+        original = ConstantLLM.llm_dict.get("fake")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        session_root = Path(temp_dir.name) / ".cbagent" / "sessions"
+        try:
+            ConstantLLM.llm_dict["fake"] = {
+                "is_tool": True,
+                "is_reasoning": False,
+                "image_ability": False,
+                "max_tokens": 12000,
+                "max_output_tokens": 2000,
+            }
+            llm = FakeLLM([
+                {"answer": "", "tool_calls": [_tc("file_read", "{}", call_id="call_mid")]},
+                {"answer": "done", "tool_calls": []},
+            ])
+            self.registry.execute_tool = MagicMock(return_value="word " * 30000)
+            self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+            s = AgentSession(
+                llm=llm,
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=self.bus,
+                ctx_enabled=False,
+                session_store=LocalSessionStore(session_root),
+            )
+
+            answer = s.chat("读取大文件后继续")
+
+            self.assertEqual(answer, "done")
+            self.assertEqual(len(llm.calls), 2)
+            second_messages = llm.calls[1]["messages"]
+            self.assertTrue(any(
+                "【上下文压缩】" in str(message.get("content") or "")
+                for message in second_messages
+            ))
+            dones = [event for event in self.events if isinstance(event, Done)]
+            compact_events = (dones[-1].auto_compact or {}).get("events", [])
+            self.assertTrue(any(event.get("reason") == "mid_turn" for event in compact_events))
+
+            restored = LocalSessionStore(session_root).load_latest_history()
+            restored_text = [str(message.content or "") for message in restored]
+            self.assertTrue(any("【上下文压缩】" in text for text in restored_text))
+            self.assertEqual(sum(text == "done" for text in restored_text), 1)
+            transcript = next(session_root.glob("session_*/transcript.jsonl"))
+            transcript_text = transcript.read_text(encoding="utf-8")
+            self.assertEqual(transcript_text.count('"user_query": "读取大文件后继续"'), 1)
         finally:
             if original is None:
                 ConstantLLM.llm_dict.pop("fake", None)
@@ -1155,7 +1242,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(len(s.history), 5)
             self.assertEqual(len(s.export_history()), 4)
 
-            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 40):
                 payload = s.compact_context()
             self.assertEqual(payload["before_messages"], 5)
             self.assertEqual(payload["after_messages"], 3)
