@@ -10,13 +10,13 @@
  */
 
 import { createMemo, Show } from "solid-js";
-import { SyntaxStyle } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import type { ChatItem } from "../types.js";
+import { createMarkdownSyntaxStyle, textAttributes } from "../theme.js";
 
 // 默认语法样式，整个进程共用一份
-const syntaxStyle = SyntaxStyle.create();
+const syntaxStyle = createMarkdownSyntaxStyle();
 
 export function AssistantMessage(props: { item: ChatItem; isLast: boolean }) {
   const theme = useTheme();
@@ -26,7 +26,11 @@ export function AssistantMessage(props: { item: ChatItem; isLast: boolean }) {
   const streaming = createMemo(() => state.busy && props.isLast);
 
   return (
-    <box paddingLeft={1} marginTop={1}>
+    <box position="relative" flexDirection="column" marginTop={1} paddingLeft={2} minWidth={0}>
+      {/* Markdown 需要直接获得剩余整行宽度，前缀使用绝对定位避免参与横向测量。 */}
+      <box position="absolute" left={0} top={0} width={2}>
+        <text fg={theme.text} attributes={textAttributes.muted}>• </text>
+      </box>
       <Show
         when={!streaming()}
         fallback={<text fg={theme.text}>{props.item.text}</text>}

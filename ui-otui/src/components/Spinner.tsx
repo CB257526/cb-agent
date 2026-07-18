@@ -9,10 +9,11 @@
  */
 
 import { createSignal, onCleanup } from "solid-js";
+import type { ColorInput } from "@opentui/core";
 
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-export function Spinner(props: { color?: string; label?: string }) {
+export function Spinner(props: { color?: ColorInput; label?: string }) {
   const [frame, setFrame] = createSignal(0);
   const timer = setInterval(() => setFrame((f) => (f + 1) % FRAMES.length), 80);
   onCleanup(() => clearInterval(timer));

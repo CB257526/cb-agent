@@ -1,51 +1,79 @@
 /**
- * cb-agent OTUI 暗色主题。
+ * cb-agent OTUI 的终端原生主题。
  *
- * 使用语义化命名，并补齐 OpenTUI 需要的实心背景色与边框激活色。
- * OpenTUI 的 box/text 走 truecolor，统一用 hex 字面量。
- *
- * 命名遵循语义而非字面颜色：用 theme.success 而不是 "green"，将来调色或加
- * light 主题只改这一处。
+ * 与网页界面不同，终端用户通常已经选择了自己可读的前景色和背景色。这里使用
+ * OpenTUI 的 default/indexed 颜色意图，让颜色最终交给终端调色板解释，避免固定
+ * truecolor 在浅色主题或高对比主题中失去可读性。
  */
 
-export const theme = {
-  /** 主品牌色：banner / 重点边框 */
-  primary: "#88c0ff",
-  /** 浅蓝：user 消息左边框 */
-  accent: "#7aa2f7",
-  /** 工具/选择项高亮 */
-  suggestion: "#82aaff",
-  /** 暖橙：权限/中断等"需注意但非错误" */
-  permission: "#f7c47a",
+import { RGBA, SyntaxStyle, TextAttributes } from "@opentui/core";
 
-  /** 状态语义色 */
-  success: "#9ece6a",
-  error: "#f7768e",
-  warning: "#e0af68",
-  info: "#7dcfff",
-
-  /** 文本 */
-  text: "#c0caf5",
-  textMuted: "#565f89",
-  textInverse: "#1a1b26",
-
-  /** 背景层次（OpenTUI 用实心色填充） */
-  background: "#1a1b26",
-  backgroundPanel: "#1f2335",
-  backgroundElement: "#292e42",
-
-  /** 边框/分隔 */
-  border: "#3b4261",
-  borderActive: "#88c0ff",
-
-  /** 工具调用块的低调边框 */
-  bashBorder: "#5c6370",
-
-  /** assistant 标识颜色 */
-  agent: "#bb9af7",
-
-  /** markdown 正文（done 后解析时用） */
-  markdownText: "#c0caf5",
+const ansi = {
+  red: RGBA.fromIndex(1),
+  green: RGBA.fromIndex(2),
+  magenta: RGBA.fromIndex(5),
+  cyan: RGBA.fromIndex(6),
+  subtle: RGBA.fromIndex(8),
 } as const;
+
+export const theme = {
+  /** 输入、选择和主要交互统一使用青色。 */
+  primary: ansi.cyan,
+  accent: ansi.cyan,
+  suggestion: ansi.cyan,
+  info: ansi.cyan,
+
+  /** Agent、计划和需注意状态使用洋红色，避免引入额外蓝黄体系。 */
+  agent: ansi.magenta,
+  permission: ansi.magenta,
+  warning: ansi.magenta,
+
+  /** 成功与失败沿用终端最稳定的绿红语义。 */
+  success: ansi.green,
+  error: ansi.red,
+
+  /** 正文和背景跟随用户终端；次要色仅用于无法设置 DIM 属性的控件。 */
+  text: RGBA.defaultForeground(),
+  textMuted: ansi.subtle,
+  textInverse: RGBA.defaultBackground(),
+  markdownText: RGBA.defaultForeground(),
+
+  /** 主画布和弹窗都使用终端默认背景；保持自适应的同时确保重绘能清除旧字符。 */
+  background: RGBA.defaultBackground(),
+  backgroundPanel: RGBA.defaultBackground(),
+  backgroundElement: RGBA.defaultBackground(),
+
+  /** 边框只承担结构提示，不参与品牌表达。 */
+  border: ansi.subtle,
+  borderActive: ansi.cyan,
+  bashBorder: ansi.subtle,
+} as const;
+
+/** 文字层级优先通过属性表达，避免把“弱化”绑定到某个固定灰色。 */
+export const textAttributes = {
+  muted: TextAttributes.DIM,
+  mutedItalic: TextAttributes.DIM | TextAttributes.ITALIC,
+  selected: TextAttributes.BOLD,
+} as const;
+
+/**
+ * Markdown 内部使用独立的文本缓冲，不会稳定继承外层 `<markdown fg>`。为常用 markup
+ * scope 显式注册终端色，既保证正文可见，也避免退回固定 truecolor 主题。
+ */
+export function createMarkdownSyntaxStyle(): SyntaxStyle {
+  return SyntaxStyle.fromStyles({
+    default: { fg: theme.markdownText },
+    "markup.heading": { fg: theme.agent, bold: true },
+    "markup.strong": { fg: theme.text, bold: true },
+    "markup.italic": { fg: theme.text, italic: true },
+    "markup.raw": { fg: theme.success },
+    "markup.link": { fg: theme.primary },
+    "markup.link.url": { fg: theme.primary, underline: true },
+    "markup.link.label": { fg: theme.primary },
+    "markup.quote": { fg: theme.success, dim: true },
+    "markup.list": { fg: theme.primary },
+    conceal: { fg: theme.textMuted, dim: true },
+  });
+}
 
 export type ThemeKey = keyof typeof theme;

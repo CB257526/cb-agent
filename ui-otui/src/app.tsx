@@ -2,15 +2,14 @@
  * cb-agent OTUI 主壳。
  *
  * Provider 栈（由外到内）：Theme → Transport → Session。
- * 布局（M2）：纵向 [消息列表 (flexGrow) | Prompt 输入]。
- * M6 会在右侧加 Sidebar、底部加 Footer/StatusBar，扩成三栏。
+ * 布局：单列 [会话标题 | 消息列表 | 活动问询 | Prompt | Footer]。
  *
  * Ctrl-C 行为：busy 时取消当前轮，空闲时退出（quit + 销毁渲染器）。
  */
 
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent } from "@opentui/core";
-import { onCleanup, Show } from "solid-js";
+import { createMemo, onCleanup, Show } from "solid-js";
 import type { Transport } from "./transport.js";
 import { theme } from "./theme.js";
 import { ThemeProvider } from "./context/theme.js";
@@ -18,11 +17,13 @@ import { TransportProvider } from "./context/transport.js";
 import { SessionProvider, useSession } from "./context/session.js";
 import { MessageList } from "./components/MessageList.js";
 import { Prompt } from "./components/Prompt.js";
-import { Sidebar } from "./components/Sidebar.js";
 import { Footer } from "./components/Footer.js";
 import { ActivityPanel } from "./components/ActivityPanel.js";
 import { SelectDialog } from "./components/SelectDialog.js";
+import { QuestionPanel } from "./components/QuestionPanel.js";
+import { SessionHeader } from "./components/SessionHeader.js";
 import { writeClipboardText } from "./clipboardImage.js";
+import { getHorizontalPadding } from "./layout.js";
 
 export function App(props: { transport: Transport }) {
   return (
@@ -40,6 +41,15 @@ function Shell(props: { transport: Transport }) {
   const dimensions = useTerminalDimensions();
   const renderer = useRenderer();
   const { state, toggleActivity, setItems, closeDialog, appendSystem } = useSession();
+  const horizontalPadding = () => getHorizontalPadding(dimensions().width);
+  const activeQuestion = createMemo(() =>
+    state.items.find(
+      (item) =>
+        item.role === "ask_question"
+        && !item.answered
+        && item.questionId === state.activeQuestionId,
+    ),
+  );
 
   const copySelectionText = (text: string): boolean => {
     if (!text) return false;
@@ -109,17 +119,21 @@ function Shell(props: { transport: Transport }) {
       height={dimensions().height}
       flexDirection="column"
       backgroundColor={theme.background}
+      paddingLeft={horizontalPadding()}
+      paddingRight={horizontalPadding()}
     >
-      {/* 上半部分：左主区（消息+输入）+ 右 Sidebar */}
-      <box flexDirection="row" flexGrow={1} minHeight={0}>
-        <box flexDirection="column" flexGrow={1} minWidth={0} paddingLeft={1} paddingRight={1}>
-          <MessageList />
-          <ActivityPanel logFile={props.transport.stderrLogFile} />
-          <Prompt />
-        </box>
-        <Sidebar />
-      </box>
-      {/* 底部状态栏 */}
+      {/* 单列主壳让消息流在常见的 80 列终端中仍有足够阅读宽度。 */}
+      <SessionHeader />
+      <MessageList />
+      <ActivityPanel logFile={props.transport.stderrLogFile} />
+      {/* 未回答的问题固定在输入区上方，回答后才回到历史流中。 */}
+      <Show when={activeQuestion()}>
+        {(item) => <QuestionPanel item={item()} />}
+      </Show>
+      {/* 编辑器拥有独立缓冲；交互浮层出现时卸载它，避免旧光标覆盖新的底部面板。 */}
+      <Show when={!activeQuestion() && !state.dialog}>
+        <Prompt />
+      </Show>
       <Footer />
       {/* 浮层 Select 弹窗（/sessions /tools /mcp 等），覆盖在最上层 */}
       <Show when={state.dialog}>

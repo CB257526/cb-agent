@@ -20,6 +20,8 @@ import { useSession } from "../context/session.js";
 import { filterCommands } from "../commands.js";
 import { SlashCommandPicker } from "./SlashCommandPicker.js";
 import { AttachmentQueue } from "./AttachmentQueue.js";
+import { getPromptMaxHeight } from "../layout.js";
+import { textAttributes } from "../theme.js";
 
 type TextareaKeyBinding = {
   name: string;
@@ -37,6 +39,7 @@ export function Prompt() {
   const [pickerIndex, setPickerIndex] = createSignal(0);
   const [historyIdx, setHistoryIdx] = createSignal(-1);
   const [textareaWidth, setTextareaWidth] = createSignal(0);
+  const maxInputHeight = () => getPromptMaxHeight(dimensions().height);
 
   let inputRef: TextareaRenderable | undefined;
   // 程序化改值（翻历史 / 粘贴）时置 true：让 onInput 跳过"重置 historyIdx"逻辑。
@@ -69,7 +72,7 @@ export function Prompt() {
   const inputHeight = createMemo(() => {
     const text = value();
     if (!text) return 1;
-    const width = Math.max(1, textareaWidth() || dimensions().width - 48);
+    const width = Math.max(1, textareaWidth() || dimensions().width - 4);
     // EditorView 给真实渲染行数；wrapAnsi 估算用于删除收缩时兜底，
     // 避免内部 viewport 偶尔晚一拍导致输入框残留空白行。
     const estimatedRows = visualRowsForText(text, width);
@@ -78,7 +81,7 @@ export function Prompt() {
       typeof vlc === "number" && Number.isFinite(vlc) && vlc > 0
         ? Math.min(vlc, estimatedRows)
         : estimatedRows;
-    return Math.max(1, Math.min(6, rows));
+    return Math.max(1, Math.min(maxInputHeight(), rows));
   });
 
   const textareaKeyBindings: TextareaKeyBinding[] = [
@@ -234,10 +237,20 @@ export function Prompt() {
       <Show when={slashActive()}>
         <SlashCommandPicker query={value().slice(1)} selectedIndex={pickerIndex()} />
       </Show>
-      <box border borderColor={theme.borderActive} paddingLeft={1} paddingRight={1}>
+      <box flexDirection="row" marginTop={1} minWidth={0}>
+        <box width={2} flexShrink={0}>
+          <text
+            fg={state.planState?.mode === "plan" ? theme.agent : theme.primary}
+            attributes={textAttributes.selected}
+          >
+            {"› "}
+          </text>
+        </box>
         <textarea
+          flexGrow={1}
+          minWidth={0}
           height={inputHeight()}
-          maxHeight={6}
+          maxHeight={maxInputHeight()}
           wrapMode="word"
           focused={!disabled()}
           placeholder={
@@ -246,8 +259,8 @@ export function Prompt() {
               : state.busy
                 ? "agent 正在工作…"
                 : state.planState?.mode === "plan"
-                  ? "Plan Mode: ask for a plan or review..."
-                  : "输入消息，回车发送（/ 看命令）"
+                  ? "Plan 模式：描述要规划的任务…"
+                  : "发送消息…"
           }
           placeholderColor={theme.textMuted}
           textColor={theme.text}

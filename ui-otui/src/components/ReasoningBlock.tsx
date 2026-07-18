@@ -10,6 +10,7 @@
 import { createSignal, Show } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import type { ChatItem } from "../types.js";
+import { textAttributes } from "../theme.js";
 
 function summary(text: string): string {
   const firstLine = text.trim().split("\n")[0] ?? "";
@@ -21,21 +22,28 @@ export function ReasoningBlock(props: { item: ChatItem }) {
   const [expanded, setExpanded] = createSignal(false);
 
   return (
-    <box flexDirection="column" marginTop={1} paddingLeft={1}>
-      <box onMouseUp={() => setExpanded((v) => !v)}>
-        <text fg={theme.textMuted}>
-          {expanded() ? "▾ " : "▸ "}
-          <span style={{ fg: theme.agent }}>Thought</span>
-          <Show when={!expanded()}>
-            <span style={{ fg: theme.textMuted }}>{`  ${summary(props.item.text)}`}</span>
-          </Show>
-        </text>
+    <box flexDirection="row" marginTop={1}>
+      <box width={2} flexShrink={0}>
+        <text fg={theme.text} attributes={textAttributes.muted}>• </text>
       </box>
-      <Show when={expanded()}>
-        <box paddingLeft={2}>
-          <text fg={theme.textMuted}>{props.item.text}</text>
+      <box flexDirection="column" flexGrow={1} minWidth={0}>
+        <box onMouseUp={() => setExpanded((v) => !v)}>
+          <text fg={theme.text} attributes={textAttributes.mutedItalic}>
+            <span style={{ fg: theme.agent }}>{expanded() ? "⌄ Thought" : "› Thought"}</span>
+            <Show when={!expanded()}>
+              <span style={{ fg: theme.text, attributes: textAttributes.mutedItalic }}>
+                {`  ${summary(props.item.text)}`}
+              </span>
+            </Show>
+          </text>
         </box>
-      </Show>
+        <Show when={expanded()}>
+          <box flexDirection="row">
+            <text fg={theme.text} attributes={textAttributes.muted}>│ </text>
+            <text fg={theme.text} attributes={textAttributes.mutedItalic}>{props.item.text}</text>
+          </box>
+        </Show>
+      </box>
     </box>
   );
 }

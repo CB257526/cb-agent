@@ -14,6 +14,7 @@
 import { createSignal, For, Show } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import type { ChatItem } from "../types.js";
+import { textAttributes } from "../theme.js";
 
 const RESULT_MAX = 800;
 const ARGS_MAX = 400;
@@ -26,7 +27,7 @@ export function ToolBlock(props: { item: ChatItem }) {
 
   const argsBrief = () => summarizeArgs(item().toolArgs);
   const statusColor = () =>
-    !item().toolDone ? theme.warning : item().toolError ? theme.error : theme.success;
+    !item().toolDone ? theme.info : item().toolError ? theme.error : theme.success;
   const statusIcon = () =>
     !item().toolDone ? "○" : item().toolError ? "✗" : "✓";
   const statusText = () =>
@@ -45,83 +46,78 @@ export function ToolBlock(props: { item: ChatItem }) {
   const diffData = () => extractDiff(result());
 
   return (
-    <box flexDirection="column" marginTop={1}>
-      {/* 标题行：点击切换折叠 */}
-      <box onMouseUp={() => setCollapsed((v) => !v)}>
-        <text fg={theme.suggestion}>
-          {collapsed() ? "⏵ " : "● "}
-          <b>{item().toolName}</b>
-          <span style={{ fg: theme.textMuted }}>
-            {argsBrief() ? `  (${argsBrief()})` : ""}{"  "}
-          </span>
-          <span style={{ fg: statusColor() }}>
-            {statusIcon()} {statusText()}
-          </span>
-        </text>
+    <box flexDirection="row" marginTop={1}>
+      <box width={2} flexShrink={0}>
+        <text fg={theme.text} attributes={textAttributes.muted}>• </text>
       </box>
-
-      {/* 展开态：IN / OUT / DIFF */}
-      <Show when={!collapsed()}>
-        <box
-          marginLeft={2}
-          flexDirection="column"
-          border
-          borderColor={theme.bashBorder}
-          paddingLeft={1}
-          paddingRight={1}
-        >
-          <Show when={argsFull()}>
-            <box flexDirection="row">
-              <box width={5}>
-                <text fg={theme.textMuted}>IN</text>
-              </box>
-              <box flexDirection="column" flexGrow={1}>
-                <For each={argsFull().split("\n")}>
-                  {(line) => <text fg={theme.text}>{line}</text>}
-                </For>
-              </box>
-            </box>
-          </Show>
-
-          <Show when={renderResult()}>
-            <box flexDirection="row" marginTop={argsFull() ? 1 : 0}>
-              <box width={5}>
-                <text fg={theme.textMuted}>OUT</text>
-              </box>
-              <box flexDirection="column" flexGrow={1}>
-                <For each={renderResult().split("\n")}>
-                  {(line) => (
-                    <text fg={item().toolError ? theme.error : theme.text}>{line}</text>
-                  )}
-                </For>
-              </box>
-            </box>
-          </Show>
-
-          <Show when={diffData()}>
-            <box flexDirection="row" marginTop={1}>
-              <box width={5}>
-                <text fg={theme.textMuted}>DIFF</text>
-              </box>
-              <box flexDirection="column" flexGrow={1}>
-                <For each={diffData()!.text.split("\n").slice(0, 200)}>
-                  {(line) => {
-                    const t = classifyLine(line);
-                    const fg =
-                      t === "add" ? theme.success : t === "remove" ? theme.error : theme.textMuted;
-                    return <text fg={fg}>{line}</text>;
-                  }}
-                </For>
-                <Show when={diffData()!.truncated}>
-                  <text fg={theme.textMuted}>
-                    ... [diff 已截断，显示 {diffData()!.linesShown}/{diffData()!.linesTotal} 行]
-                  </text>
-                </Show>
-              </box>
-            </box>
-          </Show>
+      <box flexDirection="column" flexGrow={1} minWidth={0}>
+        {/* 工具标题本身就是折叠控制，符号同时表达当前展开状态。 */}
+        <box onMouseUp={() => setCollapsed((v) => !v)}>
+          <text fg={theme.text}>
+            <span style={{ fg: theme.suggestion }}>{collapsed() ? "› " : "⌄ "}</span>
+            <b>{item().toolName}</b>
+            <span style={{ fg: theme.text, attributes: textAttributes.muted }}>
+              {argsBrief() ? `  ${argsBrief()}` : ""}{"  "}
+            </span>
+            <span style={{ fg: statusColor() }}>
+              {statusIcon()} {statusText()}
+            </span>
+          </text>
         </box>
-      </Show>
+
+        {/* 展开内容使用树状引导线，避免工具块再形成一张嵌套卡片。 */}
+        <Show when={!collapsed()}>
+          <box flexDirection="column" minWidth={0}>
+            <Show when={argsFull()}>
+              <For each={argsFull().split("\n")}>
+                {(line, index) => (
+                  <text fg={theme.text}>
+                    <span style={{ fg: theme.text, attributes: textAttributes.muted }}>
+                      {index() === 0 ? "  │ IN   " : "  │      "}
+                    </span>
+                    {line}
+                  </text>
+                )}
+              </For>
+            </Show>
+
+            <Show when={renderResult()}>
+              <For each={renderResult().split("\n")}>
+                {(line, index) => (
+                  <text fg={item().toolError ? theme.error : theme.text}>
+                    <span style={{ fg: theme.text, attributes: textAttributes.muted }}>
+                      {index() === 0 ? "  │ OUT  " : "  │      "}
+                    </span>
+                    {line}
+                  </text>
+                )}
+              </For>
+            </Show>
+
+            <Show when={diffData()}>
+              <For each={diffData()!.text.split("\n").slice(0, 200)}>
+                {(line, index) => {
+                  const type = classifyLine(line);
+                  const fg = type === "add" ? theme.success : type === "remove" ? theme.error : theme.text;
+                  return (
+                    <text fg={fg} attributes={type === "context" ? textAttributes.muted : undefined}>
+                      <span style={{ fg: theme.text, attributes: textAttributes.muted }}>
+                        {index() === 0 ? "  └ DIFF " : "         "}
+                      </span>
+                      {line}
+                    </text>
+                  );
+                }}
+              </For>
+              <Show when={diffData()!.truncated}>
+                <text fg={theme.text} attributes={textAttributes.muted}>
+                  ... [diff 已截断，显示 {diffData()!.linesShown}/{diffData()!.linesTotal} 行]
+                </text>
+              </Show>
+            </Show>
+          </box>
+        </Show>
+      </box>
     </box>
   );
 }

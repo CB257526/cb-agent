@@ -11,16 +11,20 @@
  *   纯作受控展示（selectedIndex 由我们驱动），不再依赖它的焦点与事件。
  */
 
-import { createMemo, createSignal, Show } from "solid-js";
-import { useKeyboard } from "@opentui/solid";
-import type { KeyEvent } from "@opentui/core";
+import { createMemo, createSignal, For, Show } from "solid-js";
+import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
+import { RGBA, type KeyEvent } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import type { DialogSpec } from "../types.js";
+import { getDialogMetrics, sliceAroundSelection } from "../layout.js";
+import { textAttributes } from "../theme.js";
 
 export function SelectDialog(props: { spec: DialogSpec }) {
   const theme = useTheme();
   const { closeDialog } = useSession();
+  const dimensions = useTerminalDimensions();
+  const metrics = () => getDialogMetrics(dimensions().width, dimensions().height);
 
   // OpenTUI select 需要 {name, description, value} 形状的 options
   const options = createMemo(() =>
@@ -77,15 +81,11 @@ export function SelectDialog(props: { spec: DialogSpec }) {
     }
   });
 
-  // Select 的可见项数 = floor(height / linesPerItem)。在 flex 容器里 flexGrow 算不出
-  // 确定高度，会塌缩成只剩标题。所以这里按选项数显式算高度：showDescription 时每项
-  // 占 2 行，最多显示 10 项（再多则 select 自身滚动）。
-  const LINES_PER_ITEM = 2;
-  const MAX_VISIBLE = 10;
-  const listHeight = createMemo(() => {
-    const visible = Math.max(1, Math.min(props.spec.visibleCount ?? MAX_VISIBLE, MAX_VISIBLE));
-    const n = Math.min(options().length, visible);
-    return Math.max(1, n) * LINES_PER_ITEM;
+  // 每个选项最多占两行，给标题和底部操作提示预留空间后再计算可见数量。
+  const visibleOptions = createMemo(() => {
+    const heightLimit = Math.max(1, Math.floor((metrics().maxHeight - 4) / 2));
+    const requested = Math.max(1, props.spec.visibleCount ?? 10);
+    return sliceAroundSelection(options(), index(), Math.min(10, requested, heightLimit));
   });
 
   return (
@@ -98,20 +98,21 @@ export function SelectDialog(props: { spec: DialogSpec }) {
       zIndex={100}
       alignItems="center"
       justifyContent="center"
-      backgroundColor={theme.background}
+      backgroundColor={RGBA.fromInts(0, 0, 0, 120)}
     >
       <box
         flexDirection="column"
-        width={64}
+        width={metrics().width}
+        maxHeight={metrics().maxHeight}
         border
-        borderColor={theme.borderActive}
+        borderColor={theme.border}
         backgroundColor={theme.backgroundPanel}
         paddingLeft={1}
         paddingRight={1}
       >
         {/* 标题 */}
         <box flexShrink={0} paddingBottom={1}>
-          <text fg={theme.accent}>
+          <text fg={theme.text}>
             <b>{props.spec.title}</b>
           </text>
         </box>
@@ -123,31 +124,39 @@ export function SelectDialog(props: { spec: DialogSpec }) {
         >
           <Show
             when={options().length > 0}
-            fallback={<text fg={theme.textMuted}>（空）</text>}
+            fallback={<text fg={theme.text} attributes={textAttributes.muted}>（空）</text>}
           >
-            <select
-              focused={false}
-              selectedIndex={index()}
-              height={listHeight()}
-              options={options()}
-              showDescription={true}
-              showScrollIndicator={true}
-              wrapSelection={true}
-              backgroundColor={theme.backgroundPanel}
-              textColor={theme.text}
-              focusedBackgroundColor={theme.backgroundPanel}
-              focusedTextColor={theme.text}
-              selectedBackgroundColor={theme.backgroundElement}
-              selectedTextColor={theme.borderActive}
-              descriptionColor={theme.textMuted}
-              selectedDescriptionColor={theme.textMuted}
-            />
+            <box flexDirection="column">
+              <For each={visibleOptions().items}>
+                {(option, visibleIndex) => {
+                  const absoluteIndex = () => visibleOptions().start + visibleIndex();
+                  const active = () => absoluteIndex() === index();
+                  return (
+                    <box flexDirection="column">
+                      <text
+                        fg={active() ? theme.suggestion : theme.text}
+                        attributes={active() ? textAttributes.selected : undefined}
+                        wrapMode="none"
+                        truncate
+                      >
+                        {active() ? "› " : "  "}{option.name}
+                      </text>
+                      <Show when={option.description}>
+                        <text fg={theme.text} attributes={textAttributes.muted} wrapMode="none" truncate>
+                          {`  ${option.description}`}
+                        </text>
+                      </Show>
+                    </box>
+                  );
+                }}
+              </For>
+            </box>
           </Show>
         </Show>
 
         {/* 底部提示 */}
         <box flexShrink={0} paddingTop={1}>
-          <text fg={theme.textMuted}>
+          <text fg={theme.text} attributes={textAttributes.muted} wrapMode="none" truncate>
             {props.spec.content ? "Enter/Esc 关闭" : "↑/↓ 选择 · Enter 确认 · Esc 关闭"}
           </text>
         </box>

@@ -8,6 +8,7 @@
 import { For } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import type { ChatItem, TodoItem } from "../types.js";
+import { textAttributes } from "../theme.js";
 
 function statusIcon(status: TodoItem["status"]): string {
   switch (status) {
@@ -36,22 +37,24 @@ export function TodoPanel(props: { item: ChatItem }) {
           : theme.textMuted;
 
   return (
-    <box
-      flexDirection="column"
-      marginTop={1}
-      border={["left"]}
-      borderColor={theme.permission}
-      paddingLeft={1}
-    >
-      <text fg={theme.textMuted}>Todos</text>
-      <For each={items()}>
-        {(todo) => (
-          <text fg={todo.status === "cancelled" ? theme.textMuted : theme.text}>
-            <span style={{ fg: iconColor(todo.status) }}>{statusIcon(todo.status)} </span>
-            {todo.content}
-          </text>
-        )}
-      </For>
+    <box flexDirection="row" marginTop={1}>
+      <box width={2} flexShrink={0}>
+        <text fg={theme.info}>• </text>
+      </box>
+      <box flexDirection="column" flexGrow={1} minWidth={0}>
+        <text fg={theme.text}><b>Todos</b></text>
+        <For each={items()}>
+          {(todo) => (
+            <text
+              fg={theme.text}
+              attributes={todo.status === "cancelled" ? textAttributes.muted : undefined}
+            >
+              <span style={{ fg: iconColor(todo.status) }}>{`  ${statusIcon(todo.status)} `}</span>
+              {todo.content}
+            </text>
+          )}
+        </For>
+      </box>
     </box>
   );
 }

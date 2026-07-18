@@ -2,3 +2,8 @@
 # 而不是 Bun 默认的 React 风格 jsx()/jsxDEV() 转换。
 # @opentui/solid/preload 注册了这个 Bun 插件，必须在进程启动前 preload。
 preload = ["@opentui/solid/preload"]
+
+# Bun 的测试进程有独立预加载配置；缺少这一段时 TSX 会退回服务端 Solid 运行时，
+# 造成响应式空节点被错误地插入 OpenTUI 容器。
+[test]
+preload = ["@opentui/solid/preload"]

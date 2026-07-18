@@ -1,6 +1,7 @@
 import { Show } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import type { ChatItem } from "../types.js";
+import { textAttributes } from "../theme.js";
 
 
 function compactArgs(args?: Record<string, unknown>): string {
@@ -26,44 +27,43 @@ export function SubagentPanel(props: { item: ChatItem }) {
   const args = () => compactArgs(props.item.subagentToolArgs);
 
   return (
-    <box
-      flexDirection="column"
-      border={["left"]}
-      borderColor={color()}
-      paddingLeft={1}
-      marginTop={1}
-    >
-      <text fg={color()}>
-        <b>subagent {props.item.subagentType ?? "unknown"}</b>
-        <span style={{ fg: theme.textMuted }}>
-          {`  ${props.item.subagentStatus ?? "running"}`}
-          {props.item.subagentPhase ? ` / ${props.item.subagentPhase}` : ""}
-        </span>
-      </text>
-      <Show when={props.item.subagentDescription}>
-        <text fg={theme.text}>{props.item.subagentDescription}</text>
-      </Show>
-      <Show when={props.item.subagentToolName}>
-        <text fg={theme.suggestion}>tool  {props.item.subagentToolName}</text>
-      </Show>
-      <Show when={args()}>
-        <text fg={theme.textMuted}>{args()}</text>
-      </Show>
-      <Show when={props.item.subagentMessage}>
-        <text fg={theme.textMuted}>{props.item.subagentMessage}</text>
-      </Show>
-      <text fg={theme.textMuted}>
-        {`tools ${props.item.subagentToolUses ?? 0}  tokens ${props.item.subagentTokens ?? 0}`}
-        {(props.item.subagentActiveTools ?? 0) > 0 ? `  active ${props.item.subagentActiveTools}` : ""}
-        {props.item.subagentRounds !== undefined ? `  rounds ${props.item.subagentRounds}` : ""}
-        {props.item.subagentDuration !== undefined ? `  ${props.item.subagentDuration.toFixed(2)}s` : ""}
-      </text>
-      <Show when={props.item.text}>
-        <text fg={theme.text}>{props.item.text}</text>
-      </Show>
-      <Show when={props.item.subagentOutputPath}>
-        <text fg={theme.textMuted}>{props.item.subagentOutputPath}</text>
-      </Show>
+    <box flexDirection="row" marginTop={1}>
+      <box width={2} flexShrink={0}>
+        <text fg={color()}>• </text>
+      </box>
+      <box flexDirection="column" flexGrow={1} minWidth={0}>
+        <text fg={color()}>
+          <b>Subagent {props.item.subagentType ?? "unknown"}</b>
+          <span style={{ fg: theme.text, attributes: textAttributes.muted }}>
+            {`  ${props.item.subagentStatus ?? "running"}`}
+            {props.item.subagentPhase ? ` / ${props.item.subagentPhase}` : ""}
+          </span>
+        </text>
+        <Show when={props.item.subagentDescription}>
+          <text fg={theme.text}>{`  ${props.item.subagentDescription}`}</text>
+        </Show>
+        <Show when={props.item.subagentToolName}>
+          <text fg={theme.suggestion}>{`  │ tool  ${props.item.subagentToolName}`}</text>
+        </Show>
+        <Show when={args()}>
+          <text fg={theme.text} attributes={textAttributes.muted}>{`  │ ${args()}`}</text>
+        </Show>
+        <Show when={props.item.subagentMessage}>
+          <text fg={theme.text} attributes={textAttributes.muted}>{`  │ ${props.item.subagentMessage}`}</text>
+        </Show>
+        <text fg={theme.text} attributes={textAttributes.muted}>
+          {`  └ tools ${props.item.subagentToolUses ?? 0}  tokens ${props.item.subagentTokens ?? 0}`}
+          {(props.item.subagentActiveTools ?? 0) > 0 ? `  active ${props.item.subagentActiveTools}` : ""}
+          {props.item.subagentRounds !== undefined ? `  rounds ${props.item.subagentRounds}` : ""}
+          {props.item.subagentDuration !== undefined ? `  ${props.item.subagentDuration.toFixed(2)}s` : ""}
+        </text>
+        <Show when={props.item.text}>
+          <text fg={theme.text}>{`  ${props.item.text}`}</text>
+        </Show>
+        <Show when={props.item.subagentOutputPath}>
+          <text fg={theme.text} attributes={textAttributes.muted}>{`  ${props.item.subagentOutputPath}`}</text>
+        </Show>
+      </box>
     </box>
   );
 }

@@ -10,8 +10,7 @@
  * done 后用 markdown），所以 ItemRenderer 透传 isLast。
  */
 
-import { ErrorBoundary, For, Switch, Match } from "solid-js";
-import { SyntaxStyle } from "@opentui/core";
+import { createMemo, ErrorBoundary, For, Switch, Match } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import { appendOtuiDiagnostic } from "../diagnostics.js";
@@ -22,8 +21,9 @@ import { QuestionPanel } from "./QuestionPanel.js";
 import { AssistantMessage } from "./AssistantMessage.js";
 import { SubagentPanel } from "./SubagentPanel.js";
 import type { ChatItem } from "../types.js";
+import { createMarkdownSyntaxStyle, textAttributes } from "../theme.js";
 
-const planSyntaxStyle = SyntaxStyle.create();
+const planSyntaxStyle = createMarkdownSyntaxStyle();
 
 function PlanPanel(props: { item: ChatItem }) {
   const theme = useTheme();
@@ -36,15 +36,19 @@ function PlanPanel(props: { item: ChatItem }) {
 
   return (
     <box
+      position="relative"
       flexDirection="column"
-      border={["left"]}
-      borderColor={color()}
-      paddingLeft={1}
+      paddingLeft={2}
+      minWidth={0}
       marginTop={1}
     >
+      {/* 与助手消息相同，Plan 的前缀不参与 Markdown 宽度计算。 */}
+      <box position="absolute" left={0} top={0} width={2}>
+        <text fg={color()}>• </text>
+      </box>
       <text fg={color()}>
-        <b>plan</b>
-        <span style={{ fg: theme.textMuted }}>
+        <b>Plan</b>
+        <span style={{ fg: theme.text, attributes: textAttributes.muted }}>
           {props.item.planRevision ? `  rev ${props.item.planRevision}` : ""}
           {`  ${status()}`}
         </span>
@@ -56,7 +60,9 @@ function PlanPanel(props: { item: ChatItem }) {
         bg={theme.background}
       />
       {status() === "pending" ? (
-        <text fg={theme.textMuted}>/plan approve  or  /plan reject &lt;feedback&gt;</text>
+        <text fg={theme.text} attributes={textAttributes.muted}>
+          /plan approve  或  /plan reject &lt;feedback&gt;
+        </text>
       ) : null}
     </box>
   );
@@ -69,7 +75,10 @@ function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
   return (
     <Switch>
       <Match when={item().role === "user"}>
-        <box border={["left"]} borderColor={theme.accent} paddingLeft={1} marginTop={1}>
+        <box flexDirection="row" marginTop={1}>
+          <box width={2} flexShrink={0}>
+            <text fg={theme.accent} attributes={textAttributes.selected}>› </text>
+          </box>
           <text fg={theme.text}>{item().text}</text>
         </box>
       </Match>
@@ -103,8 +112,11 @@ function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
       </Match>
 
       <Match when={item().role === "system"}>
-        <box paddingLeft={1} marginTop={1}>
-          <text fg={theme.textMuted}>{item().text}</text>
+        <box flexDirection="row" marginTop={1}>
+          <box width={2} flexShrink={0}>
+            <text fg={theme.text} attributes={textAttributes.muted}>• </text>
+          </box>
+          <text fg={theme.text} attributes={textAttributes.muted}>{item().text}</text>
         </box>
       </Match>
     </Switch>
@@ -125,25 +137,33 @@ function ItemError(props: { error: unknown }) {
 export function MessageList() {
   const theme = useTheme();
   const { state } = useSession();
+  const visibleItems = createMemo(() =>
+    state.items.filter(
+      (item) =>
+        item.role !== "ask_question"
+        || item.answered
+        || item.questionId !== state.activeQuestionId,
+    ),
+  );
 
   return (
     <scrollbox
       stickyScroll={true}
       stickyStart="bottom"
       flexGrow={1}
+      minHeight={0}
       verticalScrollbarOptions={{
         visible: true,
         trackOptions: {
-          backgroundColor: theme.backgroundElement,
+          backgroundColor: theme.background,
           foregroundColor: theme.border,
         },
       }}
     >
-      <box height={1} />
-      <For each={state.items}>
+      <For each={visibleItems()}>
         {(item, index) => (
           <ErrorBoundary fallback={(error) => <ItemError error={error} />}>
-            <ItemRenderer item={item} isLast={index() === state.items.length - 1} />
+            <ItemRenderer item={item} isLast={index() === visibleItems().length - 1} />
           </ErrorBoundary>
         )}
       </For>

@@ -1,8 +1,8 @@
 /**
- * ThemeProvider：把静态暗色主题对象通过 Solid context 注入组件树。
+ * ThemeProvider：把终端原生主题对象通过 Solid context 注入组件树。
  *
- * 当前只有单一暗色主题（theme.ts），所以 context 直接透传该对象。将来要加
- * light / 多主题切换时，把响应式 signal 放进这里即可，组件侧 useTheme() 接口不变。
+ * 当前主题使用终端默认色与 ANSI 索引色，因此无需单独维护深浅模式。将来若增加
+ * 用户可选主题，可在这里加入响应式 signal，组件侧 useTheme() 接口不需要变化。
  */
 
 import { createContext, useContext, type ParentProps } from "solid-js";

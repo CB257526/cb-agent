@@ -13,6 +13,8 @@ import { useSession } from "../context/session.js";
 import { Spinner } from "./Spinner.js";
 import { useTerminalDimensions } from "@opentui/solid";
 import { formatContextTokenCount, formatTokenCount } from "../tokenDisplay.js";
+import { getLayoutMode, shortSessionId } from "../layout.js";
+import { textAttributes } from "../theme.js";
 
 function formatPercent(percent: number): string {
   if (!Number.isFinite(percent) || percent <= 0) return "0%";
@@ -20,79 +22,70 @@ function formatPercent(percent: number): string {
   return `${Math.round(percent)}%`;
 }
 
-function shortSessionId(sessionId: string): string {
-  if (typeof sessionId !== "string") return String(sessionId ?? "");
-  const parts = sessionId.split("_");
-  if (parts.length >= 4) return `${parts[1]}_${parts[2]}_${parts[3]}`;
-  return sessionId;
-}
-
 export function Footer() {
   const theme = useTheme();
   const { state } = useSession();
   const dimensions = useTerminalDimensions();
 
-  const ctxUsed = () => state.contextWindow?.used_tokens ?? 0;
-  const ctxMax = () => state.contextWindow?.full_window_tokens ?? state.contextWindow?.max_tokens ?? 8000;
   const ctxPercent = () => state.contextWindow?.percent ?? 0;
-  const compactLayout = () => dimensions().width < 110;
+  const layoutMode = () => getLayoutMode(dimensions().width);
+  const contextLeft = () => Math.max(0, Math.min(100, 100 - ctxPercent()));
   const ctxColor = createMemo(() => {
-    const p = ctxPercent();
-    const trigger = state.contextWindow?.auto_compact_trigger_percent ?? 90;
-    return p >= trigger ? theme.error : p >= 65 ? theme.warning : theme.success;
+    const left = contextLeft();
+    return left <= 10 ? theme.error : left <= 35 ? theme.warning : theme.text;
   });
   const mcpConnected = () => state.mcp?.connected ?? 0;
   const mcpFailed = () => state.mcp?.failed ?? 0;
   const mode = () => state.planState?.mode ?? "execute";
   const planStatus = () => state.planState?.status ?? "idle";
   const permissionLabel = () => state.permissionMode === "full_access" ? "FULL" : "ASK";
+  const contextLabel = () => state.contextWindow
+    ? `${formatPercent(contextLeft())} context left`
+    : "--% context left";
+  const busyLabel = () => state.pending || (state.busy ? "working" : null);
 
   return (
-    <box flexDirection="row" justifyContent="space-between" flexShrink={0} paddingLeft={1} paddingRight={1}>
+    <box flexDirection="row" justifyContent="space-between" flexShrink={0} minWidth={0}>
       <box flexDirection="row" flexShrink={1} minWidth={0}>
-        <Show when={state.busy || state.pending}>
-          <Spinner color={theme.warning} />
-          <text fg={theme.textMuted}>{" "}</text>
+        <Show when={busyLabel()}>
+          <Spinner color={theme.info} />
+          <text fg={theme.text}>{` ${busyLabel()}  `}</text>
         </Show>
-        <Show when={state.pending}>
-          <text fg={theme.warning}>{state.pending}{"  "}</text>
-        </Show>
-        <text fg={theme.textMuted}>
-          {state.model}
-          <span style={{ fg: mode() === "plan" ? theme.warning : theme.success }}>
-            {"  "}{mode() === "plan" ? "PLAN" : "EXEC"}
-            {mode() === "plan" && planStatus() !== "idle" ? `:${planStatus()}` : ""}
-          </span>
-          <span style={{ fg: state.permissionMode === "full_access" ? theme.error : theme.textMuted }}>
-            {"  "}{permissionLabel()}
-          </span>
-          <Show when={state.session && !compactLayout()}>
-            <span style={{ fg: theme.textMuted }}> · {shortSessionId(state.session!.session_id)}</span>
-          </Show>
-        </text>
-      </box>
-
-      <box flexDirection="row" flexShrink={0}>
-        <text fg={theme.textMuted}>
-          Context {formatContextTokenCount(ctxUsed(), state.contextWindow?.source)}/{formatTokenCount(ctxMax())}{" "}
-          <span style={{ fg: ctxColor() }}>{formatPercent(ctxPercent())}</span>
-          {"  "}Input {formatTokenCount(state.promptTokens)}
-          <Show when={!compactLayout() && state.cachedPromptTokens > 0}>
-            <span style={{ fg: theme.textMuted }}> (Cached {formatTokenCount(state.cachedPromptTokens)})</span>
-          </Show>
-          {"  "}Output {formatTokenCount(state.completionTokens)}
-          <Show when={state.round > 0 && !compactLayout()}>
-            <span style={{ fg: theme.textMuted }}>{`  round ${state.round}/${state.maxRounds}`}</span>
-          </Show>
-        </text>
-        <Show when={mcpConnected() > 0 || mcpFailed() > 0}>
-          <text fg={theme.text}>
-            {"  "}
-            <span style={{ fg: mcpFailed() > 0 ? theme.error : theme.success }}>⊙ </span>
-            {mcpConnected()} MCP
+        <Show when={!busyLabel()}>
+          <text fg={theme.text} attributes={textAttributes.muted} wrapMode="none" truncate>
+            <Show when={layoutMode() !== "narrow"}>{state.model}{"  "}</Show>
+            <span style={{ fg: mode() === "plan" ? theme.agent : theme.text }}>
+              {mode() === "plan" ? "PLAN" : "EXEC"}
+              {mode() === "plan" && planStatus() !== "idle" ? `:${planStatus()}` : ""}
+            </span>
+            <span
+              style={{
+                fg: state.permissionMode === "full_access" ? theme.error : theme.text,
+                attributes: state.permissionMode === "full_access" ? undefined : textAttributes.muted,
+              }}
+            >
+              {`  ${permissionLabel()}`}
+            </span>
+            <Show when={layoutMode() === "wide" && state.session?.session_id}>
+              {`  ${shortSessionId(state.session!.session_id)}`}
+            </Show>
           </text>
         </Show>
       </box>
+
+      <text fg={theme.text} attributes={textAttributes.muted} wrapMode="none" flexShrink={0}>
+        <span style={{ fg: ctxColor() }}>{contextLabel()}</span>
+        <Show when={layoutMode() === "wide"}>
+          {`  In ${formatContextTokenCount(state.promptTokens, state.contextWindow?.source)}`}
+          {`  Out ${formatTokenCount(state.completionTokens)}`}
+        </Show>
+        <Show when={layoutMode() !== "narrow" && (mcpConnected() > 0 || mcpFailed() > 0)}>
+          <span style={{ fg: mcpFailed() > 0 ? theme.error : theme.success }}>
+            {`  ${mcpFailed() > 0 ? "!" : "•"} `}
+          </span>
+          {mcpConnected()} MCP
+        </Show>
+      </text>
     </box>
   );
 }

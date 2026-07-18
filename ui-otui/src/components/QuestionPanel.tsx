@@ -17,6 +17,7 @@ import type { KeyEvent } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import type { AskQuestionOption, ChatItem } from "../types.js";
+import { textAttributes } from "../theme.js";
 
 const OTHER_LABEL = "Other";
 
@@ -121,40 +122,40 @@ export function QuestionPanel(props: { item: ChatItem }) {
       when={pending()}
       fallback={
         // 静态摘要（已作答）
-        <box
-          flexDirection="column"
-          marginTop={1}
-          border
-          borderColor={theme.border}
-          paddingLeft={1}
-          paddingRight={1}
-        >
-          <text fg={theme.textMuted}>问题：{item().question}</text>
-          <Show
-            when={!item().answerCancelled}
-            fallback={<text fg={theme.warning}>· 已取消</text>}
-          >
-            <text fg={theme.success}>· 选择：{(item().answerLabels ?? []).join(", ") || "(空)"}</text>
-            <Show when={item().answerOther}>
-              <text fg={theme.textMuted}>  自定义：{item().answerOther}</text>
+        <box flexDirection="row" marginTop={1}>
+          <box width={2} flexShrink={0}>
+            <text fg={theme.text} attributes={textAttributes.muted}>• </text>
+          </box>
+          <box flexDirection="column" flexGrow={1} minWidth={0}>
+            <text fg={theme.text} attributes={textAttributes.muted}>问题：{item().question}</text>
+            <Show
+              when={!item().answerCancelled}
+              fallback={<text fg={theme.warning}>  已取消</text>}
+            >
+              <text fg={theme.success}>  选择：{(item().answerLabels ?? []).join(", ") || "(空)"}</text>
+              <Show when={item().answerOther}>
+                <text fg={theme.text} attributes={textAttributes.muted}>  自定义：{item().answerOther}</text>
+              </Show>
             </Show>
-          </Show>
+          </box>
         </box>
       }
     >
-      {/* 进行中 */}
+      {/* 进行中的问询固定在编辑器上方，只保留一条轻量分隔线。 */}
       <box
         flexDirection="column"
+        flexShrink={0}
         marginTop={1}
-        border
-        borderColor={theme.suggestion}
+        marginBottom={1}
+        border={["top"]}
+        borderColor={theme.border}
         paddingLeft={1}
         paddingRight={1}
       >
         <text fg={theme.text}>
           <b>{item().question}</b>
         </text>
-        <text fg={theme.textMuted}>
+        <text fg={theme.text} attributes={textAttributes.muted}>
           {multi()
             ? "↑/↓ 选择，Space 勾选/取消，Enter 提交，Esc 取消"
             : "↑/↓ 选择，Enter 选中，Esc 取消"}
@@ -166,21 +167,29 @@ export function QuestionPanel(props: { item: ChatItem }) {
               typeof item().recommendedIndex === "number" && i() === item().recommendedIndex;
             const isChecked = () => multi() && checked().has(i());
             const marker = () =>
-              multi() ? (isChecked() ? "[x]" : "[ ]") : active() ? "▸" : " ";
+              multi() ? (isChecked() ? "[x]" : "[ ]") : active() ? "›" : " ";
             return (
-              <text fg={active() ? theme.suggestion : theme.text}>
-                {marker()} {opt.label}
-                {isRec() ? " ★" : ""}
+              <text
+                fg={active() ? theme.suggestion : theme.text}
+                attributes={active() ? textAttributes.selected : undefined}
+              >
+                {marker()} {i() + 1}. {opt.label}
+                {isRec() ? "  推荐" : ""}
                 <Show when={opt.description}>
-                  <span style={{ fg: theme.textMuted }}>{`  — ${opt.description}`}</span>
+                  <span style={{ fg: theme.text, attributes: textAttributes.muted }}>{`  ${opt.description}`}</span>
                 </Show>
               </text>
             );
           }}
         </For>
         <Show when={otherMode()}>
-          <box marginTop={1} border borderColor={theme.borderActive} paddingLeft={1} paddingRight={1}>
+          <box flexDirection="row" marginTop={1}>
+            <box width={2} flexShrink={0}>
+              <text fg={theme.primary} attributes={textAttributes.selected}>› </text>
+            </box>
             <input
+              flexGrow={1}
+              minWidth={0}
               focused={true}
               placeholder="自定义答案，Enter 提交，Esc 返回"
               placeholderColor={theme.textMuted}

@@ -9,6 +9,7 @@ import { For, Show } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import type { QueuedAttachment } from "../types.js";
+import { textAttributes } from "../theme.js";
 
 function formatBytes(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "";
@@ -35,16 +36,17 @@ export function AttachmentQueue() {
   return (
     <Show when={state.attachments.length > 0}>
       <box flexDirection="column" flexShrink={0} marginBottom={1}>
-        <text fg={theme.info}>附件队列（发送后清空）</text>
         <For each={state.attachments}>
           {(item, index) => {
             const size = formatBytes(item.size);
             const suffix = [inferKind(item), item.source ?? "direct", size].filter(Boolean).join(" · ");
             return (
               <text fg={theme.text}>
-                <span style={{ fg: theme.suggestion }}>{`${index() + 1}. `}</span>
+                <span style={{ fg: theme.suggestion }}>+ </span>
                 {item.fileName}
-                <span style={{ fg: theme.textMuted }}>{suffix ? `  ${suffix}` : ""}</span>
+                <span style={{ fg: theme.text, attributes: textAttributes.muted }}>
+                  {suffix ? `  ${index() + 1} · ${suffix}` : ""}
+                </span>
               </text>
             );
           }}

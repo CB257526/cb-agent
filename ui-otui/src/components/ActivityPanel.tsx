@@ -8,6 +8,7 @@
 import { For, Show } from "solid-js";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
+import { textAttributes } from "../theme.js";
 
 const VISIBLE_LINES = 12;
 
@@ -21,14 +22,17 @@ export function ActivityPanel(props: { logFile: string }) {
       <box
         flexDirection="column"
         flexShrink={0}
-        border
+        border={["top"]}
         borderColor={theme.border}
-        backgroundColor={theme.backgroundPanel}
         paddingLeft={1}
         paddingRight={1}
       >
-        <text fg={theme.textMuted}>后端日志（Ctrl-O 关闭）· {props.logFile}</text>
-        <For each={lines()}>{(line) => <text fg={theme.textMuted}>{line}</text>}</For>
+        <text fg={theme.text} attributes={textAttributes.muted} wrapMode="none" truncate>
+          后端日志（Ctrl-O 关闭） · {props.logFile}
+        </text>
+        <For each={lines()}>
+          {(line) => <text fg={theme.text} attributes={textAttributes.muted}>{line}</text>}
+        </For>
       </box>
     </Show>
   );
