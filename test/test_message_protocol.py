@@ -148,11 +148,11 @@ class TestDropOrphanMessageObjects(unittest.TestCase):
         self.assertEqual(roles, ["assistant", "tool"])
         self.assertEqual(out[1].tool_call_id, "call_1")
 
-    def test_boundary_user_assistant_preserved(self):
-        boundary = Message.create_system_message("【上下文压缩】摘要")
-        boundary.metadata = {"kind": "compact_boundary"}
+    def test_compaction_summary_user_assistant_preserved(self):
+        summary = Message.create_user_message("handoff summary")
+        summary.metadata = {"kind": "context_compaction"}
         msgs = [
-            boundary,
+            summary,
             Message.create_user_message("问题"),
             Message.create_assistant_message("回答"),
         ]

@@ -43,6 +43,7 @@ from agent.event_bus import EventBus
 from agent.events import Event, ModelChanged, PermissionModeChanged
 from agent.session import AgentSession
 from agent.transport.jsonrpc import StdioTransport, make_event_message, make_response
+from constant.llm.constant_llm import ConstantLLM
 
 logger = logging.getLogger(__name__)
 
@@ -666,7 +667,7 @@ class Gateway:
         self.transport.write(make_response(rpc_id, result=payload))
 
     def _handle_set_model(self, rpc_id: Any, params: Dict[str, Any]) -> None:
-        """切换 LLM 请求目标。AgentSession/history 保持不变。"""
+        """切换 LLM 请求目标，并在窗口降档前先压缩旧模型上下文。"""
         if rpc_id is None:
             return
         if self._is_busy():
@@ -685,14 +686,56 @@ class Gateway:
 
         llm = getattr(self.session, "llm", None)
         switch_model = getattr(llm, "switch_model", None)
-        if not callable(switch_model):
+        preview_model = getattr(llm, "preview_model", None)
+        capture_runtime_model = getattr(llm, "capture_runtime_model", None)
+        restore_runtime_model = getattr(llm, "restore_runtime_model", None)
+        if not callable(switch_model) or not callable(preview_model):
             self.transport.write(make_response(
                 rpc_id,
                 error={"code": _ERR_INTERNAL, "message": "model switch unavailable"},
             ))
             return
         try:
-            model = switch_model(model_key.strip())
+            target = preview_model(model_key.strip())
+            old_window = ConstantLLM.model_max_tokens(getattr(llm, "model", None))
+            new_window = int(target.get("max_tokens") or 0)
+            target_limits = ConstantLLM.context_limits(target.get("model"))
+            current_usage = self.session.context_window_usage()
+            needs_downshift_compact = (
+                new_window > 0
+                and old_window > new_window
+                and int(current_usage.get("used_tokens") or 0)
+                >= int(target_limits["soft_limit_tokens"])
+            )
+            runtime_snapshot = (
+                capture_runtime_model() if callable(capture_runtime_model) else None
+            )
+            if needs_downshift_compact:
+                try:
+                    self.session.compact_context(
+                        reason="model_downshift",
+                        target_model=str(target.get("model") or ""),
+                    )
+                except Exception as compact_error:
+                    error_text = str(compact_error).lower()
+                    invalid_request = "invalid" in error_text or "400" in error_text
+                    if not invalid_request or runtime_snapshot is None:
+                        raise
+                    # Codex 在旧模型不接受 compaction 请求时会使用目标模型重试。
+                    model = switch_model(model_key.strip())
+                    try:
+                        self.session.compact_context(
+                            reason="model_downshift",
+                            target_model=str(target.get("model") or ""),
+                        )
+                    except Exception:
+                        if callable(restore_runtime_model):
+                            restore_runtime_model(runtime_snapshot)
+                        raise
+                else:
+                    model = switch_model(model_key.strip())
+            else:
+                model = switch_model(model_key.strip())
             context_window = self.session.context_window_usage()
         except ValueError as e:
             self.transport.write(make_response(

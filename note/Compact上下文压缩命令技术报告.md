@@ -1,223 +1,258 @@
-# `/compact` 上下文压缩命令技术报告
+# Codex 风格本地 Compact 技术报告
 
-> 本报告对应本次新增的显式上下文压缩命令。
-> 关键源代码：[agent/session.py](../agent/session.py)、[agent/work_context.py](../agent/work_context.py)、[agent/transport/gateway.py](../agent/transport/gateway.py)、[ui-tui/src/commands.ts](../ui-tui/src/commands.ts)。
+## 1. 改造目标
 
----
+cb-agent 原实现会先把待压缩历史转换为文本，再裁到固定 32K token 后调用摘要模型。
+在 400K 或 1M 上下文中，一次 compact 可能移出数十万 token，但摘要模型只能看到
+其中很小一部分，连续 compact 后还会形成反复压缩旧摘要的问题。
 
-## 0. 背景
+本次重构参考 Codex 本地 compaction 的核心语义：
 
-前一轮改造已经把跨轮工作信息写入 `self.history` 和项目级 `.cbagent/sessions/`，解决了“下一轮不知道看过哪些文件、跑过哪些命令”的问题。
+1. 摘要请求直接使用模型原本看到的结构化消息历史。
+2. 在完整历史末尾追加 handoff prompt，让模型为下一上下文窗口生成交接摘要。
+3. compact 成功后安装新的 replacement history，而不是在旧 history 中插入切片锚点。
+4. 保留最近原始回合，任务早期内容由 handoff summary 承接。
+5. compact 后重新建立模型可见的运行现场基线。
 
-但长期会话会出现另一个问题：`history` 中的普通对话、`【工作记录】`、滚动 state 会持续占用后续 prompt。虽然 `history_max_messages` 有窗口限制，但窗口裁剪是被动的，用户无法在任务进行到某个阶段时主动“把旧上下文压成摘要，然后继续工作”。
+核心代码位于：
 
-因此新增 `/compact`：
+- `agent/compaction.py`：结构化摘要请求、超窗重试和最近回合选择。
+- `agent/session.py`：触发、事务安装、mid-turn 继续和 Context 预算。
+- `context/world_state.py`：world state snapshot 与增量比较。
+- `agent/work_context.py`：compact v2 快照、transcript 审计与恢复。
 
-1. 立即压缩当前 active 会话的内存 `history` 和本地 `state.json`。
-2. 后续 prompt 只保留一条 `【上下文压缩】` 摘要和最近一轮普通 user/assistant 对话。
-3. 不删除、不重写 `transcript.jsonl`，旧记录仍作为审计材料留在磁盘。
-4. TUI 当前屏幕不重绘，只追加一条系统提示，避免用户视觉上“旧对话突然消失”。
+## 2. 结构化摘要请求
 
----
-
-## 1. 核心语义
-
-`/compact` 和 `/clear` 是两种完全不同的操作：
-
-| 命令 | 内存 history | 本地 transcript | 本地恢复语义 |
-|---|---|---|---|
-| `/clear` | 清空 | 删除当前 session 文件 | 重启不会恢复旧上下文 |
-| `/compact` | 压缩成摘要 + 最近一轮 | 保留原始 transcript | 重启从 compact 快照继续 |
-
-这次实现中特别保留了两个安全边界：
-
-1. `【上下文压缩】` 仍然是普通 assistant message，metadata 为 `{"kind": "compact_record"}`，不会伪装成 `role="tool"`。
-2. compact 摘要不会读取完整工具输出，也不会保存完整文件正文或完整 bash stdout。
-
-这样可以继续遵守 OpenAI tool calling 协议：`role=tool` 只存在于同一轮工具循环的 `messages` 中，不跨轮恢复。
-
----
-
-## 2. 后端流程
-
-后端入口是 `AgentSession.compact_context()`。
-
-执行顺序：
-
-1. 读取当前 `self.history` 条数，作为 `before_messages`。
-2. 从 `LocalSessionStore.state_text()` 读取当前会话的滚动状态。
-3. 如果 `history` 和 state 都为空，则返回 `no_op=true`。
-4. 调用 `_make_compact_summary()` 生成摘要。
-5. 用 `make_compact_record_message()` 包装成 `【上下文压缩】` assistant message。
-6. 用 `_latest_plain_turn_messages()` 保留最近一轮普通 user/assistant 对话。
-7. 将内存 `self.history` 改为：
+compact 请求按以下顺序组装：
 
 ```text
-[
-  assistant(kind=compact_record, content="【上下文压缩】..."),
-  user(...最近一轮用户输入...),
-  assistant(...最近一轮最终回答...)
-]
+稳定 system instructions
+当前完整 active history
+user: CONTEXT CHECKPOINT COMPACTION handoff prompt
 ```
 
-8. 如果启用了 `session_store`，调用 `save_compaction()` 落盘。
-9. 返回 `{session, history, summary, before_messages, after_messages, persisted, no_op}`。
+active history 保留原协议结构，包括：
 
-这里没有调用 `llm.think()`，也不会 emit `TextDelta/Done`。它是管理 RPC，不是一轮普通助手回答。
+- 真实 user 消息；
+- assistant 正文；
+- assistant.tool_calls；
+- 与 tool_calls 配对的 tool result；
+- 上一次 compact 生成的 handoff summary；
+- 已提交的运行时 context update。
 
----
+请求不包含 tools schema，压缩模型只能返回普通 assistant summary。摘要请求使用当前
+模型配置的 `max_output_tokens` 和 `output_token_param`，不再维护固定 8K/20K 的第二套
+输出上限。
 
-## 3. 摘要生成
-
-摘要生成优先使用静默 LLM，总长度目标不超过 1200 字。
-
-输入包括两部分：
-
-- 当前内存 `history` 的短渲染文本；
-- `state.json` 的滚动状态、当前任务、关键结论、待办/阻塞等结构化信息。
-
-系统提示要求保留：
-
-- 当前任务；
-- 用户偏好；
-- 关键结论；
-- 已读文件；
-- 已改文件；
-- 最近命令；
-- 待办/阻塞。
-
-如果 LLM 客户端不可用、模型缺失、调用异常或返回空内容，则退回 `_rule_compact_summary()`。规则兜底只重组已有 `history/state`，不推断新事实，保证 `/compact` 不会因为压缩器异常阻断主流程。
-
----
-
-## 4. 本地持久化
-
-本地会话目录新增两个 compact 文件：
+模型返回摘要后，cb-agent 将其包装为 user 消息：
 
 ```text
-.cbagent/
-  sessions/
-    index.json
-    session_xxx/
-      transcript.jsonl
-      state.json
-      compact.json
-      compactions.jsonl
+Another language model started to solve this problem ...
+<assistant 生成的 handoff summary>
 ```
 
-### 4.1 compact.json
+该消息使用 `metadata.kind=context_compaction`。role 使用 user 是为了兼容不同
+OpenAI-compatible provider，并与 Codex 的 replacement history 布局一致。
 
-`compact.json` 保存最新一次 compact 快照：
+## 3. Compact 请求超窗处理
+
+正常自动 compact 会在 soft limit 触发，因此摘要请求通常可以直接复用现有稳定前缀，
+只新增一条 handoff prompt。
+
+若模型降档或单条工具结果过大导致 compact 请求仍然超窗，处理顺序为：
+
+1. 从最旧的协议完整段开始移除。
+2. user 开始的 assistant/tool 链作为一个整体处理，不拆散 tool call/result。
+3. 若只剩一个超大回合，逐步缩短其中最大的文本正文。
+4. 保留消息角色、tool_call_id、工具名和配对关系。
+5. provider 明确返回 context overflow 时继续采用相同策略重试。
+6. 仍无法执行时抛出 `CompactionError`，不生成规则摘要。
+
+原始完整历史始终保存在 transcript 审计流中，上述缩短只影响这一次 compact 模型请求。
+
+## 4. Replacement History
+
+compact 成功后的 history 顺序为：
+
+```text
+[mid-turn 时的完整 world state]
+[最近若干完整原始回合]
+[context_compaction handoff summary]
+```
+
+summary 始终是最后一条 user 消息。连续 compact 时，上一份 summary 就是当前完整历史
+中的普通结构化消息，会自然进入下一次摘要请求，不需要专门的“上一摘要拼接”代码。
+
+### 4.1 动态保留预算
+
+最近完整回合的目标预算为：
+
+```text
+retained_target = clamp(soft_limit_tokens * 10%, 16K, 128K)
+```
+
+典型值：
+
+| 模型 soft limit | 目标保留量 |
+|---:|---:|
+| 128K 附近 | 16K |
+| 400K | 40K |
+| 1M | 100K |
+| 2M 及以上 | 128K |
+
+目标值还会受压缩后真实剩余空间约束：
+
+```text
+available = soft_limit - system/tools/world_state/summary
+retained_budget = min(retained_target, available)
+```
+
+选择从最新用户回合向前进行，只保留完整回合。最新回合自身超过预算时，保留用户输入
+与最后的普通 assistant 回答；中间工具现场已经由结构化 compact 请求总结。
+
+手动 `/compact` 如果当前历史低于动态目标且无法产生实际空间收益，会返回 `no_op`。
+
+## 5. World State Baseline
+
+world state baseline 不是任务摘要，而是“模型已经看过哪些运行现场信息”的精确快照。
+
+例如模型已经看到：
+
+```text
+instructions = 当前 AGENTS.md/MEMORY.md
+environment = cwd、平台、shell、模型
+plan = 当前已批准计划
+session_state = 当前任务、文件、命令、决策和待办
+```
+
+系统保存这些 section 的实际规范文本。下一轮如果只有 plan 变化，只追加 plan 的新值；
+某个 section 被删除时发送显式 removed 标记。
+
+长期 baseline 包含：
+
+- instructions；
+- environment；
+- current_date 与语言偏好；
+- MCP instructions；
+- session guidance；
+- SessionState；
+- PlanState。
+
+与当前用户查询绑定的 RAG knowledge，以及 hook 产生的本轮 runtime instructions，不进入
+长期 baseline，每轮按当前请求独立注入。
+
+### 5.1 不同 compact 阶段
+
+- manual/pre-turn/post-turn：replacement history 不注入 world state，并清空 baseline；
+  下一条正常请求完整重注入现场并建立新基线。
+- mid-turn：模型需要马上继续同一工具回合，因此把当前完整 world state 插入 summary
+  之前，并立即把该 snapshot 设为新基线。
+- 重启恢复：从最近 context update 的 `world_state_snapshot` metadata 恢复实际值，继续
+  计算增量变化。
+
+## 6. 触发与模型降档
+
+自动触发继续使用动态窗口：
+
+```text
+hard_limit = full_window - max_output_tokens
+margin = clamp(full_window * 2%, 2K, 16K)
+soft_limit = hard_limit - margin
+```
+
+支持以下入口：
+
+- 用户手动 `/compact`；
+- 下一用户请求发送前的 preflight；
+- 工具循环中的 mid-turn compact；
+- 完整回合结束后的 post-turn compact；
+- 大窗口模型切换到小窗口模型时的 model downshift。
+
+模型降档时先解析目标配置但不立即切换：
+
+1. 如果当前上下文超过目标模型 soft limit，先使用旧大模型 compact。
+2. 摘要请求按旧模型窗口组装，但原始回合保留预算按目标小模型 soft limit 计算。
+3. compact 成功后再安装目标模型。
+4. 旧 provider 明确返回 invalid request/400 时，允许临时切到目标模型重试。
+5. 目标模型重试仍失败时恢复旧模型状态并返回错误。
+
+## 7. 前缀缓存
+
+未触发 compact 时，请求继续严格 append-only。
+
+本地摘要请求本身沿用现有 system/history 前缀，只追加 handoff prompt，因此正常情况下
+仍可复用旧前缀缓存。安装 replacement history 会产生一次明确的前缀重置，这是正式
+compact 无法避免的语义边界。
+
+compact 安装完成后，world state 增量和新的 user/assistant/tool 消息继续只追加，不会
+回头改写旧工具结果或历史消息。
+
+## 8. 事务与失败行为
+
+compact 分为三个阶段：
+
+1. 生成摘要；
+2. 构造并验证 replacement history；
+3. 保存 compact v2 快照后替换内存 history。
+
+任一阶段失败时：
+
+- 不替换 `self.history`；
+- 不推进 world state baseline；
+- 不清空 pending context；
+- 不生成低质量规则摘要；
+- 不删除 transcript。
+
+自动 compact 失败且请求尚未达到 hard limit 时保留旧历史；已经达到 hard limit 时停止
+本轮，不把必然超窗的正式请求发送给模型。
+
+## 9. 持久化格式
+
+`compact.json` v2 示例：
 
 ```json
 {
-  "ts": "...",
-  "session_id": "session_xxx",
-  "summary": "【上下文压缩】...",
+  "version": 2,
+  "summary": "Another language model started ...",
+  "replacement_history": [],
+  "world_state_snapshot": {},
   "transcript_offset": 12,
-  "history": [
-    { "role": "assistant", "content": "【上下文压缩】...", "kind": "compact_record" },
-    { "role": "user", "content": "...", "kind": null },
-    { "role": "assistant", "content": "...", "kind": null }
-  ],
-  "before_messages": 12,
-  "after_messages": 3
+  "reason": "mid_turn",
+  "model": "model-id",
+  "target_model": "model-id",
+  "provider": "provider-id",
+  "before_messages": 80,
+  "after_messages": 12,
+  "tokens_before": 350000,
+  "tokens_after": 42000
 }
 ```
 
-`transcript_offset` 是压缩发生时 `transcript.jsonl` 已有的轮次数。恢复时只读取 offset 之后的新 transcript 行，旧行不再注入 prompt。
+- `compact.json` 只保存最新安装快照。
+- `compactions.jsonl` 追加保存每次 compact 的完整审计记录。
+- `transcript.jsonl` 不删除、不重写。
+- mid-turn 回合提交完成后推进 transcript offset，防止重启时重复追加当前回合。
 
-### 4.2 compactions.jsonl
+本次是破坏性升级：旧版或没有 `version=2` 的 compact 快照直接忽略，不执行
+`compact_boundary`/`compact_record` 迁移。旧 transcript 仍可用于人工审计。
 
-`compactions.jsonl` 追加记录每一次 compact 事件。它用于审计，不参与常规恢复。这样可以追踪每次压缩发生的时间、摘要和消息数量变化。
+## 10. 删除的旧实现
 
-### 4.3 state.json
+本次删除：
 
-compact 后会更新 `state.json`：
+- `context/compact/history.py`；
+- `context/compact/boundary.py`；
+- 固定 64K retained 常量；
+- 固定 32K 摘要输入上限；
+- 固定 8K 摘要输出上限；
+- `summary_source` 选择链路；
+- compact boundary 查找和请求切片；
+- `_history_text_for_compact()`；
+- `_rule_compact_summary()`；
+- 旧 compact 专用 state/plan 文本拼装。
 
-- `rolling_summary` 替换为 compact 摘要；
-- `compacted_at` 记录压缩时间；
-- `compact_count` 累加；
-- `compact_transcript_offset` 记录 transcript offset；
-- `files_seen`、`files_modified`、`recent_commands`、`decisions`、`pending` 做有界裁剪。
+## 11. 已知限制
 
-这让 state 继续作为 P1 `[State]` 提供长期工作状态，但不会无限增长。
-
----
-
-## 5. 恢复逻辑
-
-`LocalSessionStore.load_latest_history()` 增加 compact 优先恢复：
-
-1. 如果没有 `compact.json`，仍按旧逻辑从 `transcript.jsonl` 恢复最近若干条 user/final/work_record。
-2. 如果存在 `compact.json`，先恢复 compact 快照里的轻量 `history`。
-3. 再读取 `transcript_offset` 之后新增的 transcript 轮次。
-4. 最后用 `_trim_restored_history()` 裁剪恢复窗口，并尽量保留最近的 `compact_record` 锚点。
-
-这样旧 transcript 仍留在磁盘，但不会在重启或切换会话时重新挤进 prompt。
-
----
-
-## 6. Gateway 与 TUI
-
-Gateway 新增 `session.compact` RPC：
-
-- busy 时返回 `_ERR_BUSY`；
-- 空上下文返回 `no_op=true`；
-- 成功时返回 compact payload；
-- 异常时返回 `_ERR_INTERNAL`。
-
-TUI 新增 `/compact` 命令：
-
-- `Transport.compactSession()` 发送 `session.compact`；
-- `/help` 和命令过滤能看到 `/compact`；
-- handler 不调用 `applySessionPayload()`；
-- handler 不清空 items、不重绘旧屏幕；
-- 只追加系统提示，例如：
-
-```text
-已压缩上下文：history 12 -> 3，下轮将使用摘要继续（已落盘）。
-```
-
-会话恢复或切换时，`compact_record` 在 UI 中按 system 行渲染，避免和普通助手回答混淆。
-
----
-
-## 7. 测试覆盖
-
-本次新增和调整的测试包括：
-
-- `test/test_session_renderer.py`
-  - 验证 `compact_context()` 会压缩内存 history；
-  - 验证下一轮构造的 `[Context]` 能看到 `【上下文压缩】`。
-
-- `test/test_work_context.py`
-  - 验证 compact 后不删除 `transcript.jsonl`；
-  - 验证写入 `compact.json/compactions.jsonl`；
-  - 验证重启恢复时从 compact 锚点和 compact 后新轮次继续。
-
-- `test/test_transport.py`
-  - 验证 Gateway `session.compact` 返回 payload，并写入 compact 快照。
-
-- `ui-tui/src/__tests__/commands.test.ts`
-  - 验证 `/compact` 可被命令过滤和精确查找；
-  - 验证 `/help` 包含 `/compact`；
-  - 验证 handler 只追加系统提示，不重绘 history；
-  - 验证 no-op 提示。
-
-- `ui-tui/src/__tests__/transport.test.ts`
-  - 验证 `Transport.compactSession()` 序列化为 JSON-RPC method `session.compact`。
-
----
-
-## 8. 风险与后续方向
-
-当前实现保留的是“最新 compact 快照 + compact 后新轮次”。这适合释放 prompt，但不是磁盘瘦身工具，因为原始 `transcript.jsonl` 仍保留审计。
-
-后续可以继续扩展：
-
-1. 在 TUI 会话面板显示某会话最近一次 compact 时间。
-2. 给 `/compact` 增加可选参数，例如 `/compact --rule` 强制规则摘要。
-3. 在 `compactions.jsonl` 中记录触发来源，例如 TUI、CLI 或自动策略。
-4. 增加 compact 摘要质量检查，发现摘要缺少“待办/阻塞”等字段时自动补规则片段。
-
+compact 仍然是有损操作。结构化完整历史、原始回合保留和 world state 能显著降低退化，
+但经过很多轮 compact 后，模型准确度仍可能下降。特别长且目标已经发生明显变化的任务，
+应创建新会话，而不是无限依赖摘要继续压缩。

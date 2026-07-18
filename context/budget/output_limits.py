@@ -4,17 +4,14 @@
 
 - CAPPED_DEFAULT_MAX_TOKENS: 默认输出预留(slot 友好,8K)
 - ESCALATED_MAX_TOKENS: 触顶后自动升级 (64K)
-- COMPACT_MAX_OUTPUT_TOKENS: 压缩摘要请求专用上限 (20K)
-
-cb-agent 当前不主动 escalate,但保留常量供 session/compact 模块引用,
-让阈值统一可调。
+cb-agent 当前不主动 escalate。compact 直接使用当前模型配置的输出上限，不再维护
+第二套摘要专用常量。
 """
 
 from __future__ import annotations
 
 CAPPED_DEFAULT_MAX_TOKENS = 8_000  # 默认输出预留(slot 友好,8K)
 ESCALATED_MAX_TOKENS = 64_000  # 触顶后自动升级 (64K)
-COMPACT_MAX_OUTPUT_TOKENS = 20_000  # 压缩摘要请求专用上限 (20K)
 
 
 def get_max_output_tokens_for_model(
@@ -34,6 +31,5 @@ def get_max_output_tokens_for_model(
 __all__ = [
     "CAPPED_DEFAULT_MAX_TOKENS",
     "ESCALATED_MAX_TOKENS",
-    "COMPACT_MAX_OUTPUT_TOKENS",
     "get_max_output_tokens_for_model",
 ]

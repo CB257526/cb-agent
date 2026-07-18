@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import math
@@ -56,6 +55,13 @@ from tools.tools.pending_images import (
     set_pending_image_buffer,
 )
 from agent.cb_agents import CbAgentsLLM
+from agent.compaction import (
+    dynamic_retained_token_target,
+    estimate_message_tokens,
+    make_summary_message,
+    run_local_compaction,
+    select_retained_history,
+)
 from agent.event_bus import EventBus
 from agent.events import (
     BackgroundNotification, Cancelled, ContextWindowUpdated, Done, Error, PlanApproved, PlanDelta,
@@ -70,18 +76,12 @@ from agent.plan_state import PlanStateStore
 from agent.question_registry import QuestionRegistry
 from constant.llm.constant_llm import ConstantLLM
 from context import (
-    COMPACT_BOUNDARY_KIND,
-    DEFAULT_RETAINED_MESSAGE_TOKENS,
     MemoryLoader,
     count_tokens,
     get_dynamic_context_sections,
-    get_messages_after_compact_boundary,
     get_static_system_prompt,
-    has_meaningful_summary_source,
-    is_compact_boundary,
-    make_compact_boundary_message,
-    select_compaction_history,
 )
+from context.world_state import EMPTY_WORLD_STATE, WorldStateSnapshot
 from core.message import Message, MessageRole
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
@@ -94,28 +94,15 @@ from agent.work_context import (
 )
 logger = logging.getLogger(__name__)
 
-# metadata.kind 值,标记运行时上下文更新消息。这类消息在 UI 导出和上下文压缩
-# 摘要时被过滤,因为它们的语义是"告知模型当前环境"而非"用户说了什么"。
-# 关于这方面建议去cb-agent/note/上下文中的指纹机制.md进行了解
+# metadata.kind 标记运行时上下文更新消息。这类消息不在 UI 中展示；compact 摘要
+# 请求仍会看到其结构化原文，但 replacement 的原始回合不重复保留，现场连续性由
+# world state snapshot 单独负责。
 CONTEXT_UPDATE_KIND = "context_update" #标记一个user类型的消息是否属于section块更新的消息
-CONTEXT_FINGERPRINTS_KEY = "context_fingerprints" #上下文指纹的key
-
-# Compact 后最多保留 64K 原始消息，摘要最多 8K tokens，两者分别计费。
-COMPACT_RETAINED_MESSAGE_TOKENS = DEFAULT_RETAINED_MESSAGE_TOKENS
-COMPACT_SUMMARY_MAX_TOKENS = 8_000
-# 发送给摘要模型的历史正文设独立上限；旧摘要始终优先保留。
-COMPACT_SOURCE_MAX_TOKENS = 32_000
-# 为静态 system、工具 schema、当前用户输入和协议包装预留空间。大窗口模型仍使用
-# 64K 原始尾部，小窗口模型则自动降低 retained budget，避免 compact 后依旧超窗。
-COMPACT_REQUEST_RESERVE_TOKENS = 4_000
+WORLD_STATE_SNAPSHOT_KEY = "world_state_snapshot"
 
 
-def _clip_compact_text(text: Any, limit: int = 1200) -> str:
-    """把 compact 周边的短预览文本裁到固定字符数。
-
-    完整 compact 摘要使用 _clip_text_tokens 的 8K token 上限；本函数只服务 UI
-    预览、state 片段和规则摘要中的单项字段，避免短字段被大段输出撑开。
-    """
+def _clip_preview_text(text: Any, limit: int = 1200) -> str:
+    """把 UI 与状态预览文本裁到固定字符数。"""
     if text is None:
         return ""
     s = str(text).replace("\r\n", "\n").replace("\r", "\n")
@@ -125,58 +112,14 @@ def _clip_compact_text(text: Any, limit: int = 1200) -> str:
     return s[: max(0, limit - 1)].rstrip() + "…"
 
 
-def _clip_text_tokens(text: Any, max_tokens: int) -> str:
-    """按 token 上限裁剪文本，避免使用字符数近似导致中英文偏差。"""
-    value = "" if text is None else str(text)
-    limit = max(1, int(max_tokens))
-    if not value or count_tokens(value) <= limit:
-        return value
-
-    low, high = 0, len(value)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if count_tokens(value[:middle]) <= limit:
-            low = middle
-        else:
-            high = middle - 1
-    return value[:low].rstrip() + "…"
-
-
-def _message_text_for_compact(message: Message) -> str:
-    """把一条协议消息完整渲染成摘要输入文本。"""
-    role = _message_role_name(message)
-    kind = _message_kind(message)
-    payload = message.to_dict()
-    label = role if not kind else f"{role}/{kind}"
-    return f"{label}: {json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)}"
-
-
-def _context_text_fingerprint(text: str) -> str:
-    """生成稳定的运行时上下文内容指纹（哈希值）。"""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _context_fingerprints_from_history(history: Sequence[Message]) -> Dict[str, str]:
-    """从最近一次 context update 恢复累计 section 指纹。"""
+def _world_state_from_history(history: Sequence[Message]) -> WorldStateSnapshot:
+    """从最近一次 context update 恢复模型已见的完整现场基线。"""
     for message in reversed(history):
-        # 如果当前message不属于环境信息发生变化类型的消息
         if _message_kind(message) != CONTEXT_UPDATE_KIND:
             continue
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
-        raw = metadata.get(CONTEXT_FINGERPRINTS_KEY)
-        if isinstance(raw, dict):
-            #name:section块的名字
-            #fingerprint:section块的指纹
-            return {
-                str(name): str(fingerprint)
-                for name, fingerprint in raw.items()
-                if name and fingerprint
-            }
-
-        # 最新 context update 没有指纹时说明它来自旧版本，不能继续沿用更早基线。
-        # 返回空字典会让下一轮完整注入一次并自动升级到新格式。
-        return {}
-    return {}
+        return WorldStateSnapshot.from_payload(metadata.get(WORLD_STATE_SNAPSHOT_KEY))
+    return EMPTY_WORLD_STATE
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -229,7 +172,7 @@ def _history_message_to_payload(message: Message) -> Dict[str, Any]:
         tool_name = str(message.tool_name or "")
         call_id = str(message.tool_call_id or "")
         is_error = bool(message.is_error)
-        preview = _clip_compact_text(_message_content_to_text(message.content), 240)
+        preview = _clip_preview_text(_message_content_to_text(message.content), 240)
         label = tool_name or call_id or "tool"
         status_label = "工具失败" if is_error else "工具完成"
         payload["content"] = f"【{status_label}】{label}" + (f": {preview}" if preview else "")
@@ -249,8 +192,8 @@ def _message_role_name(message: Message) -> str:
 def _message_kind(message: Message) -> str:
     """读取本地 message kind。
 
-    work_record/compact_record 在 OpenAI 协议里都是普通 assistant message，
-    本地只靠 metadata.kind 区分用途。/compact 保留最近一轮时要排除这类
+    context update/compaction summary 在 OpenAI 协议里都是普通消息，
+    本地只靠 metadata.kind 区分用途。compact 保留最近回合时要排除这类
     维护性消息，只留下真正的 user/assistant 对话。
     """
     metadata = message.metadata if isinstance(message.metadata, dict) else {}
@@ -323,18 +266,18 @@ def _strip_plan_sections_from_context_update(content: Any) -> Any:
 
 def _make_context_update_message(
     context_text: str,
-    context_fingerprints: Optional[Dict[str, str]] = None,
+    world_state_snapshot: Optional[WorldStateSnapshot] = None,
 ) -> Message:
     """基于运行时上下文文本构造 Message 对象。
 
     标记 metadata.kind = CONTEXT_UPDATE_KIND,用于:
     - export_history() 中过滤掉(UI 不展示上下文更新消息)
-    - _history_text_for_compact() 中跳过(压缩摘要不包含上下文更新)
-    - 跨轮恢复时识别并处理(避免把旧 context 当作用户指令重放)
+    - compact 的原始回合保留阶段跳过，现场信息由 world state 单独管理
+    - 跨轮恢复时恢复完整 baseline，避免重启后重复注入全部现场
     """
     metadata: Dict[str, Any] = {"kind": CONTEXT_UPDATE_KIND}
-    if context_fingerprints is not None:
-        metadata[CONTEXT_FINGERPRINTS_KEY] = dict(context_fingerprints)
+    if world_state_snapshot is not None:
+        metadata[WORLD_STATE_SNAPSHOT_KEY] = world_state_snapshot.to_payload()
     return Message(
         role=MessageRole.USER,
         content=_format_context_update_text(context_text),
@@ -520,7 +463,7 @@ class AgentSession:
         self.rule_trace_summarizer = RuleTraceSummarizer()
         self.history: List[Message] = []
         self._pending_context_update_text = ""
-        self._pending_context_fingerprints: Dict[str, str] = {}
+        self._pending_world_state = EMPTY_WORLD_STATE
         self.plan_store = PlanStateStore(session_store=self.session_store)
         if self.session_store is not None:
             try:
@@ -531,9 +474,9 @@ class AgentSession:
             except Exception:
                 logger.exception("本地会话历史恢复失败,忽略")
                 self.history = []
-        # 新格式从最近一条 context update 的 metadata 恢复 section 基线；旧会话
-        # 没有该字段时保持空字典，下一轮会完整注入一次并自动升级。
-        self._context_fingerprints = _context_fingerprints_from_history(self.history)
+        # 从最近一条 context update 恢复模型实际看过的 section 值。缺少新格式快照
+        # 时按空基线处理，下一轮会完整注入一次。
+        self._world_state_baseline = _world_state_from_history(self.history)
         # 当前正在跑的 chat 的 cancel token；前端取消 RPC 会调用它的 .cancel()
         # 没在 chat 中时为 None
         self.current_cancel_token: Optional[CancelToken] = None
@@ -758,8 +701,8 @@ class AgentSession:
         """
         self.history.clear()
         self._pending_context_update_text = ""
-        self._pending_context_fingerprints = {}
-        self._context_fingerprints = {}
+        self._pending_world_state = EMPTY_WORLD_STATE
+        self._world_state_baseline = EMPTY_WORLD_STATE
         if self.session_store is None:
             return {
                 "session": None,
@@ -791,8 +734,8 @@ class AgentSession:
         summary = self.session_store.switch_session(session_id)
         self.history = self.session_store.load_latest_history()
         self._pending_context_update_text = ""
-        self._pending_context_fingerprints = {}
-        self._context_fingerprints = _context_fingerprints_from_history(self.history)
+        self._pending_world_state = EMPTY_WORLD_STATE
+        self._world_state_baseline = _world_state_from_history(self.history)
         # MemoryLoader 自身仍缓存文件解析结果，切换会话后需要显式失效。
         if self.memory_loader is not None:
             try:
@@ -813,16 +756,12 @@ class AgentSession:
         *,
         source_history: Optional[Sequence[Message]] = None,
         reason: str = "user_compact",
+        target_model: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """把 active history 替换为“摘要 + 最近完整回合”。
-
-        transcript.jsonl 保留 compact 前审计记录；内存 history 与 compact.json 只保存
-        replacement history。摘要预算与 64K 原始尾部预算相互独立。
-        """
+        """使用结构化历史生成 Codex 风格交接摘要并事务安装新 history。"""
         compact_source = list(source_history) if source_history is not None else list(self.history)
         before_messages = len(compact_source)
-        state_text = self._session_state_text()
-        if before_messages == 0 and not state_text:
+        if before_messages == 0:
             return {
                 "session": self.current_session_payload().get("session"),
                 "history": self.export_history(),
@@ -835,22 +774,13 @@ class AgentSession:
                 "no_op": True,
             }
 
-        active_history = get_messages_after_compact_boundary(compact_source)
-        # 计算可以保留的原始消息的最大值
-        retained_budget = min(
-            COMPACT_RETAINED_MESSAGE_TOKENS, #64k
-            max(
-                1,
-                self._context_budget_tokens() #模型的总上下文窗口预算
-                - COMPACT_SUMMARY_MAX_TOKENS #摘要预算8K
-                - COMPACT_REQUEST_RESERVE_TOKENS, #为静态 system、工具 schema、当前用户输入和协议包装预留空间4K
-            ),
+        summary_limits = self._context_limits()
+        install_limits = (
+            ConstantLLM.context_limits(target_model)
+            if target_model else summary_limits
         )
-        selection = select_compaction_history(
-            active_history,
-            retained_token_budget=retained_budget,
-        )
-        if not has_meaningful_summary_source(selection.summary_source):
+        retained_target = dynamic_retained_token_target(install_limits["soft_limit_tokens"])
+        if reason in {"manual", "user_compact"} and estimate_message_tokens(compact_source) <= retained_target:
             return {
                 "session": self.current_session_payload().get("session"),
                 "history": self.export_history(),
@@ -859,20 +789,91 @@ class AgentSession:
                 "summary": "",
                 "before_messages": before_messages,
                 "after_messages": before_messages,
-                "retained_tokens": selection.retained_tokens,
+                "retained_tokens": estimate_message_tokens(compact_source),
                 "persisted": False,
                 "no_op": True,
             }
 
-        summary = self._make_compact_summary(
-            messages=selection.summary_source,
-            state_text=state_text,
+        enabled_tools = frozenset(self._enabled_tools_for_prompt())
+        static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
+        static_system = "\n\n".join(part.strip() for part in static_parts if part and part.strip())
+        if self.system_prompt_addendum.strip():
+            static_system = (
+                f"{static_system}\n\n{self.system_prompt_addendum.strip()}"
+                if static_system else self.system_prompt_addendum.strip()
+            )
+        system_message = (
+            {"role": "system", "content": static_system}
+            if static_system else None
         )
-        boundary = make_compact_boundary_message(
-            summary,
-            reason=reason,
+        model_result = run_local_compaction(
+            llm=self.llm,
+            system_message=system_message,
+            history=compact_source,
+            hard_limit_tokens=summary_limits["hard_limit_tokens"],
+            estimate_request_tokens=lambda request: self._estimate_request_tokens(request, None),
         )
-        replacement_history = [boundary, *selection.retained_messages]
+        summary_message = make_summary_message(model_result.summary, reason=reason)
+
+        # mid-turn 会马上继续同一工具回合，因此必须把当前完整现场放入 replacement
+        # history；manual/pre-turn 则清空基线，让下一条正常请求完整重注入。
+        installed_world_state = (
+            self._pending_world_state
+            if reason == "mid_turn" and self._pending_world_state.sections
+            else self._world_state_baseline if reason == "mid_turn" else EMPTY_WORLD_STATE
+        )
+        world_state_message = (
+            _make_context_update_message(
+                _format_context_sections(list(installed_world_state.sections.items()), []),
+                installed_world_state,
+            )
+            if installed_world_state.sections else None
+        )
+        tools_schema = self._stable_tools_schema(
+            self._filter_tools_schema_for_plan_mode(
+                self.registry.get_tools_description_openai_schema()
+                if self.llm.is_Function_Calling else None
+            )
+        )
+        fixed_messages: List[Dict[str, Any]] = []
+        if system_message:
+            fixed_messages.append(system_message)
+        if world_state_message is not None:
+            fixed_messages.append(world_state_message.to_dict())
+        fixed_messages.append(summary_message.to_dict())
+        fixed_tokens = self._estimate_request_tokens(fixed_messages, tools_schema)
+        retained_budget = min(
+            retained_target,
+            max(0, install_limits["soft_limit_tokens"] - fixed_tokens),
+        )
+
+        def _replacement_for_budget(token_budget: int):
+            """按给定预算构造 replacement，并把 mid-turn 现场放在最后用户回合前。"""
+
+            selected = select_retained_history(compact_source, token_budget=token_budget)
+            replacement = list(selected.messages)
+            if world_state_message is not None:
+                insertion_index = next(
+                    (
+                        index
+                        for index in range(len(replacement) - 1, -1, -1)
+                        if _message_role_name(replacement[index]) == "user"
+                    ),
+                    len(replacement),
+                )
+                replacement.insert(insertion_index, world_state_message)
+            replacement.append(summary_message)
+            return selected, replacement
+
+        retained, replacement_history = _replacement_for_budget(retained_budget)
+        while retained_budget > 0 and retained.messages:
+            post_messages = ([system_message] if system_message else []) + [
+                message.to_dict() for message in replacement_history
+            ]
+            if self._estimate_request_tokens(post_messages, tools_schema) <= install_limits["soft_limit_tokens"]:
+                break
+            retained_budget = max(0, retained_budget * 3 // 4 - 1)
+            retained, replacement_history = _replacement_for_budget(retained_budget)
         after_messages = len(replacement_history)
 
         persisted = False
@@ -880,13 +881,20 @@ class AgentSession:
             try:
                 from agent.work_context import _message_to_persist_payload
                 self.session_store.save_compaction(
-                    summary=str(boundary.content or ""),
+                    summary=str(summary_message.content or ""),
                     history_payload=[
                         _message_to_persist_payload(message)
                         for message in replacement_history
                     ],
                     before_messages=before_messages,
                     after_messages=after_messages,
+                    reason=reason,
+                    model=str(getattr(self.llm, "model", "") or ""),
+                    target_model=str(target_model or getattr(self.llm, "model", "") or ""),
+                    provider=str(getattr(self.llm, "provider", "") or ""),
+                    world_state_snapshot=installed_world_state.to_payload(),
+                    tokens_before=estimate_message_tokens(compact_source),
+                    tokens_after=estimate_message_tokens(replacement_history),
                 )
                 persisted = True
             except Exception:
@@ -896,8 +904,8 @@ class AgentSession:
         # 只有落盘成功（或未启用持久化）后才替换内存，避免磁盘失败造成状态分裂。
         self.history = replacement_history
         self._pending_context_update_text = ""
-        self._pending_context_fingerprints = {}
-        self._context_fingerprints = {}
+        self._pending_world_state = EMPTY_WORLD_STATE
+        self._world_state_baseline = installed_world_state
         if self.memory_loader is not None:
             try:
                 self.memory_loader.reset_cache(reason=reason)
@@ -909,11 +917,17 @@ class AgentSession:
             "history": self.export_history(),
             "context_window": self.context_window_usage(),
             "plan_state": self.plan_state(),
-            "summary": str(boundary.content or ""),
+            "summary": str(summary_message.content or ""),
             "before_messages": before_messages,
             "after_messages": after_messages,
-            "retained_tokens": selection.retained_tokens,
-            "oversized_latest_turn": selection.oversized_latest_turn,
+            "retained_tokens": retained.tokens,
+            "retained_target_tokens": retained_target,
+            "oversized_latest_turn": retained.oversized_latest_turn,
+            "world_state_sections": len(installed_world_state.sections),
+            "attempts": model_result.attempts,
+            "dropped_compact_messages": model_result.dropped_messages,
+            "model": str(getattr(self.llm, "model", "") or ""),
+            "target_model": str(target_model or getattr(self.llm, "model", "") or ""),
             "persisted": persisted,
             "no_op": False,
         }
@@ -1066,21 +1080,22 @@ class AgentSession:
                 + state_text,
             ))
 
-        # 相同名称只保留最后一个值，防止扩展调用点意外产生重复 section。
-        normalized_sections: Dict[str, str] = {}
+        # 查询知识和 hook 运行时指令只对当前请求有效，不能成为跨轮 world state。
+        # 其余具名 section 保存实际文本，compact 和重启后都能精确恢复基线。
+        transient_names = {"knowledge", "runtime_instructions"}
+        persistent_sections: List[tuple[str, str]] = []
+        transient_sections: List[tuple[str, str]] = []
         for name, text in context_sections:
             if name and text and text.strip():
-                normalized_sections[str(name)] = text.strip()
-        current_fingerprints = {
-            name: _context_text_fingerprint(text)
-            for name, text in normalized_sections.items()
-        }
-        changed_sections = [
-            (name, text)
-            for name, text in normalized_sections.items()
-            if self._context_fingerprints.get(name) != current_fingerprints[name]
-        ]
-        removed_sections = sorted(set(self._context_fingerprints) - set(current_fingerprints))
+                item = (str(name), text.strip())
+                if str(name) in transient_names:
+                    transient_sections.append(item)
+                else:
+                    persistent_sections.append(item)
+        current_world_state = WorldStateSnapshot.from_sections(persistent_sections)
+        world_diff = current_world_state.diff(self._world_state_baseline)
+        changed_sections = [*world_diff.changed, *transient_sections]
+        removed_sections = world_diff.removed
 
         # 组装最终 messages 列表
         messages: List[Dict[str, Any]] = []
@@ -1099,16 +1114,14 @@ class AgentSession:
         messages.extend(self._sliced_history_dicts())
 
         # 仅当至少一个块变化或删除时追加 context update。基线等本轮成功提交后更新，
-        # 防止 preflight compact 重建 messages 时误以为新上下文已经持久化。
+        # 防止 preflight compact 重建 messages 时误以为新现场已经持久化。
         context_text = (
             _format_context_sections(changed_sections, removed_sections)
             if changed_sections or removed_sections
             else ""
         )
         self._pending_context_update_text = context_text
-        self._pending_context_fingerprints = (
-            current_fingerprints if context_text else {}
-        )
+        self._pending_world_state = current_world_state
         if context_text:
             messages.append({
                 "role": "user",
@@ -1166,10 +1179,9 @@ class AgentSession:
         return list(sections)
 
     def _sliced_history_dicts(self) -> List[Dict[str, Any]]:
-        """Return the full active history after the latest compact boundary."""
-        active = get_messages_after_compact_boundary(self.history)
+        """返回当前已经安装的完整 active replacement history。"""
         dicts: List[Dict[str, Any]] = []
-        for m in active:
+        for m in self.history:
             item = m.to_dict()
             metadata = m.metadata if isinstance(m.metadata, dict) else {}
             if (
@@ -1177,9 +1189,9 @@ class AgentSession:
                 and item.get("role") == "user"
                 and isinstance(item.get("content"), str)
                 and "<context-update>" in item.get("content", "")
-                # 只清理旧版本整块注入的 Plan Mode 文本。新格式具备累计指纹，
-                # plan section 必须留在 history 中，否则基线未变时下一轮不会重发。
-                and CONTEXT_FINGERPRINTS_KEY not in metadata
+                # 只清理旧版本整块注入的 Plan Mode 文本。新格式具备完整现场快照，
+                # plan section 必须留在 history 中，否则会破坏恢复基线。
+                and WORLD_STATE_SNAPSHOT_KEY not in metadata
             ):
                 item["content"] = _strip_plan_sections_from_context_update(item.get("content"))
                 if not str(item.get("content") or "").strip():
@@ -1556,7 +1568,7 @@ class AgentSession:
                 context_message = (
                     _make_context_update_message(
                         self._pending_context_update_text,
-                        self._pending_context_fingerprints,
+                        self._pending_world_state,
                     )
                     if self._pending_context_update_text else None
                 )
@@ -1584,12 +1596,12 @@ class AgentSession:
         # 新增的部分，避免把 system / state user / 历史轮次重复推回。
         commit_offset = len(messages)
         committed_context_text = self._pending_context_update_text
-        committed_context_fingerprints = dict(self._pending_context_fingerprints)
+        committed_world_state = self._pending_world_state
         turn_prefix_messages: List[Message] = []
         if committed_context_text:
             turn_prefix_messages.append(_make_context_update_message(
                 committed_context_text,
-                committed_context_fingerprints,
+                committed_world_state,
             ))
         turn_prefix_messages.append(Message(role=MessageRole.USER, content=history_user_text))
         loop_state: Dict[str, Any] = {
@@ -1672,12 +1684,12 @@ class AgentSession:
                 )
             except Exception:
                 logger.exception("对齐 mid-turn compact 的 transcript offset 失败")
-        # 只有当前回合已经进入 history/transcript 后才推进指纹基线。删除全部 section
-        # 时指纹字典为空，但 committed_context_text 仍能明确表示这次更新有效。
+        # 只有当前回合已经进入 history/transcript 后才推进现场基线。这样 provider
+        # 失败或 preflight 重建请求都不会让本地状态领先于模型实际看到的内容。
         if committed_context_text:
-            self._context_fingerprints = committed_context_fingerprints
+            self._world_state_baseline = committed_world_state
         self._pending_context_update_text = ""
-        self._pending_context_fingerprints = {}
+        self._pending_world_state = EMPTY_WORLD_STATE
         # 自动记忆更新:现在只驱动 MEMORY.md 长期记忆(KnowledgeBase.capture_turn
         # 内按用户显式"请记住"类触发写入)。结构化知识页改由模型显式调用
         # knowledge_write 工具写入——原先依赖 work_record 文本的自动知识页捕获
@@ -1744,8 +1756,8 @@ class AgentSession:
                 logger.exception("清理会话时取消子代理任务失败")
         self.history.clear()
         self._pending_context_update_text = ""
-        self._pending_context_fingerprints = {}
-        self._context_fingerprints = {}
+        self._pending_world_state = EMPTY_WORLD_STATE
+        self._world_state_baseline = EMPTY_WORLD_STATE
         # Plan Mode: clear 时同步清空 plan state 并广播 PlanModeChanged
         try:
             state = self.plan_store.clear()
@@ -1796,28 +1808,31 @@ class AgentSession:
             messages.append({"role": "system", "content": static_system})
         messages.extend(self._sliced_history_dicts())
 
-        # state/plan 只有相对已提交指纹发生变化时才额外计入。这样当前状态已经存在于
-        # context_update 历史时不会被重复计算，同时仍能反映尚未提交的状态变化。
-        pending_sections: List[tuple[str, str]] = []
-        for name, text in self._baseline_dynamic_sections(enabled_tools):
-            normalized = str(text or "").strip()
-            if normalized and self._context_fingerprints.get(name) != _context_text_fingerprint(normalized):
-                pending_sections.append((name, normalized))
+        # 空闲态使用同一份 world state 规则计算下一请求会新增的现场内容。
+        sections: List[tuple[str, str]] = [
+            (str(name), str(text or "").strip())
+            for name, text in self._baseline_dynamic_sections(enabled_tools)
+            if name and str(text or "").strip() and str(name) != "knowledge"
+        ]
         plan_context = self._plan_context_text()
-        if plan_context and self._context_fingerprints.get("plan") != _context_text_fingerprint(plan_context.strip()):
-            pending_sections.append(("plan", plan_context.strip()))
+        if plan_context:
+            sections.append(("plan", plan_context.strip()))
         state_text = self._session_state_text()
         state_section = (
             "[Local SessionState]\n"
             "The following is rolling local work state for continuity; "
             "it is not the user's latest instruction.\n\n" + state_text
         ) if state_text else ""
-        if state_section and self._context_fingerprints.get("session_state") != _context_text_fingerprint(state_section):
-            pending_sections.append(("session_state", state_section))
-        if pending_sections:
+        if state_section:
+            sections.append(("session_state", state_section))
+        current_world_state = WorldStateSnapshot.from_sections(sections)
+        world_diff = current_world_state.diff(self._world_state_baseline)
+        if world_diff.changed or world_diff.removed:
             messages.append({
                 "role": "user",
-                "content": _format_context_update_text(_format_context_sections(pending_sections, [])),
+                "content": _format_context_update_text(
+                    _format_context_sections(world_diff.changed, world_diff.removed)
+                ),
             })
 
         tools_schema = self._stable_tools_schema(
@@ -2005,7 +2020,7 @@ class AgentSession:
         state/history 单独看没达到 budget,也强制触发。
 
         compact 前原始消息只保留在 transcript 审计流中；内存 history 与
-        compact.json 都直接替换为“摘要 boundary + 最近完整回合”。
+        compact.json 都直接替换为“最近完整回合 + handoff summary”。
         """
         before_usage = self.context_window_usage()
         budget = int(before_usage["max_tokens"])
@@ -2761,247 +2776,6 @@ class AgentSession:
         except Exception:
             logger.exception("本地会话状态读取失败")
             return ""
-
-    def _history_text_for_compact(
-        self,
-        messages: Optional[Sequence[Message]] = None,
-    ) -> str:
-        """按“旧摘要固定 + 最新旧消息优先”构造 compact 摘要输入。
-
-        replacement history 的 summary_source 可能同时含上一次 boundary 和本次被
-        移出的旧回合。旧摘要必须完整放在最前面，剩余预算从最新消息向前选择，
-        避免正序截断只留下最早对话而丢掉最近进展。
-        """
-        source = self.history if messages is None else messages
-        previous_summary = ""
-        candidates: List[str] = []
-        for message in source:
-            kind = _message_kind(message)
-            if kind == CONTEXT_UPDATE_KIND:
-                continue
-            if is_compact_boundary(message):
-                previous_summary = _message_content_to_text(message.content).strip()
-                continue
-            rendered = _message_text_for_compact(message)
-            if rendered.strip():
-                candidates.append(rendered)
-
-        fixed_parts: List[str] = []
-        if previous_summary:
-            fixed_parts.append("[上一次上下文压缩摘要]\n" + previous_summary)
-        fixed_text = "\n\n".join(fixed_parts)
-        remaining_tokens = max(
-            0,
-            COMPACT_SOURCE_MAX_TOKENS - count_tokens(fixed_text),
-        )
-
-        selected_reversed: List[str] = []
-        for rendered in reversed(candidates):
-            rendered_tokens = count_tokens(rendered)
-            if rendered_tokens <= remaining_tokens:
-                selected_reversed.append(rendered)
-                remaining_tokens -= rendered_tokens
-                continue
-            if remaining_tokens > 0 and not selected_reversed:
-                # 单条最新消息就超过预算时仍保留其开头，至少不丢掉消息角色与主旨。
-                selected_reversed.append(_clip_text_tokens(rendered, remaining_tokens))
-            break
-
-        selected_reversed.reverse()
-        if selected_reversed:
-            fixed_parts.append("[本次被移出原始尾部的消息]\n" + "\n".join(selected_reversed))
-        return _clip_text_tokens("\n\n".join(fixed_parts), COMPACT_SOURCE_MAX_TOKENS)
-
-    def _state_snapshot_for_compact(self, state_text: str) -> str:
-        """把 state.json 中的关键结构化状态渲染给 compact summarizer。
-
-        LocalSessionStore.state_text() 已经覆盖 rolling_summary、文件、命令和待办；
-        这里再补 active_task/decisions 等字段，让 LLM 和规则兜底都能看到计划要求
-        的“当前任务、关键结论、待办/阻塞”。
-        """
-        if self.session_store is None:
-            return state_text
-        state = self.session_store.state if isinstance(self.session_store.state, dict) else {}
-        parts: List[str] = []
-        active_task = _clip_compact_text(state.get("active_task"), 240)
-        if active_task:
-            parts.append("当前任务：" + active_task)
-        if state_text:
-            parts.append("滚动状态：\n" + _clip_compact_text(state_text, 4000))
-        decisions = state.get("decisions") if isinstance(state.get("decisions"), list) else []
-        if decisions:
-            parts.append("关键结论：" + "；".join(_clip_compact_text(x, 120) for x in decisions[-8:]))
-        pending = state.get("pending") if isinstance(state.get("pending"), list) else []
-        if pending:
-            parts.append("待办/阻塞：" + "；".join(_clip_compact_text(x, 120) for x in pending[-8:]))
-        return _clip_compact_text("\n".join(parts), 6000)
-
-    def _plan_snapshot_for_compact(self) -> str:
-        """Render compact-only plan metadata without duplicating the full plan.
-
-        Approved/pending plans are persisted by PlanStateStore and injected into
-        every turn via _plan_context_text(). Compact summaries should preserve
-        implementation progress and decisions around the plan, but they do not
-        need to copy the full Markdown plan into the boundary summary.
-        """
-        if self.is_subagent:
-            # 自动压缩也不能读取项目级 fallback PlanState，否则长任务会在压缩时
-            # 意外继承父会话计划，破坏子代理的角色和上下文隔离。
-            return ""
-        try:
-            state = self.plan_store.load(include_content=True)
-        except Exception:
-            logger.exception("plan state read failed for compact")
-            return ""
-
-        mode = str(state.get("mode") or "execute")
-        status = str(state.get("status") or "idle")
-        pending_plan = str(state.get("pending_plan") or "")
-        approved_plan = str(state.get("approved_plan") or "")
-        feedback = str(state.get("last_feedback") or "")
-        if (
-            mode == "execute"
-            and status == "idle"
-            and not pending_plan
-            and not approved_plan
-            and not feedback
-        ):
-            return ""
-
-        parts = [
-            f"计划状态：mode={mode}; status={status}; revision={state.get('revision') or 0}",
-        ]
-        current_path = state.get("current_path")
-        approved_path = state.get("approved_path")
-        if current_path:
-            parts.append("当前计划文件：" + str(current_path))
-        if approved_path:
-            parts.append("已批准计划文件：" + str(approved_path))
-        if feedback:
-            parts.append("最近拒绝反馈：" + _clip_compact_text(feedback, 300))
-        if pending_plan:
-            parts.append(
-                "待审批计划全文由 PlanState 每轮注入；压缩摘要只需保留围绕该计划的用户意见、阻塞和修订方向。"
-            )
-        if approved_plan:
-            parts.append(
-                "已批准计划全文由 PlanState 每轮注入，直到用户清空会话或提交新计划；"
-                "压缩摘要必须保留实施进度、已完成步骤、剩余步骤、偏离原因和阻塞。"
-            )
-        return _clip_compact_text("\n".join(parts), 1600)
-
-    def _make_compact_summary(
-        self,
-        *,
-        messages: Optional[Sequence[Message]] = None,
-        state_text: str,
-        focus: Optional[str] = None,
-    ) -> str:
-        """生成 /compact 摘要文本。
-
-        优先走 OpenAI-compatible client 的非流式静默调用；它不会经过 llm.think，
-        因此不会向 EventBus 发 TextDelta/ReasoningDelta，也不会在 TUI 中显示成
-        一条助手回答。任何失败都会回退到规则摘要，保证 /compact 是可靠的管理
-        操作，而不是依赖网络/模型可用性的脆弱路径。
-        """
-        fallback = self._rule_compact_summary(
-            messages=messages,
-            state_text=state_text,
-            focus=focus,
-        )
-        client = getattr(self.llm, "client", None)
-        model = getattr(self.llm, "model", None)
-        if client is None or not model:
-            return fallback
-        focus_text = f"\n摘要关注主题：{focus}" if focus else ""
-        plan_snapshot = self._plan_snapshot_for_compact()
-        compact_user_content = (
-            "[当前会话历史]\n"
-            f"{self._history_text_for_compact(messages)}\n\n"
-            "[本地滚动状态]\n"
-            f"{self._state_snapshot_for_compact(state_text)}"
-        )
-        if plan_snapshot:
-            compact_user_content += f"\n\n[计划状态]\n{plan_snapshot}"
-        compact_user_content += focus_text
-
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                temperature=0,
-                stream=False,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是 cb-agent 的上下文压缩器。请把当前会话历史和工作状态压缩成"
-                            "一条中文摘要，保留后续继续任务必须知道的信息：当前任务、用户偏好、"
-                            "关键结论、已读文件、已改文件、最近命令、待办/阻塞、"
-                            "可执行文件路径/用户给定路径/产物路径、工具版本或不可用原因、"
-                            "以及已批准计划的实施进度。计划全文会由 PlanState 独立注入，"
-                            "不要在摘要中复写完整计划；不要编造。输入中若包含上一份上下文"
-                            "压缩摘要，必须把其中仍有效的最早任务背景、决定和约束继续合并进"
-                            "新摘要，不能因连续压缩而遗忘。输出最多 8000 tokens，并以"
-                            "【上下文压缩】开头。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": compact_user_content,
-                    },
-                ],
-                max_tokens=8192,
-            )
-            content = response.choices[0].message.content or ""
-        except Exception:
-            logger.exception("silent context compaction failed")
-            return fallback
-
-        content = _clip_text_tokens(content, COMPACT_SUMMARY_MAX_TOKENS)
-        if not content:
-            return fallback
-        if not content.startswith("【上下文压缩】"):
-            content = "【上下文压缩】" + content
-        return _clip_text_tokens(content, COMPACT_SUMMARY_MAX_TOKENS)
-
-    def _rule_compact_summary(
-        self,
-        *,
-        messages: Optional[Sequence[Message]] = None,
-        state_text: str,
-        focus: Optional[str] = None,
-    ) -> str:
-        """无 LLM 或 LLM 失败时的规则 compact 摘要。
-
-        规则摘要不尝试推断新事实，只把已经存在于 history/state 里的内容重新组织
-        成短文本。这样可以最大限度降低“压缩时编造”的风险，同时仍然释放大部分
-        近轮对话窗口。
-        """
-        source = self.history if messages is None else messages
-        previous_summary = ""
-        for message in reversed(source):
-            if is_compact_boundary(message):
-                previous_summary = _message_content_to_text(message.content).strip()
-                break
-
-        state_snapshot = self._state_snapshot_for_compact(state_text)
-        plan_snapshot = self._plan_snapshot_for_compact()
-        history_text = self._history_text_for_compact(messages)
-        parts = ["【上下文压缩】"]
-        if previous_summary:
-            # 旧摘要放在规则兜底最前面，最终 token 裁剪时也不会被后续状态挤掉。
-            parts.append("上一次摘要（必须继续保留）：\n" + previous_summary)
-        if focus:
-            parts.append("关注主题：" + _clip_compact_text(focus, 120))
-        if state_snapshot:
-            parts.append("状态摘要：" + _clip_compact_text(state_snapshot, 700))
-        if plan_snapshot:
-            parts.append("计划状态：" + _clip_compact_text(plan_snapshot, 450))
-        if history_text:
-            parts.append("最近对话：" + _clip_compact_text(history_text, 500))
-        if len(parts) == 1:
-            parts.append("当前没有可压缩的有效上下文。")
-        return _clip_text_tokens("\n".join(parts), COMPACT_SUMMARY_MAX_TOKENS)
 
     def _make_work_record(
         self,

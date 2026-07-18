@@ -808,7 +808,6 @@ class TestAgentSessionRuntimeUpdates(unittest.TestCase):
 
         self.assertEqual(session.collaboration_mode(), "execute")
         self.assertEqual(session._plan_context_text(), "")
-        self.assertEqual(session._plan_snapshot_for_compact(), "")
         session.plan_store.load.assert_not_called()
         session.plan_store.context_text.assert_not_called()
 

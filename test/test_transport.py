@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
@@ -156,6 +157,22 @@ class FakeLLM:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.calls: List[Dict[str, Any]] = []
+        self.max_output_tokens = 4096
+        self.output_token_param = "max_tokens"
+        owner = self
+
+        class _Completions:
+            def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(content="网关测试交接摘要")
+                    )]
+                )
+
+        self.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+
+    def _apply_output_token_limit(self, request_kwargs):
+        request_kwargs[self.output_token_param] = self.max_output_tokens
 
     def think(self, messages, tools=None, event_bus=None,
               cancel_event=None, round_idx=0):
@@ -553,9 +570,9 @@ class TestGatewayDispatch(unittest.TestCase):
                 ],
             )
 
-            # 默认 64K 下这段小历史应 no-op；测试通过收紧预算验证 RPC 的
+            # 默认动态预算下这段小历史应 no-op；测试通过收紧预算验证 RPC 的
             # replacement history 路径，而不是重新引入“手动 compact 必须压缩”。
-            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+            with patch("agent.session.dynamic_retained_token_target", return_value=20):
                 msgs = self._run_gateway_with_msgs(
                     FakeLLM([]),
                     [json.dumps({"jsonrpc": "2.0", "id": "cp1", "method": "session.compact"})],
@@ -566,13 +583,67 @@ class TestGatewayDispatch(unittest.TestCase):
             replies = [m for m in msgs if m.get("id") == "cp1"]
             self.assertEqual(len(replies), 1)
             result = replies[0]["result"]
-            self.assertIn("【上下文压缩】", result["summary"])
+            self.assertIn("Another language model started", result["summary"])
             self.assertLess(result["after_messages"], result["before_messages"])
             self.assertFalse(result["no_op"])
             self.assertIn("context_window", result)
             self.assertGreater(result["context_window"]["used_tokens"], 0)
             self.assertTrue(result["persisted"])
             self.assertTrue((store.active_dir / "compact.json").exists())
+
+    def test_model_downshift_compacts_with_old_model_before_switch(self):
+        """大窗口降档时必须先用旧模型 compact，再安装目标模型。"""
+
+        original_old = ConstantLLM.llm_dict.get("old-large")
+        original_new = ConstantLLM.llm_dict.get("new-small")
+        ConstantLLM.llm_dict["old-large"] = {
+            "is_tool": True, "max_tokens": 100_000, "max_output_tokens": 4_000,
+        }
+        ConstantLLM.llm_dict["new-small"] = {
+            "is_tool": True, "max_tokens": 20_000, "max_output_tokens": 2_000,
+        }
+        self.addCleanup(lambda: ConstantLLM.llm_dict.__setitem__("old-large", original_old) if original_old is not None else ConstantLLM.llm_dict.pop("old-large", None))
+        self.addCleanup(lambda: ConstantLLM.llm_dict.__setitem__("new-small", original_new) if original_new is not None else ConstantLLM.llm_dict.pop("new-small", None))
+
+        order: List[str] = []
+
+        class SwitchableLLM:
+            model = "old-large"
+
+            def preview_model(self, _key):
+                return {"model": "new-small", "max_tokens": 20_000}
+
+            def switch_model(self, _key):
+                order.append("switch")
+                self.model = "new-small"
+                return {"model": "new-small", "key": "small", "provider": "fake"}
+
+        llm = SwitchableLLM()
+
+        class Session:
+            def __init__(self):
+                self.llm = llm
+
+            def context_window_usage(self):
+                return {"used_tokens": 30_000}
+
+            def compact_context(self, *, reason, target_model=None):
+                order.append(f"compact:{self.llm.model}:{reason}:{target_model}")
+                return {"no_op": False}
+
+        output = io.StringIO()
+        gateway = Gateway(
+            session=Session(),  # type: ignore[arg-type]
+            event_bus=EventBus(),
+            transport=StdioTransport(stdin=io.StringIO(""), stdout=output),
+            redirect_stdout_to_stderr=False,
+        )
+        gateway._handle_set_model("m1", {"model": "new-small"})
+
+        self.assertEqual(order, ["compact:old-large:model_downshift:new-small", "switch"])
+        responses = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+        response = next(item for item in responses if item.get("id") == "m1")
+        self.assertEqual(response["result"]["model"]["model"], "new-small")
 
     def test_gateway_list_tools(self):
         """session.list_tools 应返回 registry 里的工具名/描述/schema 列表。"""

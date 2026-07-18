@@ -1,4 +1,4 @@
-"""增量上下文指纹与连续 compact 回归测试。"""
+"""Codex 风格结构化 compact 与 world state 回归测试。"""
 
 from __future__ import annotations
 
@@ -16,27 +16,65 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from agent.compaction import (
+    COMPACTION_SUMMARY_KIND,
+    SUMMARY_PREFIX,
+    SUMMARIZATION_PROMPT,
+    CompactionError,
+    dynamic_retained_token_target,
+)
 from agent.event_bus import EventBus
 from agent.executor import ToolExecutor
 from agent.session import AgentSession
-from agent.work_context import LocalSessionStore, _message_to_persist_payload
-from context.compact import make_compact_boundary_message
+from agent.work_context import LocalSessionStore
+from constant.llm.constant_llm import ConstantLLM
+from context.world_state import WorldStateSnapshot
 from core.message import Message, MessageRole
 
 
-class FakeLLM:
-    """记录请求并按顺序返回固定回答。"""
+class FakeCompletions:
+    """记录静默摘要请求并返回可配置结果。"""
 
-    def __init__(self, answers: list[str] | None = None) -> None:
+    def __init__(self, owner: "FakeLLM") -> None:
+        self.owner = owner
+
+    def create(self, **kwargs):
+        self.owner.compact_calls.append(kwargs)
+        if self.owner.compact_error is not None:
+            raise self.owner.compact_error
+        summary = self.owner.compact_summaries.pop(0) if self.owner.compact_summaries else "handoff"
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=summary))]
+        )
+
+
+class FakeLLM:
+    """同时支持普通 think 与非流式 compact 请求。"""
+
+    def __init__(self, answers: list[str] | None = None, summaries: list[str] | None = None) -> None:
         self.answers = list(answers or [])
+        self.compact_summaries = list(summaries or [])
         self.calls: list[dict[str, Any]] = []
+        self.compact_calls: list[dict[str, Any]] = []
+        self.compact_error: Exception | None = None
         self.is_Function_Calling = True
         self.model = "fake"
+        self.provider = "fake-provider"
+        self.max_output_tokens = 4096
+        self.output_token_param = "max_tokens"
+        self.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions(self))
+        )
 
     def think(self, messages, tools=None, **kwargs):
         self.calls.append({"messages": list(messages), "tools": tools})
         answer = self.answers.pop(0) if self.answers else "ok"
         return {"answer": answer, "tool_calls": []}
+
+    def _apply_output_token_limit(self, request_kwargs):
+        if self.output_token_param == "none":
+            return
+        request_kwargs[self.output_token_param] = self.max_output_tokens
 
 
 class FakeRegistry:
@@ -49,12 +87,12 @@ class FakeRegistry:
         return []
 
 
-def _session(*, store: LocalSessionStore | None = None, answers=None) -> AgentSession:
+def _session(*, store: LocalSessionStore | None = None, answers=None, summaries=None) -> AgentSession:
     bus = EventBus()
-    registry = FakeRegistry()
+    llm = FakeLLM(answers, summaries)
     return AgentSession(
-        llm=FakeLLM(answers),
-        registry=registry,
+        llm=llm,
+        registry=FakeRegistry(),
         executor=ToolExecutor(lambda *_args, **_kwargs: "{}", bus),
         event_bus=bus,
         ctx_enabled=False,
@@ -78,221 +116,254 @@ def _context_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def test_section_diff_only_emits_changed_and_removed_sections():
-    current = [
-        ("environment", "ENV-A"),
-        ("knowledge", "KNOWLEDGE-A"),
-    ]
+def test_world_state_diff_only_emits_changed_and_removed_sections():
+    current = [("environment", "ENV-A"), ("knowledge", "KNOWLEDGE-A")]
 
     async def dynamic_sections(**_kwargs):
         return list(current)
 
     session = _session()
     with patch("agent.session.get_dynamic_context_sections", new=dynamic_sections):
-        first = session._build_chat_messages(
-            user_content="first",
-            system_instructions="",
-        )
-        first_update = _context_messages(first)[0]["content"]
-        assert "ENV-A" in first_update
-        assert "KNOWLEDGE-A" in first_update
+        first = session._build_chat_messages(user_content="first", system_instructions="")
+        assert "ENV-A" in _context_messages(first)[0]["content"]
+        assert "KNOWLEDGE-A" in _context_messages(first)[0]["content"]
 
-        # 模拟回合成功提交后推进累计指纹基线。
-        session._context_fingerprints = dict(session._pending_context_fingerprints)
-        second = session._build_chat_messages(
-            user_content="second",
-            system_instructions="",
-        )
-        assert _context_messages(second) == []
+        session._world_state_baseline = session._pending_world_state
+        second = session._build_chat_messages(user_content="second", system_instructions="")
+        # knowledge 与查询绑定，即使稳定也必须作为本轮临时上下文重新出现。
+        assert "KNOWLEDGE-A" in _context_messages(second)[0]["content"]
+        assert "ENV-A" not in _context_messages(second)[0]["content"]
 
-        current[:] = [
-            ("environment", "ENV-A"),
-            ("knowledge", "KNOWLEDGE-B"),
-        ]
-        third = session._build_chat_messages(
-            user_content="third",
-            system_instructions="",
-        )
-        third_update = _context_messages(third)[0]["content"]
-        assert "KNOWLEDGE-B" in third_update
-        assert "ENV-A" not in third_update
-
-        session._context_fingerprints = dict(session._pending_context_fingerprints)
-        current[:] = [("environment", "ENV-A")]
-        fourth = session._build_chat_messages(
-            user_content="fourth",
-            system_instructions="",
-        )
-        fourth_update = _context_messages(fourth)[0]["content"]
-        assert '<context-section name="knowledge" state="removed" />' in fourth_update
-        assert "ENV-A" not in fourth_update
+        current[:] = [("environment", "ENV-B")]
+        third = session._build_chat_messages(user_content="third", system_instructions="")
+        update = _context_messages(third)[0]["content"]
+        assert "ENV-B" in update
+        assert "KNOWLEDGE-A" not in update
 
 
-def test_restart_recovers_fingerprint_and_avoids_full_reinjection():
+def test_restart_recovers_actual_world_state_snapshot():
     async def dynamic_sections(**_kwargs):
         return [("environment", "STABLE-ENV")]
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / ".cbagent" / "sessions"
-        store = LocalSessionStore(root)
         with (
             patch("agent.session.get_dynamic_context_sections", new=dynamic_sections),
             patch.object(AgentSession, "_build_system_instructions", return_value=""),
         ):
-            first = _session(store=store, answers=["first-answer"])
+            first = _session(store=LocalSessionStore(root), answers=["first-answer"])
             first.chat("first-question")
-            expected = dict(first._context_fingerprints)
-            assert expected
+            assert first._world_state_baseline.sections["environment"] == "STABLE-ENV"
 
             restarted = _session(store=LocalSessionStore(root))
-            assert restarted._context_fingerprints == expected
+            assert restarted._world_state_baseline == first._world_state_baseline
             request = restarted._build_chat_messages(
                 user_content="second-question",
                 system_instructions="",
             )
-            # 请求中仍包含上一轮已提交的 context update；关键是本轮没有再追加一条。
-            assert len(_context_messages(request)) == 1
-            assert restarted._pending_context_update_text == ""
+            updates = _context_messages(request)
+            # 第一条来自已提交历史；第二条反映上一轮结束后 state.json 新增的当前任务。
+            assert len(updates) == 2
+            assert "当前任务：first-question" in updates[-1]["content"]
 
 
-def test_compact_clears_fingerprint_and_next_turn_reinjects_all_sections():
+def test_structured_compact_request_keeps_protocol_messages_and_appends_prompt():
+    session = _session(summaries=["structured handoff"])
+    session.history = [
+        _user("inspect repository"),
+        Message.create_assistant_message(
+            tool_calls=[{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": '{"path":"a.py"}'},
+            }]
+        ),
+        Message.create_tool_message("call-1", "file_read", "FILE-MARKER"),
+        _assistant("finished inspection"),
+    ]
+
+    result = session.compact_context(reason="auto")
+
+    request = session.llm.compact_calls[0]["messages"]
+    assert session.llm.compact_calls[0]["max_tokens"] == 4096
+    assert request[-1] == {"role": "user", "content": SUMMARIZATION_PROMPT}
+    assert any(message.get("tool_call_id") == "call-1" for message in request)
+    assert any(message.get("content") == "FILE-MARKER" for message in request)
+    assert request[-2]["content"] == "finished inspection"
+    assert result["summary"].startswith(SUMMARY_PREFIX)
+    assert (session.history[-1].metadata or {}).get("kind") == COMPACTION_SUMMARY_KIND
+
+
+def test_compact_respects_none_output_token_param():
+    """provider 配置为 none 时，摘要请求只做预算预留，不发送输出限制字段。"""
+
+    session = _session(summaries=["handoff"])
+    session.llm.output_token_param = "none"
+    session.history = [_user("task"), _assistant("progress")]
+
+    session.compact_context(reason="auto")
+
+    request = session.llm.compact_calls[0]
+    assert "max_tokens" not in request
+    assert "max_completion_tokens" not in request
+
+
+def test_consecutive_compactions_send_previous_handoff_as_structured_history():
+    session = _session(summaries=["FIRST-HANDOFF", "SECOND-HANDOFF"])
+    session.history = [_user("FIRST-TASK"), _assistant("first-result")]
+    session.compact_context(reason="auto")
+    session.history.extend([_user("SECOND-TASK"), _assistant("second-result")])
+    session.compact_context(reason="auto")
+
+    second_request = session.llm.compact_calls[1]["messages"]
+    assert any(
+        SUMMARY_PREFIX in str(message.get("content") or "")
+        and "FIRST-HANDOFF" in str(message.get("content") or "")
+        for message in second_request
+    )
+    assert any(message.get("content") == "SECOND-TASK" for message in second_request)
+
+
+def test_manual_compact_resets_baseline_and_next_turn_reinjects_full_state():
     async def dynamic_sections(**_kwargs):
         return [("environment", "STABLE-ENV")]
 
-    session = _session(answers=["answer-1", "answer-2"])
+    session = _session(summaries=["handoff"])
+    session.history = [_user("Q" * 20000), _assistant("A" * 20000)]
+    session._world_state_baseline = WorldStateSnapshot.from_sections([
+        ("environment", "STABLE-ENV")
+    ])
     with (
         patch("agent.session.get_dynamic_context_sections", new=dynamic_sections),
-        patch.object(AgentSession, "_build_system_instructions", return_value=""),
+        patch("agent.session.dynamic_retained_token_target", return_value=100),
     ):
-        session.chat("question-1")
-        session.chat("question-2")
-        assert session._context_fingerprints
-
-        with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
-            result = session.compact_context()
+        result = session.compact_context(reason="user_compact")
         assert not result["no_op"]
-        assert session._context_fingerprints == {}
-
-        request = session._build_chat_messages(
-            user_content="question-3",
-            system_instructions="",
-        )
-        update = _context_messages(request)[0]["content"]
-        assert "STABLE-ENV" in update
+        assert session._world_state_baseline.sections == {}
+        request = session._build_chat_messages(user_content="next", system_instructions="")
+        assert "STABLE-ENV" in _context_messages(request)[0]["content"]
 
 
-def test_summary_input_keeps_previous_summary_and_latest_old_message():
-    session = _session()
-    source = [
-        make_compact_boundary_message("EARLIEST-DECISION"),
-        _user("A" * 2_000),
-        _assistant("B" * 2_000),
-        _user("LATEST-OLD-MESSAGE-" + "Z" * 500),
-    ]
+def test_mid_turn_compact_installs_full_world_state_before_summary():
+    session = _session(summaries=["handoff"])
+    session.history = [_user("task"), _assistant("progress")]
+    session._pending_world_state = WorldStateSnapshot.from_sections([
+        ("environment", "ENV-NOW"),
+        ("plan", "PLAN-NOW"),
+    ])
 
-    with patch("agent.session.COMPACT_SOURCE_MAX_TOKENS", 120):
-        text = session._history_text_for_compact(source)
+    result = session.compact_context(reason="mid_turn")
 
-    assert "EARLIEST-DECISION" in text
-    assert "LATEST-OLD-MESSAGE" in text
-    assert "A" * 100 not in text
-
-
-def test_three_consecutive_compactions_keep_earliest_summary_content():
-    session = _session()
-    session.history = [
-        _user("FIRST-TASK-MARKER"),
-        _assistant("first-answer"),
-        _user("second-question"),
-        _assistant("second-answer"),
-    ]
-
-    with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
-        first = session.compact_context()
-        assert "FIRST-TASK-MARKER" in first["summary"]
-
-        session.history.extend([
-            _user("third-question"),
-            _assistant("third-answer"),
-            _user("fourth-question"),
-            _assistant("fourth-answer"),
-        ])
-        second = session.compact_context()
-        assert "FIRST-TASK-MARKER" in second["summary"]
-
-        session.history.extend([
-            _user("fifth-question"),
-            _assistant("fifth-answer"),
-            _user("sixth-question"),
-            _assistant("sixth-answer"),
-        ])
-        third = session.compact_context()
-        assert "FIRST-TASK-MARKER" in third["summary"]
-
-
-def test_manual_compact_is_noop_when_all_turns_fit_raw_budget():
-    session = _session()
-    session.history = [
-        _user("small-question"),
-        _assistant("small-answer"),
-    ]
-    before = [_message_to_persist_payload(message) for message in session.history]
-
-    result = session.compact_context()
-
-    assert result["no_op"]
-    assert result["summary"] == ""
-    assert [_message_to_persist_payload(message) for message in session.history] == before
-
-
-def test_llm_compactor_receives_old_summary_and_8192_output_limit():
-    captured: dict[str, Any] = {}
-
-    class Completions:
-        def create(self, **kwargs):
-            captured.update(kwargs)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(
-                    message=SimpleNamespace(content="【上下文压缩】new-summary"),
-                )],
-            )
-
-    session = _session()
-    session.llm.client = SimpleNamespace(
-        chat=SimpleNamespace(completions=Completions()),
+    assert result["world_state_sections"] == 2
+    assert session._world_state_baseline.sections["environment"] == "ENV-NOW"
+    assert (session.history[-1].metadata or {}).get("kind") == COMPACTION_SUMMARY_KIND
+    context_message = next(
+        message for message in session.history
+        if (message.metadata or {}).get("kind") == "context_update"
     )
-    source = [
-        make_compact_boundary_message("EARLIEST-DECISION"),
-        _user("old-question"),
-    ]
-
-    summary = session._make_compact_summary(messages=source, state_text="")
-
-    assert summary == "【上下文压缩】new-summary"
-    assert captured["max_tokens"] == 8192
-    assert "EARLIEST-DECISION" in captured["messages"][1]["content"]
+    assert "ENV-NOW" in str(context_message.content)
+    assert session.history.index(context_message) < len(session.history) - 1
 
 
-def test_compact_json_saves_full_summary_and_replacement_history():
+def test_compact_failure_keeps_history_and_snapshot_unchanged():
+    session = _session()
+    session.history = [_user("task"), _assistant("progress")]
+    session._world_state_baseline = WorldStateSnapshot.from_sections([("environment", "ENV")])
+    original_history = [message.model_copy(deep=True) for message in session.history]
+    session.llm.compact_error = RuntimeError("network unavailable")
+
+    try:
+        session.compact_context(reason="auto")
+    except CompactionError:
+        pass
+    else:
+        raise AssertionError("compact 应该失败")
+
+    assert session.history == original_history
+    assert session._world_state_baseline.sections == {"environment": "ENV"}
+
+
+def test_compact_v2_persists_replacement_history_and_world_state():
     with tempfile.TemporaryDirectory() as td:
-        store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
-        summary = "【上下文压缩】" + "X" * 5_000
-        boundary = make_compact_boundary_message(summary)
-        retained = [_user("recent-question"), _assistant("recent-answer")]
-        replacement = [boundary, *retained]
+        root = Path(td) / ".cbagent" / "sessions"
+        store = LocalSessionStore(root)
+        session = _session(store=store, summaries=["persisted handoff"])
+        session.history = [_user("task"), _assistant("progress")]
+        session._pending_world_state = WorldStateSnapshot.from_sections([("environment", "ENV")])
 
-        store.save_compaction(
-            summary=summary,
-            history_payload=[_message_to_persist_payload(message) for message in replacement],
-            before_messages=20,
-            after_messages=3,
+        session.compact_context(reason="mid_turn")
+
+        compact = json.loads((store.active_dir / "compact.json").read_text(encoding="utf-8"))
+        assert compact["version"] == 2
+        assert compact["world_state_snapshot"] == {"environment": "ENV"}
+        assert compact["replacement_history"][-1]["kind"] == COMPACTION_SUMMARY_KIND
+        restored = LocalSessionStore(root).load_latest_history()
+        assert (restored[-1].metadata or {}).get("kind") == COMPACTION_SUMMARY_KIND
+
+
+def test_legacy_compact_snapshot_is_ignored():
+    """破坏性升级后旧 compact 快照不得覆盖 transcript 事实。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / ".cbagent" / "sessions"
+        store = LocalSessionStore(root)
+        store.append_turn(
+            user_query="真实问题",
+            final_answer="真实回答",
+            committed_messages=[_user("真实问题"), _assistant("真实回答")],
+        )
+        legacy = {
+            "summary": "LEGACY-SUMMARY",
+            "history": [{"role": "user", "content": "LEGACY-HISTORY"}],
+            "transcript_offset": 1,
+        }
+        (store.active_dir / "compact.json").write_text(
+            json.dumps(legacy, ensure_ascii=False),
+            encoding="utf-8",
         )
 
-        saved = json.loads((store.active_dir / "compact.json").read_text(encoding="utf-8"))
-        assert saved["summary"] == summary
-        assert len(saved["history"]) == 3
+        restored = LocalSessionStore(root).load_latest_history()
+        text = "\n".join(str(message.content) for message in restored)
+        assert "真实问题" in text
+        assert "LEGACY-HISTORY" not in text
 
-        restored = LocalSessionStore(store.root).load_latest_history()
-        assert len(restored) == 3
-        assert (restored[0].metadata or {}).get("kind") == "compact_boundary"
-        assert restored[1].content == "recent-question"
+
+def test_dynamic_retained_budget_uses_ten_percent_with_bounds():
+    assert dynamic_retained_token_target(128_000) == 16 * 1024
+    assert dynamic_retained_token_target(400_000) == 40_000
+    assert dynamic_retained_token_target(1_000_000) == 100_000
+    assert dynamic_retained_token_target(2_000_000) == 128 * 1024
+
+
+def test_model_downshift_uses_target_window_for_replacement_budget():
+    """旧大模型负责摘要，replacement 必须按目标小模型窗口收紧。"""
+
+    original = ConstantLLM.llm_dict.get("small-target")
+    ConstantLLM.llm_dict["small-target"] = {
+        "is_tool": True,
+        "is_reasoning": False,
+        "max_tokens": 20_000,
+        "max_output_tokens": 2_000,
+    }
+    try:
+        session = _session(summaries=["downshift handoff"])
+        session.history = [
+            _user(f"task-{index}-" + "word " * 4000)
+            if index % 2 == 0 else _assistant(f"answer-{index}-" + "word " * 4000)
+            for index in range(8)
+        ]
+
+        result = session.compact_context(
+            reason="model_downshift",
+            target_model="small-target",
+        )
+
+        assert result["target_model"] == "small-target"
+        assert result["retained_target_tokens"] == 16 * 1024
+        messages, tools = session._baseline_request_parts()
+        assert session._estimate_request_tokens(messages, tools) <= 16_000
+    finally:
+        if original is None:
+            ConstantLLM.llm_dict.pop("small-target", None)
+        else:
+            ConstantLLM.llm_dict["small-target"] = original

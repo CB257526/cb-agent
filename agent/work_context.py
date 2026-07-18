@@ -132,8 +132,8 @@ def _tail_list(data: Any, limit: int) -> List[Any]:
 def _message_kind(message: Message) -> str:
     """读取 Message.metadata.kind，缺失时返回空串。
 
-    work_record/compact_record 都是普通 assistant message，真正区分它们的不是
-    OpenAI role，而是本地 metadata。这个 helper 让恢复、裁剪和 UI 导出都能
+    context update/compaction summary 都通过普通协议角色进入模型，真正区分它们
+    的是本地 metadata。这个 helper 让恢复、裁剪和 UI 导出都能
     用同一套语义判断。
     """
     meta = message.metadata if isinstance(message.metadata, dict) else {}
@@ -149,7 +149,7 @@ def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
     - 保留 assistant.reasoning_content，兼容要求跨轮回传思考内容的模型
     - 保留 tool 消息的 tool_call_id 与 name
     - 保留 tool 消息的本地错误状态，供恢复后的 UI 正确展示
-    - 保留 metadata.kind 用于识别 compact_boundary
+    - 保留 metadata.kind 用于识别 context update 与 compaction summary
     这样跨轮恢复时可以原样把 tool_use + tool_result 块塞回 messages，让模型
     看到上一轮真实工具调用细节（CC 同款累积模式）。
     """
@@ -172,14 +172,16 @@ def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
     kind = metadata.get("kind")
     if kind:
         payload["kind"] = str(kind)
-    context_fingerprints = metadata.get("context_fingerprints")
-    if isinstance(context_fingerprints, dict):
-        # 指纹基线必须跟随 context update 一起落盘，重启后才能继续做增量 diff。
-        payload["context_fingerprints"] = {
-            str(name): str(fingerprint)
-            for name, fingerprint in context_fingerprints.items()
-            if name and fingerprint
+    world_state_snapshot = metadata.get("world_state_snapshot")
+    if isinstance(world_state_snapshot, dict):
+        # 保存实际 section 值，重启后才能精确计算新增、变化和删除。
+        payload["world_state_snapshot"] = {
+            str(name): str(value)
+            for name, value in world_state_snapshot.items()
+            if name and isinstance(value, str) and value.strip()
         }
+    if metadata.get("reason"):
+        payload["reason"] = str(metadata.get("reason"))
     # 中断标记需要跟随归档后的消息继续保留，否则 active_turn 一旦转存到
     # transcript，UI 下次恢复时就无法区分正常完成轮和异常中断轮。
     if metadata.get("interrupted"):
@@ -190,9 +192,8 @@ def _message_to_persist_payload(message: Message) -> Dict[str, Any]:
 def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
     """把持久化 payload 还原为 Message。
 
-    支持的 role：user / system / assistant（可带 tool_calls）/ tool。
-    旧 compact.json 里的轻量结构（仅 role/content/kind）也仍能恢复成普通文本
-    消息——这条路径主要服务破坏性更新前可能残留的旧快照。
+    支持的 role：user / system / assistant（可带 tool_calls）/ tool。旧版 compact
+    快照不会进入本函数；只有 v2 replacement history 会被恢复。
     """
     if not isinstance(payload, dict):
         return None
@@ -253,14 +254,15 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
     metadata: Dict[str, Any] = {}
     if kind:
         metadata["kind"] = str(kind)
-    context_fingerprints = payload.get("context_fingerprints")
-    if isinstance(context_fingerprints, dict):
-        # 空字典也是有效基线，表示上一轮显式删除了全部动态 section。
-        metadata["context_fingerprints"] = {
-            str(name): str(fingerprint)
-            for name, fingerprint in context_fingerprints.items()
-            if name and fingerprint
+    world_state_snapshot = payload.get("world_state_snapshot")
+    if isinstance(world_state_snapshot, dict):
+        metadata["world_state_snapshot"] = {
+            str(name): str(value)
+            for name, value in world_state_snapshot.items()
+            if name and isinstance(value, str) and value.strip()
         }
+    if payload.get("reason"):
+        metadata["reason"] = str(payload.get("reason"))
     if payload.get("interrupted"):
         metadata["interrupted"] = True
     if metadata:
@@ -430,38 +432,13 @@ def _active_turn_started_event(events: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _trim_restored_history(messages: List[Message], max_messages: int) -> List[Message]:
-    """按恢复窗口裁剪 history，并尽量保留最近一次 compact_boundary。
-
-    普通恢复直接取尾部 max_messages 即可；但 compact 后的第一条消息是
-    `【上下文压缩】` boundary，它承担早期上下文摘要的职责。如果后续新消息
-    很多，简单尾裁剪会把 boundary 挤掉，导致早期任务状态丢失。因此这里
-    优先保留最近一个 compact_boundary，再用剩余窗口装其后的最新消息。
-
-    CC 模式下 history 累积的是原始协议消息(assistant.tool_calls / role=tool),
-    任何尾裁剪/anchor+tail 都可能把 assistant.tool_calls 切掉而留下它的 tool
-    响应,形成"孤儿 tool"。跨进程恢复后第一轮就把它发给 LLM 会触发 OpenAI
-    兼容协议 400。因此截断后统一过一遍孤儿清理——这是 _build_chat_messages
-    切片清理之外的第二道保险(防止恢复进内存的 history 本身就不合法)。
-    """
+    """按恢复窗口裁剪 history，并清理可能出现的孤儿工具消息。"""
     if max_messages <= 0:
         return []
     if len(messages) <= max_messages:
         return drop_orphan_tool_message_objects(messages)
 
-    boundary_idx = None
-    for idx, message in enumerate(messages):
-        if _message_kind(message) == "compact_boundary":
-            boundary_idx = idx
-
-    if boundary_idx is None:
-        return drop_orphan_tool_message_objects(messages[-max_messages:])
-
-    anchor = messages[boundary_idx]
-    tail_capacity = max_messages - 1
-    if tail_capacity <= 0:
-        return [anchor]
-    trimmed = [anchor] + messages[boundary_idx + 1:][-tail_capacity:]
-    return drop_orphan_tool_message_objects(trimmed)
+    return drop_orphan_tool_message_objects(messages[-max_messages:])
 
 
 def _extract_tool_call_name(call: Dict[str, Any]) -> str:
@@ -868,7 +845,7 @@ def trace_entry_from_tool_result(
                 k: v for k, v in parsed.items()
                 if k not in {"content", "stdout", "stderr", "result"}
             }
-            summary_source = (
+            summary_candidate = (
                 parsed.get("error")
                 or parsed.get("summary")
                 or parsed.get("message")
@@ -877,7 +854,7 @@ def trace_entry_from_tool_result(
                 or parsed.get("stdout")
                 or parsed
             )
-            summary = _clip(summary_source, result_limit)
+            summary = _clip(summary_candidate, result_limit)
             is_error = is_error or bool(parsed.get("error"))
     else:
         summary = _clip(parsed, result_limit)
@@ -1149,9 +1126,9 @@ class LocalSessionStore:
         assistant。恢复时按顺序还原即可，模型在新一轮就能看到上一轮真实工具
         调用细节。
 
-        执行过 /compact 的会话仍然优先读 compact.json：里面的 ``history``
-        字段保存了 compact 时刻的 boundary 之后消息（含 boundary system 消息
-        本身）。transcript_offset 之后的新轮再追加。
+        执行过 /compact 的会话优先读取 v2 compact.json 中的
+        ``replacement_history``，再追加 transcript_offset 之后的新回合。旧版或
+        无版本快照按用户确认的破坏性升级策略直接忽略。
 
         旧格式（user_query/final_answer/work_record 三段式）已不再支持；
         破坏性更新已确认，旧目录在启动期清空。
@@ -1169,8 +1146,8 @@ class LocalSessionStore:
         }
 
         start_idx = 0
-        if isinstance(compact, dict) and compact:
-            raw_history = compact.get("history")
+        if isinstance(compact, dict) and compact.get("version") == 2:
+            raw_history = compact.get("replacement_history")
             if isinstance(raw_history, list):
                 for payload in raw_history:
                     msg = _message_payload_to_message(payload)
@@ -1497,6 +1474,13 @@ class LocalSessionStore:
         history_payload: List[Dict[str, Any]],
         before_messages: int,
         after_messages: int,
+        reason: str,
+        model: str,
+        target_model: str,
+        provider: str,
+        world_state_snapshot: Dict[str, str],
+        tokens_before: int,
+        tokens_after: int,
     ) -> Dict[str, Any]:
         """保存当前会话的 /compact 快照，并更新滚动 state。
 
@@ -1521,15 +1505,21 @@ class LocalSessionStore:
 
         ts = _now_iso()
         compact = {
+            "version": 2,
             "ts": ts,
             "session_id": self.active_session_id,
-            # summary 已由 AgentSession 按 8K token 上限裁剪，这里必须完整保存。
-            # compact.json 是恢复锚点，不能再做字符级二次截断。
             "summary": str(summary or ""),
             "transcript_offset": self._count_transcript_turns(self.active_dir),
-            "history": history_payload,
+            "replacement_history": history_payload,
+            "world_state_snapshot": dict(world_state_snapshot),
+            "reason": str(reason or ""),
+            "model": str(model or ""),
+            "target_model": str(target_model or model or ""),
+            "provider": str(provider or ""),
             "before_messages": before_messages,
             "after_messages": after_messages,
+            "tokens_before": max(0, int(tokens_before)),
+            "tokens_after": max(0, int(tokens_after)),
         }
         try:
             self._write_json(compact_path, compact)
@@ -1542,7 +1532,7 @@ class LocalSessionStore:
 
             state = self.state if isinstance(self.state, dict) else self._new_state()
             state["updated_at"] = ts
-            # 完整摘要通过 compact.json/history 的 boundary 恢复；state 只保留一份
+            # 完整摘要通过 compact.json/replacement_history 恢复；state 只保留一份
             # 短审计预览，避免 SessionState 在下一轮重复注入完整摘要。
             state["last_compact_summary"] = _clip(summary, ROLLING_SUMMARY_LIMIT)
             state["rolling_summary"] = ""
@@ -1585,11 +1575,11 @@ class LocalSessionStore:
             return
         path = self.active_dir / "compact.json"
         compact = self._read_json(path, {})
-        if not isinstance(compact, dict) or not compact:
+        if not isinstance(compact, dict) or compact.get("version") != 2:
             return
         compact["transcript_offset"] = self._count_transcript_turns(self.active_dir)
         if history_payload is not None:
-            compact["history"] = history_payload
+            compact["replacement_history"] = history_payload
             compact["after_messages"] = len(history_payload)
         self._write_json(path, compact)
 
@@ -1624,6 +1614,9 @@ class LocalSessionStore:
         """
         state = self.state or {}
         parts: List[str] = []
+        active_task = _clip(state.get("active_task"), 200)
+        if active_task:
+            parts.append("当前任务：" + active_task)
         summary = _clip(state.get("rolling_summary"), ROLLING_SUMMARY_LIMIT)
         if summary:
             parts.append(summary)
@@ -1654,6 +1647,9 @@ class LocalSessionStore:
         pending = state.get("pending") if isinstance(state.get("pending"), list) else []
         if pending:
             parts.append("待办/阻塞：" + "；".join(_clip(x, 80) for x in pending[-5:]))
+        decisions = state.get("decisions") if isinstance(state.get("decisions"), list) else []
+        if decisions:
+            parts.append("关键决策：" + "；".join(_clip(x, 100) for x in decisions[-8:]))
         return "\n".join(p for p in parts if p)
 
     def append_turn(

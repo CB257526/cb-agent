@@ -3,8 +3,8 @@
 背景:
 - CC 对齐重构后,self.history 累积的是原始协议消息:
   user → assistant(tool_calls=[a,b]) → tool(a) → tool(b) → assistant(final) → ...
-- _build_chat_messages 会先按 compact_boundary 切片,再保留完整 active history。
-  旧版本和显式 max_messages 恢复路径仍可能截断在 assistant(tool_calls) 和它的
+- _build_chat_messages 直接使用当前 active replacement history。
+  显式 max_messages 恢复路径仍可能截断在 assistant(tool_calls) 和它的
   tool 响应之间,导致切片开头出现"孤儿 tool 消息"——它的父
   assistant.tool_calls 被切掉了。
 - OpenAI 兼容协议(DeepSeek 等)对此会直接报错:

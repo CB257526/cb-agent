@@ -12,12 +12,8 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from constant.llm.constant_llm import ConstantLLM
+from agent.compaction import estimate_message_tokens, select_retained_history
 from context.budget.window import get_context_window_for_model
-from context.compact import (
-    estimate_messages_tokens,
-    make_compact_boundary_message,
-    select_compaction_history,
-)
 from context.prompts.builder import (
     get_dynamic_context_prompt,
     get_dynamic_context_sections,
@@ -146,20 +142,19 @@ def test_compaction_selects_complete_turns_from_newest_backwards():
         _tool("call_new", "new-tool-result"),
         _assistant("new-final"),
     ]
-    budget = estimate_messages_tokens(middle + newest)
+    budget = estimate_message_tokens(middle + newest)
 
-    selection = select_compaction_history(
+    selection = select_retained_history(
         oldest + middle + newest,
-        retained_token_budget=budget,
+        token_budget=budget,
     )
 
-    retained_text = "\n".join(_text(message) for message in selection.retained_messages)
-    summary_text = "\n".join(_text(message) for message in selection.summary_source)
-    assert "old-user" in summary_text
+    retained_text = "\n".join(_text(message) for message in selection.messages)
+    assert "old-user" not in retained_text
     assert "middle-user" in retained_text
     assert "new-tool-result" in retained_text
-    assert selection.retained_tokens <= budget
-    assert [message.tool_call_id for message in selection.retained_messages if message.tool_call_id] == [
+    assert selection.tokens <= budget
+    assert [message.tool_call_id for message in selection.messages if message.tool_call_id] == [
         "call_new"
     ]
 
@@ -177,28 +172,10 @@ def test_oversized_latest_turn_keeps_user_and_final_answer_only():
         _assistant("latest-final"),
     ]
 
-    selection = select_compaction_history(newest, retained_token_budget=300)
+    selection = select_retained_history(newest, token_budget=300)
 
     assert selection.oversized_latest_turn
-    assert [_text(message) for message in selection.retained_messages] == [
+    assert [_text(message) for message in selection.messages] == [
         "latest-user",
         "latest-final",
     ]
-    summary_text = "\n".join(_text(message) for message in selection.summary_source)
-    assert "T" * 100 in summary_text
-    assert any(message.tool_calls for message in selection.summary_source)
-
-
-def test_previous_boundary_always_enters_next_summary_source():
-    boundary = make_compact_boundary_message("EARLIEST_DECISION")
-    old_turn = [_user("old-user"), _assistant("old-answer")]
-    newest = [_user("new-user"), _assistant("new-answer")]
-    budget = estimate_messages_tokens(newest)
-
-    selection = select_compaction_history(
-        [boundary, *old_turn, *newest],
-        retained_token_budget=budget,
-    )
-
-    assert selection.summary_source[0] is boundary
-    assert "EARLIEST_DECISION" in _text(selection.summary_source[0])

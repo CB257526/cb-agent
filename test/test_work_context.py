@@ -8,7 +8,7 @@ tool_calls / role=tool / final assistant)。这里只覆盖必须保证的几个
 3. load_latest_history 能还原 assistant.tool_calls 与 role=tool
 4. save_pending_user_message 配合 commit 流程不会重复
 5. switch/list 多 session 隔离仍然成立
-6. compact_boundary 落盘 + 恢复后切片使用
+6. compact v2 replacement history 落盘与恢复
 """
 
 from __future__ import annotations
@@ -26,10 +26,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from context.compact import (
-    COMPACT_BOUNDARY_KIND,
-    make_compact_boundary_message,
-)
+from agent.compaction import COMPACTION_SUMMARY_KIND, make_summary_message
 from agent.work_context import (
     LocalSessionStore,
     RuleTraceSummarizer,
@@ -505,8 +502,8 @@ class TestSessionIsolation(unittest.TestCase):
                 store.switch_session("../outside")
 
 
-class TestCompactBoundaryPersistence(unittest.TestCase):
-    def test_save_compaction_with_boundary_payload_round_trip(self):
+class TestCompactionPersistence(unittest.TestCase):
+    def test_save_compaction_v2_round_trip(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -521,12 +518,19 @@ class TestCompactBoundaryPersistence(unittest.TestCase):
                 committed_messages=[_user("旧二"), _assistant("老答二")],
             )
 
-            boundary = make_compact_boundary_message("摘要:已读 a.py")
+            summary_message = make_summary_message("摘要:已读 a.py", reason="manual")
             store.save_compaction(
-                summary=str(boundary.content or ""),
-                history_payload=[_message_to_persist_payload(boundary)],
+                summary=str(summary_message.content or ""),
+                history_payload=[_message_to_persist_payload(summary_message)],
                 before_messages=4,
                 after_messages=1,
+                reason="manual",
+                model="fake",
+                target_model="fake",
+                provider="fake-provider",
+                world_state_snapshot={},
+                tokens_before=100,
+                tokens_after=20,
             )
 
             self.assertTrue((store.active_dir / "compact.json").exists())
@@ -540,13 +544,13 @@ class TestCompactBoundaryPersistence(unittest.TestCase):
 
             restored = LocalSessionStore(root)
             history = restored.load_latest_history(max_messages=20)
-            # 第一条应是 boundary
+            # 第一条应是新的 compaction summary。
             self.assertEqual(
                 (history[0].metadata or {}).get("kind"),
-                COMPACT_BOUNDARY_KIND,
+                COMPACTION_SUMMARY_KIND,
             )
             text = "\n".join(str(m.content) for m in history)
-            self.assertIn("【上下文压缩】", text)
+            self.assertIn("Another language model started", text)
             self.assertIn("新一", text)
             # boundary 之前的旧消息不再注入
             self.assertNotIn("旧一", text)

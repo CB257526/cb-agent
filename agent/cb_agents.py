@@ -387,6 +387,48 @@ class CbAgentsLLM:
             "config_path": str(self.model_config.path) if self.model_config.path is not None else None,
         }
 
+    def preview_model(self, key_or_model: str) -> Dict[str, Any]:
+        """解析目标模型配置，但不修改当前客户端和进程环境。"""
+
+        choice = self._choice_or_raise(key_or_model)
+        return {
+            "key": choice.key,
+            "model": choice.model_id,
+            "provider": choice.provider_name,
+            "max_tokens": ConstantLLM.model_max_tokens(choice.model_id),
+            "max_output_tokens": ConstantLLM.model_max_output_tokens(choice.model_id),
+            "output_token_param": choice.output_token_param,
+        }
+
+    def capture_runtime_model(self) -> Dict[str, Any]:
+        """捕获可原样恢复的当前模型运行时状态。"""
+
+        with self._client_lock:
+            return {
+                "model": self.model,
+                "current_model_key": self.current_model_key,
+                "api_key": self.api_key,
+                "base_url": self.base_url,
+                "client": self.client,
+                "is_Function_Calling": self.is_Function_Calling,
+                "max_output_tokens": self.max_output_tokens,
+                "output_token_param": self.output_token_param,
+            }
+
+    def restore_runtime_model(self, snapshot: Dict[str, Any]) -> None:
+        """恢复降档 compact 失败前捕获的模型状态。"""
+
+        with self._client_lock:
+            self.model = snapshot.get("model")
+            self.current_model_key = snapshot.get("current_model_key")
+            self.api_key = snapshot.get("api_key")
+            self.base_url = snapshot.get("base_url")
+            self.client = snapshot.get("client")
+            self.is_Function_Calling = bool(snapshot.get("is_Function_Calling"))
+            self.max_output_tokens = int(snapshot.get("max_output_tokens") or 1)
+            self.output_token_param = str(snapshot.get("output_token_param") or "max_tokens")
+            self._publish_current_model_env()
+
     def switch_model(self, key_or_model: str) -> Dict[str, Any]:
         """Switch the active OpenAI-compatible request target.
 

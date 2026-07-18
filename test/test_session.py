@@ -12,6 +12,7 @@ import threading
 import unittest
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,7 @@ if sys.platform == "win32":
         pass
 
 from agent.cancel import get_current_cancel_token
+from agent.compaction import COMPACTION_SUMMARY_KIND, SUMMARY_PREFIX, make_summary_message
 from agent.event_bus import EventBus, collect_all
 from agent.events import (
     Cancelled, ContextWindowUpdated, Done, Error, ReasoningDelta, RoundEnd, RoundStart,
@@ -58,6 +60,24 @@ class FakeLLM:
         self.emit_text = emit_text
         self.emit_reasoning = emit_reasoning
         self.calls: List[Dict[str, Any]] = []
+        self.compact_calls: List[Dict[str, Any]] = []
+        self.max_output_tokens = 4096
+        self.output_token_param = "max_tokens"
+        owner = self
+
+        class _Completions:
+            def create(self, **kwargs):
+                owner.compact_calls.append(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(content="测试交接摘要")
+                    )]
+                )
+
+        self.client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+
+    def _apply_output_token_limit(self, request_kwargs):
+        request_kwargs[self.output_token_param] = self.max_output_tokens
 
     def think(self, messages, tools=None, event_bus=None, round_idx=0, cancel_event=None):
         self.calls.append({
@@ -502,12 +522,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_dynamic_context_follows_compact_boundary_slice(self):
-        """P1 回归:Context% 估算与请求口径一致,走 boundary 切片。
-
-        /compact 后 boundary 之前的原始消息不再进入下一轮 prompt,Context% 也应
-        只统计 boundary(含)之后的部分,而不是物理尾部 self.history[-window:]。
-        """
+    def test_dynamic_context_uses_installed_replacement_history(self):
+        """Context 估算只读取 compact 安装后的 replacement history。"""
         original = ConstantLLM.llm_dict.get("fake")
         try:
             ConstantLLM.llm_dict["fake"] = {
@@ -520,16 +536,16 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
             from core.message import Message
-            from context.compact import make_compact_boundary_message
-            # 灌一段很长的早期 history(会被 compact 切掉)
             s.history.append(Message.create_user_message("早期问题 " + "A" * 3000))
             s.history.append(Message.create_assistant_message("早期回答 " + "B" * 3000))
             text_before = s._dynamic_context_text()
             self.assertIn("A" * 100, text_before)
 
-            # 追加 boundary(模拟 /compact);boundary 之后只有一句短消息
-            s.history.append(make_compact_boundary_message("摘要"))
-            s.history.append(Message.create_user_message("新问题"))
+            # compact 会直接替换 active history，不再依赖 boundary 切片。
+            s.history = [
+                Message.create_user_message("新问题"),
+                make_summary_message("摘要", reason="auto"),
+            ]
 
             text_after = s._dynamic_context_text()
             # 早期长消息已被切片排除,不再出现在估算文本里
@@ -542,12 +558,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_history_window_no_longer_truncates_after_compact_boundary(self):
-        """验证 active history 在 compact boundary 之后会完整发送。
-
-        compact_boundary 之前的历史仍会被切掉,但 boundary 之后不再按
-        history_window 做消息数截断。
-        """
+    def test_history_window_no_longer_truncates_replacement_history(self):
+        """验证 active replacement history 不再按 history_window 截断。"""
         original = ConstantLLM.llm_dict.get("fake")
         try:
             ConstantLLM.llm_dict["fake"] = {
@@ -560,19 +572,17 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
             from core.message import Message
-            from context.compact import make_compact_boundary_message
-
-            # 构造：boundary 锚点 + 6 条尾部消息，history_window=3 也不截断
-            s.history.append(make_compact_boundary_message("ANCHOR_SUMMARY"))
+            # 构造 summary + 6 条尾部消息，history_window=3 也不截断。
             for i in range(6):
                 s.history.append(Message.create_user_message(f"tail-{i}"))
+            s.history.append(make_summary_message("ANCHOR_SUMMARY", reason="auto"))
             s.history_window = 3
 
             dicts = s._sliced_history_dicts()
 
-            # 应该返回完整 active history：boundary + 6 条 tail
+            # 应该返回完整 active history：6 条 tail + summary。
             self.assertEqual(len(dicts), 7)
-            self.assertIn("ANCHOR_SUMMARY", str(dicts[0].get("content")))
+            self.assertIn("ANCHOR_SUMMARY", str(dicts[-1].get("content")))
             joined = json.dumps(dicts, ensure_ascii=False)
             for i in range(6):
                 self.assertIn(f"tail-{i}", joined)
@@ -645,33 +655,6 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_compact_summary_preserves_plan_state_without_copying_full_plan(self):
-        """compact 摘要记录计划状态/实施进度要求,计划全文继续由 PlanState 注入。"""
-        from core.message import Message
-
-        llm = FakeLLM([])
-        with tempfile.TemporaryDirectory() as td:
-            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
-            s = AgentSession(
-                llm=llm, registry=self.registry, executor=self.executor,
-                event_bus=self.bus, ctx_enabled=False, session_store=store,
-            )
-            unique = "UNIQUE_FULL_PLAN_BODY_SHOULD_NOT_BE_COPIED"
-            plan = "# Approved Plan\n\n" + "\n".join(
-                f"- step {i} {unique}" for i in range(20)
-            )
-            s.plan_store.save_pending_plan(plan)
-            s.plan_store.approve()
-
-            summary = s._rule_compact_summary(
-                messages=[Message.create_user_message("已完成 step 1, 下一步 step 2")],
-                state_text="",
-            )
-
-            self.assertIn("计划状态", summary)
-            self.assertIn("已批准计划全文由 PlanState 每轮注入", summary)
-            self.assertNotIn(unique, summary)
-
     def test_preflight_auto_compact_when_full_request_exceeds_budget(self):
         """验证 preflight 只在完整请求超过安全上下文预算时触发 compact。
 
@@ -680,7 +663,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
         预期行为：
         - chat 正常返回 "ok"（compact 成功释放空间后继续）
-        - history 中出现了 compact_boundary 消息
+        - history 中出现 context_compaction handoff 消息
         - Done.auto_compact 非空
         - 触发原因是 "preflight_context_overflow"
         """
@@ -702,9 +685,9 @@ class TestAgentSessionBasic(unittest.TestCase):
             answer = s.chat("continue")
 
             self.assertEqual(answer, "ok")
-            # 验证 compact_boundary 已写入 history
+            # 验证新的 handoff summary 已写入 history。
             self.assertTrue(any(
-                (m.metadata or {}).get("kind") == "compact_boundary"
+                (m.metadata or {}).get("kind") == COMPACTION_SUMMARY_KIND
                 for m in s.history
             ))
             # 验证 Done 事件包含 auto_compact 信息
@@ -898,7 +881,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(len(llm.calls), 2)
             second_messages = llm.calls[1]["messages"]
             self.assertTrue(any(
-                "【上下文压缩】" in str(message.get("content") or "")
+                SUMMARY_PREFIX in str(message.get("content") or "")
                 for message in second_messages
             ))
             dones = [event for event in self.events if isinstance(event, Done)]
@@ -907,7 +890,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             restored = LocalSessionStore(session_root).load_latest_history()
             restored_text = [str(message.content or "") for message in restored]
-            self.assertTrue(any("【上下文压缩】" in text for text in restored_text))
+            self.assertTrue(any(SUMMARY_PREFIX in text for text in restored_text))
             self.assertEqual(sum(text == "done" for text in restored_text), 1)
             transcript = next(session_root.glob("session_*/transcript.jsonl"))
             transcript_text = transcript.read_text(encoding="utf-8")
@@ -1239,22 +1222,22 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             s.chat("旧问题一")
             s.chat("旧问题二")
-            self.assertEqual(len(s.history), 5)
+            self.assertEqual(len(s.history), 6)
             self.assertEqual(len(s.export_history()), 4)
 
-            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 40):
+            with patch("agent.session.dynamic_retained_token_target", return_value=40):
                 payload = s.compact_context()
-            self.assertEqual(payload["before_messages"], 5)
+            self.assertEqual(payload["before_messages"], 6)
             self.assertEqual(payload["after_messages"], 3)
             self.assertTrue(payload["persisted"])
-            self.assertIn("【上下文压缩】", payload["summary"])
-            # replacement history 的第一条是 boundary，后面是最新回合首尾消息。
+            self.assertIn(SUMMARY_PREFIX, payload["summary"])
+            # replacement history 末尾是 handoff summary，前面是最新回合首尾消息。
             self.assertEqual(
-                (s.history[0].metadata or {}).get("kind"),
-                "compact_boundary",
+                (s.history[-1].metadata or {}).get("kind"),
+                COMPACTION_SUMMARY_KIND,
             )
-            self.assertIn("旧问题二", str(s.history[1].content))
-            self.assertIn("旧回答二", str(s.history[2].content))
+            self.assertIn("旧问题二", str(s.history[0].content))
+            self.assertIn("旧回答二", str(s.history[1].content))
             self.assertTrue((store.active_dir / "compact.json").exists())
             self.assertTrue((store.active_dir / "compactions.jsonl").exists())
             self.assertTrue((store.active_dir / "transcript.jsonl").exists())
@@ -1262,13 +1245,13 @@ class TestAgentSessionBasic(unittest.TestCase):
             s.chat("继续")
             next_turn_messages = llm.calls[2]["messages"]
             context_text = "\n".join(str(m.get("content", "")) for m in next_turn_messages)
-            self.assertIn("【上下文压缩】", context_text)
-            # boundary 之前的旧 user/assistant 不再作为独立条目出现在请求里
+            self.assertIn(SUMMARY_PREFIX, context_text)
+            # replacement 之外的旧 user/assistant 不再作为独立条目出现在请求里。
             raw_user_assistant = [
                 m for m in next_turn_messages
                 if m.get("role") in {"user", "assistant"}
             ]
-            # 旧回答一只允许出现在摘要 boundary 中，不再作为独立 assistant 消息保留。
+            # 旧回答一不再作为独立 assistant 消息保留。
             self.assertFalse(any(
                 m.get("role") == "assistant" and m.get("content") == "旧回答一"
                 for m in raw_user_assistant
@@ -1299,7 +1282,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             store.save_compaction = fail_save_compaction  # type: ignore[method-assign]
 
-            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+            with patch("agent.session.dynamic_retained_token_target", return_value=20):
                 with self.assertRaises(OSError):
                     s.compact_context()
 
@@ -1329,7 +1312,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             s.chat("旧问题一")
             s.chat("旧问题二")
 
-            with patch("agent.session.COMPACT_RETAINED_MESSAGE_TOKENS", 20):
+            with patch("agent.session.dynamic_retained_token_target", return_value=20):
                 s.compact_context()
 
             self.assertIn("user_compact", loader.reasons)
