@@ -47,6 +47,10 @@ export const theme = {
   border: ansi.subtle,
   borderActive: ansi.cyan,
   bashBorder: ansi.subtle,
+
+  /** 选区必须使用显式不透明颜色；否则默认前景色无法作为可见的选区背景。 */
+  selectionBackground: RGBA.fromIndex(14),
+  selectionForeground: RGBA.fromIndex(0),
 } as const;
 
 /** 文字层级优先通过属性表达，避免把“弱化”绑定到某个固定灰色。 */

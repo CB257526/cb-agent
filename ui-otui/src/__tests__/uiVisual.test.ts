@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { TextBufferRenderable, type BaseRenderable } from "@opentui/core";
 import { createComponent } from "solid-js";
 import type { Transport } from "../transport.js";
 import type { ChatItem, PermissionMode, PlanMode } from "../types.js";
+import { theme } from "../theme.js";
 
 class FakeTransport extends EventEmitter {
   readonly stderrLogFile = "/tmp/cb-agent-test.log";
@@ -44,6 +46,12 @@ function normalizedFrame(frame: string): string {
     .map((line) => line.trimEnd())
     .join("\n")
     .trimEnd();
+}
+
+function collectTextBuffers(node: BaseRenderable, result: TextBufferRenderable[] = []): TextBufferRenderable[] {
+  if (node instanceof TextBufferRenderable) result.push(node);
+  for (const child of node.getChildren()) collectTextBuffers(child, result);
+  return result;
 }
 
 async function waitForHighlighting(node: { getChildren(): unknown[] }): Promise<void> {
@@ -119,6 +127,26 @@ async function renderApp(width: number, height: number, history = true) {
 }
 
 describe("OTUI 视觉帧", () => {
+  test("鼠标选区覆盖默认文本并使用可见背景", async () => {
+    const { setup } = await renderApp(80, 24);
+    const buffers = collectTextBuffers(setup.renderer.root);
+    expect(buffers.length).toBeGreaterThan(0);
+    expect(buffers.every((buffer) => buffer.selectionBg?.slot === theme.selectionBackground.slot)).toBe(true);
+    expect(buffers.every((buffer) => buffer.selectionFg?.slot === theme.selectionForeground.slot)).toBe(true);
+
+    await setup.mockMouse.drag(2, 1, 20, 1);
+    await setup.flush();
+    const selectedText = setup.renderer.getSelection()?.getSelectedText?.() ?? "";
+    expect(selectedText).toContain("cb-agent");
+    const selectedSpans = setup
+      .captureSpans()
+      .lines
+      .flatMap((line) => line.spans)
+      .filter((span) => span.bg.slot === theme.selectionBackground.slot);
+    expect(selectedSpans.length).toBeGreaterThan(0);
+    setup.renderer.destroy();
+  });
+
   test("120 列展示完整状态信息", async () => {
     const { setup } = await renderApp(120, 36);
     expect(normalizedFrame(setup.captureCharFrame())).toMatchSnapshot();

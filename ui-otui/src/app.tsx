@@ -24,6 +24,7 @@ import { QuestionPanel } from "./components/QuestionPanel.js";
 import { SessionHeader } from "./components/SessionHeader.js";
 import { writeClipboardText } from "./clipboardImage.js";
 import { getHorizontalPadding } from "./layout.js";
+import { applySelectionColors } from "./selection.js";
 
 export function App(props: { transport: Transport }) {
   return (
@@ -50,6 +51,14 @@ function Shell(props: { transport: Transport }) {
         && item.questionId === state.activeQuestionId,
     ),
   );
+
+  // OpenTUI 的 Markdown 节点会在渲染过程中动态重建；在每帧完成后遍历一次渲染树，
+  // 保证新旧消息、代码块和输入框都能用同一套可见选区，不依赖组件逐个传样式。
+  const onFrame = () => applySelectionColors(renderer.root);
+  renderer.on("frame", onFrame);
+  onCleanup(() => {
+    renderer.off("frame", onFrame);
+  });
 
   const copySelectionText = (text: string): boolean => {
     if (!text) return false;
