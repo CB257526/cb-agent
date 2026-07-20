@@ -40,6 +40,8 @@ export interface CommandCtx {
   setPending: (label: string | null) => void;
   /** 打开浮层 Select 弹窗（方向键选 + 回车确认）。 */
   openDialog: (spec: DialogSpec) => void;
+  /** 把文本写回 Prompt 输入框（/skill 选中后注入 $skill 用）。 */
+  setPromptInput?: (text: string) => void;
   /** 用切换/新建会话返回的 payload 重绘对话流（恢复 history + 更新 session/上下文窗口）。 */
   applySessionPayload: (payload: SessionPayload) => void;
 }
@@ -370,14 +372,66 @@ export const COMMANDS: readonly SlashCommand[] = [
   },
   {
     name: "/skill",
-    description: "列出或手动加载 Skill：/skill [name] [args]",
-    handler: async ({ transport, args, appendSystem }) => {
-      const [name = "", ...rest] = args.trim().split(/\s+/);
+    description: "选择 Skill 并注入到输入框：/skill [name] [args]",
+    handler: async ({ transport, args, appendSystem, openDialog, setPromptInput, setPending }) => {
+      const trimmed = args.trim();
+      const [name = "", ...rest] = trimmed ? trimmed.split(/\s+/) : [""];
+      const extraArgs = rest.join(" ").trim();
+
+      // 显式带 name：预览正文（调试/查看手册），不自动发送。
+      if (name) {
+        setPending?.("正在加载 Skill…");
+        try {
+          const result = await transport.loadSkill(name, extraArgs);
+          appendSystem(result.content);
+          // 同时把 $name 写回输入框，方便用户补任务描述后发送。
+          if (result.name && setPromptInput) {
+            const mention = `$${result.name}`;
+            setPromptInput(extraArgs ? `${mention} ${extraArgs}` : `${mention} `);
+            appendSystem(`已注入 ${mention} 到输入框。补全任务描述后回车发送即可。`);
+          }
+        } catch (e) {
+          appendSystem(`✗ /skill 失败：${(e as Error).message}`);
+        } finally {
+          setPending?.(null);
+        }
+        return;
+      }
+
+      // 无参数：弹窗选择 Skill，选中后注入 `$skill-name ` 到输入框。
+      // 真正的正文注入由后端 AgentSession 在提交时识别 `$skill` 完成。
+      setPending?.("正在读取 Skill 列表…");
       try {
-        const result = await transport.loadSkill(name, rest.join(" "));
-        appendSystem(result.content);
+        const result = await transport.listSkills();
+        const skills = Array.isArray(result.skills) ? result.skills : [];
+        if (!skills.length) {
+          appendSystem("当前没有发现任何 Skill。");
+          return;
+        }
+        const options = skills.map((skill) => ({
+          name: skill.name,
+          description: skill.short_description || skill.description || skill.path || "",
+          value: skill.name,
+        }));
+        openDialog({
+          title: `选择 Skill（${skills.length}）`,
+          options,
+          visibleCount: 8,
+          onSelect: (skillName) => {
+            const mention = `$${skillName}`;
+            if (setPromptInput) {
+              setPromptInput(`${mention} `);
+              appendSystem(`已选择 ${mention}。补全任务描述后回车发送，本轮会注入该 Skill 手册。`);
+            } else {
+              // 兜底：没有输入框注入通道时，至少把 mention 展示给用户复制。
+              appendSystem(`请在输入框使用：${mention} <你的任务描述>`);
+            }
+          },
+        });
       } catch (e) {
         appendSystem(`✗ /skill 失败：${(e as Error).message}`);
+      } finally {
+        setPending?.(null);
       }
     },
   },

@@ -168,6 +168,8 @@ class Gateway:
             self._handle_reject_plan(rpc_id, params)
         elif method == "session.list_tools":
             self._handle_list_tools(rpc_id)
+        elif method == "session.list_skills":
+            self._handle_list_skills(rpc_id)
         elif method == "session.load_skill":
             self._handle_load_skill(rpc_id, params)
         elif method == "session.answer_question":
@@ -643,6 +645,45 @@ class Gateway:
             ))
             return
         self.transport.write(make_response(rpc_id, result={"tools": tools}))
+
+    def _handle_list_skills(self, rpc_id: Any) -> None:
+        """返回当前发现的 Skill 元数据列表，供 OTUI /skill 弹窗选择。
+
+        结果形状: { skills: [{name, description, short_description, path}] }
+        - 只返回索引信息，不返回正文；正文仍由 `$skill` 显式提及或 load_skill 加载
+        - skill manager 不可用时返回空列表，不把 UI 选择流程打成硬错误
+        """
+        if rpc_id is None:
+            return
+
+        manager = getattr(self.session, "skill_manager", None)
+        if manager is None:
+            self.transport.write(make_response(rpc_id, result={"skills": []}))
+            return
+
+        try:
+            manager.check_for_changes()
+            skills = []
+            for skill in manager.list_skills():
+                description = (
+                    getattr(skill, "short_description", None)
+                    or getattr(skill, "description", "")
+                    or ""
+                )
+                skills.append({
+                    "name": getattr(skill, "name", "") or "",
+                    "description": str(description),
+                    "short_description": getattr(skill, "short_description", None),
+                    "path": str(getattr(skill, "skill_file", "") or ""),
+                })
+        except Exception as e:
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+            return
+
+        self.transport.write(make_response(rpc_id, result={"skills": skills}))
 
     def _handle_list_models(self, rpc_id: Any) -> None:
         """返回统一模型配置中的模型列表，不暴露 apiKey。"""

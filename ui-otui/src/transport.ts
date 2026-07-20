@@ -394,7 +394,17 @@ export class Transport extends EventEmitter {
     return this.requestRpc("session.cache_stats");
   }
 
-  /** 手动加载 Skill 内容，供 /skill 命令展示。 */
+  /** 拉取 Skill 索引列表，供 /skill 弹窗选择。 */
+  listSkills(): Promise<{ skills: Array<{
+    name: string;
+    description?: string;
+    short_description?: string | null;
+    path?: string;
+  }> }> {
+    return this.requestRpc("session.list_skills");
+  }
+
+  /** 手动加载 Skill 内容，供 /skill <name> 预览正文。 */
   loadSkill(name: string, args = ""): Promise<{ name: string | null; content: string }> {
     return this.requestRpc("session.load_skill", { name, args });
   }

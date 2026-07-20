@@ -11,7 +11,7 @@
  * 避免 <textarea> 自己消费。
  */
 
-import { createSignal, createMemo, Show } from "solid-js";
+import { createSignal, createMemo, onCleanup, onMount, Show } from "solid-js";
 import { wrapAnsi } from "bun";
 import { useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent, PasteEvent, TextareaRenderable } from "@opentui/core";
@@ -34,7 +34,16 @@ type TextareaKeyBinding = {
 export function Prompt() {
   const theme = useTheme();
   const dimensions = useTerminalDimensions();
-  const { state, submit, runCommand, getHistoryAt, pasteFromClipboard, togglePlanMode, togglePermissionMode } = useSession();
+  const {
+    state,
+    submit,
+    runCommand,
+    getHistoryAt,
+    pasteFromClipboard,
+    togglePlanMode,
+    togglePermissionMode,
+    registerPromptInputSetter,
+  } = useSession();
   const [value, setValue] = createSignal("");
   const [pickerIndex, setPickerIndex] = createSignal(0);
   const [historyIdx, setHistoryIdx] = createSignal(-1);
@@ -56,6 +65,14 @@ export function Prompt() {
     if (inputRef) inputRef.setText(v);
     programmatic = false;
   };
+
+  // 把输入框写入器注册给 session，供 /skill 等命令注入 `$skill` 提及。
+  onMount(() => {
+    registerPromptInputSetter(setInputValue);
+  });
+  onCleanup(() => {
+    registerPromptInputSetter(null);
+  });
 
   const visualRowsForText = (text: string, width: number) =>
     text

@@ -725,6 +725,37 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertIn("已发现 1 个 Skill", replies[0]["result"]["content"])
             self.assertIn("manual-skill", replies[0]["result"]["content"])
 
+    def test_gateway_list_skills(self):
+        """session.list_skills 返回结构化 Skill 索引，供 OTUI 弹窗选择。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            skill_dir = root / "picker-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: picker-skill\ndescription: skill for picker\n---\npicker body\n",
+                encoding="utf-8",
+            )
+            manager = SkillManager(skills_dir=root)
+
+            msgs = self._run_gateway_with_msgs(
+                FakeLLM([]),
+                [json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": "sk-index",
+                    "method": "session.list_skills",
+                })],
+                wait_for=2,
+                skill_manager=manager,
+            )
+
+            replies = [m for m in msgs if m.get("id") == "sk-index"]
+            self.assertEqual(len(replies), 1)
+            skills = replies[0]["result"]["skills"]
+            self.assertEqual(len(skills), 1)
+            self.assertEqual(skills[0]["name"], "picker-skill")
+            self.assertIn("skill for picker", skills[0]["description"])
+            self.assertTrue(str(skills[0]["path"]).endswith("SKILL.md"))
+
     def test_gateway_mcp_status_rpc_and_ready_starts_background_loader(self):
         """gateway_ready 后触发 MCP 后台加载，session.mcp_status 返回当前快照。"""
         calls: List[str] = []

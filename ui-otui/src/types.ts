@@ -621,6 +621,14 @@ export interface DialogOption {
   value: string;
 }
 
+/** session.list_skills 返回的 Skill 索引项。 */
+export interface SkillSummary {
+  name: string;
+  description?: string;
+  short_description?: string | null;
+  path?: string;
+}
+
 /** 浮层 Select 弹窗描述。/sessions /tools /mcp 等命令用它开小窗而非往对话流打印。 */
 export interface DialogSpec {
   title: string;

@@ -38,6 +38,22 @@ class FakeTransport extends EventEmitter {
       ],
     });
   }
+
+  listSkills() {
+    return Promise.resolve({
+      skills: [
+        { name: "pdf", description: "处理 PDF 文件" },
+        { name: "docx", description: "处理 Word 文档" },
+      ],
+    });
+  }
+
+  loadSkill(name: string) {
+    return Promise.resolve({
+      name,
+      content: `skill body for ${name}`,
+    });
+  }
 }
 
 function normalizedFrame(frame: string): string {

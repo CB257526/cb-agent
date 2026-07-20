@@ -226,6 +226,10 @@ interface SessionContextValue {
   openDialog: (spec: DialogSpec) => void;
   /** 关闭浮层弹窗。 */
   closeDialog: () => void;
+  /** 注册 Prompt 输入框写入器（Prompt 挂载时调用）。 */
+  registerPromptInputSetter: (setter: ((text: string) => void) | null) => void;
+  /** 把文本写回 Prompt 输入框。 */
+  setPromptInput: (text: string) => void;
   /** Set Plan/Execute mode. */
   setPlanMode: (mode: PlanMode) => Promise<void>;
   /** Toggle Plan/Execute mode. */
@@ -271,6 +275,8 @@ export function SessionProvider(props: ParentProps) {
   // 附件队列等这个 ack 后再清空，避免 submit 被拒时用户得重挑文件。
   let pendingSubmitId: string | null = null;
   let streamingPlanId: string | null = null;
+  // Prompt 组件挂载后注册 setInputValue；/skill 等命令通过它把文本写回输入框。
+  let promptInputSetter: ((text: string) => void) | null = null;
 
   // 本次 chat 是否产生过任何可见输出（文本/思考/工具调用）。submit 时复位，
   // 收到 text_delta/reasoning_delta/tool_start 置 true；done 时若仍为 false，
@@ -817,6 +823,14 @@ export function SessionProvider(props: ParentProps) {
     void setPermissionMode(next);
   };
 
+  const setPromptInput = (text: string) => {
+    promptInputSetter?.(text);
+  };
+
+  const registerPromptInputSetter = (setter: ((text: string) => void) | null) => {
+    promptInputSetter = setter;
+  };
+
   const runCommand = (cmd: SlashCommand, commandLine?: string) => {
     const line = (commandLine ?? cmd.name).trim();
     const ctx: CommandCtx = {
@@ -848,6 +862,7 @@ export function SessionProvider(props: ParentProps) {
       setPlanMode,
       setPending: (label) => setState("pending", label),
       openDialog: (spec) => setState("dialog", spec),
+      setPromptInput,
       applySessionPayload,
     };
     const ret = cmd.handler(ctx);
@@ -942,6 +957,8 @@ export function SessionProvider(props: ParentProps) {
     pasteFromClipboard,
     openDialog: (spec) => setState("dialog", spec),
     closeDialog: () => setState("dialog", null),
+    registerPromptInputSetter,
+    setPromptInput,
     setPlanMode,
     togglePlanMode,
     togglePermissionMode,
