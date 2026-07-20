@@ -300,14 +300,39 @@ export function SessionProvider(props: ParentProps) {
   // 说明模型返回了空响应（completion_tokens=0），给用户一条提示而非静默无反应。
   let sawOutput = false;
 
+  /**
+   * Thought 不可变 chunk 缓冲（对齐旧 TUI note/TUI思考流渲染卡死修复技术报告.md）。
+   *
+   * 根因：单条 thought 上反复 `text += delta`，展开后 OpenTUI Text 高度/绘制会不同步，
+   * 表现为「只见首行/中段空白、高度却很大」（用户截图）。
+   * 策略：累积后 flush 成新 item，旧 item.text 永不修改 → 旧 Text 节点稳定。
+   */
+  let thoughtBuf = "";
+  let thoughtFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  const THOUGHT_FLUSH_CHARS = 200;
+  const THOUGHT_FLUSH_MS = 80;
+
   const appendItem = (item: ChatItem) =>
     setState("items", (prev) => [...prev, item]);
 
   const appendSystem = (text: string) =>
     appendItem({ id: nextId(), role: "system", text });
 
+  const flushThoughtBuffer = () => {
+    if (thoughtFlushTimer !== null) {
+      clearTimeout(thoughtFlushTimer);
+      thoughtFlushTimer = null;
+    }
+    if (!thoughtBuf) return;
+    const chunk = thoughtBuf;
+    thoughtBuf = "";
+    appendItem({ id: nextId(), role: "thought", text: chunk });
+  };
+
   /** text_delta：追加到末尾 assistant item；末尾不是 assistant 则新建一条。 */
   const appendAssistantText = (delta: string) => {
+    // 思考段结束后进入正文：先落盘剩余 thought chunk
+    flushThoughtBuffer();
     setState(
       produce((s) => {
         const last = s.items[s.items.length - 1];
@@ -320,18 +345,20 @@ export function SessionProvider(props: ParentProps) {
     );
   };
 
-  /** reasoning_delta：追加到末尾 thought item；末尾不是 thought 则新建一条。 */
+  /** reasoning_delta：缓冲后以不可变 chunk 追加（禁止原地 text+=）。 */
   const appendThoughtText = (delta: string) => {
-    setState(
-      produce((s) => {
-        const last = s.items[s.items.length - 1];
-        if (last && last.role === "thought") {
-          last.text += delta;
-        } else {
-          s.items.push({ id: nextId(), role: "thought", text: delta });
-        }
-      }),
-    );
+    if (!delta) return;
+    thoughtBuf += delta;
+    if (thoughtBuf.length >= THOUGHT_FLUSH_CHARS) {
+      flushThoughtBuffer();
+      return;
+    }
+    if (thoughtFlushTimer === null) {
+      thoughtFlushTimer = setTimeout(() => {
+        thoughtFlushTimer = null;
+        flushThoughtBuffer();
+      }, THOUGHT_FLUSH_MS);
+    }
   };
 
   const appendPlanText = (delta: string) => {
@@ -478,20 +505,26 @@ export function SessionProvider(props: ParentProps) {
         appendThoughtText(safeText(e.delta));
         break;
 
-      case "tool_start":
+      case "tool_start": {
         sawOutput = true;
+        // 思考段夹在工具之间：先 flush，保证 chunk 顺序正确
+        flushThoughtBuffer();
         // 按 call_id 配对（修掉旧实现"按 name + 最近未完成"匹配的隐患）
+        // file_edit / file_write 默认展开：工具循环里一眼看到改了什么
+        const toolName = safeText(e.name || "unknown");
+        const fileToolsDefaultOpen = toolName === "file_edit" || toolName === "file_write";
         appendItem({
           id: nextId(),
           role: "tool",
           text: "",
           toolCallId: safeText(e.call_id),
-          toolName: safeText(e.name || "unknown"),
+          toolName,
           toolArgs: safeRecord(e.arguments),
           toolDone: false,
-          collapsed: true,
+          collapsed: !fileToolsDefaultOpen,
         });
         break;
+      }
 
       case "tool_complete":
         setState(
@@ -699,6 +732,7 @@ export function SessionProvider(props: ParentProps) {
         break;
 
       case "done":
+        flushThoughtBuffer();
         if (e.context_window !== undefined) setState("contextWindow", e.context_window ?? null);
         // 整轮没有任何文本/思考/工具输出 = 模型空响应。提示可能原因，避免用户以为 UI 卡了。
         // 被取消的轮次不算空响应（用户主动中断），跳过提示。
@@ -714,11 +748,13 @@ export function SessionProvider(props: ParentProps) {
         break;
 
       case "error":
+        flushThoughtBuffer();
         appendSystem(`✗ ${safeText(e.where)}: ${safeText(e.message)}`);
         setState("busy", false);
         break;
 
       case "cancelled":
+        flushThoughtBuffer();
         appendSystem(`⏸ 已中断 (${safeText(e.where)})`);
         setState("busy", false);
         break;

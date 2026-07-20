@@ -6,14 +6,17 @@
  *     不会被流式更新拽回底部，更不会跳顶（这正是旧 Ink 实现的致命缺陷）。
  *   - scrollbox 渲染到独立屏幕缓冲区，与终端 scrollback 解耦。
  *
- * 各 role 分派到对应组件渲染。assistant 需要知道自己是否是最后一条（流式期间用纯文本、
- * done 后用 markdown），所以 ItemRenderer 透传 isLast。
+ * Thought：session 把 reasoning 刷成不可变 chunk（多条 role=thought）。
+ * For 仍按 store item 稳定 identity 迭代；连续 thought 只在首条渲染
+ * ThoughtGroup，组内用 createMemo 响应式收集后续 chunk，避免：
+ *   - N 个「› Thought」标题
+ *   - Solid For 不重跑已有项导致 props.items 过期
  *
  * Ctrl-L 清屏：不删 items，只在末尾插入 clear_viewport 占位（高度≈可视区），再强制
  * 滚到底。主界面看起来被清空，但上滑仍能看到之前的对话。
  */
 
-import { createMemo, ErrorBoundary, For, Match, onCleanup, onMount, Switch } from "solid-js";
+import { createMemo, ErrorBoundary, For, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
@@ -28,6 +31,35 @@ import type { ChatItem } from "../types.js";
 import { createMarkdownSyntaxStyle, textAttributes } from "../theme.js";
 
 const planSyntaxStyle = createMarkdownSyntaxStyle();
+
+/**
+ * 连续 thought 的视觉入口。
+ * 挂在组内第一条 thought 上；从 store 响应式收集直到非 thought。
+ * 后续 chunk 的 ItemRenderer 返回 null。
+ */
+function ThoughtGroup(props: { headId: string }) {
+  const { state } = useSession();
+
+  const group = createMemo(() => {
+    const items = state.items;
+    const start = items.findIndex((it) => it.id === props.headId);
+    if (start < 0) return [] as ChatItem[];
+    // 若前一条也是 thought，说明自己不是 head（理论上不该挂载）
+    if (start > 0 && items[start - 1]?.role === "thought") return [] as ChatItem[];
+    const out: ChatItem[] = [];
+    for (let i = start; i < items.length; i++) {
+      if (items[i].role !== "thought") break;
+      out.push(items[i]);
+    }
+    return out;
+  });
+
+  return (
+    <Show when={group().length > 0}>
+      <ReasoningBlock items={group()} />
+    </Show>
+  );
+}
 
 function PlanPanel(props: { item: ChatItem }) {
   const theme = useTheme();
@@ -72,9 +104,20 @@ function PlanPanel(props: { item: ChatItem }) {
   );
 }
 
-function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
+function ItemRenderer(props: {
+  item: ChatItem;
+  isLast: boolean;
+  index: number;
+  items: ChatItem[];
+}) {
   const theme = useTheme();
   const item = () => props.item;
+
+  const isThoughtHead = createMemo(() => {
+    if (item().role !== "thought") return false;
+    const prev = props.index > 0 ? props.items[props.index - 1] : null;
+    return !prev || prev.role !== "thought";
+  });
 
   return (
     <Switch>
@@ -91,8 +134,13 @@ function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
         <AssistantMessage item={item()} isLast={props.isLast} />
       </Match>
 
+      <Match when={item().role === "thought" && isThoughtHead()}>
+        <ThoughtGroup headId={item().id} />
+      </Match>
+
+      {/* 连续 thought 的非首条：占位 null，内容由 head 的 ThoughtGroup 展示 */}
       <Match when={item().role === "thought"}>
-        <ReasoningBlock item={item()} />
+        <box height={0} flexShrink={0} />
       </Match>
 
       <Match when={item().role === "tool"}>
@@ -201,7 +249,12 @@ export function MessageList() {
       <For each={visibleItems()}>
         {(item, index) => (
           <ErrorBoundary fallback={(error) => <ItemError error={error} />}>
-            <ItemRenderer item={item} isLast={index() === visibleItems().length - 1} />
+            <ItemRenderer
+              item={item}
+              index={index()}
+              items={visibleItems()}
+              isLast={index() === visibleItems().length - 1}
+            />
           </ErrorBoundary>
         )}
       </For>
