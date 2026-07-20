@@ -43,6 +43,107 @@ _DISPLAY_STDOUT_PREVIEW = 800
 _DISPLAY_STDERR_PREVIEW = 400
 
 
+def _foreground_process_group_options() -> Dict[str, Any]:
+    """返回前台命令的独立进程组选项。
+
+    超时处理需要终止命令及其派生进程，因此子进程必须与 cb-agent 自身进程组隔离。
+    POSIX 使用 start_new_session，Windows 使用 CREATE_NEW_PROCESS_GROUP。
+    """
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"creationflags": 0, "start_new_session": True}
+
+
+def _signal_process_tree(proc: subprocess.Popen, *, force: bool) -> bool:
+    """向独立的命令进程组发送终止信号。
+
+    返回 True 表示已完成进程组级处理；返回 False 时调用方只能安全地终止直接
+    子进程。POSIX 下必须先确认目标进程组不是 cb-agent 自身进程组，避免再次出现
+    Bash 超时把 Python 后端和 OTUI 一并杀死的问题。
+    """
+    if os.name == "nt":
+        try:
+            if force:
+                completed = subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=5,
+                )
+                return completed.returncode == 0
+            os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    try:
+        target_pgid = os.getpgid(proc.pid)
+        own_pgid = os.getpgrp()
+    except ProcessLookupError:
+        # 独立会话的组长可能已经退出，但后代仍持有 stdout/stderr 管道。创建会话时
+        # 已保证 pid 同时也是 pgid，因此继续尝试终止该组，避免留下孤儿进程。
+        target_pgid = proc.pid
+        own_pgid = os.getpgrp()
+    except OSError as exc:
+        logger.warning("读取 Bash 子进程组失败: pid=%s error=%s", proc.pid, exc)
+        return False
+
+    if target_pgid <= 0 or target_pgid == own_pgid:
+        logger.error(
+            "拒绝向未隔离的 Bash 进程组发送信号: pid=%s target_pgid=%s own_pgid=%s",
+            proc.pid,
+            target_pgid,
+            own_pgid,
+        )
+        return False
+
+    try:
+        os.killpg(target_pgid, signal.SIGKILL if force else signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        return True
+    except OSError as exc:
+        logger.warning(
+            "终止 Bash 进程组失败: pid=%s pgid=%s force=%s error=%s",
+            proc.pid,
+            target_pgid,
+            force,
+            exc,
+        )
+        return False
+
+
+def _stop_process_tree(proc: subprocess.Popen) -> tuple[str, str]:
+    """先温和、后强制地结束命令进程树，并尽量回收已经产生的输出。"""
+    if not _signal_process_tree(proc, force=False):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+    try:
+        return proc.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as exc:
+        logger.warning("等待 Bash 子进程退出失败，将强制清理: pid=%s error=%s", proc.pid, exc)
+
+    if not _signal_process_tree(proc, force=True):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    try:
+        return proc.communicate(timeout=2)
+    except Exception as exc:
+        logger.warning("回收 Bash 子进程输出失败: pid=%s error=%s", proc.pid, exc)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return "", "[进程已终止，输出丢失]"
+
+
 def _clip(s: str, n: int) -> str:
     """字符级截断，超长追加提示。"""
     if len(s) <= n:
@@ -462,43 +563,30 @@ class BashTool(Tool):
         exit_code = -1
 
         try:
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-            preexec_fn = None if os.name == "nt" else (
-                lambda: signal.signal(signal.SIGPIPE, signal.SIG_DFL))
+            process_group_options = _foreground_process_group_options()
             proc = subprocess.Popen(
                 shell + [all_cmd],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace",
-                creationflags=creationflags, preexec_fn=preexec_fn,
+                **process_group_options,
             )
             stdout, stderr = proc.communicate(timeout=timeout)
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
             timed_out = True
             if proc:
-                try:
-                    if os.name == "nt":
-                        os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
-                    else:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except Exception:
-                    pass
-                try:
-                    stdout, stderr = proc.communicate(timeout=2)
-                except Exception:
-                    stdout, stderr = "", "[进程已终止，输出丢失]"
-                finally:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                logger.warning("Bash 命令超时，开始清理独立进程组: pid=%s timeout=%.2fs", proc.pid, timeout)
+                stdout, stderr = _stop_process_tree(proc)
             else:
                 stdout, stderr = "", "[超时]"
             exit_code = -1
         except KeyboardInterrupt:
             interrupted = True
-            stdout, stderr = "", "[用户中断]"
+            if proc:
+                stdout, stderr = _stop_process_tree(proc)
+            if not stderr:
+                stderr = "[用户中断]"
             exit_code = -1
         except Exception as e:
             stdout, stderr = "", str(e)

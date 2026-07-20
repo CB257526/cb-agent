@@ -166,33 +166,39 @@ from agent.cb_agents import CbAgentsLLM
 
 
 
-#测试openai模型
-import os
-model_id = os.getenv("LLM_MODEL_ID")
-api_key = os.getenv("LLM_API_KEY")
-base_url = os.getenv("LLM_BASE_URL")
+def main() -> None:
+    """执行 OpenAI 兼容接口的流式冒烟测试。"""
+    import os
 
-from dotenv import load_dotenv
-load_dotenv()
+    from dotenv import load_dotenv
+    from openai import OpenAI
 
-from openai import OpenAI
-client = OpenAI(base_url=base_url, api_key=api_key)
-# 使用流式
-stream = client.chat.completions.create(
-    model=model_id,
-    messages=[
-        {"role": "user", "content": "你好"}
-    ],
-    temperature=0.5,
-    stream=True  # 开启流式
-)
+    # 只有直接运行脚本时才读取配置并发起真实网络请求；测试框架导入本文件时无副作用。
+    load_dotenv()
+    model_id = os.getenv("LLM_MODEL_ID")
+    api_key = os.getenv("LLM_API_KEY")
+    base_url = os.getenv("LLM_BASE_URL")
+    client = OpenAI(base_url=base_url, api_key=api_key)
 
-# 逐块接收并拼接
-full_content = ""
-for chunk in stream:
-    if chunk.choices[0].delta.content is not None:
-        content = chunk.choices[0].delta.content
-        print(content, end="")
-        full_content += content
+    stream = client.chat.completions.create(
+        model=model_id,
+        messages=[
+            {"role": "user", "content": "你好"}
+        ],
+        temperature=0.5,
+        stream=True,
+    )
 
-print(f"\n完整内容: {full_content}")
+    # 流式打印的同时保留完整内容，方便快速确认中转接口是否正常。
+    full_content = ""
+    for chunk in stream:
+        if chunk.choices[0].delta.content is not None:
+            content = chunk.choices[0].delta.content
+            print(content, end="")
+            full_content += content
+
+    print(f"\n完整内容: {full_content}")
+
+
+if __name__ == "__main__":
+    main()

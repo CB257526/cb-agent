@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -32,7 +34,7 @@ from tools.tools.bash_permission import (
 )
 from tools.tools.bash_background import BackgroundRegistry, reset_background_registry
 from tools.tools.bash_task_tool import BashTaskTool
-from tools.tools.bash_tool import BashTool
+from tools.tools.bash_tool import BashTool, _signal_process_tree
 from tools.tools.file_read_tool import FileReadTool
 
 
@@ -611,6 +613,96 @@ class TestBashToolEndToEnd(unittest.TestCase):
         store = PermissionStore(store_path=Path(tempfile.mkdtemp()) / "p.json")
         gate = PermissionGate(store=store, strict=False)
         return BashTool(permission=gate)
+
+    @unittest.skipIf(os.name == "nt", "该回归用例验证 POSIX 进程组隔离")
+    def test_foreground_process_starts_in_isolated_session(self):
+        """前台 Bash 必须创建独立会话，超时信号才不会命中 cb-agent。"""
+        reset_session()
+        proc = MagicMock()
+        proc.communicate.return_value = ("", "")
+        proc.returncode = 0
+
+        with patch("tools.tools.bash_tool.subprocess.Popen", return_value=proc) as popen:
+            self._tool().run({"command": "echo isolated"})
+
+        kwargs = popen.call_args.kwargs
+        self.assertTrue(kwargs.get("start_new_session"))
+        self.assertNotIn("preexec_fn", kwargs)
+
+    @unittest.skipIf(os.name == "nt", "该回归用例验证 POSIX 进程组保护")
+    def test_signal_rejects_agent_process_group(self):
+        """防御性校验必须拒绝向 cb-agent 自身进程组发信号。"""
+        proc = MagicMock()
+        proc.pid = 43210
+        with (
+            patch("tools.tools.bash_tool.os.getpgid", return_value=1234),
+            patch("tools.tools.bash_tool.os.getpgrp", return_value=1234),
+            patch("tools.tools.bash_tool.os.killpg") as killpg,
+        ):
+            sent = _signal_process_tree(proc, force=False)
+
+        self.assertFalse(sent)
+        killpg.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "该回归用例验证 POSIX 孤儿进程清理")
+    def test_signal_uses_session_id_after_group_leader_exits(self):
+        """进程组长退出后仍使用其 pid 清理同一独立会话中的后代。"""
+        proc = MagicMock()
+        proc.pid = 43210
+        with (
+            patch("tools.tools.bash_tool.os.getpgid", side_effect=ProcessLookupError),
+            patch("tools.tools.bash_tool.os.getpgrp", return_value=1234),
+            patch("tools.tools.bash_tool.os.killpg") as killpg,
+        ):
+            sent = _signal_process_tree(proc, force=True)
+
+        self.assertTrue(sent)
+        killpg.assert_called_once_with(43210, signal.SIGKILL)
+
+    @unittest.skipIf(os.name == "nt", "该回归用例使用 POSIX sleep 命令")
+    def test_timeout_does_not_kill_parent_and_next_command_runs(self):
+        """超时只终止目标命令，承载 BashTool 的父进程和后续命令必须存活。"""
+        project_root = Path(__file__).resolve().parents[1]
+        probe_code = "\n".join([
+            "import json",
+            "from tools.tools.bash_tool import BashTool",
+            "tool = BashTool(dangerously_skip_permissions=True)",
+            "timed = json.loads(tool.run({'command': 'sleep 5', 'timeout': 100}))",
+            "next_result = json.loads(tool.run({'command': 'echo still-alive'}))",
+            "print(json.dumps({'timed_out': timed['timeout'], 'next_ok': next_result['exit_code'] == 0, 'stdout': next_result['stdout']}))",
+        ])
+
+        # 探针本身也创建独立会话；即使实现未来回归，最多只会结束探针，不会杀测试进程。
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            start_new_session=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["timed_out"])
+        self.assertTrue(payload["next_ok"])
+        self.assertIn("still-alive", payload["stdout"])
+
+    def test_root_smoke_script_is_safe_to_import(self):
+        """测试框架误导入顶层 test.py 时不得发起真实 LLM 请求。"""
+        project_root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import runpy; runpy.run_path('test.py', run_name='cbagent_import_probe'); print('IMPORT_OK')",
+            ],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("IMPORT_OK", completed.stdout)
 
     def test_echo(self):
         reset_session()
