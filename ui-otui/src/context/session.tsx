@@ -202,6 +202,13 @@ function safeArray<T = unknown>(value: unknown): T[] {
   return Array.isArray(value) ? value as T[] : [];
 }
 
+/** MessageList 挂载后暴露的滚动控制，供 Ctrl-L 清屏强制贴底。 */
+export interface MessageListScroller {
+  scrollToBottom: () => void;
+  /** 当前 MessageList 可视高度（行）；未就绪时返回 0。 */
+  getViewportHeight: () => number;
+}
+
 interface SessionContextValue {
   state: SessionState;
   /** 提交用户输入：斜杠命令拦截执行，否则追加 user item + 置 busy + 发 prompt.submit。 */
@@ -230,6 +237,14 @@ interface SessionContextValue {
   registerPromptInputSetter: (setter: ((text: string) => void) | null) => void;
   /** 把文本写回 Prompt 输入框。 */
   setPromptInput: (text: string) => void;
+  /** 注册 MessageList 滚动 API（Ctrl-L 清屏贴底用）。 */
+  registerMessageListScroller: (api: MessageListScroller | null) => void;
+  /**
+   * Ctrl-L：只清主视口，不删历史。
+   * 在对话流末尾插入与可视等高的空白占位并滚到底；上滑仍可看到之前消息。
+   * 与 /clear（前后端 history 都清）不同。
+   */
+  clearViewport: (opts?: { height?: number }) => void;
   /** Set Plan/Execute mode. */
   setPlanMode: (mode: PlanMode) => Promise<void>;
   /** Toggle Plan/Execute mode. */
@@ -277,6 +292,8 @@ export function SessionProvider(props: ParentProps) {
   let streamingPlanId: string | null = null;
   // Prompt 组件挂载后注册 setInputValue；/skill 等命令通过它把文本写回输入框。
   let promptInputSetter: ((text: string) => void) | null = null;
+  // MessageList 挂载后注册滚动 API；Ctrl-L 清屏时强制贴底。
+  let messageListScroller: MessageListScroller | null = null;
 
   // 本次 chat 是否产生过任何可见输出（文本/思考/工具调用）。submit 时复位，
   // 收到 text_delta/reasoning_delta/tool_start 置 true；done 时若仍为 false，
@@ -831,6 +848,31 @@ export function SessionProvider(props: ParentProps) {
     promptInputSetter = setter;
   };
 
+  const registerMessageListScroller = (api: MessageListScroller | null) => {
+    messageListScroller = api;
+  };
+
+  const clearViewport = (opts?: { height?: number }) => {
+    // 优先用 MessageList 真实可视高度；未就绪时用调用方兜底高度。
+    const measured = messageListScroller?.getViewportHeight() ?? 0;
+    const fallback = Math.max(1, Math.floor(opts?.height ?? 12));
+    const height = measured > 0 ? measured : fallback;
+    setState("items", (prev) => [
+      ...prev,
+      {
+        id: nextId(),
+        role: "clear_viewport",
+        text: "",
+        clearHeight: height,
+      },
+    ]);
+    // 占位插入后等一帧再贴底，让 scrollHeight 包含新内容。
+    const pin = () => messageListScroller?.scrollToBottom();
+    queueMicrotask(pin);
+    setTimeout(pin, 0);
+    setTimeout(pin, 32);
+  };
+
   const runCommand = (cmd: SlashCommand, commandLine?: string) => {
     const line = (commandLine ?? cmd.name).trim();
     const ctx: CommandCtx = {
@@ -959,6 +1001,8 @@ export function SessionProvider(props: ParentProps) {
     closeDialog: () => setState("dialog", null),
     registerPromptInputSetter,
     setPromptInput,
+    registerMessageListScroller,
+    clearViewport,
     setPlanMode,
     togglePlanMode,
     togglePermissionMode,

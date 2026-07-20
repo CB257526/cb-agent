@@ -560,12 +560,25 @@ export interface CacheStatsPayload {
   models: CacheStatsBucket[];
 }
 
-export type Role = "user" | "assistant" | "tool" | "system" | "ask_question" | "todo" | "thought" | "plan" | "subagent";
+export type Role =
+  | "user"
+  | "assistant"
+  | "tool"
+  | "system"
+  | "ask_question"
+  | "todo"
+  | "thought"
+  | "plan"
+  | "subagent"
+  /** Ctrl-L 清屏占位：把主视口顶到空白，但历史仍可上滑查看。 */
+  | "clear_viewport";
 /** 对话流里渲染的一项。一个 chat round 通常会产生多个 item。 */
 export interface ChatItem {
   id: string;
   role: Role;
   text: string;             // user / assistant 用
+  /** clear_viewport 用：占位高度（行数），通常等于 MessageList 可视高度。 */
+  clearHeight?: number;
   toolCallId?: string;      // tool item 用：后端 call_id，精确配对 tool_complete
   toolName?: string;        // tool item 用
   toolArgs?: Record<string, unknown>;

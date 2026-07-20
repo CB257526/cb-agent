@@ -8,9 +8,13 @@
  *
  * 各 role 分派到对应组件渲染。assistant 需要知道自己是否是最后一条（流式期间用纯文本、
  * done 后用 markdown），所以 ItemRenderer 透传 isLast。
+ *
+ * Ctrl-L 清屏：不删 items，只在末尾插入 clear_viewport 占位（高度≈可视区），再强制
+ * 滚到底。主界面看起来被清空，但上滑仍能看到之前的对话。
  */
 
-import { createMemo, ErrorBoundary, For, Switch, Match } from "solid-js";
+import { createMemo, ErrorBoundary, For, Match, onCleanup, onMount, Switch } from "solid-js";
+import type { ScrollBoxRenderable } from "@opentui/core";
 import { useTheme } from "../context/theme.js";
 import { useSession } from "../context/session.js";
 import { appendOtuiDiagnostic } from "../diagnostics.js";
@@ -119,6 +123,11 @@ function ItemRenderer(props: { item: ChatItem; isLast: boolean }) {
           <text fg={theme.text} attributes={textAttributes.muted}>{item().text}</text>
         </box>
       </Match>
+
+      <Match when={item().role === "clear_viewport"}>
+        {/* 纯占位：把历史内容顶出可视区。高度由 clearHeight 指定，至少 1 行。 */}
+        <box height={Math.max(1, item().clearHeight ?? 1)} flexShrink={0} />
+      </Match>
     </Switch>
   );
 }
@@ -136,7 +145,9 @@ function ItemError(props: { error: unknown }) {
 
 export function MessageList() {
   const theme = useTheme();
-  const { state } = useSession();
+  const { state, registerMessageListScroller } = useSession();
+  let scrollRef: ScrollBoxRenderable | undefined;
+
   const visibleItems = createMemo(() =>
     state.items.filter(
       (item) =>
@@ -145,6 +156,30 @@ export function MessageList() {
         || item.questionId !== state.activeQuestionId,
     ),
   );
+
+  const scrollToBottom = () => {
+    const box = scrollRef;
+    if (!box) return;
+    // sticky 在用户手动上滑后可能断开；Ctrl-L 需要强制贴底。
+    // scrollHeight 是内容总高，设 scrollTop 到内容底部即可把最新占位顶入视口。
+    try {
+      box.scrollTop = Math.max(0, box.scrollHeight);
+    } catch {
+      // 布局尚未就绪时忽略；clearViewport 会再尝试一次。
+    }
+  };
+
+  const getViewportHeight = () => {
+    const h = scrollRef?.height;
+    return typeof h === "number" && Number.isFinite(h) && h > 0 ? Math.floor(h) : 0;
+  };
+
+  onMount(() => {
+    registerMessageListScroller({ scrollToBottom, getViewportHeight });
+  });
+  onCleanup(() => {
+    registerMessageListScroller(null);
+  });
 
   return (
     <scrollbox
@@ -158,6 +193,9 @@ export function MessageList() {
           backgroundColor: theme.background,
           foregroundColor: theme.border,
         },
+      }}
+      ref={(r: ScrollBoxRenderable) => {
+        scrollRef = r;
       }}
     >
       <For each={visibleItems()}>

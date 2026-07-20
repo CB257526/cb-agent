@@ -41,7 +41,7 @@ export function App(props: { transport: Transport }) {
 function Shell(props: { transport: Transport }) {
   const dimensions = useTerminalDimensions();
   const renderer = useRenderer();
-  const { state, toggleActivity, setItems, closeDialog, appendSystem } = useSession();
+  const { state, toggleActivity, clearViewport, closeDialog, appendSystem } = useSession();
   const horizontalPadding = () => getHorizontalPadding(dimensions().width);
   const activeQuestion = createMemo(() =>
     state.items.find(
@@ -116,9 +116,13 @@ function Shell(props: { transport: Transport }) {
     } else if (key.ctrl && key.name === "o") {
       toggleActivity();
     } else if (key.ctrl && key.name === "l") {
-      // 仿 bash Ctrl-L：清当前可视对话流，但保留后端 history（与 /clear 区别）。
-      // scrollbox 是独立屏幕缓冲，清空 items 即得到干净屏，无需操作终端 scrollback。
-      setItems([]);
+      // 仿 bash Ctrl-L：只清主视口，不删对话 items / 后端 history。
+      // 在流末尾插入与可视区等高的空白占位并滚到底；上滑仍可看到之前消息。
+      // 真正清空会话请用 /clear。
+      key.preventDefault?.();
+      // 兜底高度：终端总高减去标题/输入/Footer 等 chrome（约 6 行）。
+      const fallbackHeight = Math.max(4, dimensions().height - 6);
+      clearViewport({ height: fallbackHeight });
     }
   });
 
