@@ -113,14 +113,18 @@ export function ToolBlock(props: { item: ChatItem }) {
   });
 
   const fileDiff = createMemo(() => {
-    if (!isFileTool()) return "";
-    return parsed().diff || "";
+    if (!isFileTool()) return null as DiffViewModel | null;
+    const raw = parsed().diff || "";
+    if (!raw.trim()) return null;
+    return prepareDiffForView(raw);
   });
 
   /** Diff 组件可视高度：行数上限，避免超大 patch 撑爆视口 */
   const diffHeight = createMemo(() => {
+    const d = fileDiff();
+    if (!d || !d.ok) return 4;
     const p = parsed();
-    const total = p.diff_lines_shown || countLines(p.diff || "") || 1;
+    const total = p.diff_lines_shown || countLines(d.text) || 1;
     return Math.max(3, Math.min(DIFF_VIEW_MAX_LINES, total + 1));
   });
 
@@ -185,38 +189,62 @@ export function ToolBlock(props: { item: ChatItem }) {
             </Show>
 
             <Show when={fileDiff()}>
-              <box flexDirection="column" minWidth={0} marginTop={0} paddingLeft={2}>
-                <diff
-                  diff={fileDiff()}
-                  view="unified"
-                  showLineNumbers={true}
-                  wrapMode="word"
-                  filetype={filetype()}
-                  height={diffHeight()}
-                  fg={theme.text}
-                  addedSignColor={theme.success}
-                  removedSignColor={theme.error}
-                  addedBg={DIFF_ADDED_BG}
-                  removedBg={DIFF_REMOVED_BG}
-                  contextBg={DIFF_CONTEXT_BG}
-                  addedContentBg={DIFF_ADDED_BG}
-                  removedContentBg={DIFF_REMOVED_BG}
-                  contextContentBg={DIFF_CONTEXT_BG}
-                  lineNumberFg={theme.textMuted}
-                  lineNumberBg={DIFF_CONTEXT_BG}
-                  addedLineNumberBg={DIFF_ADDED_BG}
-                  removedLineNumberBg={DIFF_REMOVED_BG}
-                />
-                <Show when={parsed().diff_truncated || (parsed().diff_lines_total ?? 0) > DIFF_VIEW_MAX_LINES}>
-                  <text fg={theme.text} attributes={textAttributes.muted}>
-                    {`  … [diff 已截断`}
-                    {parsed().diff_lines_total
-                      ? `，约 ${Math.min(DIFF_VIEW_MAX_LINES, parsed().diff_lines_shown ?? DIFF_VIEW_MAX_LINES)}/${parsed().diff_lines_total} 行`
-                      : ""}
-                    {"]"}
-                  </text>
-                </Show>
-              </box>
+              {(d) => {
+                const model = d();
+                if (!model.ok) {
+                  return (
+                    <box flexDirection="column" minWidth={0} marginTop={0} paddingLeft={2}>
+                      <text fg={theme.error} wrapMode="word">
+                        {`  │ Diff 无法解析：${model.error}`}
+                      </text>
+                      <text fg={theme.text} attributes={textAttributes.muted} wrapMode="word">
+                        {"  │ 常见原因：patch 行缺少 +/-/空格 前缀，或截断切断了 hunk 中部。"}
+                      </text>
+                      <For each={model.previewLines.slice(0, 8)}>
+                        {(line) => (
+                          <text fg={theme.text} attributes={textAttributes.muted} wrapMode="none">
+                            {`  │ ${line}`}
+                          </text>
+                        )}
+                      </For>
+                    </box>
+                  );
+                }
+                return (
+                  <box flexDirection="column" minWidth={0} marginTop={0} paddingLeft={2}>
+                    <diff
+                      diff={model.text}
+                      view="unified"
+                      showLineNumbers={true}
+                      wrapMode="word"
+                      filetype={filetype()}
+                      height={diffHeight()}
+                      fg={theme.text}
+                      addedSignColor={theme.success}
+                      removedSignColor={theme.error}
+                      addedBg={DIFF_ADDED_BG}
+                      removedBg={DIFF_REMOVED_BG}
+                      contextBg={DIFF_CONTEXT_BG}
+                      addedContentBg={DIFF_ADDED_BG}
+                      removedContentBg={DIFF_REMOVED_BG}
+                      contextContentBg={DIFF_CONTEXT_BG}
+                      lineNumberFg={theme.textMuted}
+                      lineNumberBg={DIFF_CONTEXT_BG}
+                      addedLineNumberBg={DIFF_ADDED_BG}
+                      removedLineNumberBg={DIFF_REMOVED_BG}
+                    />
+                    <Show when={parsed().diff_truncated || (parsed().diff_lines_total ?? 0) > DIFF_VIEW_MAX_LINES}>
+                      <text fg={theme.text} attributes={textAttributes.muted}>
+                        {`  … [diff 已截断`}
+                        {parsed().diff_lines_total
+                          ? `，约 ${Math.min(DIFF_VIEW_MAX_LINES, parsed().diff_lines_shown ?? DIFF_VIEW_MAX_LINES)}/${parsed().diff_lines_total} 行`
+                          : ""}
+                        {"]"}
+                      </text>
+                    </Show>
+                  </box>
+                );
+              }}
             </Show>
           </box>
         </Show>
@@ -321,6 +349,90 @@ function countLines(s: string): number {
   let n = 1;
   for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
   return n;
+}
+
+/** OpenTUI <diff> / jsdiff 可渲染的视图模型 */
+type DiffViewModel =
+  | { ok: true; text: string }
+  | { ok: false; text: string; error: string; previewLines: string[] };
+
+/**
+ * 清洗 + 轻量校验 unified patch，避免 OpenTUI 抛
+ * `Error parsing diff: Hunk at line N contained invalid line ...`
+ * 却只显示这句含糊错误。
+ */
+function prepareDiffForView(raw: string): DiffViewModel {
+  const normalized = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  // 去掉 JSON 转义残留的多余空行，保证 ---/+++/@@ 后是合法 hunk 体
+  const lines = normalized.split("\n");
+  const cleaned: string[] = [];
+  let inHunk = false;
+  let bad: { lineNo: number; line: string; reason: string } | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNo = i + 1;
+
+    if (line.startsWith("--- ") || line.startsWith("+++ ") || line.startsWith("diff ")) {
+      inHunk = false;
+      cleaned.push(line);
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      cleaned.push(line);
+      continue;
+    }
+    // 文件元数据（index / similarity 等）可忽略
+    if (!inHunk) {
+      if (line === "" && cleaned.length > 0) continue;
+      cleaned.push(line);
+      continue;
+    }
+
+    // hunk 体内：允许空行（当上下文空行）→ 补成 " " 前缀
+    if (line === "") {
+      cleaned.push(" ");
+      continue;
+    }
+    const op = line[0];
+    if (op === "+" || op === "-" || op === " " || op === "\\") {
+      cleaned.push(line);
+      continue;
+    }
+    // 粘连的非法行（如 "-old+new" 中第二段以 + 开头但整行以 - 起也可 parse；
+    // 真正非法是不以这四类开头，例如 "@@" 中途坏了或 "Index:" 混入）
+    // 若整行像被粘成 "-foo+bar" 仍以 - 开头，jsdiff 会当删除行接受；
+    // 真正炸的是类似 "line without prefix" 或截断后残片。
+    bad = {
+      lineNo,
+      line: line.length > 120 ? line.slice(0, 120) + "…" : line,
+      reason: `hunk 体第 ${lineNo} 行缺少 +/-/空格/\\\\ 前缀`,
+    };
+    break;
+  }
+
+  const text = cleaned.join("\n").replace(/\n+$/, "\n");
+  if (bad) {
+    return {
+      ok: false,
+      text,
+      error: `${bad.reason}：${JSON.stringify(bad.line)}`,
+      previewLines: lines.slice(Math.max(0, bad.lineNo - 3), bad.lineNo + 2).map((l, idx) => {
+        const n = Math.max(0, bad!.lineNo - 3) + idx + 1;
+        return `${n}| ${l}`;
+      }),
+    };
+  }
+  if (!text.includes("@@")) {
+    return {
+      ok: false,
+      text,
+      error: "缺少 @@ hunk 头（不是完整 unified diff）",
+      previewLines: lines.slice(0, 8).map((l, i) => `${i + 1}| ${l}`),
+    };
+  }
+  return { ok: true, text };
 }
 
 function guessFiletype(path: string): string | undefined {

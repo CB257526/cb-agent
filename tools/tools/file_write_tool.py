@@ -272,46 +272,141 @@ def _generate_unified_diff(
 ) -> tuple[str, bool, int, int]:
     """生成 unified diff，供 TUI 展示文件变更。
 
-    Args:
-        old: 旧文件内容，None 表示新建文件。
-        new: 新文件内容。
-        file_path: 文件路径（用于 diff 头部）。
-        max_lines: 最大行数，超出截断。
+    关键：OpenTUI / jsdiff 的 parsePatch 要求 hunk 体每行以 ``+``/``-``/`` ``/``\\``
+    开头。若用 ``splitlines(keepends=True)`` 且末行无换行，difflib 会把
+    ``-old`` 与 ``+new`` 粘成一行 ``-old+new``，触发
+    ``Hunk at line N contained invalid line``。
+
+    截断时不能简单 ``lines[:max]``：会切断 hunk 中部，导致
+    ``Added/Removed line count did not match``。必须按完整 hunk 截断，
+    或对溢出的最后一个 hunk 重写 ``@@`` 计数。
 
     Returns:
         (diff_text, truncated, total_lines, shown_lines)
-        - diff_text: unified diff 文本
-        - truncated: 是否被截断
-        - total_lines: diff 总行数
-        - shown_lines: 实际显示行数
     """
-    old_lines: list[str]
-    from_file: str
+    # 不用 keepends：行内容不含换行。再统一补 \n。
+    # 注意：部分 Python 版本下 unified_diff(lineterm="\n") 只给 header 加 \n，
+    # body（' line'/'-x'/'+y'）可能不带换行；"".join 会粘成 " line1-line2+line2x"。
     if old is None:
-        # 新建文件：所有行都是新增
-        old_lines = []
+        old_lines: list[str] = []
         from_file = "/dev/null"
     else:
-        old_lines = old.splitlines(keepends=True)
+        old_lines = old.splitlines()
         from_file = file_path
 
-    new_lines = new.splitlines(keepends=True)
+    new_lines = new.splitlines()
     to_file = file_path
 
-    diff_gen = difflib.unified_diff(
-        old_lines,
-        new_lines,
-        fromfile=from_file,
-        tofile=to_file,
-        lineterm="\n",
-    )
-
-    # 收成单个字符串交给 JSON 传输，前端按 \n split 即可还原逐行结构
-    all_lines = list(diff_gen)
+    all_lines = [
+        _ensure_diff_line_nl(line)
+        for line in difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=from_file,
+            tofile=to_file,
+            lineterm="\n",
+            n=3,
+        )
+    ]
     total_lines = len(all_lines)
+    if total_lines == 0:
+        return "", False, 0, 0
 
     if total_lines <= max_lines:
         return "".join(all_lines), False, total_lines, total_lines
 
-    shown = all_lines[:max_lines]
-    return "".join(shown), True, total_lines, max_lines
+    shown = _truncate_unified_diff_lines(all_lines, max_lines)
+    return "".join(shown), True, total_lines, len(shown)
+
+
+def _ensure_diff_line_nl(line: str) -> str:
+    """保证 unified diff 每一行都以 \\n 结尾（防 join 粘行）。"""
+    return line if line.endswith("\n") else line + "\n"
+
+
+def _truncate_unified_diff_lines(lines: list[str], max_lines: int) -> list[str]:
+    """按完整 hunk 截断 unified diff；必要时重写最后一个不完整 hunk 的 @@ 计数。"""
+    if len(lines) <= max_lines:
+        return lines
+
+    header: list[str] = []
+    i = 0
+    while i < len(lines) and not lines[i].startswith("@@"):
+        header.append(lines[i])
+        i += 1
+
+    out = header[:]
+    if len(out) >= max_lines:
+        return out[:max_lines]
+
+    while i < len(lines):
+        if not lines[i].startswith("@@"):
+            i += 1
+            continue
+
+        hunk_header = lines[i]
+        i += 1
+        body: list[str] = []
+        while i < len(lines) and not lines[i].startswith("@@"):
+            # 多文件 diff 的下一文件头（本工具单文件，防御性保留）
+            if lines[i].startswith("--- ") or lines[i].startswith("diff "):
+                break
+            body.append(lines[i])
+            i += 1
+
+        need = 1 + len(body)
+        if len(out) + need <= max_lines:
+            out.append(hunk_header)
+            out.extend(body)
+            continue
+
+        # 装不下完整 hunk：尽量塞 partial body 并重写 @@ 行数
+        room = max_lines - len(out) - 1
+        if room < 1:
+            break
+        partial = body[:room]
+        rewritten = _rewrite_hunk_header(hunk_header, partial)
+        if rewritten is None:
+            break
+        out.append(rewritten)
+        out.extend(partial)
+        break
+
+    return out
+
+
+def _rewrite_hunk_header(hunk_header: str, body: list[str]) -> Optional[str]:
+    """根据实际 body 重写 ``@@ -a,b +c,d @@``，使 jsdiff 计数校验通过。"""
+    import re
+
+    m = re.match(
+        r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)",
+        hunk_header.rstrip("\n"),
+    )
+    if not m:
+        return None
+
+    old_start, new_start, rest = m.group(1), m.group(2), m.group(3) or ""
+    old_count = 0
+    new_count = 0
+    for line in body:
+        if not line:
+            # 空行在 unified 里极少；跳过避免炸解析
+            continue
+        op = line[0]
+        if op == "+":
+            new_count += 1
+        elif op == "-":
+            old_count += 1
+        elif op == " ":
+            old_count += 1
+            new_count += 1
+        elif op == "\\":
+            # "\ No newline at end of file" — 不计入 old/new lines
+            continue
+        else:
+            # 非法前缀：无法安全重写
+            return None
+
+    # unified 惯例：计数为 0 时 start 仍按原起点写出
+    return f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{rest}\n"
