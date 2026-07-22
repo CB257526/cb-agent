@@ -15,6 +15,7 @@ from agent.event_bus import EventBus
 from agent.events import (
     Cancelled, ReasoningDelta, TextDelta, TokenUsage, ToolCallPlanned,
 )
+from agent.llm_errors import LLMRequestError, classify_llm_exception
 # 加载安装目录中的 .env，避免全局 cbagent 启动时误读用户工作目录的 .env。
 _APP_ROOT = Path(os.environ.get("CBAGENT_APP_ROOT") or Path(__file__).resolve().parents[1]).expanduser().resolve()
 load_dotenv(_APP_ROOT / ".env")
@@ -806,10 +807,20 @@ class CbAgentsLLM:
             )
             return result
 
+        except LLMRequestError:
+            # 已经分类过的错误直接向上抛，供 Session 做事务控制。
+            raise
         except Exception as e:
             logger.exception("LLM think failed: round=%s model=%s", round_idx, self.model)
             print(f"❌ 调用LLM API时发生错误: {e}", file=sys.stderr)
-            return None
+            # 不再返回 None 伪装成功；分类后抛出，避免 Session 提交空 assistant 回合。
+            raise classify_llm_exception(
+                e,
+                provider=str(getattr(self, "provider", "") or ""),
+                model_key=str(getattr(self, "current_model_key", "") or ""),
+                model_id=str(self.model or ""),
+                round_idx=round_idx,
+            ) from e
     
     #根据api厂商是否支持Function Calling进行不同的请求
     # 1 不支持Function Calling

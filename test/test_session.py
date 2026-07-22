@@ -1431,9 +1431,11 @@ class TestAgentSessionBasic(unittest.TestCase):
         llm = FakeLLM(["bad string result"])
         s = self._make_session(llm)
         ans = s.chat("q")
-        self.assertEqual(ans, "")
+        # provider/结构错误不再提交空 assistant 回合，而是返回结构化错误文案。
+        self.assertIn("请求无效", ans)
         errors = [e for e in self.events if isinstance(e, Error)]
         self.assertTrue(any(err.where == "llm" for err in errors))
+        self.assertEqual(s.history, [])
 
 
 if __name__ == "__main__":

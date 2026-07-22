@@ -62,6 +62,13 @@ from agent.compaction import (
     run_local_compaction,
     select_retained_history,
 )
+from agent.llm_errors import (
+    LLMContextOverflowError,
+    LLMInvalidRequestError,
+    LLMRateLimitError,
+    LLMRequestError,
+    LLMTransportError,
+)
 from agent.event_bus import EventBus
 from agent.events import (
     BackgroundNotification, Cancelled, ContextWindowUpdated, Done, Error, PlanApproved, PlanDelta,
@@ -229,7 +236,13 @@ def _format_context_sections(
     changed_sections: Sequence[tuple[str, str]],
     removed_sections: Sequence[str],
 ) -> str:
-    """把变化块渲染成具名更新，明确新值替换同名旧值。"""
+    """把变化块渲染成具名更新，明确新值替换同名旧值。
+       接受改变了的section块与要删除的section块
+       返回一个类似于
+       section_name:env macos
+       section_name:env state="removed"
+       意思env块更新为macos，之前的env块已被删除
+    """
     parts = [
         "The newest section with the same name replaces earlier values.",
     ]
@@ -755,8 +768,8 @@ class AgentSession:
         self,
         *,
         source_history: Optional[Sequence[Message]] = None,
-        reason: str = "user_compact",
-        target_model: Optional[str] = None,
+        reason: str = "user_compact", #啥原因触发压缩
+        target_model: Optional[str] = None, #压缩完成后 继续对话的模型
     ) -> Dict[str, Any]:
         """使用结构化历史生成 Codex 风格交接摘要并事务安装新 history。"""
         compact_source = list(source_history) if source_history is not None else list(self.history)
@@ -774,11 +787,12 @@ class AgentSession:
                 "no_op": True,
             }
 
-        summary_limits = self._context_limits()
-        install_limits = (
+        summary_limits = self._context_limits() #压缩模型的上下文窗口限制
+        install_limits = ( #压缩完成后 继续对话的模型的上下文窗口限制
             ConstantLLM.context_limits(target_model)
             if target_model else summary_limits
         )
+        # 计算压缩后保留的 token 数
         retained_target = dynamic_retained_token_target(install_limits["soft_limit_tokens"])
         if reason in {"manual", "user_compact"} and estimate_message_tokens(compact_source) <= retained_target:
             return {
@@ -815,15 +829,19 @@ class AgentSession:
         )
         summary_message = make_summary_message(model_result.summary, reason=reason)
 
+        # worldstate：就是section
         # mid-turn 会马上继续同一工具回合，因此必须把当前完整现场放入 replacement
         # history；manual/pre-turn 则清空基线，让下一条正常请求完整重注入。
+        # 确定要装配的section是当前回合最新的_pending_world_state还是_world_state_baseline
         installed_world_state = (
             self._pending_world_state
             if reason == "mid_turn" and self._pending_world_state.sections
             else self._world_state_baseline if reason == "mid_turn" else EMPTY_WORLD_STATE
         )
+
         world_state_message = (
             _make_context_update_message(
+                # 更新上下文中的section，然后转化为字符串
                 _format_context_sections(list(installed_world_state.sections.items()), []),
                 installed_world_state,
             )
@@ -836,12 +854,16 @@ class AgentSession:
             )
         )
         fixed_messages: List[Dict[str, Any]] = []
+        # 装配系统提示词
         if system_message:
             fixed_messages.append(system_message)
+        # 装配当前的section
         if world_state_message is not None:
             fixed_messages.append(world_state_message.to_dict())
+        # 装配模型生成的摘要
         fixed_messages.append(summary_message.to_dict())
         fixed_tokens = self._estimate_request_tokens(fixed_messages, tools_schema)
+
         retained_budget = min(
             retained_target,
             max(0, install_limits["soft_limit_tokens"] - fixed_tokens),
@@ -861,7 +883,9 @@ class AgentSession:
                     ),
                     len(replacement),
                 )
+                # 装配section
                 replacement.insert(insertion_index, world_state_message)
+            # 装配模型生成的摘要
             replacement.append(summary_message)
             return selected, replacement
 
@@ -880,19 +904,20 @@ class AgentSession:
         if self.session_store is not None:
             try:
                 from agent.work_context import _message_to_persist_payload
-                self.session_store.save_compaction(
-                    summary=str(summary_message.content or ""),
-                    history_payload=[
+                # 将这次compact事件落盘
+                self.session_store.save_compaction( 
+                    summary=str(summary_message.content or ""), # 模型输出摘要
+                    history_payload=[ # 新的history：replacement_history，包含当前section+被保留的message+摘要
                         _message_to_persist_payload(message)
                         for message in replacement_history
                     ],
-                    before_messages=before_messages,
+                    before_messages=before_messages, # 压缩前后条数（用于 UI 展示压缩幅度）
                     after_messages=after_messages,
-                    reason=reason,
+                    reason=reason, # 导致 compact 的原因
                     model=str(getattr(self.llm, "model", "") or ""),
                     target_model=str(target_model or getattr(self.llm, "model", "") or ""),
                     provider=str(getattr(self.llm, "provider", "") or ""),
-                    world_state_snapshot=installed_world_state.to_payload(),
+                    world_state_snapshot=installed_world_state.to_payload(), # 装回的环境快照
                     tokens_before=estimate_message_tokens(compact_source),
                     tokens_after=estimate_message_tokens(replacement_history),
                 )
@@ -902,7 +927,7 @@ class AgentSession:
                 raise
 
         # 只有落盘成功（或未启用持久化）后才替换内存，避免磁盘失败造成状态分裂。
-        self.history = replacement_history
+        self.history = replacement_history  # 新的history：replacement_history，包含当前section+被保留的message+摘要
         self._pending_context_update_text = ""
         self._pending_world_state = EMPTY_WORLD_STATE
         self._world_state_baseline = installed_world_state
@@ -936,8 +961,8 @@ class AgentSession:
         self,
         user_query: str,
         cancel_token: Optional[CancelToken] = None,
-        attachments: Optional[List[Dict[str, Any]]] = None,
-        persistent_user_text: Optional[str] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,  # 可选附件列表
+        persistent_user_text: Optional[str] = None, 
     ) -> str:
         """处理一次用户输入，返回最终答案字符串。
 
@@ -964,7 +989,7 @@ class AgentSession:
             return self._chat_impl(
                 user_query,
                 token,
-                attachments=attachments,
+                attachments=attachments,  # 可选附件列表
                 persistent_user_text=persistent_user_text,
             )
         finally:
@@ -1611,10 +1636,47 @@ class AgentSession:
             "turn_prefix_messages": turn_prefix_messages,
         }
 
-        #工具调用次数，最终回答，工具轨迹，本轮压缩事件
-        rounds_used, final_answer, trace_collector, loop_compactions = self._tool_loop(
-            messages, tools_schema, token, loop_state=loop_state,
-        )
+        # 工具调用次数，最终回答，工具轨迹，本轮压缩事件。
+        # provider 失败会抛 LLMRequestError：保留 active/pending checkpoint，
+        # 不把半截 user-only 回合提交进正式 history/transcript。
+        history_before_turn = list(self.history)
+        baseline_before_turn = self._world_state_baseline
+        try:
+            rounds_used, final_answer, trace_collector, loop_compactions = self._tool_loop(
+                messages, tools_schema, token, loop_state=loop_state,
+            )
+        except LLMRequestError as exc:
+            auto_compactions.extend(list(loop_state.get("auto_compactions") or []))
+            # 回滚可能在 overflow compact 路径被替换的 history；失败回合不提交。
+            if not loop_state.get("history_replaced"):
+                self.history = history_before_turn
+            self._pending_context_update_text = ""
+            self._pending_world_state = EMPTY_WORLD_STATE
+            # baseline 只在成功提交后推进；失败保持回合开始时的值。
+            self._world_state_baseline = baseline_before_turn
+            error_text = self._format_llm_request_error(exc)
+            self.event_bus.emit(Error(
+                where="llm",
+                message=error_text,
+                round_idx=int(getattr(exc, "round_idx", 0) or 0),
+            ))
+            self.event_bus.emit(Done(
+                final_answer=error_text,
+                rounds_used=int(getattr(exc, "round_idx", 0) or 0),
+                cancelled=False,
+                context_window=self.context_window_usage(),
+                auto_compact={
+                    "compacted": bool(auto_compactions),
+                    "events": auto_compactions,
+                } if auto_compactions else None,
+            ))
+            logger.error(
+                "chat aborted by provider error without committing turn: type=%s status=%s",
+                type(exc).__name__,
+                getattr(exc, "status_code", None),
+            )
+            return error_text
+
         auto_compactions.extend(loop_compactions)
 
         # CC 模式跨轮累积：把本轮 _tool_loop 内新增的 user/assistant/tool 消息
@@ -2357,13 +2419,72 @@ class AgentSession:
             # 文本自动路由为 PlanDelta 事件，块外文本继续走正常 TextDelta。
             plan_bus = _PlanParsingEventBus(self) if self.collaboration_mode() == "plan" else None
             self._request_token_estimates[round_idx] = request_tokens_est
-            result = self.llm.think(
-                messages,
-                tools=tools_schema,
-                event_bus=plan_bus if plan_bus is not None else self.event_bus,
-                cancel_event=token.event,
-                round_idx=round_idx,
-            )
+            try:
+                result = self.llm.think(
+                    messages,
+                    tools=tools_schema,
+                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
+                    cancel_event=token.event,
+                    round_idx=round_idx,
+                )
+            except LLMContextOverflowError as exc:
+                # 本轮最多自动 compact + 重试一次；再次 overflow 则上抛保留 checkpoint。
+                if loop_state.get("provider_overflow_retried"):
+                    exc.round_idx = round_idx
+                    raise
+                compact_event = self._mid_turn_compact(
+                    messages=messages,
+                    loop_state=loop_state,
+                    round_idx=round_idx,
+                )
+                if compact_event is None:
+                    exc.round_idx = round_idx
+                    raise
+                loop_compactions.append(compact_event)
+                loop_state["provider_overflow_retried"] = True
+                loop_state.setdefault("auto_compactions", []).append(compact_event)
+                # compact 后消息前缀已变，重新 think 同一轮语义。
+                result = self.llm.think(
+                    messages,
+                    tools=tools_schema,
+                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
+                    cancel_event=token.event,
+                    round_idx=round_idx,
+                )
+            except LLMRateLimitError as exc:
+                # 有界重试一次；不提交失败回合。
+                if loop_state.get("provider_rate_limit_retried"):
+                    exc.round_idx = round_idx
+                    raise
+                loop_state["provider_rate_limit_retried"] = True
+                time.sleep(min(2.0, max(0.2, float(exc.details.get("retry_after") or 0.5))))
+                result = self.llm.think(
+                    messages,
+                    tools=tools_schema,
+                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
+                    cancel_event=token.event,
+                    round_idx=round_idx,
+                )
+            except LLMTransportError as exc:
+                # 仅在尚未产生可见正文时允许一次幂等重试，避免用户看到重复流式文本。
+                if (
+                    loop_state.get("provider_transport_retried")
+                    or (exc.partial_answer or "").strip()
+                ):
+                    exc.round_idx = round_idx
+                    raise
+                loop_state["provider_transport_retried"] = True
+                result = self.llm.think(
+                    messages,
+                    tools=tools_schema,
+                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
+                    cancel_event=token.event,
+                    round_idx=round_idx,
+                )
+            except LLMRequestError as exc:
+                # 鉴权 / invalid / 未知错误：不自动重试。
+                exc.round_idx = round_idx
+                raise
             # 流式结束后，flush 解析器缓冲区中残留的计划块内容
             if plan_bus is not None:
                 plan_bus.finish(round_idx)
@@ -2399,17 +2520,15 @@ class AgentSession:
                 return round_idx, final, trace_collector, loop_compactions
 
             if not isinstance(result, dict):
-                #TODO：错误信息不明确
-                logger.error("LLM returned unexpected result: round=%s type=%s", round_idx, type(result).__name__)
-                self.event_bus.emit(Error(
-                    where="llm",
+                # think() 已不再返回 None；非 dict/list 视为实现错误，上抛不提交回合。
+                raise LLMInvalidRequestError(
                     message=f"模型返回非预期结构: {type(result).__name__}",
+                    provider=str(getattr(self.llm, "provider", "") or ""),
+                    model_key=str(getattr(self.llm, "current_model_key", "") or ""),
+                    model_id=str(getattr(self.llm, "model", "") or ""),
                     round_idx=round_idx,
-                ))
-                self.event_bus.emit(RoundEnd(
-                    round_idx=round_idx, has_tool_calls=False, final=True,
-                ))
-                return round_idx, "", trace_collector, loop_compactions
+                    retryable=False,
+                )
 
             # Plan Mode: FC 模型的 answer 字段也可能包含 <proposed_plan> 块。
             # 流式解析（plan_bus）处理增量输出，这里处理完整 answer 中的残余块。
@@ -2743,6 +2862,23 @@ class AgentSession:
             and isinstance(last.content, str)
             and last.content == final_answer
         )
+
+    @staticmethod
+    def _format_llm_request_error(exc: LLMRequestError) -> str:
+        """把 provider 错误渲染成用户可见短文案，不泄露密钥。"""
+
+        kind = {
+            LLMContextOverflowError: "上下文超限",
+            LLMRateLimitError: "请求限流",
+            LLMTransportError: "网络/传输错误",
+            LLMInvalidRequestError: "请求无效",
+        }.get(type(exc), "请求失败")
+        status = f" HTTP {exc.status_code}" if exc.status_code else ""
+        model = f" model={exc.model_id}" if exc.model_id else ""
+        detail = str(exc.message or "").strip() or type(exc).__name__
+        if len(detail) > 240:
+            detail = detail[:240] + "…"
+        return f"[LLM {kind}{status}{model}] {detail}"
 
     def _history_tail_is_final_answer(self, final_answer: str) -> bool:
         """判断 history 末尾是否已经是本轮最终 assistant 回答。
