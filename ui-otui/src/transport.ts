@@ -386,7 +386,8 @@ export class Transport extends EventEmitter {
 
   /** 切换当前 LLM 请求目标；会话 history 不变。 */
   setModel(model_key: string): Promise<ModelSwitchPayload> {
-    return this.requestRpc("session.set_model", { model_key });
+    // 降档切换可能经历旧模型 compact 和目标模型重试，不能沿用普通 RPC 的 5 秒超时。
+    return this.requestRpc("session.set_model", { model_key }, 180000);
   }
 
   /** 获取今天的 prompt cache 命中统计。 */

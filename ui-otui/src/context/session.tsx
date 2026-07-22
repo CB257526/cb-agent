@@ -953,7 +953,9 @@ export function SessionProvider(props: ParentProps) {
 
   const submit = (text: string) => {
     const pending = state.attachments;
-    if ((!text.trim() && pending.length === 0) || state.busy) return;
+    // /model、/compact 等状态变更命令完成前不接受普通 prompt，避免请求在后端
+    // 同步 RPC 后排队，并在前端已经误判失败后才突然开始执行。
+    if ((!text.trim() && pending.length === 0) || state.busy || state.pending !== null) return;
     // 斜杠命令：拦截，不走 prompt.submit，也不入历史
     if (text.startsWith("/")) {
       const cmd = findCommand(text);

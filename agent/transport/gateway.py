@@ -93,6 +93,9 @@ class Gateway:
         self._chat_task: Optional[asyncio.Task] = None
         self._busy = False  # 同一时间只允许一个 chat
         self._busy_lock = threading.Lock()
+        # prompt 接受时立即登记 token，不能等 worker 线程进入 AgentSession.chat。
+        # 否则用户在 ack 后立刻 Ctrl+C 会命中 current_cancel_token 尚为空的竞态窗口。
+        self._active_cancel_token: Optional[CancelToken] = None
 
         # 订阅所有事件 → 写 transport
         # subscribe 不传 type 表示订阅全部
@@ -215,6 +218,7 @@ class Gateway:
             return
 
         # 单 session：拒绝并发 chat。UI 应该等上一个 done 事件再发下一个 prompt
+        token = CancelToken()
         with self._busy_lock:
             if self._busy:
                 logger.info("prompt rejected: busy id=%s text_chars=%s attachments=%s", rpc_id, len(text), len(attachments))
@@ -225,6 +229,7 @@ class Gateway:
                     ))
                 return
             self._busy = True
+            self._active_cancel_token = token
 
         # 立刻 ack——chat 是异步任务，结果通过事件流送
         if rpc_id is not None:
@@ -236,12 +241,23 @@ class Gateway:
         if loop is None:
             with self._busy_lock:
                 self._busy = False
+                if self._active_cancel_token is token:
+                    self._active_cancel_token = None
             logger.error("prompt accepted but event loop unavailable: id=%s", rpc_id)
             return
-        asyncio.run_coroutine_threadsafe(self._run_chat(text, attachments), loop)
+        asyncio.run_coroutine_threadsafe(self._run_chat(text, attachments, token), loop)
 
-    async def _run_chat(self, text: str, attachments: Optional[list] = None) -> None:
-        token = CancelToken()
+    async def _run_chat(
+        self,
+        text: str,
+        attachments: Optional[list] = None,
+        token: Optional[CancelToken] = None,
+    ) -> None:
+        token = token or CancelToken()
+        # 兼容测试或其它直接调用 _run_chat 的入口，也保证取消处理始终有 token 可取。
+        with self._busy_lock:
+            if self._active_cancel_token is None:
+                self._active_cancel_token = token
         logger.info("chat task start: text_chars=%s attachments=%s", len(text), len(attachments or []))
         try:
             await self.session.chat_async(text, cancel_token=token, attachments=attachments or [])
@@ -262,10 +278,15 @@ class Gateway:
         finally:
             with self._busy_lock:
                 self._busy = False
+                if self._active_cancel_token is token:
+                    self._active_cancel_token = None
             logger.info("chat task finished")
 
     def _handle_cancel(self, rpc_id: Any, params: Dict[str, Any]) -> None:
-        token = self.session.current_cancel_token
+        with self._busy_lock:
+            token = self._active_cancel_token
+        if token is None:
+            token = self.session.current_cancel_token
         if token is None:
             logger.info("cancel requested but no active token: id=%s", rpc_id)
             if rpc_id is not None:
@@ -738,10 +759,16 @@ class Gateway:
             return
         try:
             target = preview_model(model_key.strip())
-            old_window = ConstantLLM.model_max_tokens(getattr(llm, "model", None))
-            new_window = int(target.get("max_tokens") or 0)
-            target_limits = ConstantLLM.context_limits(target.get("model"))
             current_usage = self.session.context_window_usage()
+            old_window = int(current_usage.get("max_tokens") or 0)
+            if old_window <= 0:
+                old_window = ConstantLLM.model_max_tokens(getattr(llm, "model", None))
+            new_window = int(target.get("max_tokens") or 0)
+            choice_target_limits = target.get("context_limits")
+            target_limits = choice_target_limits
+            if not isinstance(target_limits, dict) or not target_limits:
+                # 兼容旧 LLM 实现；新版 preview_model 会返回具体 choice 的边界。
+                target_limits = ConstantLLM.context_limits(target.get("model"))
             needs_downshift_compact = (
                 new_window > 0
                 and old_window > new_window
@@ -751,12 +778,15 @@ class Gateway:
             runtime_snapshot = (
                 capture_runtime_model() if callable(capture_runtime_model) else None
             )
+            compact_kwargs: Dict[str, Any] = {
+                "reason": "model_downshift",
+                "target_model": str(target.get("model") or ""),
+            }
+            if isinstance(choice_target_limits, dict) and choice_target_limits:
+                compact_kwargs["target_context_limits"] = dict(choice_target_limits)
             if needs_downshift_compact:
                 try:
-                    self.session.compact_context(
-                        reason="model_downshift",
-                        target_model=str(target.get("model") or ""),
-                    )
+                    self.session.compact_context(**compact_kwargs)
                 except Exception as compact_error:
                     error_text = str(compact_error).lower()
                     invalid_request = "invalid" in error_text or "400" in error_text
@@ -765,10 +795,7 @@ class Gateway:
                     # Codex 在旧模型不接受 compaction 请求时会使用目标模型重试。
                     model = switch_model(model_key.strip())
                     try:
-                        self.session.compact_context(
-                            reason="model_downshift",
-                            target_model=str(target.get("model") or ""),
-                        )
+                        self.session.compact_context(**compact_kwargs)
                     except Exception:
                         if callable(restore_runtime_model):
                             restore_runtime_model(runtime_snapshot)

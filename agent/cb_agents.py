@@ -494,6 +494,7 @@ class CbAgentsLLM:
             "is_tool": cfg.is_tool,
             "is_reasoning": cfg.is_reasoning,
             "image_ability": cfg.image_ability,
+            "context_limits": cfg.context_limits(),
         }
 
     def capture_runtime_model(self) -> Dict[str, Any]:

@@ -17,6 +17,8 @@ from core.message import Message, MessageRole
 
 SUMMARIZATION_PROMPT = """You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
+This is a special summarization request, not a normal agent turn. Do not call tools and do not imitate or emit any tool-call protocol. Return plain Markdown prose only.
+
 Include:
 - Current progress and key decisions made
 - Important context, constraints, or user preferences
@@ -33,6 +35,42 @@ CONTEXT_UPDATE_KIND = "context_update"
 
 class CompactionError(RuntimeError):
     """表示压缩请求无法生成可安装的新历史。"""
+
+
+_TOOL_CALL_PROTOCOL_MARKERS = (
+    "<｜｜dsml｜｜tool_calls>",
+    "<｜｜dsml｜｜invoke",
+    "<|dsml|>tool_calls",
+    "<tool_call",
+    "<function_calls",
+)
+
+
+def _validated_summary_from_response(response: Any) -> str:
+    """提取纯文本摘要，并拒绝模型误生成的工具调用协议。
+
+    compact 使用普通非流式请求且不会提供工具 schema。部分模型仍会受历史中的
+    Agent 指令影响，把下一步操作以文本工具调用协议输出。此类内容不是交接摘要，
+    一旦安装会把完整历史替换成一条无意义命令，因此必须在持久化前拦截。
+    """
+
+    try:
+        message = response.choices[0].message
+    except Exception as error:
+        raise CompactionError("压缩响应缺少 assistant summary") from error
+
+    if getattr(message, "tool_calls", None):
+        raise CompactionError("压缩模型错误返回了工具调用，拒绝替换会话历史")
+
+    summary = str(getattr(message, "content", None) or "").strip()
+    if not summary:
+        raise CompactionError("压缩模型返回了空摘要")
+
+    # 只规范大小写，不删除内容；全角 DSML 标记也能按原样识别。
+    normalized = summary.lower()
+    if any(marker in normalized for marker in _TOOL_CALL_PROTOCOL_MARKERS):
+        raise CompactionError("压缩模型返回了文本化工具调用，拒绝替换会话历史")
+    return summary
 
 
 @dataclass(frozen=True)
@@ -350,12 +388,7 @@ def run_local_compaction(
                     continue
             raise CompactionError(f"本地压缩请求失败: {error}") from error
 
-        try:
-            summary = str(response.choices[0].message.content or "").strip()
-        except Exception as error:
-            raise CompactionError("压缩响应缺少 assistant summary") from error
-        if not summary:
-            raise CompactionError("压缩模型返回了空摘要")
+        summary = _validated_summary_from_response(response)
         return CompactionModelResult(
             summary=summary,
             attempts=attempts,

@@ -770,6 +770,7 @@ class AgentSession:
         source_history: Optional[Sequence[Message]] = None,
         reason: str = "user_compact", #啥原因触发压缩
         target_model: Optional[str] = None, #压缩完成后 继续对话的模型
+        target_context_limits: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """使用结构化历史生成 Codex 风格交接摘要并事务安装新 history。"""
         compact_source = list(source_history) if source_history is not None else list(self.history)
@@ -788,8 +789,12 @@ class AgentSession:
             }
 
         summary_limits = self._context_limits() #压缩模型的上下文窗口限制
-        install_limits = ( #压缩完成后 继续对话的模型的上下文窗口限制
-            ConstantLLM.context_limits(target_model)
+        # Gateway 已经按唯一 ModelChoice.key 解析目标窗口时，必须直接使用该快照。
+        # 仅兼容旧调用方时才按 model_id 回退，避免同名模型或自定义 provider 串配置。
+        install_limits = (
+            dict(target_context_limits)
+            if isinstance(target_context_limits, dict) and target_context_limits
+            else ConstantLLM.context_limits(target_model)
             if target_model else summary_limits
         )
         # 计算压缩后保留的 token 数

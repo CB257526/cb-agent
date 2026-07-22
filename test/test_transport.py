@@ -434,6 +434,41 @@ class TestGatewayDispatch(unittest.TestCase):
         finally:
             bus.unsubscribe(gateway._on_event)
 
+    def test_gateway_cancel_works_before_chat_worker_installs_session_token(self):
+        """prompt ack 后立刻取消时，也必须命中 Gateway 预先登记的 token。"""
+
+        llm = FakeLLM([])
+        session, bus = _make_session_for_gateway(llm)
+        out = io.StringIO()
+        gateway = Gateway(
+            session=session,
+            event_bus=bus,
+            transport=StdioTransport(stdin=io.StringIO(""), stdout=out),
+        )
+        setattr(gateway, "_loop", object())
+        scheduled = []
+
+        def capture_coroutine(coro, _loop):
+            scheduled.append(coro)
+            return MagicMock()
+
+        try:
+            with patch(
+                "agent.transport.gateway.asyncio.run_coroutine_threadsafe",
+                side_effect=capture_coroutine,
+            ):
+                gateway._handle_prompt_submit("prompt-1", {"text": "继续"})
+
+            self.assertIsNone(session.current_cancel_token)
+            token = gateway._active_cancel_token
+            self.assertIsNotNone(token)
+            gateway._handle_cancel("cancel-1", {})
+            self.assertTrue(token.is_cancelled())
+        finally:
+            for coro in scheduled:
+                coro.close()
+            bus.unsubscribe(gateway._on_event)
+
     def test_gateway_ready_includes_active_turn_history(self):
         with tempfile.TemporaryDirectory() as td:
             store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
@@ -644,6 +679,106 @@ class TestGatewayDispatch(unittest.TestCase):
         responses = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
         response = next(item for item in responses if item.get("id") == "m1")
         self.assertEqual(response["result"]["model"]["model"], "new-small")
+
+    def test_model_switch_uses_choice_limits_before_deciding_to_compact(self):
+        """目标 choice 为 500K 时，不能按同名内建小窗口误触发 compact。"""
+
+        order: List[str] = []
+
+        class SwitchableLLM:
+            model = "old-large"
+
+            def preview_model(self, _key):
+                return {
+                    "model": "custom-target",
+                    "max_tokens": 500_000,
+                    "context_limits": {
+                        "full_window_tokens": 500_000,
+                        "max_output_tokens": 16_000,
+                        "estimation_margin_tokens": 10_000,
+                        "soft_limit_tokens": 474_000,
+                        "hard_limit_tokens": 484_000,
+                    },
+                }
+
+            def switch_model(self, _key):
+                order.append("switch")
+                return {"model": "custom-target", "key": "target", "provider": "fake"}
+
+        llm = SwitchableLLM()
+
+        class Session:
+            def __init__(self):
+                self.llm = llm
+
+            def context_window_usage(self):
+                return {"used_tokens": 271_714, "max_tokens": 1_000_000}
+
+            def compact_context(self, **_kwargs):
+                order.append("compact")
+
+        output = io.StringIO()
+        gateway = Gateway(
+            session=Session(),
+            event_bus=EventBus(),
+            transport=StdioTransport(stdin=io.StringIO(""), stdout=output),
+            redirect_stdout_to_stderr=False,
+        )
+
+        gateway._handle_set_model("m2", {"model": "custom-target"})
+
+        self.assertEqual(order, ["switch"])
+
+    def test_model_downshift_passes_choice_limits_to_compaction(self):
+        """确需降档时，replacement 预算必须使用目标 choice 的真实边界。"""
+
+        compact_calls: List[Dict[str, Any]] = []
+
+        class SwitchableLLM:
+            model = "old-large"
+
+            def preview_model(self, _key):
+                return {
+                    "model": "custom-target",
+                    "max_tokens": 500_000,
+                    "context_limits": {
+                        "full_window_tokens": 500_000,
+                        "max_output_tokens": 16_000,
+                        "estimation_margin_tokens": 10_000,
+                        "soft_limit_tokens": 474_000,
+                        "hard_limit_tokens": 484_000,
+                    },
+                }
+
+            def switch_model(self, _key):
+                return {"model": "custom-target", "key": "target", "provider": "fake"}
+
+        llm = SwitchableLLM()
+
+        class Session:
+            def __init__(self):
+                self.llm = llm
+
+            def context_window_usage(self):
+                return {"used_tokens": 480_000, "max_tokens": 1_000_000}
+
+            def compact_context(self, **kwargs):
+                compact_calls.append(kwargs)
+
+        gateway = Gateway(
+            session=Session(),
+            event_bus=EventBus(),
+            transport=StdioTransport(stdin=io.StringIO(""), stdout=io.StringIO()),
+            redirect_stdout_to_stderr=False,
+        )
+
+        gateway._handle_set_model("m3", {"model": "custom-target"})
+
+        self.assertEqual(len(compact_calls), 1)
+        self.assertEqual(
+            compact_calls[0]["target_context_limits"]["soft_limit_tokens"],
+            474_000,
+        )
 
     def test_gateway_list_tools(self):
         """session.list_tools 应返回 registry 里的工具名/描述/schema 列表。"""
