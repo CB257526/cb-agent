@@ -365,6 +365,8 @@ function prepareDiffForView(raw: string): DiffViewModel {
   const normalized = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   // 去掉 JSON 转义残留的多余空行，保证 ---/+++/@@ 后是合法 hunk 体
   const lines = normalized.split("\n");
+  // 丢弃末位空串（分裂自末尾 \n），避免空行被当 hunk 体空格行多塞一行
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   const cleaned: string[] = [];
   let inHunk = false;
   let bad: { lineNo: number; line: string; reason: string } | null = null;
