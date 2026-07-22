@@ -60,9 +60,11 @@ class TestModelConfigManager(unittest.TestCase):
         assert choice is not None
         self.assertEqual(choice.display_name, "Kimi K2.7 Code")
         self.assertEqual(choice.base_url, "https://api.moonshot.cn/v1")
-        self.assertTrue(ConstantLLM.resolve_is_tool("kimi-k2.7-code"))
-        self.assertTrue(ConstantLLM.resolve_image_ability("kimi-k2.7-code"))
-        self.assertEqual(ConstantLLM.model_max_tokens("kimi-k2.7-code"), 1000000)
+        # models.json 不再写回全局 llm_dict；能力以 ModelChoice/ActiveModelConfig 为准。
+        active = choice.to_active_config()
+        self.assertTrue(active.is_tool)
+        self.assertTrue(active.image_ability)
+        self.assertEqual(active.max_context_tokens, 1000000)
         self.assertEqual(choice.max_output_tokens, 32000)
         self.assertEqual(choice.output_token_param, "max_completion_tokens")
 
@@ -99,6 +101,46 @@ class TestModelConfigManager(unittest.TestCase):
         assert choice is not None
         self.assertTrue(choice.is_tool)
         self.assertFalse(choice.image_ability)
+
+    def test_same_model_id_different_providers_keep_distinct_windows(self) -> None:
+        manager = ModelConfigManager.from_provider_dicts(Path("models.json"), [
+            {
+                "name": "ProviderA",
+                "models": {
+                    "same-model": {
+                        "max_tokens": 128000,
+                        "max_output_tokens": 8000,
+                        "is_tool": True,
+                    }
+                },
+            },
+            {
+                "name": "ProviderB",
+                "models": {
+                    "same-model": {
+                        "max_tokens": 32000,
+                        "max_output_tokens": 4000,
+                        "is_tool": False,
+                    }
+                },
+            },
+        ])
+        a = manager.find("providera:same-model")
+        b = manager.find("providerb:same-model")
+        self.assertIsNotNone(a)
+        self.assertIsNotNone(b)
+        assert a is not None and b is not None
+        self.assertEqual(a.model_id, b.model_id)
+        self.assertEqual(a.to_active_config().max_context_tokens, 128000)
+        self.assertEqual(b.to_active_config().max_context_tokens, 32000)
+        self.assertTrue(a.to_active_config().is_tool)
+        self.assertFalse(b.to_active_config().is_tool)
+        # 全局 llm_dict 不应被后加载的同名配置污染。
+        # 即使 resolve 仍可走内建/默认，两个 active config 也必须互不影响。
+        self.assertNotEqual(
+            a.to_active_config().max_context_tokens,
+            b.to_active_config().max_context_tokens,
+        )
 
 
 if __name__ == "__main__":

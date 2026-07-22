@@ -114,6 +114,60 @@ class ModelChoice:
             "base_url": self.base_url,
         }
 
+    def to_active_config(self) -> "ActiveModelConfig":
+        """把本 choice 固化为运行时配置，避免再按 model_id 查全局表。"""
+
+        return ActiveModelConfig(
+            key=self.key,
+            provider_key=self.provider_key,
+            provider_name=self.provider_name,
+            model_id=self.model_id,
+            base_url=self.base_url,
+            max_context_tokens=int(self.max_tokens),
+            max_output_tokens=int(self.max_output_tokens),
+            output_token_param=str(self.output_token_param or "max_tokens"),
+            is_tool=bool(self.is_tool),
+            is_reasoning=bool(self.is_reasoning),
+            image_ability=bool(self.image_ability),
+        )
+
+
+@dataclass(frozen=True)
+class ActiveModelConfig:
+    """当前 LLM 客户端绑定的不可变运行时配置。
+
+    窗口、输出上限和能力必须跟具体 ModelChoice.key 绑定。同一个 model_id
+    可以在不同 provider 下有不同值，因此运行时不能再只按 model_id 查全局表。
+    """
+
+    key: str
+    provider_key: str
+    provider_name: str
+    model_id: str
+    base_url: str
+    max_context_tokens: int
+    max_output_tokens: int
+    output_token_param: str
+    is_tool: bool
+    is_reasoning: bool
+    image_ability: bool
+
+    def context_limits(self) -> Dict[str, int]:
+        """按本 choice 的窗口/输出上限计算 soft/hard limit。"""
+
+        full_window = max(1, int(self.max_context_tokens))
+        max_output = min(max(1, int(self.max_output_tokens)), max(1, full_window - 1))
+        hard_limit = max(1, full_window - max_output)
+        margin = min(16_000, max(2_000, int(full_window * 0.02)))
+        margin = min(margin, max(0, hard_limit // 5), max(0, hard_limit - 1))
+        return {
+            "full_window_tokens": full_window,
+            "max_output_tokens": max_output,
+            "estimation_margin_tokens": margin,
+            "soft_limit_tokens": max(1, hard_limit - margin),
+            "hard_limit_tokens": hard_limit,
+        }
+
 
 class ModelConfigManager:
     """Loads configured providers and exposes sanitized choices for UI/RPC."""
@@ -128,7 +182,9 @@ class ModelConfigManager:
         self._by_model: Dict[str, ModelChoice] = {}
         for choice in choices:
             self._by_model.setdefault(choice.model_id, choice)
-        self.register_capabilities()
+        # 不再把 models.json 能力写回全局 ConstantLLM.llm_dict[model_id]，
+        # 避免同名模型跨 provider 互相覆盖。内建 llm_dict 仅作默认/env 兜底。
+        self._warn_duplicate_model_ids()
 
     @classmethod
     def load(cls, project_root: Optional[Path] = None) -> "ModelConfigManager":
@@ -226,12 +282,28 @@ class ModelConfigManager:
                     return path
         return None
 
-    def register_capabilities(self) -> None:
+    def _warn_duplicate_model_ids(self) -> None:
+        """同名 model_id 允许存在，但日志提醒 UI 必须用唯一 key 区分。"""
+
+        seen: Dict[str, str] = {}
         for choice in self.choices:
-            ConstantLLM.llm_dict[choice.model_id] = {
-                **ConstantLLM.llm_dict.get(choice.model_id, {}),
-                **choice.capability_config(),
-            }
+            previous = seen.get(choice.model_id)
+            if previous and previous != choice.key:
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning(
+                    "同名 model_id 出现在多个 provider: model_id=%s keys=%s,%s；"
+                    "运行时窗口/能力以 ModelChoice.key 为准，不要只按 model_id 查找",
+                    choice.model_id,
+                    previous,
+                    choice.key,
+                )
+            else:
+                seen[choice.model_id] = choice.key
+
+    def register_capabilities(self) -> None:
+        """兼容旧调用：故意不再写回全局 llm_dict。"""
+
+        return None
 
     def first_choice(self) -> Optional[ModelChoice]:
         return self.choices[0] if self.choices else None
@@ -340,6 +412,7 @@ def _unique_key(base: str, seen: set[str]) -> str:
 
 
 __all__ = [
+    "ActiveModelConfig",
     "CONFIG_ENV",
     "ModelChoice",
     "ModelConfigManager",

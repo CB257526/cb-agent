@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any
 import json
 from constant.llm.constant_llm import ConstantLLM
-from constant.llm.model_config import ModelChoice, ModelConfigManager
+from constant.llm.model_config import ActiveModelConfig, ModelChoice, ModelConfigManager
 from agent.event_bus import EventBus
 from agent.events import (
     Cancelled, ReasoningDelta, TextDelta, TokenUsage, ToolCallPlanned,
@@ -301,12 +301,31 @@ class CbAgentsLLM:
         """
         self.model_config = ModelConfigManager.load(Path(__file__).resolve().parents[1])
         env_model = model or os.getenv("LLM_MODEL_ID")
-        configured_choice = self.model_config.find_by_model(env_model or "") if env_model else self.model_config.first_choice()
+        # 优先按唯一 key 查找；仅有 model_id 时才回退 find_by_model（first-wins）。
+        configured_choice = None
+        if env_model:
+            configured_choice = self.model_config.find(env_model) or self.model_config.find_by_model(env_model)
+        if configured_choice is None:
+            configured_choice = self.model_config.first_choice()
         self.current_model_key: Optional[str] = configured_choice.key if configured_choice is not None else None
 
         self.model = env_model or (configured_choice.model_id if configured_choice is not None else None)
-        self.max_output_tokens = ConstantLLM.model_max_output_tokens(self.model)
-        self.output_token_param = ConstantLLM.output_token_param(self.model)
+        # 运行时能力和窗口绑定 ActiveModelConfig，不再只按 model_id 查全局表。
+        self.active_model_config: Optional[ActiveModelConfig] = (
+            self._build_active_config(configured_choice)
+            if configured_choice is not None
+            else self._fallback_active_config(self.model, base_url="")
+        )
+        self.max_output_tokens = int(
+            self.active_model_config.max_output_tokens
+            if self.active_model_config is not None
+            else ConstantLLM.model_max_output_tokens(self.model)
+        )
+        self.output_token_param = str(
+            self.active_model_config.output_token_param
+            if self.active_model_config is not None
+            else ConstantLLM.output_token_param(self.model)
+        )
         apiKey = apiKey or (configured_choice.api_key if configured_choice is not None else None) or os.getenv("LLM_API_KEY")
         baseUrl = baseUrl or (configured_choice.base_url if configured_choice is not None else None) or os.getenv("LLM_BASE_URL")
         timeout = timeout or int(os.getenv("LLM_TIMEOUT", 60))
@@ -315,6 +334,11 @@ class CbAgentsLLM:
         self.timeout = timeout
         self.base_url = baseUrl
         self.api_key = apiKey
+        # 补上 base_url 到 active config（初始化时可能尚未解析完）。
+        if self.active_model_config is not None and not self.active_model_config.base_url and baseUrl:
+            self.active_model_config = ActiveModelConfig(
+                **{**self.active_model_config.__dict__, "base_url": str(baseUrl)}
+            )
         self._client_lock = threading.RLock()
         # 当前正在读取的 OpenAI stream 句柄表。取消请求来自 Gateway 或通讯平台。
         # 线程，而真正读 chunk 的代码在 chat worker 里；保存句柄后，取消方就能主动
@@ -364,11 +388,71 @@ class CbAgentsLLM:
     def _choice_or_raise(self, key_or_model: str) -> ModelChoice:
         choice = self.model_config.find(key_or_model)
         if choice is None:
-            available = ", ".join(c.model_id for c in self.model_config.choices) or "(none)"
-            raise ValueError(f"未找到模型配置: {key_or_model}. 可用模型: {available}")
+            available = ", ".join(c.key for c in self.model_config.choices) or "(none)"
+            raise ValueError(f"未找到模型配置: {key_or_model}. 可用模型 key: {available}")
         return choice
 
+    def _force_max_context_tokens(self) -> Optional[int]:
+        """可选全局强制覆盖：仅 CBAGENT_FORCE_MAX_CONTEXT_TOKENS。"""
+
+        raw = (os.getenv("CBAGENT_FORCE_MAX_CONTEXT_TOKENS") or "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    def _build_active_config(self, choice: ModelChoice) -> ActiveModelConfig:
+        """从 ModelChoice 生成运行时配置；支持显式全局 force 覆盖。"""
+
+        cfg = choice.to_active_config()
+        force = self._force_max_context_tokens()
+        if force is None:
+            return cfg
+        max_output = min(cfg.max_output_tokens, max(1, force - 1))
+        return ActiveModelConfig(
+            key=cfg.key,
+            provider_key=cfg.provider_key,
+            provider_name=cfg.provider_name,
+            model_id=cfg.model_id,
+            base_url=cfg.base_url,
+            max_context_tokens=force,
+            max_output_tokens=max_output,
+            output_token_param=cfg.output_token_param,
+            is_tool=cfg.is_tool,
+            is_reasoning=cfg.is_reasoning,
+            image_ability=cfg.image_ability,
+        )
+
+    def _fallback_active_config(self, model_id: Optional[str], *, base_url: str) -> ActiveModelConfig:
+        """无 models.json 时，用内建 llm_dict + env 构造 active config。"""
+
+        mid = str(model_id or "unknown")
+        return ActiveModelConfig(
+            key=f"env:{mid}",
+            provider_key="env",
+            provider_name="Env",
+            model_id=mid,
+            base_url=str(base_url or ""),
+            max_context_tokens=ConstantLLM.model_max_tokens(mid),
+            max_output_tokens=ConstantLLM.model_max_output_tokens(mid),
+            output_token_param=ConstantLLM.output_token_param(mid),
+            is_tool=ConstantLLM.resolve_is_tool(mid, default=True),
+            is_reasoning=ConstantLLM.resolve_is_reasoning(mid, default=False),
+            image_ability=ConstantLLM.resolve_image_ability(mid, default=False),
+        )
+
+    def active_context_limits(self) -> Dict[str, int]:
+        """返回当前 active model 的 soft/hard 窗口边界。"""
+
+        if self.active_model_config is not None:
+            return self.active_model_config.context_limits()
+        return ConstantLLM.context_limits(self.model)
+
     def list_models(self) -> Dict[str, Any]:
+        cfg = self.active_model_config
         return {
             "models": self.model_config.public_models(
                 current_key=self.current_model_key,
@@ -379,11 +463,18 @@ class CbAgentsLLM:
                 "model": self.model,
                 "base_url": self.base_url,
                 "is_tool": self.is_Function_Calling,
-                "max_tokens": ConstantLLM.model_max_tokens(self.model),
+                "max_tokens": (
+                    cfg.max_context_tokens if cfg is not None else ConstantLLM.model_max_tokens(self.model)
+                ),
                 "max_output_tokens": self.max_output_tokens,
                 "output_token_param": self.output_token_param,
-                "image_ability": ConstantLLM.resolve_image_ability(self.model, default=False),
-                "is_reasoning": ConstantLLM.resolve_is_reasoning(self.model, default=False),
+                "image_ability": (
+                    cfg.image_ability if cfg is not None else ConstantLLM.resolve_image_ability(self.model, default=False)
+                ),
+                "is_reasoning": (
+                    cfg.is_reasoning if cfg is not None else ConstantLLM.resolve_is_reasoning(self.model, default=False)
+                ),
+                "force_max_context_tokens": self._force_max_context_tokens() is not None,
             },
             "config_path": str(self.model_config.path) if self.model_config.path is not None else None,
         }
@@ -392,13 +483,17 @@ class CbAgentsLLM:
         """解析目标模型配置，但不修改当前客户端和进程环境。"""
 
         choice = self._choice_or_raise(key_or_model)
+        cfg = self._build_active_config(choice)
         return {
-            "key": choice.key,
-            "model": choice.model_id,
-            "provider": choice.provider_name,
-            "max_tokens": ConstantLLM.model_max_tokens(choice.model_id),
-            "max_output_tokens": ConstantLLM.model_max_output_tokens(choice.model_id),
-            "output_token_param": choice.output_token_param,
+            "key": cfg.key,
+            "model": cfg.model_id,
+            "provider": cfg.provider_name,
+            "max_tokens": cfg.max_context_tokens,
+            "max_output_tokens": cfg.max_output_tokens,
+            "output_token_param": cfg.output_token_param,
+            "is_tool": cfg.is_tool,
+            "is_reasoning": cfg.is_reasoning,
+            "image_ability": cfg.image_ability,
         }
 
     def capture_runtime_model(self) -> Dict[str, Any]:
@@ -414,6 +509,7 @@ class CbAgentsLLM:
                 "is_Function_Calling": self.is_Function_Calling,
                 "max_output_tokens": self.max_output_tokens,
                 "output_token_param": self.output_token_param,
+                "active_model_config": self.active_model_config,
             }
 
     def restore_runtime_model(self, snapshot: Dict[str, Any]) -> None:
@@ -428,6 +524,7 @@ class CbAgentsLLM:
             self.is_Function_Calling = bool(snapshot.get("is_Function_Calling"))
             self.max_output_tokens = int(snapshot.get("max_output_tokens") or 1)
             self.output_token_param = str(snapshot.get("output_token_param") or "max_tokens")
+            self.active_model_config = snapshot.get("active_model_config")
             self._publish_current_model_env()
 
     def switch_model(self, key_or_model: str) -> Dict[str, Any]:
@@ -445,24 +542,29 @@ class CbAgentsLLM:
         if not all([choice.model_id, api_key, base_url]):
             raise ValueError(f"模型 {choice.model_id} 缺少 apiKey/baseURL 配置")
 
+        active = self._build_active_config(choice)
         with self._client_lock:
             self.model = choice.model_id
             self.current_model_key = choice.key
             self.api_key = api_key
             self.base_url = base_url
             self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.timeout)
-            self.is_Function_Calling = self._is_able_Function_Calling()
-            # 环境变量仍保持最高优先级，模型切换不能绕过 MAX_OUTPUT_TOKENS 覆盖。
-            self.max_output_tokens = ConstantLLM.model_max_output_tokens(choice.model_id)
-            self.output_token_param = choice.output_token_param
+            self.active_model_config = ActiveModelConfig(
+                **{**active.__dict__, "base_url": str(base_url)}
+            )
+            self.is_Function_Calling = bool(self.active_model_config.is_tool)
+            self.max_output_tokens = int(self.active_model_config.max_output_tokens)
+            self.output_token_param = str(self.active_model_config.output_token_param)
             self._publish_current_model_env()
 
         logger.info(
-            "LLM model switched: model=%s provider=%s base_url=%s function_calling=%s",
+            "LLM model switched: key=%s model=%s provider=%s base_url=%s function_calling=%s window=%s",
+            choice.key,
             choice.model_id,
             choice.provider_name,
             base_url,
             self.is_Function_Calling,
+            self.active_model_config.max_context_tokens,
         )
         return {
             "key": choice.key,
@@ -471,11 +573,11 @@ class CbAgentsLLM:
             "provider": choice.provider_name,
             "base_url": base_url,
             "is_tool": self.is_Function_Calling,
-            "is_reasoning": ConstantLLM.resolve_is_reasoning(choice.model_id, default=False),
-            "max_tokens": ConstantLLM.model_max_tokens(choice.model_id),
+            "is_reasoning": bool(self.active_model_config.is_reasoning),
+            "max_tokens": int(self.active_model_config.max_context_tokens),
             "max_output_tokens": self.max_output_tokens,
             "output_token_param": self.output_token_param,
-            "image_ability": ConstantLLM.resolve_image_ability(choice.model_id, default=False),
+            "image_ability": bool(self.active_model_config.image_ability),
         }
 
     def _next_stream_id(self) -> int:
@@ -728,9 +830,14 @@ class CbAgentsLLM:
     def _is_able_Function_Calling(self) -> bool:
         """根据模型能力判断是否支持函数调用。
 
-        取值优先级:环境变量 IS_TOOL > llm_dict[model]["is_tool"] > 默认 True。
-        换服务商导致模型名和 llm_dict 对不上时,用 .env 的 IS_TOOL 兜底。
+        取值优先级:环境变量 IS_TOOL > active_model_config.is_tool >
+        内建 llm_dict[model][\"is_tool\"] > 默认 True。
         """
+        env_val = os.getenv(ConstantLLM.ENV_IS_TOOL)
+        if env_val is not None and str(env_val).strip() != "":
+            return ConstantLLM.resolve_is_tool(self.model, default=True)
+        if self.active_model_config is not None:
+            return bool(self.active_model_config.is_tool)
         return ConstantLLM.resolve_is_tool(self.model, default=True)
 
     def think(

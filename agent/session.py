@@ -1840,11 +1840,18 @@ class AgentSession:
     def _model_max_tokens(self) -> int:
         """返回当前模型声明的完整上下文窗口。
 
-        这里不再读 ContextBuilder.config.max_tokens 作为主来源，因为用户已经把
-        各模型真实窗口统一维护在 ``constant/llm/constant_llm.py``。ContextBuilder
-        只是“如何组织上下文”的组件，模型窗口是 LLM 配置的一部分，两者拆开后，
-        切换模型时状态栏和自动 compact 不会被旧的 8000 默认值误导。
+        优先读 llm.active_model_config（按 ModelChoice.key 绑定）；无 active
+        config 时再回退 ConstantLLM 的 model_id/env 路径。
         """
+        active = getattr(self.llm, "active_model_config", None)
+        if active is not None and getattr(active, "max_context_tokens", None):
+            return max(1, int(active.max_context_tokens))
+        limits = getattr(self.llm, "active_context_limits", None)
+        if callable(limits):
+            try:
+                return max(1, int(limits()["full_window_tokens"]))
+            except Exception:
+                pass
         return ConstantLLM.model_max_tokens(getattr(self.llm, "model", None))
 
     def _context_budget_tokens(self) -> int:
@@ -1852,7 +1859,17 @@ class AgentSession:
         return self._context_limits()["soft_limit_tokens"]
 
     def _context_limits(self) -> Dict[str, int]:
-        """返回当前模型统一的完整窗口与 soft/hard 边界。"""
+        """返回当前模型统一的完整窗口与 soft/hard 边界。
+
+        优先使用 llm.active_context_limits()，保证 Footer、compact 预算和真实
+        provider 请求读取同一份 ModelChoice 运行时配置。
+        """
+        limits_fn = getattr(self.llm, "active_context_limits", None)
+        if callable(limits_fn):
+            try:
+                return dict(limits_fn())
+            except Exception:
+                logger.exception("读取 active_context_limits 失败，回退 ConstantLLM")
         return ConstantLLM.context_limits(getattr(self.llm, "model", None))
 
     def _baseline_request_parts(self) -> tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
