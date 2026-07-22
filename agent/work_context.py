@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -33,6 +34,10 @@ from agent.message_protocol import drop_orphan_tool_message_objects
 from utils.common import count_tokens
 
 logger = logging.getLogger(__name__)
+
+# transcript 追加后是否强制 fsync。默认关闭，避免每轮同步落盘拖慢交互；
+# 需要更强崩溃耐久时可设 CBAGENT_TRANSCRIPT_FSYNC=1。
+_TRANSCRIPT_FSYNC_ENV = "CBAGENT_TRANSCRIPT_FSYNC"
 
 # 单个工具结果最多进入 trace 的字符数。注意这不是给 LLM 的本轮消息上限；
 # 本轮 ``messages`` 仍然保留完整工具结果，只有跨轮 trace 被限制。
@@ -287,6 +292,155 @@ def _messages_from_transcript_item(item: Dict[str, Any]) -> List[Message]:
         msg = _message_payload_to_message(payload)
         if msg is not None:
             out.append(msg)
+    return out
+
+
+@dataclass(frozen=True)
+class TranscriptRecord:
+    """transcript.jsonl 中一条可恢复的合法记录。
+
+    physical_line：1-based 物理行号（含空行），仅用于日志与人工排障。
+    legacy_nonempty_ordinal：1-based 非空物理行序号，兼容 compact v2 的
+    transcript_offset（与旧 _count_transcript_turns 语义一致：空行不计，
+    坏 JSON 行也占序号）。
+    turn_seq：新写入的单调序号；旧记录缺失时回退为 legacy_nonempty_ordinal。
+    turn_id：崩溃恢复去重键。
+    payload：原始 JSON object，进入模型 history 前还要再经消息还原。
+    """
+
+    physical_line: int
+    legacy_nonempty_ordinal: int
+    turn_seq: int
+    turn_id: str
+    payload: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TranscriptReadResult:
+    """transcript 物理读取结果，与消息解析结果分离。
+
+    records 只含合法 JSON object；corrupt_lines 是 1-based 物理行号。
+    trailing_partial_line 表示文件末尾存在无换行的半截行，不影响此前记录。
+    """
+
+    records: List[TranscriptRecord]
+    corrupt_lines: List[int]
+    trailing_partial_line: bool = False
+
+
+def _transcript_fsync_enabled() -> bool:
+    """是否在 transcript 追加后 fsync。默认关闭。"""
+
+    raw = (os.getenv(_TRANSCRIPT_FSYNC_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _read_transcript_file(path: Path) -> TranscriptReadResult:
+    """逐物理行解析 transcript.jsonl，坏行跳过且不抹掉其它合法记录。
+
+    该函数只负责“物理读取 + JSON 解析”，不解释 compact offset，也不做
+    turn_id 去重。上层 load_latest_history / save_compaction 再按 v2/v3
+    游标规则选择要回放的记录。
+    """
+
+    if not path.exists():
+        return TranscriptReadResult(records=[], corrupt_lines=[], trailing_partial_line=False)
+
+    try:
+        raw = path.read_bytes()
+    except Exception:
+        logger.exception("failed to load transcript from %s", path)
+        return TranscriptReadResult(records=[], corrupt_lines=[], trailing_partial_line=False)
+
+    trailing_partial = bool(raw) and not raw.endswith(b"\n") and not raw.endswith(b"\r\n")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="replace")
+        logger.error("transcript %s 含非法 UTF-8，已替换后继续恢复", path)
+
+    records: List[TranscriptRecord] = []
+    corrupt_lines: List[int] = []
+    nonempty_ordinal = 0
+
+    # splitlines() 会去掉行尾换行，但保留空行；最后一行无换行时也不会丢失。
+    for physical_line, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        nonempty_ordinal += 1
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            corrupt_lines.append(physical_line)
+            logger.error(
+                "transcript 坏行已跳过: path=%s physical_line=%s nonempty_ordinal=%s",
+                path,
+                physical_line,
+                nonempty_ordinal,
+            )
+            continue
+        if not isinstance(item, dict):
+            corrupt_lines.append(physical_line)
+            logger.error(
+                "transcript 非 object 行已跳过: path=%s physical_line=%s",
+                path,
+                physical_line,
+            )
+            continue
+
+        turn_id = str(item.get("turn_id") or "").strip()
+        raw_seq = item.get("turn_seq")
+        try:
+            turn_seq = int(raw_seq) if raw_seq is not None else nonempty_ordinal
+        except (TypeError, ValueError):
+            turn_seq = nonempty_ordinal
+        if turn_seq <= 0:
+            turn_seq = nonempty_ordinal
+
+        records.append(
+            TranscriptRecord(
+                physical_line=physical_line,
+                legacy_nonempty_ordinal=nonempty_ordinal,
+                turn_seq=turn_seq,
+                turn_id=turn_id,
+                payload=item,
+            )
+        )
+
+    if trailing_partial:
+        # 半截尾行如果本身就是坏 JSON，已在上面计入 corrupt_lines。
+        logger.warning("transcript 末尾存在无换行半截行: path=%s", path)
+
+    return TranscriptReadResult(
+        records=records,
+        corrupt_lines=corrupt_lines,
+        trailing_partial_line=trailing_partial,
+    )
+
+
+def _dedupe_transcript_records(records: Sequence[TranscriptRecord]) -> List[TranscriptRecord]:
+    """按 turn_seq 排序，并按 turn_id 去重（重复时保留最后一条完整记录）。
+
+    无 turn_id 的记录不去重，避免把两轮缺字段的旧数据错误合并。
+    """
+
+    ordered = sorted(
+        records,
+        key=lambda item: (
+            int(item.turn_seq),
+            int(item.legacy_nonempty_ordinal),
+            int(item.physical_line),
+        ),
+    )
+    last_by_turn_id: Dict[str, int] = {}
+    for index, record in enumerate(ordered):
+        if record.turn_id:
+            last_by_turn_id[record.turn_id] = index
+    out: List[TranscriptRecord] = []
+    for index, record in enumerate(ordered):
+        if record.turn_id and last_by_turn_id.get(record.turn_id) != index:
+            continue
+        out.append(record)
     return out
 
 
@@ -902,6 +1056,13 @@ class LocalSessionStore:
         # work_record 是已经压缩过的跨轮工作事实，应该继续落盘和恢复；trace_entries
         # 是逐工具明细，QQ/微信这类通讯平台可关闭它，避免 transcript 长期膨胀。
         self.persist_trace_entries = bool(persist_trace_entries)
+        # 最近一次 transcript 恢复诊断：坏行号、半截尾行等。只进 UI/审计，不进模型 history。
+        self.last_transcript_recovery: Dict[str, Any] = {
+            "corrupt_lines": [],
+            "trailing_partial_line": False,
+            "recovered_records": 0,
+            "warnings": [],
+        }
         self._load_or_create()
 
     @property
@@ -1126,37 +1287,65 @@ class LocalSessionStore:
         assistant。恢复时按顺序还原即可，模型在新一轮就能看到上一轮真实工具
         调用细节。
 
-        执行过 /compact 的会话优先读取 v2 compact.json 中的
-        ``replacement_history``，再追加 transcript_offset 之后的新回合。旧版或
-        无版本快照按用户确认的破坏性升级策略直接忽略。
+        compact 游标兼容：
+        - v3：按 ``transcript_cursor_seq``（turn_seq）只回放更大序号的合法记录；
+        - v2：``transcript_offset`` 表示当时非空物理行数量；坏 JSON 行也占序号，
+          只能按 ``legacy_nonempty_ordinal > offset`` 选择，禁止对有效 records
+          直接切片。
 
         旧格式（user_query/final_answer/work_record 三段式）已不再支持；
         破坏性更新已确认，旧目录在启动期清空。
         """
         if not self.active_session_id:
+            self.last_transcript_recovery = {
+                "corrupt_lines": [],
+                "trailing_partial_line": False,
+                "recovered_records": 0,
+                "warnings": [],
+            }
             return []
 
-        transcript_items = self._read_transcript_items(self.active_dir)
-        compact = self._read_json(self.active_dir / "compact.json", {})
-        messages: List[Message] = []
-        committed_turn_ids = {
-            str(item.get("turn_id"))
-            for item in transcript_items
-            if isinstance(item, dict) and item.get("turn_id")
+        read_result = self._read_transcript_result(self.active_dir)
+        selected_records = self._select_transcript_records_after_compact(
+            read_result.records,
+            self._read_json(self.active_dir / "compact.json", {}),
+        )
+        selected_records = _dedupe_transcript_records(selected_records)
+        warnings: List[str] = []
+        if read_result.corrupt_lines:
+            warnings.append(
+                "transcript_corrupt_lines:"
+                + ",".join(str(line) for line in read_result.corrupt_lines)
+            )
+        if read_result.trailing_partial_line:
+            warnings.append("transcript_trailing_partial_line")
+        self.last_transcript_recovery = {
+            "corrupt_lines": list(read_result.corrupt_lines),
+            "trailing_partial_line": bool(read_result.trailing_partial_line),
+            "recovered_records": len(selected_records),
+            "warnings": warnings,
         }
 
-        start_idx = 0
-        if isinstance(compact, dict) and compact.get("version") == 2:
+        compact = self._read_json(self.active_dir / "compact.json", {})
+        messages: List[Message] = []
+        # 去重集必须覆盖全部 transcript 合法 turn_id（含 compact 锚点前）。
+        # 否则已提交但被 compact 摘要替代的旧 active/pending 残留会再次注入。
+        committed_turn_ids = {
+            record.turn_id
+            for record in read_result.records
+            if record.turn_id
+        }
+
+        if isinstance(compact, dict) and compact.get("version") in {2, 3}:
             raw_history = compact.get("replacement_history")
             if isinstance(raw_history, list):
                 for payload in raw_history:
                     msg = _message_payload_to_message(payload)
                     if msg is not None:
                         messages.append(msg)
-            start_idx = int(compact.get("transcript_offset") or 0)
 
-        for item in transcript_items[max(0, start_idx):]:
-            messages.extend(_messages_from_transcript_item(item))
+        for record in selected_records:
+            messages.extend(_messages_from_transcript_item(record.payload))
 
         # active_turn.jsonl 是 pending_user.json 的增强版：它除了用户输入，还能
         # 保存已经完成的工具配对。active 与 pending 属于同一 turn_id 时只恢复
@@ -1191,6 +1380,35 @@ class LocalSessionStore:
         if max_messages is None:
             return drop_orphan_tool_message_objects(messages)
         return _trim_restored_history(messages, max_messages)
+
+    def _select_transcript_records_after_compact(
+        self,
+        records: Sequence[TranscriptRecord],
+        compact: Any,
+    ) -> List[TranscriptRecord]:
+        """按 compact 版本选择需要回放到 active history 的 transcript 记录。"""
+
+        if not isinstance(compact, dict):
+            return list(records)
+        version = compact.get("version")
+        if version == 3:
+            try:
+                cursor_seq = int(compact.get("transcript_cursor_seq") or 0)
+            except (TypeError, ValueError):
+                cursor_seq = 0
+            return [record for record in records if record.turn_seq > cursor_seq]
+        if version == 2:
+            try:
+                offset = int(compact.get("transcript_offset") or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            # v2 offset 与 _count_transcript_turns 一致：非空物理行数，坏行也占位。
+            return [
+                record
+                for record in records
+                if record.legacy_nonempty_ordinal > max(0, offset)
+            ]
+        return list(records)
 
     @staticmethod
     def _new_turn_id() -> str:
@@ -1504,11 +1722,14 @@ class LocalSessionStore:
         state_snapshot = deepcopy(self.state)
 
         ts = _now_iso()
+        # v3 用 turn_seq 游标；同时保留 transcript_offset 便于旧工具/人工审计对照。
+        transcript_cursor_seq = self._max_transcript_turn_seq(self.active_dir)
         compact = {
-            "version": 2,
+            "version": 3,
             "ts": ts,
             "session_id": self.active_session_id,
             "summary": str(summary or ""),
+            "transcript_cursor_seq": transcript_cursor_seq,
             "transcript_offset": self._count_transcript_turns(self.active_dir),
             "replacement_history": history_payload,
             "world_state_snapshot": dict(world_state_snapshot),
@@ -1539,6 +1760,7 @@ class LocalSessionStore:
             state["compacted_at"] = ts
             state["compact_count"] = int(state.get("compact_count") or 0) + 1
             state["compact_transcript_offset"] = compact["transcript_offset"]
+            state["compact_transcript_cursor_seq"] = compact["transcript_cursor_seq"]
             state["files_seen"] = _tail_mapping(state.get("files_seen"), FILES_SEEN_LIMIT)
             state["files_modified"] = _tail_mapping(state.get("files_modified"), FILES_MODIFIED_LIMIT)
             state["recent_commands"] = _tail_list(state.get("recent_commands"), RECENT_COMMANDS_LIMIT)
@@ -1569,42 +1791,48 @@ class LocalSessionStore:
         """把最近 compact 锚点推进到当前 transcript 末尾并刷新 replacement history。
 
         mid-turn compact 发生时本轮 transcript 尚未提交；回合提交成功后必须推进
-        offset，否则下次恢复会把已经包含在 replacement history 的本轮再追加一次。
+        cursor，否则下次恢复会把已经包含在 replacement history 的本轮再追加一次。
+        v2 快照在此升级为 v3 游标，避免继续依赖非空行下标。
         """
         if not self.active_session_id:
             return
         path = self.active_dir / "compact.json"
         compact = self._read_json(path, {})
-        if not isinstance(compact, dict) or compact.get("version") != 2:
+        if not isinstance(compact, dict) or compact.get("version") not in {2, 3}:
             return
+        compact["version"] = 3
+        compact["transcript_cursor_seq"] = self._max_transcript_turn_seq(self.active_dir)
         compact["transcript_offset"] = self._count_transcript_turns(self.active_dir)
         if history_payload is not None:
             compact["replacement_history"] = history_payload
             compact["after_messages"] = len(history_payload)
         self._write_json(path, compact)
 
-    def _read_transcript_items(self, session_dir: Path) -> List[Dict[str, Any]]:
-        """读取 transcript.jsonl 为结构化行列表。
+    def _read_transcript_result(self, session_dir: Path) -> TranscriptReadResult:
+        """读取 transcript.jsonl 的物理解析结果。"""
 
-        这个 helper 只返回 JSON object 行，坏行会触发异常日志并让整次读取失败
-        为空列表。保持保守语义的原因是：如果 transcript 损坏，宁愿少恢复上下文，
-        也不要把半截 JSON 或错误数据伪装成可用 history 注入模型。
+        return _read_transcript_file(session_dir / "transcript.jsonl")
+
+    def _read_transcript_items(self, session_dir: Path) -> List[Dict[str, Any]]:
+        """兼容旧调用：只返回合法 JSON object 行，坏行跳过。
+
+        不再因单行损坏返回空列表。需要坏行诊断时请读
+        ``last_transcript_recovery`` 或 ``_read_transcript_result``。
         """
-        path = session_dir / "transcript.jsonl"
-        if not path.exists():
-            return []
-        items: List[Dict[str, Any]] = []
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                item = json.loads(line)
-                if isinstance(item, dict):
-                    items.append(item)
-        except Exception:
-            logger.exception("failed to load transcript from %s", path)
-            return []
-        return items
+        return [record.payload for record in self._read_transcript_result(session_dir).records]
+
+    def _max_transcript_turn_seq(self, session_dir: Path) -> int:
+        """返回 transcript 中最大 turn_seq；无记录时为 0。"""
+
+        records = self._read_transcript_result(session_dir).records
+        if not records:
+            return 0
+        return max(int(record.turn_seq) for record in records)
+
+    def _next_transcript_turn_seq(self, session_dir: Path) -> int:
+        """为即将写入的回合分配单调递增 turn_seq。"""
+
+        return self._max_transcript_turn_seq(session_dir) + 1
 
     def state_text(self) -> str:
         """把 state.json 渲染成可注入 ContextBuilder 的 P1 State 文本。
@@ -1680,8 +1908,11 @@ class LocalSessionStore:
             or self._pending_turn_id_for_user(user_query)
             or self._new_turn_id()
         )
+        # turn_seq 是 compact v3 游标与恢复排序的稳定主键；turn_id 只负责崩溃去重。
+        turn_seq = self._next_transcript_turn_seq(self.active_dir)
         item = {
             "ts": _now_iso(),
+            "turn_seq": turn_seq,
             "turn_id": resolved_turn_id,
             "user_query": user_query,
             "final_answer": final_answer,
@@ -1691,16 +1922,35 @@ class LocalSessionStore:
                 if work_record and self.persist_trace_entries else []
             ),
         }
-        with (self.active_dir / "transcript.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+        # 正式提交顺序：先可靠追加 transcript，再清 active/pending 并更新 state。
+        # transcript 写失败时不得清理 active turn，否则中断恢复会丢已完成工具事实。
+        transcript_path = self.active_dir / "transcript.jsonl"
+        try:
+            with transcript_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+                f.flush()
+                if _transcript_fsync_enabled():
+                    os.fsync(f.fileno())
+        except Exception:
+            logger.exception("transcript 追加失败，保留 active/pending turn: %s", transcript_path)
+            raise
         self.clear_pending_user_message()
         self.clear_active_turn()
         if work_record:
             self.merge_work_record(work_record, user_query=user_query)
         else:
             self._bump_turn(user_query=user_query)
-        self.save_state(self.state)
-        self._write_index()
+        try:
+            self.save_state(self.state)
+            self._write_index()
+        except Exception:
+            # transcript 已是事实来源；state/index 失败时重启仍可按 turn_id 去重恢复。
+            logger.exception(
+                "transcript 已提交但 state/index 更新失败: session=%s turn_id=%s",
+                self.active_session_id,
+                resolved_turn_id,
+            )
+            raise
 
     def merge_work_record(self, record: WorkRecord, *, user_query: str = "") -> None:
         """把本轮 WorkRecord 合并进滚动 state。
@@ -1799,6 +2049,11 @@ class LocalSessionStore:
             state = {}
         created_at = str(state.get("created_at") or self._mtime_iso(session_dir))
         updated_at = str(state.get("updated_at") or self._newest_mtime_iso(session_dir))
+        recovery = (
+            dict(self.last_transcript_recovery)
+            if session_id == self.active_session_id
+            else {"corrupt_lines": [], "trailing_partial_line": False, "recovered_records": 0, "warnings": []}
+        )
         return {
             "session_id": session_id,
             "created_at": created_at,
@@ -1810,6 +2065,8 @@ class LocalSessionStore:
                 180,
             ),
             "is_active": session_id == self.active_session_id,
+            # 恢复诊断只给 UI/RPC，不注入模型上下文。
+            "transcript_recovery": recovery,
         }
 
     def _count_transcript_turns(self, session_dir: Path) -> int:
@@ -1883,5 +2140,7 @@ __all__ = [
     "TraceCollector",
     "TraceEntry",
     "TraceSummarizer",
+    "TranscriptReadResult",
+    "TranscriptRecord",
     "WorkRecord",
 ]

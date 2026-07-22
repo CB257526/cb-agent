@@ -32,6 +32,7 @@ from agent.work_context import (
     RuleTraceSummarizer,
     WorkRecord,
     _message_to_persist_payload,
+    _read_transcript_file,
     trace_entry_from_tool_result,
 )
 from core.message import Message
@@ -502,8 +503,260 @@ class TestSessionIsolation(unittest.TestCase):
                 store.switch_session("../outside")
 
 
+class TestTranscriptSalvage(unittest.TestCase):
+    def _write_transcript(self, store: LocalSessionStore, lines: list[str]) -> Path:
+        path = store.active_dir / "transcript.jsonl"
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        return path
+
+    def _turn_line(
+        self,
+        *,
+        turn_id: str,
+        user: str,
+        answer: str,
+        turn_seq: int | None = None,
+    ) -> str:
+        payload = {
+            "ts": "2026-01-01T00:00:00+00:00",
+            "turn_id": turn_id,
+            "user_query": user,
+            "final_answer": answer,
+            "messages": [
+                _message_to_persist_payload(_user(user)),
+                _message_to_persist_payload(_assistant(answer)),
+            ],
+            "trace_entries": [],
+        }
+        if turn_seq is not None:
+            payload["turn_seq"] = turn_seq
+        return json.dumps(payload, ensure_ascii=False)
+
+    def test_corrupt_trailing_line_does_not_drop_valid_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            self._write_transcript(
+                store,
+                [
+                    self._turn_line(turn_id="t1", user="问题1", answer="回答1", turn_seq=1),
+                    self._turn_line(turn_id="t2", user="问题2", answer="回答2", turn_seq=2),
+                    '{"turn_id":"t3","messages":[',  # 损坏尾行
+                ],
+            )
+            history = store.load_latest_history()
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("问题1", text)
+            self.assertIn("问题2", text)
+            self.assertEqual(len(store.last_transcript_recovery["corrupt_lines"]), 1)
+            self.assertTrue(store.last_transcript_recovery["warnings"])
+
+    def test_corrupt_middle_line_recovers_surrounding_turns(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            self._write_transcript(
+                store,
+                [
+                    self._turn_line(turn_id="t1", user="前段", answer="前答", turn_seq=1),
+                    "{not-json",
+                    self._turn_line(turn_id="t3", user="后段", answer="后答", turn_seq=3),
+                ],
+            )
+            history = store.load_latest_history()
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("前段", text)
+            self.assertIn("后段", text)
+            self.assertEqual(store.last_transcript_recovery["corrupt_lines"], [2])
+
+    def test_v2_offset_uses_legacy_nonempty_ordinal_not_valid_record_index(self):
+        """v2 offset 按非空物理行计数；坏行也占序号，不能对有效 records 切片。"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            # 非空行序号：1=旧一, 2=坏行, 3=旧二, 4=新一
+            self._write_transcript(
+                store,
+                [
+                    self._turn_line(turn_id="old1", user="旧一", answer="老答一"),
+                    "{broken",
+                    self._turn_line(turn_id="old2", user="旧二", answer="老答二"),
+                    self._turn_line(turn_id="new1", user="新一", answer="新答一"),
+                ],
+            )
+            summary_message = make_summary_message("摘要", reason="manual")
+            compact = {
+                "version": 2,
+                "transcript_offset": 3,  # 覆盖 old1 + 坏行 + old2
+                "replacement_history": [_message_to_persist_payload(summary_message)],
+            }
+            (store.active_dir / "compact.json").write_text(
+                json.dumps(compact, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = _read_transcript_file(store.active_dir / "transcript.jsonl")
+            # 有效 records 只有 3 条；若错误地对 records[3:] 切片会得到空。
+            self.assertEqual(len(result.records), 3)
+            self.assertEqual(result.records[0].legacy_nonempty_ordinal, 1)
+            self.assertEqual(result.records[1].legacy_nonempty_ordinal, 3)
+            self.assertEqual(result.records[2].legacy_nonempty_ordinal, 4)
+
+            history = store.load_latest_history()
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("Another language model started", text)
+            self.assertIn("新一", text)
+            self.assertNotIn("旧一", text)
+            self.assertNotIn("旧二", text)
+
+    def test_v2_offset_with_blank_lines_and_post_offset_corrupt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            # 空行不占 nonempty ordinal；offset 后的坏行也不应吞掉后续合法回合。
+            path = store.active_dir / "transcript.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        self._turn_line(turn_id="old", user="旧", answer="旧答"),
+                        "",
+                        self._turn_line(turn_id="mid", user="中", answer="中答"),
+                        "{bad",
+                        self._turn_line(turn_id="new", user="新", answer="新答"),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            summary_message = make_summary_message("摘要", reason="manual")
+            (store.active_dir / "compact.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "transcript_offset": 2,  # old + mid
+                        "replacement_history": [_message_to_persist_payload(summary_message)],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            history = store.load_latest_history()
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("新", text)
+            self.assertNotIn("旧", text)
+            self.assertNotIn("中", text)
+
+    def test_v3_cursor_dedupes_turn_id_and_ignores_blank_lines(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            self._write_transcript(
+                store,
+                [
+                    self._turn_line(turn_id="a", user="A1", answer="a1", turn_seq=1),
+                    "",
+                    self._turn_line(turn_id="b", user="B1", answer="b1", turn_seq=2),
+                    self._turn_line(turn_id="b", user="B2", answer="b2", turn_seq=3),  # 同 turn_id 保留最后
+                    self._turn_line(turn_id="c", user="C1", answer="c1", turn_seq=4),
+                ],
+            )
+            summary_message = make_summary_message("摘要", reason="manual")
+            (store.active_dir / "compact.json").write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "transcript_cursor_seq": 1,
+                        "replacement_history": [_message_to_persist_payload(summary_message)],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            history = store.load_latest_history()
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("B2", text)
+            self.assertNotIn("B1", text)
+            self.assertIn("C1", text)
+            self.assertNotIn("A1", text)
+
+    def test_append_turn_writes_turn_seq_and_save_compaction_v3(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.append_turn(
+                user_query="旧一",
+                final_answer="老答一",
+                committed_messages=[_user("旧一"), _assistant("老答一")],
+            )
+            store.append_turn(
+                user_query="旧二",
+                final_answer="老答二",
+                committed_messages=[_user("旧二"), _assistant("老答二")],
+            )
+            line = json.loads((store.active_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(line["turn_seq"], 2)
+
+            summary_message = make_summary_message("摘要:已读 a.py", reason="manual")
+            compact = store.save_compaction(
+                summary=str(summary_message.content or ""),
+                history_payload=[_message_to_persist_payload(summary_message)],
+                before_messages=4,
+                after_messages=1,
+                reason="manual",
+                model="fake",
+                target_model="fake",
+                provider="fake-provider",
+                world_state_snapshot={},
+                tokens_before=100,
+                tokens_after=20,
+            )
+            self.assertEqual(compact["version"], 3)
+            self.assertEqual(compact["transcript_cursor_seq"], 2)
+            self.assertTrue((store.active_dir / "compact.json").exists())
+            self.assertTrue((store.active_dir / "compactions.jsonl").exists())
+
+            store.append_turn(
+                user_query="新一",
+                final_answer="新答一",
+                committed_messages=[_user("新一"), _assistant("新答一")],
+            )
+            restored = LocalSessionStore(root)
+            history = restored.load_latest_history()
+            self.assertEqual(
+                (history[0].metadata or {}).get("kind"),
+                COMPACTION_SUMMARY_KIND,
+            )
+            text = "\n".join(str(m.content) for m in history)
+            self.assertIn("Another language model started", text)
+            self.assertIn("新一", text)
+            self.assertNotIn("旧一", text)
+            self.assertNotIn("老答一", text)
+
+    def test_transcript_write_failure_keeps_active_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            store.begin_active_turn(user_query="进行中", turn_id="turn-x")
+            self.assertTrue((store.active_dir / "active_turn.jsonl").exists())
+
+            transcript_path = store.active_dir / "transcript.jsonl"
+            # 先创建普通文件，再改成目录，使 open(..., "a") 失败。
+            transcript_path.write_text("", encoding="utf-8")
+            transcript_path.unlink()
+            transcript_path.mkdir()
+            with self.assertRaises(Exception):
+                store.append_turn(
+                    user_query="进行中",
+                    final_answer="失败",
+                    committed_messages=[_user("进行中"), _assistant("失败")],
+                    turn_id="turn-x",
+                )
+            self.assertTrue((store.active_dir / "active_turn.jsonl").exists())
+
+
 class TestCompactionPersistence(unittest.TestCase):
     def test_save_compaction_v2_round_trip(self):
+        """旧 v2 快照仍可读取；新写入的是 v3。"""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -519,23 +772,18 @@ class TestCompactionPersistence(unittest.TestCase):
             )
 
             summary_message = make_summary_message("摘要:已读 a.py", reason="manual")
-            store.save_compaction(
-                summary=str(summary_message.content or ""),
-                history_payload=[_message_to_persist_payload(summary_message)],
-                before_messages=4,
-                after_messages=1,
-                reason="manual",
-                model="fake",
-                target_model="fake",
-                provider="fake-provider",
-                world_state_snapshot={},
-                tokens_before=100,
-                tokens_after=20,
+            # 手工写入 v2，验证兼容回放。
+            (store.active_dir / "compact.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "transcript_offset": 2,
+                        "replacement_history": [_message_to_persist_payload(summary_message)],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
             )
-
-            self.assertTrue((store.active_dir / "compact.json").exists())
-            self.assertTrue((store.active_dir / "compactions.jsonl").exists())
-
             store.append_turn(
                 user_query="新一",
                 final_answer="新答一",
@@ -544,7 +792,6 @@ class TestCompactionPersistence(unittest.TestCase):
 
             restored = LocalSessionStore(root)
             history = restored.load_latest_history(max_messages=20)
-            # 第一条应是新的 compaction summary。
             self.assertEqual(
                 (history[0].metadata or {}).get("kind"),
                 COMPACTION_SUMMARY_KIND,
@@ -552,7 +799,6 @@ class TestCompactionPersistence(unittest.TestCase):
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("Another language model started", text)
             self.assertIn("新一", text)
-            # boundary 之前的旧消息不再注入
             self.assertNotIn("旧一", text)
             self.assertNotIn("老答一", text)
 

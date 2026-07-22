@@ -294,7 +294,9 @@ def test_compact_v2_persists_replacement_history_and_world_state():
         session.compact_context(reason="mid_turn")
 
         compact = json.loads((store.active_dir / "compact.json").read_text(encoding="utf-8"))
-        assert compact["version"] == 2
+        # compact 快照升级为 v3：用 transcript_cursor_seq 替代列表下标 offset。
+        assert compact["version"] == 3
+        assert "transcript_cursor_seq" in compact
         assert compact["world_state_snapshot"] == {"environment": "ENV"}
         assert compact["replacement_history"][-1]["kind"] == COMPACTION_SUMMARY_KIND
         restored = LocalSessionStore(root).load_latest_history()
