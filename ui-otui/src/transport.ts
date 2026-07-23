@@ -294,26 +294,36 @@ export class Transport extends EventEmitter {
     return id;
   }
 
-  /** 发送 RPC 并等响应。timeoutMs 默认 5s；compact 等需要调 LLM 的 RPC 要传更长超时。 */
+  /** 发送 RPC 并等待响应；状态变更操作可传 null，直到后端明确返回结果。 */
   private requestRpc<T = unknown>(
     method: string,
     params: Record<string, unknown> = {},
-    timeoutMs = 5000,
+    timeoutMs: number | null = 5000,
   ): Promise<T> {
     const id = this.sendRpc(method, params);
     return new Promise<T>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const cleanup = () => {
+        this.removeListener("response", onResp);
+        this.removeListener("exit", onExit);
+        if (timer !== null) clearTimeout(timer);
+      };
       const onResp = (rid: string | number, body: { result?: unknown; error?: { code: number; message: string } }) => {
         if (rid !== id) return;
-        this.removeListener("response", onResp);
-        clearTimeout(timer);
+        cleanup();
         if (body.error) reject(new Error(body.error.message));
         else resolve(body.result as T);
       };
-      const timer = setTimeout(() => {
-        this.removeListener("response", onResp);
+      const onExit = () => {
+        cleanup();
+        reject(new Error(`Python agent exited before RPC ${method} completed`));
+      };
+      if (timeoutMs !== null) timer = setTimeout(() => {
+        cleanup();
         reject(new Error(`RPC ${method} timeout`));
       }, timeoutMs);
       this.on("response", onResp);
+      this.on("exit", onExit);
     });
   }
 
@@ -329,10 +339,9 @@ export class Transport extends EventEmitter {
     return this.sendRpc("session.clear_history");
   }
 
-  /** 压缩当前 active 会话上下文；不重绘 UI，只返回压缩结果供命令提示。
-   * 压缩要调 LLM 做摘要，耗时远超普通 RPC，给 120s 长超时。 */
+  /** 压缩当前 active 会话上下文；直到后端明确返回结果，不使用客户端盲目超时。 */
   compactSession(): Promise<CompactPayload> {
-    return this.requestRpc("session.compact", {}, 120000);
+    return this.requestRpc("session.compact", {}, null);
   }
 
   setMode(mode: PlanMode): Promise<{ mode: PlanMode; plan_state: PlanState; session?: SessionSummary | null }> {
@@ -386,8 +395,8 @@ export class Transport extends EventEmitter {
 
   /** 切换当前 LLM 请求目标；会话 history 不变。 */
   setModel(model_key: string): Promise<ModelSwitchPayload> {
-    // 降档切换可能经历旧模型 compact 和目标模型重试，不能沿用普通 RPC 的 5 秒超时。
-    return this.requestRpc("session.set_model", { model_key }, 180000);
+    // 降档切换可能经历旧模型 compact 和目标模型重试，直到后端明确返回结果。
+    return this.requestRpc("session.set_model", { model_key }, null);
   }
 
   /** 获取今天的 prompt cache 命中统计。 */

@@ -626,6 +626,78 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertTrue(result["persisted"])
             self.assertTrue((store.active_dir / "compact.json").exists())
 
+    def test_gateway_compact_keeps_reader_responsive(self):
+        """compact 阻塞期间 list_models 仍应立即返回，状态变更则明确返回 busy。"""
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class LLM:
+            model = "fake"
+
+            def list_models(self):
+                return {"models": [{"key": "fake", "model": "fake"}]}
+
+        class Session:
+            llm = LLM()
+            current_cancel_token = None
+
+            def compact_context(self):
+                started.set()
+                release.wait(timeout=2.0)
+                return {
+                    "before_messages": 10,
+                    "after_messages": 2,
+                    "persisted": True,
+                }
+
+        out = io.StringIO()
+        bus = EventBus()
+        gateway = Gateway(
+            session=Session(),  # type: ignore[arg-type]
+            event_bus=bus,
+            transport=StdioTransport(stdin=io.StringIO(""), stdout=out),
+            redirect_stdout_to_stderr=False,
+        )
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        gateway._loop = loop
+
+        def responses():
+            return [
+                json.loads(line)
+                for line in out.getvalue().splitlines()
+                if line.strip()
+            ]
+
+        try:
+            gateway._handle_compact("cp-async")
+            self.assertTrue(started.wait(timeout=1.0))
+
+            gateway._handle_list_models("models-during-compact")
+            gateway._handle_clear_history("clear-during-compact")
+            interim = responses()
+            self.assertTrue(any(item.get("id") == "models-during-compact" for item in interim))
+            busy = next(item for item in interim if item.get("id") == "clear-during-compact")
+            self.assertEqual(busy["error"]["code"], -32001)
+            self.assertFalse(any(item.get("id") == "cp-async" for item in interim))
+
+            release.set()
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if any(item.get("id") == "cp-async" for item in responses()):
+                    break
+                time.sleep(0.01)
+            compact_response = next(item for item in responses() if item.get("id") == "cp-async")
+            self.assertEqual(compact_response["result"]["after_messages"], 2)
+        finally:
+            release.set()
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=1.0)
+            loop.close()
+            bus.unsubscribe(gateway._on_event)
+
     def test_model_downshift_compacts_with_old_model_before_switch(self):
         """大窗口降档时必须先用旧模型 compact，再安装目标模型。"""
 
@@ -779,6 +851,95 @@ class TestGatewayDispatch(unittest.TestCase):
             compact_calls[0]["target_context_limits"]["soft_limit_tokens"],
             474_000,
         )
+
+    def test_model_downshift_keeps_reader_responsive(self):
+        """模型降档执行 compact 时，模型列表查询不能被长请求堵住。"""
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class SwitchableLLM:
+            model = "old-large"
+
+            def list_models(self):
+                return {"models": [{"key": "new-small", "model": "new-small"}]}
+
+            def preview_model(self, _key):
+                return {
+                    "model": "new-small",
+                    "max_tokens": 20_000,
+                    "context_limits": {
+                        "full_window_tokens": 20_000,
+                        "max_output_tokens": 2_000,
+                        "estimation_margin_tokens": 2_000,
+                        "soft_limit_tokens": 16_000,
+                        "hard_limit_tokens": 18_000,
+                    },
+                }
+
+            def switch_model(self, _key):
+                self.model = "new-small"
+                return {"model": "new-small", "key": "new-small", "provider": "fake"}
+
+        llm = SwitchableLLM()
+
+        class Session:
+            current_cancel_token = None
+
+            def __init__(self):
+                self.llm = llm
+
+            def context_window_usage(self):
+                return {"used_tokens": 30_000, "max_tokens": 100_000}
+
+            def compact_context(self, **_kwargs):
+                started.set()
+                release.wait(timeout=2.0)
+                return {"persisted": True}
+
+        out = io.StringIO()
+        bus = EventBus()
+        gateway = Gateway(
+            session=Session(),  # type: ignore[arg-type]
+            event_bus=bus,
+            transport=StdioTransport(stdin=io.StringIO(""), stdout=out),
+            redirect_stdout_to_stderr=False,
+        )
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        gateway._loop = loop
+
+        def responses():
+            return [
+                json.loads(line)
+                for line in out.getvalue().splitlines()
+                if line.strip()
+            ]
+
+        try:
+            gateway._handle_set_model("switch-async", {"model": "new-small"})
+            self.assertTrue(started.wait(timeout=1.0))
+            gateway._handle_list_models("models-during-switch")
+
+            interim = responses()
+            self.assertTrue(any(item.get("id") == "models-during-switch" for item in interim))
+            self.assertFalse(any(item.get("id") == "switch-async" for item in interim))
+
+            release.set()
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if any(item.get("id") == "switch-async" for item in responses()):
+                    break
+                time.sleep(0.01)
+            switch_response = next(item for item in responses() if item.get("id") == "switch-async")
+            self.assertEqual(switch_response["result"]["model"]["model"], "new-small")
+        finally:
+            release.set()
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=1.0)
+            loop.close()
+            bus.unsubscribe(gateway._on_event)
 
     def test_gateway_list_tools(self):
         """session.list_tools 应返回 registry 里的工具名/描述/schema 列表。"""

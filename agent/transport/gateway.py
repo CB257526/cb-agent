@@ -5,7 +5,8 @@
 2. UI → agent：阻塞读 stdin，按 method 分发：
    - prompt.submit  → 在 asyncio loop 上启动 session.chat_async（不阻塞 stdin 读循环）
    - session.cancel → 直接 set 当前 token（threading.Event.set 线程安全）
-   - session.compact → 压缩当前会话上下文，保留 transcript 审计
+   - session.compact → 投递到工作线程压缩上下文，stdin 继续处理查询 RPC
+   - session.set_model → 投递到工作线程切模，兼容降档前的 compact
    - session.mcp_status → 查询 MCP 后台连接进度
    - session.quit   → 关 loop，主流程退出
 
@@ -91,8 +92,10 @@ class Gateway:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._chat_task: Optional[asyncio.Task] = None
-        self._busy = False  # 同一时间只允许一个 chat
+        # chat、compact 和切模都可能读写 history，同一时间只允许一项。
+        self._busy = False
         self._busy_lock = threading.Lock()
+        self._busy_operation: Optional[str] = None
         # prompt 接受时立即登记 token，不能等 worker 线程进入 AgentSession.chat。
         # 否则用户在 ack 后立刻 Ctrl+C 会命中 current_cancel_token 尚为空的竞态窗口。
         self._active_cancel_token: Optional[CancelToken] = None
@@ -229,6 +232,7 @@ class Gateway:
                     ))
                 return
             self._busy = True
+            self._busy_operation = "chat"
             self._active_cancel_token = token
 
         # 立刻 ack——chat 是异步任务，结果通过事件流送
@@ -241,6 +245,7 @@ class Gateway:
         if loop is None:
             with self._busy_lock:
                 self._busy = False
+                self._busy_operation = None
                 if self._active_cancel_token is token:
                     self._active_cancel_token = None
             logger.error("prompt accepted but event loop unavailable: id=%s", rpc_id)
@@ -278,6 +283,7 @@ class Gateway:
         finally:
             with self._busy_lock:
                 self._busy = False
+                self._busy_operation = None
                 if self._active_cancel_token is token:
                     self._active_cancel_token = None
             logger.info("chat task finished")
@@ -325,6 +331,13 @@ class Gateway:
             loop.call_soon_threadsafe(stop_event.set)
 
     def _handle_clear_history(self, rpc_id: Any) -> None:
+        if self._is_busy():
+            if rpc_id is not None:
+                self.transport.write(make_response(
+                    rpc_id,
+                    error={"code": _ERR_BUSY, "message": "session busy"},
+                ))
+            return
         try:
             self.session.clear_history()
         except Exception as e:
@@ -346,12 +359,30 @@ class Gateway:
         """
         if rpc_id is None:
             return
-        if self._is_busy():
+        if not self._claim_busy_operation("compact"):
             self.transport.write(make_response(
                 rpc_id,
                 error={"code": _ERR_BUSY, "message": "session busy"},
             ))
             return
+
+        loop = self._loop
+        if loop is None:
+            # 单元测试和非标准嵌入入口可能没有启动 asyncio loop，此时保留同步兼容路径。
+            self._execute_compact_rpc(rpc_id)
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._run_compact_rpc(rpc_id), loop)
+        except Exception as e:
+            self._release_busy_operation("compact")
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+
+    def _execute_compact_rpc(self, rpc_id: Any) -> None:
+        """同步执行 compact 并写响应，仅供无事件循环的兼容入口。"""
+
         try:
             payload = self.session.compact_context()
         except Exception as e:
@@ -359,8 +390,35 @@ class Gateway:
                 rpc_id,
                 error={"code": _ERR_INTERNAL, "message": str(e)},
             ))
-            return
-        self.transport.write(make_response(rpc_id, result=payload))
+        else:
+            self.transport.write(make_response(rpc_id, result=payload))
+        finally:
+            self._release_busy_operation("compact")
+
+    async def _run_compact_rpc(self, rpc_id: Any) -> None:
+        """在线程池执行 compact，让 stdin 读取线程继续处理查询和 busy 响应。"""
+
+        logger.info("compact task start: id=%s", rpc_id)
+        try:
+            payload = await asyncio.to_thread(self.session.compact_context)
+        except Exception as e:
+            response = make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            )
+            logger.exception("compact task failed: id=%s", rpc_id)
+        else:
+            response = make_response(rpc_id, result=payload)
+            logger.info(
+                "compact task finished: id=%s before=%s after=%s persisted=%s",
+                rpc_id,
+                payload.get("before_messages"),
+                payload.get("after_messages"),
+                payload.get("persisted"),
+            )
+        finally:
+            self._release_busy_operation("compact")
+        self.transport.write(response)
 
     def _handle_mcp_status(self, rpc_id: Any) -> None:
         """返回 MCP 后台连接状态。
@@ -732,12 +790,6 @@ class Gateway:
         """切换 LLM 请求目标，并在窗口降档前先压缩旧模型上下文。"""
         if rpc_id is None:
             return
-        if self._is_busy():
-            self.transport.write(make_response(
-                rpc_id,
-                error={"code": _ERR_BUSY, "message": "session busy"},
-            ))
-            return
         model_key = params.get("model_key") or params.get("model")
         if not isinstance(model_key, str) or not model_key.strip():
             self.transport.write(make_response(
@@ -745,6 +797,33 @@ class Gateway:
                 error={"code": _ERR_INVALID_PARAMS, "message": "params.model_key required"},
             ))
             return
+        if not self._claim_busy_operation("model_switch"):
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_BUSY, "message": "session busy"},
+            ))
+            return
+
+        resolved_key = model_key.strip()
+        loop = self._loop
+        if loop is None:
+            # 保留直接调用 handler 的单元测试和嵌入式同步用法。
+            self._execute_set_model_rpc(rpc_id, resolved_key)
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._run_set_model_rpc(rpc_id, resolved_key),
+                loop,
+            )
+        except Exception as e:
+            self._release_busy_operation("model_switch")
+            self.transport.write(make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            ))
+
+    def _perform_model_switch(self, model_key: str) -> Dict[str, Any]:
+        """执行可能包含降档 compact 的阻塞模型切换，并返回成功 payload。"""
 
         llm = getattr(self.session, "llm", None)
         switch_model = getattr(llm, "switch_model", None)
@@ -752,80 +831,114 @@ class Gateway:
         capture_runtime_model = getattr(llm, "capture_runtime_model", None)
         restore_runtime_model = getattr(llm, "restore_runtime_model", None)
         if not callable(switch_model) or not callable(preview_model):
-            self.transport.write(make_response(
-                rpc_id,
-                error={"code": _ERR_INTERNAL, "message": "model switch unavailable"},
-            ))
-            return
-        try:
-            target = preview_model(model_key.strip())
-            current_usage = self.session.context_window_usage()
-            old_window = int(current_usage.get("max_tokens") or 0)
-            if old_window <= 0:
-                old_window = ConstantLLM.model_max_tokens(getattr(llm, "model", None))
-            new_window = int(target.get("max_tokens") or 0)
-            choice_target_limits = target.get("context_limits")
-            target_limits = choice_target_limits
-            if not isinstance(target_limits, dict) or not target_limits:
-                # 兼容旧 LLM 实现；新版 preview_model 会返回具体 choice 的边界。
-                target_limits = ConstantLLM.context_limits(target.get("model"))
-            needs_downshift_compact = (
-                new_window > 0
-                and old_window > new_window
-                and int(current_usage.get("used_tokens") or 0)
-                >= int(target_limits["soft_limit_tokens"])
-            )
-            runtime_snapshot = (
-                capture_runtime_model() if callable(capture_runtime_model) else None
-            )
-            compact_kwargs: Dict[str, Any] = {
-                "reason": "model_downshift",
-                "target_model": str(target.get("model") or ""),
-            }
-            if isinstance(choice_target_limits, dict) and choice_target_limits:
-                compact_kwargs["target_context_limits"] = dict(choice_target_limits)
-            if needs_downshift_compact:
+            raise RuntimeError("model switch unavailable")
+
+        target = preview_model(model_key)
+        current_usage = self.session.context_window_usage()
+        old_window = int(current_usage.get("max_tokens") or 0)
+        if old_window <= 0:
+            old_window = ConstantLLM.model_max_tokens(getattr(llm, "model", None))
+        new_window = int(target.get("max_tokens") or 0)
+        choice_target_limits = target.get("context_limits")
+        target_limits = choice_target_limits
+        if not isinstance(target_limits, dict) or not target_limits:
+            # 兼容旧 LLM 实现；新版 preview_model 会返回具体 choice 的边界。
+            target_limits = ConstantLLM.context_limits(target.get("model"))
+        needs_downshift_compact = (
+            new_window > 0
+            and old_window > new_window
+            and int(current_usage.get("used_tokens") or 0)
+            >= int(target_limits["soft_limit_tokens"])
+        )
+        runtime_snapshot = (
+            capture_runtime_model() if callable(capture_runtime_model) else None
+        )
+        compact_kwargs: Dict[str, Any] = {
+            "reason": "model_downshift",
+            "target_model": str(target.get("model") or ""),
+        }
+        if isinstance(choice_target_limits, dict) and choice_target_limits:
+            compact_kwargs["target_context_limits"] = dict(choice_target_limits)
+        if needs_downshift_compact:
+            try:
+                self.session.compact_context(**compact_kwargs)
+            except Exception as compact_error:
+                error_text = str(compact_error).lower()
+                invalid_request = "invalid" in error_text or "400" in error_text
+                if not invalid_request or runtime_snapshot is None:
+                    raise
+                # 旧模型拒绝压缩请求时，切到目标模型重试；重试失败必须回滚模型。
+                model = switch_model(model_key)
                 try:
                     self.session.compact_context(**compact_kwargs)
-                except Exception as compact_error:
-                    error_text = str(compact_error).lower()
-                    invalid_request = "invalid" in error_text or "400" in error_text
-                    if not invalid_request or runtime_snapshot is None:
-                        raise
-                    # Codex 在旧模型不接受 compaction 请求时会使用目标模型重试。
-                    model = switch_model(model_key.strip())
-                    try:
-                        self.session.compact_context(**compact_kwargs)
-                    except Exception:
-                        if callable(restore_runtime_model):
-                            restore_runtime_model(runtime_snapshot)
-                        raise
-                else:
-                    model = switch_model(model_key.strip())
+                except Exception:
+                    if callable(restore_runtime_model):
+                        restore_runtime_model(runtime_snapshot)
+                    raise
             else:
-                model = switch_model(model_key.strip())
-            context_window = self.session.context_window_usage()
-        except ValueError as e:
-            self.transport.write(make_response(
-                rpc_id,
-                error={"code": _ERR_INVALID_PARAMS, "message": str(e)},
-            ))
-            return
-        except Exception as e:
-            self.transport.write(make_response(
-                rpc_id,
-                error={"code": _ERR_INTERNAL, "message": str(e)},
-            ))
-            return
+                model = switch_model(model_key)
+        else:
+            model = switch_model(model_key)
+        context_window = self.session.context_window_usage()
+        return {"model": model, "context_window": context_window}
 
-        payload = {"model": model, "context_window": context_window}
+    def _emit_model_changed(self, payload: Dict[str, Any]) -> None:
+        """模型切换成功后统一发事件，保证同步和异步入口行为一致。"""
+
+        model = payload["model"]
         self.event_bus.emit(ModelChanged(
             model=model.get("model") or "",
             model_key=model.get("key"),
             provider=model.get("provider"),
-            context_window=context_window,
+            context_window=payload.get("context_window"),
         ))
-        self.transport.write(make_response(rpc_id, result=payload))
+
+    def _execute_set_model_rpc(self, rpc_id: Any, model_key: str) -> None:
+        """同步执行模型切换，仅供无事件循环的兼容入口。"""
+
+        try:
+            payload = self._perform_model_switch(model_key)
+        except ValueError as e:
+            response = make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": str(e)},
+            )
+        except Exception as e:
+            response = make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            )
+        else:
+            self._emit_model_changed(payload)
+            response = make_response(rpc_id, result=payload)
+        finally:
+            self._release_busy_operation("model_switch")
+        self.transport.write(response)
+
+    async def _run_set_model_rpc(self, rpc_id: Any, model_key: str) -> None:
+        """在线程池执行模型切换，避免降档 compact 阻塞全部 JSON-RPC。"""
+
+        logger.info("model switch task start: id=%s key=%s", rpc_id, model_key)
+        try:
+            payload = await asyncio.to_thread(self._perform_model_switch, model_key)
+        except ValueError as e:
+            response = make_response(
+                rpc_id,
+                error={"code": _ERR_INVALID_PARAMS, "message": str(e)},
+            )
+        except Exception as e:
+            response = make_response(
+                rpc_id,
+                error={"code": _ERR_INTERNAL, "message": str(e)},
+            )
+            logger.exception("model switch task failed: id=%s key=%s", rpc_id, model_key)
+        else:
+            self._emit_model_changed(payload)
+            response = make_response(rpc_id, result=payload)
+            logger.info("model switch task finished: id=%s key=%s", rpc_id, model_key)
+        finally:
+            self._release_busy_operation("model_switch")
+        self.transport.write(response)
 
     def _handle_cache_stats(self, rpc_id: Any) -> None:
         """返回今天的 prompt cache 命中统计。"""
@@ -946,6 +1059,24 @@ class Gateway:
         """线程安全读取 busy 状态，供会话切换/新建等同步 RPC 使用。"""
         with self._busy_lock:
             return self._busy
+
+    def _claim_busy_operation(self, operation: str) -> bool:
+        """原子占用单会话状态变更槽，避免 compact 与 chat 并发改写 history。"""
+
+        with self._busy_lock:
+            if self._busy:
+                return False
+            self._busy = True
+            self._busy_operation = str(operation or "operation")
+            return True
+
+    def _release_busy_operation(self, operation: str) -> None:
+        """释放指定状态变更槽，忽略已经被后续生命周期清理的旧操作。"""
+
+        with self._busy_lock:
+            if self._busy_operation == operation:
+                self._busy = False
+                self._busy_operation = None
 
     # ---------- 启动 ----------
 
