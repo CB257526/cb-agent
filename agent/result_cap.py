@@ -156,10 +156,11 @@ def _extract_existing_persist_path(result: str) -> Optional[str]:
         data = json.loads(result)
         if not isinstance(data, dict):
             return None
-        # bash_output.py 的落盘路径字段
-        output_file = data.get("output_file")
-        if output_file and isinstance(output_file, str):
-            return output_file
+        # bash_output：优先 stdout_file，其次兼容 output_file。
+        for key in ("stdout_file", "output_file"):
+            value = data.get(key)
+            if value and isinstance(value, str):
+                return value
         return None
     except (json.JSONDecodeError, TypeError, AttributeError):
         return None

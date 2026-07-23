@@ -225,19 +225,65 @@ class TestOutput(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             r = process_output("hi", "", Path(d), "abc")
             self.assertIsNone(r.output_file)
+            self.assertIsNone(r.stdout_file)
+            self.assertIsNone(r.stderr_file)
             self.assertFalse(r.output_truncated)
             self.assertEqual(r.stdout, "hi")
+
+    def test_stdout_model_truncate_persists_full_text(self):
+        """100K 以上 stdout：preview 截断，但完整文件可读（不要求 >1MB）。"""
+        from tools.tools.bash_output import MAX_STDOUT_CHARS
+
+        with tempfile.TemporaryDirectory() as d:
+            # 介于 100K 与 1MB 之间：旧逻辑会丢弃，新逻辑必须落盘。
+            mid = "x" * (MAX_STDOUT_CHARS + 50_000)
+            r = process_output(mid, "", Path(d), "mid")
+            self.assertTrue(r.output_truncated)
+            self.assertIsNotNone(r.stdout_file)
+            self.assertEqual(r.output_file, r.stdout_file)
+            self.assertTrue(Path(r.stdout_file).exists())
+            self.assertEqual(Path(r.stdout_file).read_text(encoding="utf-8"), mid)
+            self.assertLess(len(r.stdout), len(mid))
+            self.assertIn("full_file:", r.stdout)
+            self.assertIn("file_read", r.stdout)
 
     def test_large_output_persists(self):
         with tempfile.TemporaryDirectory() as d:
             big = "x" * (2 * 1024 * 1024)  # 2MB
             r = process_output(big, "", Path(d), "abc")
             self.assertIsNotNone(r.output_file)
+            self.assertIsNotNone(r.stdout_file)
             self.assertTrue(r.output_truncated)
             self.assertTrue(Path(r.output_file).exists())
             self.assertEqual(Path(r.output_file).read_text(encoding="utf-8"), big)
             # 截断的 stdout 应该显著小于原始
             self.assertLess(len(r.stdout), len(big) // 2)
+
+    def test_stderr_truncate_persists_separately(self):
+        from tools.tools.bash_output import MAX_STDERR_CHARS
+
+        with tempfile.TemporaryDirectory() as d:
+            err = "e" * (MAX_STDERR_CHARS + 1000)
+            out = "ok"
+            r = process_output(out, err, Path(d), "err")
+            self.assertTrue(r.output_truncated)
+            self.assertIsNone(r.stdout_file)
+            self.assertIsNotNone(r.stderr_file)
+            self.assertEqual(Path(r.stderr_file).read_text(encoding="utf-8"), err)
+            self.assertIn("stderr", r.stderr)
+
+    def test_stdout_and_stderr_paths_do_not_collide(self):
+        from tools.tools.bash_output import MAX_STDERR_CHARS, MAX_STDOUT_CHARS
+
+        with tempfile.TemporaryDirectory() as d:
+            out = "o" * (MAX_STDOUT_CHARS + 10)
+            err = "e" * (MAX_STDERR_CHARS + 10)
+            r = process_output(out, err, Path(d), "both")
+            self.assertIsNotNone(r.stdout_file)
+            self.assertIsNotNone(r.stderr_file)
+            self.assertNotEqual(r.stdout_file, r.stderr_file)
+            self.assertEqual(Path(r.stdout_file).read_text(encoding="utf-8"), out)
+            self.assertEqual(Path(r.stderr_file).read_text(encoding="utf-8"), err)
 
 
 class TestPermission(unittest.TestCase):

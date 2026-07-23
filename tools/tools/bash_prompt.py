@@ -99,8 +99,8 @@ prefix 的写法：
 
 不要自己用 `>`、`Out-File`、`Tee-Object` 重定向输出到文件。让命令直接往 stdout 打，bash 工具会自动处理：
 
-- 输出 ≤100KB：直接在 `stdout` 字段返回
-- 输出 >1MB：完整原文落盘到 `output_file` 路径，`stdout` 字段只保留首尾片段并标记 `output_truncated=true`；后续用 `file_read(path=<output_file>, tail=N)` 或 `head=N`、`start_line/end_line` 拉感兴趣的部分，超长单行可用 `start_char/end_char` 分段读取
+- 输出 ≤100K 字符：直接在 `stdout` 字段返回，无需 artifact
+- 触发模型可见截断（stdout>100K 字符或 stderr>20K 字符）：先把完整原文分别落到 `stdout_file` / `stderr_file`（`output_file` 是 stdout 兼容别名），`stdout`/`stderr` 只保留 preview 并标记 `output_truncated=true`；用 `file_read(path=<stdout_file>, head=N)` 或 `start_line/end_line` 续读
 - 后台任务：完整输出始终写在 `output_file`（task 返回里），用 `bash_task(action=output, ...)` 拿尾部，需要全文用 `file_read`
 
 特别是 PowerShell：用 `>` 默认会写 UTF-16-LE BOM 文件，再读会乱码。永远让 bash 工具替你管落盘。
