@@ -187,3 +187,75 @@ def test_memory_loader_memoize_caches(tmp_path: Path):
     loader.reset_cache(reason="test")
     c = asyncio.run(loader.get_memory_files())
     assert any("v2" in f.content for f in c)
+
+
+def test_enforce_budget_local_cannot_evict_managed():
+    from context.memory.loader import MemoryBudgetError, enforce_memory_budget
+
+    managed = MemoryFileInfo(
+        path=Path("/managed/CLAUDE.md"),
+        type="Managed",
+        content="MANAGED-KEEP " + ("m" * 100),
+    )
+    local = MemoryFileInfo(
+        path=Path("/cwd/CLAUDE.local.md"),
+        type="Local",
+        content="LOCAL-HUGE " + ("L" * 50_000),
+    )
+    # 总预算 40K；Managed 必须完整留下，Local 只能 preview 或 omitted。
+    report = enforce_memory_budget([managed, local], 40_000)
+    types = [f.type for f in report.selected]
+    assert "Managed" in types
+    assert any("MANAGED-KEEP" in f.content for f in report.selected)
+    # Local 若入选则必须是 truncated preview，不能把 Managed 挤掉
+    selected_text = "\n".join(f.content for f in report.selected)
+    assert "MANAGED-KEEP" in selected_text
+    assert report.used_chars <= 40_000 + 200  # 允许极小估算误差
+
+
+def test_enforce_budget_formatter_overhead_counted(tmp_path: Path):
+    from context.memory.loader import enforce_memory_budget
+    from context.memory.formatter import format_memory_files
+
+    files = [
+        MemoryFileInfo(path=tmp_path / f"p{i}.md", type="Project", content="x" * 1000)
+        for i in range(5)
+    ]
+    limit = 3500
+    report = enforce_memory_budget(files, limit)
+    formatted = format_memory_files(report.selected, omitted=report.omitted)
+    # 最终注入文本（含标题）不应明显超过 limit（manifest 可能额外一点点）
+    assert len(format_memory_files(report.selected)) <= limit + 50
+    assert report.omitted or report.selected
+    assert report.used_chars <= limit + 50
+
+
+def test_enforce_budget_managed_too_large_raises():
+    from context.memory.loader import MemoryBudgetError, enforce_memory_budget
+
+    managed = MemoryFileInfo(
+        path=Path("/managed/big.md"),
+        type="Managed",
+        content="M" * 50_000,
+    )
+    try:
+        enforce_memory_budget([managed], 1000)
+        assert False, "expected MemoryBudgetError"
+    except MemoryBudgetError as e:
+        assert "Managed" in str(e)
+
+
+def test_include_after_256k_not_silently_dropped(tmp_path: Path):
+    """256KB 之后的 @include 必须仍被解析（不再在 include 前静默截断）。"""
+    from context.memory.loader import MAX_FILE_BYTES, _process_memory_file
+
+    included = tmp_path / "tail_include.md"
+    included.write_text("INCLUDED-MARKER", encoding="utf-8")
+    main = tmp_path / "main.md"
+    # 正文略大于 256KB，include 写在文件尾部
+    body = ("A" * (MAX_FILE_BYTES + 100)) + f"\n@./tail_include.md\n"
+    main.write_text(body, encoding="utf-8")
+    out = asyncio.run(_process_memory_file(main, "Project", processed=set()))
+    paths = [str(f.path) for f in out]
+    assert any(p.endswith("tail_include.md") for p in paths)
+    assert any("INCLUDED-MARKER" in f.content for f in out)

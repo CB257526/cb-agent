@@ -48,12 +48,15 @@ def format_memory_files(
     files: Sequence[MemoryFileInfo],
     *,
     knowledge_context: str = "",
+    omitted: Sequence[MemoryFileInfo] = (),
+    truncated_paths: Sequence[str] = (),
 ) -> str:
     """把多个 MemoryFileInfo 拼成 memory section 注入文本。
 
-    files 为空返回空串(memory section 会被过滤掉)。
+    files 为空且无 knowledge/manifest 时返回空串。
+    omitted/truncated 生成模型可见 manifest，禁止静默丢弃。
     """
-    if not files and not knowledge_context.strip():
+    if not files and not knowledge_context.strip() and not omitted and not truncated_paths:
         return ""
     chunks: list[str] = [MEMORY_INSTRUCTION_PROMPT]
     for f in files:
@@ -66,7 +69,17 @@ def format_memory_files(
             "\nRetrieved knowledge context (structured knowledge base / RAG):\n\n"
             + knowledge_context.strip()
         )
+    manifest_lines: list[str] = []
+    for f in omitted:
+        manifest_lines.append(f"- omitted ({f.type}): {f.path}")
+    for path in truncated_paths:
+        manifest_lines.append(f"- truncated preview: {path}")
+    if manifest_lines:
+        chunks.append(
+            "\nMemory budget manifest (files not fully injected):\n"
+            + "\n".join(manifest_lines)
+        )
     return "\n".join(chunks)
 
 
-__all__ = ["MEMORY_INSTRUCTION_PROMPT", "format_memory_files"]
+__all__ = ["MEMORY_INSTRUCTION_PROMPT", "format_memory_files", "_TYPE_LABEL"]

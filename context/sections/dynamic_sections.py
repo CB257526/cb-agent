@@ -16,16 +16,42 @@ async def memory_sections(memory_loader: Any, query: str = "") -> list[tuple[str
 
     两部分必须拆开：用户查询变化时，通常只有检索知识变化，不应因此把整份
     AGENT.md、CLAUDE.md 或 MEMORY.md 再写入一次 history。
+
+    Memory 读取失败时抛出异常，由上层 dynamic section 走 error 语义（保留 baseline，
+    不发送 removed），不得伪装成 section absent。
     """
     from .. import memory as _memory_pkg
+    from ..memory.loader import MemoryBudgetError
 
     reset = getattr(memory_loader, "reset_cache", None)
     if callable(reset):
         # 记忆文件可能由工具在运行中修改，每轮构建前重新读取以保证立即生效。
         reset(reason="memory_sections_realtime_reload")
 
-    files = await memory_loader.get_memory_files()
-    instructions = _memory_pkg.format_memory_files(files) if files else ""
+    try:
+        files = await memory_loader.get_memory_files()
+    except MemoryBudgetError:
+        # Managed 装不下：向上抛，阻止本轮请求（不能静默半截 Managed）。
+        raise
+    except Exception as error:
+        # 临时 IO/解析失败：向上抛，让 get_dynamic_context_sections 记为 error。
+        raise RuntimeError(f"memory files load failed: {error}") from error
+
+    report = None
+    get_report = getattr(memory_loader, "get_last_budget_report", None)
+    if callable(get_report):
+        report = get_report()
+    omitted = tuple(report.omitted) if report is not None else ()
+    truncated_paths = (
+        tuple(str(item[0].path) for item in report.truncated)
+        if report is not None
+        else ()
+    )
+    instructions = _memory_pkg.format_memory_files(
+        files,
+        omitted=omitted,
+        truncated_paths=truncated_paths,
+    ) if (files or omitted or truncated_paths) else ""
 
     knowledge = ""
     get_knowledge_context = getattr(memory_loader, "get_knowledge_context", None)

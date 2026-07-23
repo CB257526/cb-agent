@@ -21,6 +21,7 @@ import hashlib
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, List, Optional
 
@@ -47,20 +48,33 @@ logger = logging.getLogger(__name__)
 
 MAX_INCLUDE_DEPTH = 5
 MAX_MEMORY_CHARACTER_COUNT = 40_000
-MAX_FILE_BYTES = 256 * 1024  # 单个文件 256KB 上限
+MAX_FILE_BYTES = 256 * 1024  # 单个文件正文纳入预算的软上限
+# 为扫描 @include 允许读到的硬上限；超过则明确失败，禁止静默截断导致尾部 include 丢失。
+MAX_INCLUDE_SCAN_BYTES = 2 * 1024 * 1024
+
+
+class MemoryBudgetError(RuntimeError):
+    """Managed 指令无法完整纳入预算时抛出，调用方应阻止本次请求。"""
 
 
 def _safe_read_text(path: Path) -> Optional[str]:
-    """读 markdown 文件,失败返回 None。
+    """读 markdown 全文（含 @include 扫描所需内容）。
 
-    限制单文件大小,避免一个超大文件撑爆 system prompt。
+    不再在 include 解析前静默截断 256KB：超大文件要么完整读入（≤2MB），
+    要么返回 None 并打日志，由上层标记失败。正文是否进入 prompt 由预算层决定。
     """
     try:
         raw = path.read_bytes()
     except OSError:
         return None
-    if len(raw) > MAX_FILE_BYTES:
-        raw = raw[:MAX_FILE_BYTES]
+    if len(raw) > MAX_INCLUDE_SCAN_BYTES:
+        logger.error(
+            "memory 文件超过 include 扫描上限 (%s bytes > %s): %s",
+            len(raw),
+            MAX_INCLUDE_SCAN_BYTES,
+            path,
+        )
+        return None
     try:
         return raw.decode("utf-8", errors="replace")
     except Exception:
@@ -194,7 +208,12 @@ class MemoryLoader:
         self.knowledge_namespace = "workspace:" + namespace_digest
         self._knowledge_base = None
         self._knowledge_context_disabled_reason = ""
+        self._last_budget_report: Optional[MemoryBudgetReport] = None
         self._memo = _AsyncMemoize(self._compute_memory_files)
+
+    def get_last_budget_report(self) -> Optional[MemoryBudgetReport]:
+        """最近一次预算裁剪报告（含 omitted/truncated，供 manifest 注入）。"""
+        return self._last_budget_report
 
     async def get_memory_files(self) -> List[MemoryFileInfo]:
         """返回当前会话的 memory 文件列表(已合并、去重、深度受限)。"""
@@ -334,8 +353,11 @@ class MemoryLoader:
         await _add_file(get_short_term_memory_path(self.cwd), "ShortTerm")
         await _add_file(get_local_memory_path(self.cwd), "Local")
 
-        # 总字符数上限保护(对齐 claude-code MAX_MEMORY_CHARACTER_COUNT)
-        return _enforce_total_char_limit(out, self.MAX_MEMORY_CHARACTER_COUNT)
+        # 总字符数上限：按类型优先级，计入 formatter 开销；禁止 Local 挤掉 Managed。
+        budgeted = enforce_memory_budget(out, self.MAX_MEMORY_CHARACTER_COUNT)
+        # omitted/truncated 元数据挂在 loader 上，供 formatter 生成 manifest。
+        self._last_budget_report = budgeted
+        return budgeted.selected
 
 
 async def _process_then_extend(
@@ -348,27 +370,160 @@ async def _process_then_extend(
     sink.extend(chunk)
 
 
-def _enforce_total_char_limit(
+# 数字越小优先级越高。同一 type 内，原列表靠后 = 更靠近 cwd（Project 加载顺序根→cwd）。
+_TYPE_PRIORITY: dict[str, int] = {
+    "Managed": 0,
+    "User": 1,
+    "Global": 1,
+    "Project": 2,
+    "ShortTerm": 3,
+    "Local": 3,
+    "Knowledge": 4,
+}
+
+
+@dataclass
+class MemoryBudgetReport:
+    """一次预算裁剪结果。"""
+
+    selected: List[MemoryFileInfo]
+    omitted: List[MemoryFileInfo]
+    truncated: List[tuple[MemoryFileInfo, str]]  # (原文件, preview 正文)
+    used_chars: int
+    limit: int
+
+
+def _formatter_entry_overhead(path: Path, file_type: str) -> int:
+    """估算 format_memory_files 为单文件追加的标题开销（路径 + 标签 + 换行）。"""
+    from .formatter import _TYPE_LABEL
+
+    label = _TYPE_LABEL.get(file_type, "instructions")  # type: ignore[arg-type]
+    # 与 formatter 模板一致: "\nContents of {path} ({label}):\n\n{content}"
+    return len(f"\nContents of {path} ({label}):\n\n")
+
+
+def _prompt_overhead() -> int:
+    from .formatter import MEMORY_INSTRUCTION_PROMPT
+
+    return len(MEMORY_INSTRUCTION_PROMPT)
+
+
+def enforce_memory_budget(
     files: Iterable[MemoryFileInfo],
     limit: int,
-) -> List[MemoryFileInfo]:
-    """从尾部(优先级高)往头部累加,超过 limit 的尾段被丢弃。
+) -> MemoryBudgetReport:
+    """按固定优先级把 memory 文件装入字符预算。
 
-    保留高优先级 -> Local/Project cwd 文件先纳入预算,远祖目录的可能被截掉。
+    规则：
+    1. Managed 必须完整纳入；装不下则抛 MemoryBudgetError（阻止请求）。
+    2. User/Global 优先完整纳入；装不下则整文件 omitted（禁止无提示截断指令）。
+    3. Project：更靠近 cwd 的优先；装不下则 omitted。
+    4. ShortTerm/Local：可注入有来源的 preview，其余 omitted 并记入 manifest。
+    5. 预算计入 formatter 标题与 MEMORY_INSTRUCTION_PROMPT 开销。
     """
+    from dataclasses import replace
+
     files = list(files)
     if limit <= 0:
-        return files
-    total = 0
-    keep_from_tail: List[MemoryFileInfo] = []
-    for f in reversed(files):
-        size = len(f.content)
-        if total + size > limit and keep_from_tail:
-            break
-        keep_from_tail.append(f)
-        total += size
-    keep_from_tail.reverse()
-    return keep_from_tail
+        return MemoryBudgetReport(selected=files, omitted=[], truncated=[], used_chars=0, limit=limit)
+
+    # 排序键：优先级升序，同优先级保留原相对顺序（Project 靠后 = 更近 cwd 优先用 stable sort 反转索引）
+    indexed = list(enumerate(files))
+    indexed.sort(
+        key=lambda item: (
+            _TYPE_PRIORITY.get(item[1].type, 99),
+            # 同 type 内原列表靠后优先（更靠近 cwd 的 Project）
+            -item[0],
+        )
+    )
+
+    remaining = max(0, int(limit) - _prompt_overhead())
+    selected_map: dict[int, MemoryFileInfo] = {}
+    omitted: List[MemoryFileInfo] = []
+    truncated: List[tuple[MemoryFileInfo, str]] = []
+
+    for original_index, info in indexed:
+        overhead = _formatter_entry_overhead(info.path, info.type)
+        content = info.content or ""
+        # 单文件正文硬上限：超过则先裁到 preview，指令类仍视为“无法完整纳入”
+        oversized = len(content.encode("utf-8", errors="replace")) > MAX_FILE_BYTES
+        if oversized and info.type in {"Managed", "User", "Global", "Project"}:
+            # 指令文件不允许静默截断：整文件 omitted，Managed 另外走硬错误。
+            if info.type == "Managed":
+                raise MemoryBudgetError(
+                    f"Managed 指令文件过大无法完整注入（>{MAX_FILE_BYTES} bytes）: {info.path}"
+                )
+            omitted.append(info)
+            continue
+
+        if oversized:
+            # ShortTerm/Local：落 preview
+            preview = content[: max(0, min(len(content), remaining - overhead - 80))]
+            preview = (
+                preview
+                + f"\n\n... [文件超过 {MAX_FILE_BYTES} bytes，已省略后续；完整内容见 {info.path}] ..."
+            )
+            cost = overhead + len(preview)
+            if cost > remaining and selected_map:
+                omitted.append(info)
+                continue
+            selected_map[original_index] = replace(info, content=preview)
+            truncated.append((info, preview))
+            remaining = max(0, remaining - cost)
+            continue
+
+        cost = overhead + len(content)
+        if cost <= remaining:
+            selected_map[original_index] = info
+            remaining -= cost
+            continue
+
+        # 装不下
+        if info.type == "Managed":
+            raise MemoryBudgetError(
+                f"Managed 指令无法完整纳入 {limit} 字符预算: {info.path} "
+                f"(need={cost}, remaining={remaining})。请拆分 Managed 指令后重试。"
+            )
+        if info.type in {"User", "Global", "Project"}:
+            omitted.append(info)
+            continue
+        # ShortTerm/Local：有预算则 preview，否则 omit
+        if remaining <= overhead + 64:
+            omitted.append(info)
+            continue
+        body_budget = remaining - overhead - 80
+        if body_budget <= 0:
+            omitted.append(info)
+            continue
+        preview = content[:body_budget] + (
+            f"\n\n... [预算不足已截断 preview；完整文件: {info.path}] ..."
+        )
+        selected_map[original_index] = replace(info, content=preview)
+        truncated.append((info, preview))
+        remaining = max(0, remaining - (overhead + len(preview)))
+
+    # 按原加载顺序输出 selected，保持 Prompt 结构稳定
+    selected = [selected_map[i] for i in sorted(selected_map)]
+    used = limit - remaining if limit > 0 else 0
+    # used 重算为实际选中内容 + 开销
+    used = _prompt_overhead()
+    for f in selected:
+        used += _formatter_entry_overhead(f.path, f.type) + len(f.content or "")
+    return MemoryBudgetReport(
+        selected=selected,
+        omitted=omitted,
+        truncated=truncated,
+        used_chars=used,
+        limit=limit,
+    )
 
 
-__all__ = ["MemoryLoader", "MAX_INCLUDE_DEPTH", "MAX_MEMORY_CHARACTER_COUNT"]
+__all__ = [
+    "MemoryLoader",
+    "MemoryBudgetError",
+    "MemoryBudgetReport",
+    "MAX_INCLUDE_DEPTH",
+    "MAX_MEMORY_CHARACTER_COUNT",
+    "MAX_FILE_BYTES",
+    "enforce_memory_budget",
+]
