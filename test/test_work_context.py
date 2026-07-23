@@ -113,7 +113,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertEqual(line["messages"][2]["tool_call_id"], "call_1")
 
             restored = LocalSessionStore(root)
-            history = restored.load_latest_history(max_messages=20)
+            history = restored.load_latest_history()
             self.assertEqual(len(history), 4)
             self.assertEqual(history[1].tool_calls[0]["id"], "call_1")
             self.assertEqual(history[2].tool_call_id, "call_1")
@@ -134,10 +134,9 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
 
             restored = LocalSessionStore(root)
             full_history = restored.load_latest_history()
-            limited_history = restored.load_latest_history(max_messages=12)
 
+            # 生产路径永远恢复完整 active history，不再提供 max_messages 裁剪。
             self.assertEqual(len(full_history), 16)
-            self.assertEqual(len(limited_history), 12)
             text = "\n".join(str(m.content) for m in full_history)
             self.assertIn("问题 0", text)
             self.assertIn("回答 7", text)
@@ -180,7 +179,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertTrue((store.active_dir / "pending_user.json").exists())
 
             restored = LocalSessionStore(root)
-            history = restored.load_latest_history(max_messages=20)
+            history = restored.load_latest_history()
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("上一轮", text)
             self.assertIn("回完", text)
@@ -192,7 +191,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                 committed_messages=[_user("尚未回答"), _assistant("刚回")],
             )
             self.assertFalse((restored.active_dir / "pending_user.json").exists())
-            final = LocalSessionStore(root).load_latest_history(max_messages=20)
+            final = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(m.content) for m in final)
             self.assertEqual(text.count("尚未回答"), 1)
             self.assertIn("刚回", text)
@@ -205,7 +204,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             store.begin_active_turn(user_query="正在处理")
 
             restored = LocalSessionStore(root)
-            history = restored.load_latest_history(max_messages=20)
+            history = restored.load_latest_history()
             text = "\n".join(str(m.content) for m in history)
 
             self.assertEqual(text.count("正在处理"), 1)
@@ -231,7 +230,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             )
 
             restored = LocalSessionStore(root)
-            history = restored.load_latest_history(max_messages=20)
+            history = restored.load_latest_history()
             roles = [m.role.value if hasattr(m.role, "value") else str(m.role) for m in history]
 
             self.assertEqual(roles, ["user", "assistant", "tool"])
@@ -271,7 +270,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                 ),
             )
 
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
 
             self.assertEqual(
                 [m.role.value if hasattr(m.role, "value") else str(m.role) for m in history],
@@ -310,7 +309,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                 tool_message=_tool("call_done", "file_read", "{\"content\":\"abc\"}"),
             )
 
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
 
             self.assertEqual(len(history), 3)
             self.assertEqual([tc["id"] for tc in history[1].tool_calls], ["call_done"])
@@ -332,7 +331,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             )
 
             self.assertFalse((store.active_dir / "active_turn.jsonl").exists())
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(m.content) for m in history)
             self.assertEqual(text.count("完整问题"), 1)
             self.assertIn("完整回答", text)
@@ -352,7 +351,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             # 残留 active_turn。恢复时应以 transcript 为准，不能把同一轮再追加一次。
             store.begin_active_turn(user_query="已提交问题", turn_id=turn_id)
 
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(m.content) for m in history)
 
             self.assertEqual(text.count("已提交问题"), 1)
@@ -374,7 +373,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             # 模拟 append_turn 写完 transcript 后、清理 active_turn 前崩溃留下的文件。
             active_path.write_text(active_snapshot, encoding="utf-8")
 
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(m.content) for m in history)
             self.assertEqual(text.count("默认 id 问题"), 1)
             self.assertEqual(text.count("默认 id 回答"), 1)
@@ -388,7 +387,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             store.save_pending_user_message("新输入", turn_id="new_turn")
 
             self.assertTrue((store.active_dir / "active_turn.jsonl").exists())
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("新输入", text)
             self.assertIn("旧未完成", text)
@@ -405,7 +404,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             # save_pending_user_message 不应删除旧检查点；这里额外确认内容没有变化。
             self.assertEqual(active_path.read_text(encoding="utf-8"), active_snapshot)
 
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("新输入", text)
             self.assertIn("旧未完成", text)
@@ -423,7 +422,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                 "user_query": "新输入",
             })
 
-            history = LocalSessionStore(root).load_latest_history(max_messages=20)
+            history = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("新输入", text)
             self.assertIn("旧未完成", text)
@@ -456,7 +455,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertIn("继续", active)
             self.assertNotIn("图片下载失败，请重试", active)
 
-            restored = LocalSessionStore(root).load_latest_history(max_messages=20)
+            restored = LocalSessionStore(root).load_latest_history()
             text = "\n".join(str(message.content) for message in restored)
             self.assertIn("图片下载失败，请重试", text)
             self.assertIn("已重新获取图片", text)
@@ -494,7 +493,7 @@ class TestSessionIsolation(unittest.TestCase):
             self.assertEqual(sessions, {first_id, second_id})
 
             store.switch_session(first_id)  # type: ignore[arg-type]
-            history = store.load_latest_history(max_messages=20)
+            history = store.load_latest_history()
             text = "\n".join(str(m.content) for m in history)
             self.assertIn("一号问题", text)
             self.assertNotIn("二号问题", text)
@@ -791,7 +790,7 @@ class TestCompactionPersistence(unittest.TestCase):
             )
 
             restored = LocalSessionStore(root)
-            history = restored.load_latest_history(max_messages=20)
+            history = restored.load_latest_history()
             self.assertEqual(
                 (history[0].metadata or {}).get("kind"),
                 COMPACTION_SUMMARY_KIND,

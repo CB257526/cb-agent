@@ -585,16 +585,6 @@ def _active_turn_started_event(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {}
 
 
-def _trim_restored_history(messages: List[Message], max_messages: int) -> List[Message]:
-    """按恢复窗口裁剪 history，并清理可能出现的孤儿工具消息。"""
-    if max_messages <= 0:
-        return []
-    if len(messages) <= max_messages:
-        return drop_orphan_tool_message_objects(messages)
-
-    return drop_orphan_tool_message_objects(messages[-max_messages:])
-
-
 def _extract_tool_call_name(call: Dict[str, Any]) -> str:
     return str((call.get("function") or {}).get("name") or "")
 
@@ -1279,8 +1269,8 @@ class LocalSessionStore:
             "pending": [],
         }
 
-    def load_latest_history(self, max_messages: Optional[int] = None) -> List[Message]:
-        """从 transcript 恢复最近 history（CC 模式：raw messages 累积）。
+    def load_latest_history(self) -> List[Message]:
+        """从 transcript 恢复完整 active history（不按消息数裁剪）。
 
         新格式：每条 transcript 记录的 ``messages`` 字段是本轮 commit 到 history
         的完整消息列表，含 user / assistant(可带 tool_calls) / role=tool / final
@@ -1295,6 +1285,9 @@ class LocalSessionStore:
 
         旧格式（user_query/final_answer/work_record 三段式）已不再支持；
         破坏性更新已确认，旧目录在启动期清空。
+
+        注意：生产路径永远返回完整可恢复 history。测试若需人为截断，应在
+        测试侧自行切片，并调用 drop_orphan_tool_message_objects 清理协议。
         """
         if not self.active_session_id:
             self.last_transcript_recovery = {
@@ -1377,9 +1370,7 @@ class LocalSessionStore:
 
         if not messages:
             return []
-        if max_messages is None:
-            return drop_orphan_tool_message_objects(messages)
-        return _trim_restored_history(messages, max_messages)
+        return drop_orphan_tool_message_objects(messages)
 
     def _select_transcript_records_after_compact(
         self,

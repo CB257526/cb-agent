@@ -1,28 +1,24 @@
 """消息协议合法化 —— 清理孤儿 tool 消息。
 
 背景:
-- CC 对齐重构后,self.history 累积的是原始协议消息:
+- self.history 累积的是原始协议消息:
   user → assistant(tool_calls=[a,b]) → tool(a) → tool(b) → assistant(final) → ...
-- _build_chat_messages 直接使用当前 active replacement history。
-  显式 max_messages 恢复路径仍可能截断在 assistant(tool_calls) 和它的
-  tool 响应之间,导致切片开头出现"孤儿 tool 消息"——它的父
-  assistant.tool_calls 被切掉了。
+- _build_chat_messages 直接使用当前 active replacement history（全量，不按消息数裁剪）。
+- 存储损坏、外部手工改写 transcript、或恢复层异常时，仍可能出现“孤儿 tool 消息”
+  —— 它的父 assistant.tool_calls 缺失。
 - OpenAI 兼容协议(DeepSeek 等)对此会直接报错:
   "messages with role 'tool' must be a response to a preceding message with
-  'tool_calls'"。跨进程恢复(_trim_restored_history)截断时也有同样风险。
+  'tool_calls'"。
 
 这里的算法对两种载体各提供一份实现:
-- dict 版服务 _build_chat_messages 切片后的 OpenAI dict messages;
-- Message 版服务 work_context 的跨进程 history 恢复。
+- dict 版服务发送前的 OpenAI dict messages;
+- Message 版服务 work_context 跨进程 history 恢复。
 
 判定规则一致:从前往后扫,assistant.tool_calls 声明的 id 进入"已见"集合;
-role=tool 消息只有当它的 tool_call_id 已在集合里才保留,否则丢弃。这样既能
-清掉开头的孤儿,也能防御中间任何配对断裂的 tool 消息。
+role=tool 消息只有当它的 tool_call_id 已在集合里才保留,否则丢弃。
 
-注意:这一层只丢"无父"的 tool 消息,不处理"有父无子"(assistant.tool_calls
-声明了某个 id 但没有对应 tool 响应)。后者在本项目的累积逻辑里不会发生——
-_tool_loop 内 assistant.tool_calls 之后必定 append 全部 tool 响应,而 tool
-响应总在 assistant 之后,window 截断不会留下 assistant 却切掉它后面的 tool。
+注意:这一层是**存储损坏防御**，不是正常窗口截断的补救。正常 active history
+出现孤儿时应记录高等级错误。本层只丢"无父"的 tool 消息,不处理"有父无子"。
 """
 
 from __future__ import annotations
@@ -79,15 +75,19 @@ def drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> int:
     if dropped:
         # 原地替换内容,保持调用方持有的 list 引用不变。
         messages[:] = keep
-        logger.info("drop_orphan_tool_messages: dropped %s orphan tool message(s)", dropped)
+        logger.error(
+            "drop_orphan_tool_messages: dropped %s orphan tool message(s) "
+            "(storage-damage defense; active history should not produce orphans)",
+            dropped,
+        )
     return dropped
 
 
 def drop_orphan_tool_message_objects(messages: List[Message]) -> List[Message]:
     """丢弃孤儿 tool 消息(Message 版)。返回新列表,不修改入参。
 
-    用于 work_context._trim_restored_history:跨进程恢复后按窗口截断 history,
-    同样可能把 assistant.tool_calls 切掉而留下它的 tool 响应。
+    用于 work_context.load_latest_history:跨进程恢复时防御存储损坏，
+    不是消息窗口截断后的补救。
     """
     if not messages:
         return []

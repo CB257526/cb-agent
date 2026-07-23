@@ -1,6 +1,12 @@
 # 跨轮上下文管理重构技术报告 —— 转向 Claude Code 原始消息累积模式
 
 > 2026-07-17 更新：本文记录的是当时的历史实现。文中 local microcompact 已从运行时和测试中移除；当前工具循环保持 append-only，体积控制只依赖工具结果入口硬截断与正式 compact，避免改写请求中段破坏 provider prefix cache。
+>
+> **2026-07-23 清理说明（以代码为准，勿再按下文操作）**：
+> - `history_window` 构造参数与子代理 `history_window=8` 已删除；active history **永不**按消息数裁剪。
+> - `load_latest_history(max_messages=...)` 生产接口与 `_trim_restored_history` 已删除；恢复始终返回完整 history。
+> - hierarchical compact **禁止**未摘要丢最旧消息；`dropped_compact_messages` 已从 compact 返回字段移除。
+> - `session_state` 默认不注入模型；bash 截断先落盘；附件全文进 artifact，请求只带 preview。
 
 ## 概述
 

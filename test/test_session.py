@@ -425,12 +425,10 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_history_window_no_longer_cuts_tool_call_pair(self):
-        """history_window 不再裁剪 active history,工具调用链应完整保留。
+    def test_active_history_keeps_full_tool_call_pair(self):
+        """active history 始终全量保留，工具调用链不得被消息数裁剪。
 
-        构造:第一轮一个 file_read 工具调用 -> 第二轮收尾。即使手动把
-        history_window 调到 2,下一轮也不应按消息数截断,因此 tool 结果仍能
-        在前文找到它的 assistant.tool_calls。
+        构造:第一轮一个 file_read 工具调用 -> 第二轮收尾。第二轮请求里 tool 结果必须仍能在前文找到它的 assistant.tool_calls。
         """
         call_id = "call_orphan_cut"
         original = ConstantLLM.llm_dict.get("fake")
@@ -457,8 +455,6 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             s.chat("读 a.txt")
             # 第一轮后 history:user, assistant(tool_calls), tool, assistant(final)
-            # history_window 只是兼容字段,不再按消息数裁剪 active history。
-            s.history_window = 2
 
             s.chat("继续")
 
@@ -558,8 +554,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_history_window_no_longer_truncates_replacement_history(self):
-        """验证 active replacement history 不再按 history_window 截断。"""
+    def test_replacement_history_is_not_message_count_trimmed(self):
+        """验证 active replacement history 按全量发送，不按消息数截断。"""
         original = ConstantLLM.llm_dict.get("fake")
         try:
             ConstantLLM.llm_dict["fake"] = {
@@ -572,11 +568,10 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
             from core.message import Message
-            # 构造 summary + 6 条尾部消息，history_window=3 也不截断。
+            # 构造 summary + 6 条尾部消息，应全部进入请求。
             for i in range(6):
                 s.history.append(Message.create_user_message(f"tail-{i}"))
             s.history.append(make_summary_message("ANCHOR_SUMMARY", reason="auto"))
-            s.history_window = 3
 
             dicts = s._sliced_history_dicts()
 
@@ -1076,7 +1071,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 s.chat("先读文件再跑长命令")
 
-            restored = LocalSessionStore(root).load_latest_history(max_messages=20)
+            restored = LocalSessionStore(root).load_latest_history()
             visible = [
                 m for m in restored
                 if (m.metadata or {}).get("kind") != "context_update"
@@ -1143,7 +1138,7 @@ class TestAgentSessionBasic(unittest.TestCase):
                 s.chat("提交顺序")
 
             self.assertFalse((store.active_dir / "active_turn.jsonl").exists())
-            restored = LocalSessionStore(root).load_latest_history(max_messages=20)
+            restored = LocalSessionStore(root).load_latest_history()
             restored_text = "\n".join(str(message.content) for message in restored)
             self.assertEqual(restored_text.count("提交顺序"), 1)
             self.assertEqual(restored_text.count("先提交的回答"), 1)

@@ -409,7 +409,6 @@ class AgentSession:
         skill_manager: Optional[SkillManager] = None,
         bash_prompt_provider=None,
         ctx_enabled: bool = True,  #控制整个 GSSC 上下文构建管线是否启用
-        history_window: int = 12,  # Legacy debug knob; active history is no longer window-trimmed.
         session_store: Optional[LocalSessionStore] = None,
         trace_summarizer: Optional[TraceSummarizer] = None,
         message_logger: Optional[MessageLogger] = None,
@@ -442,9 +441,7 @@ class AgentSession:
         self.skill_manager = skill_manager
         self.bash_prompt_provider = bash_prompt_provider
         self.ctx_enabled = ctx_enabled
-        # Legacy debug knob. Active history is now restored and sent in full;
-        # overflow is handled by compact, not by silently trimming messages.
-        self.history_window = history_window
+        # active history 始终全量发送；超窗只通过正式 compact 释放，禁止按消息数裁剪。
         self.session_store = session_store
         # provider usage 到达时用 round_idx 找回同一请求的原始估算，既用于 Context
         # 精确刷新，也用于按 provider/model 校准本地 tokenizer 的系统性偏差。
@@ -504,9 +501,8 @@ class AgentSession:
         self.mcp_status_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self.mcp_background_loader: Optional[Callable[[], Dict[str, Any]]] = None
         logger.info(
-            "AgentSession initialized: ctx_enabled=%s history_window=%s restored_history=%s message_logger=%s",
+            "AgentSession initialized: ctx_enabled=%s restored_history=%s message_logger=%s",
             self.ctx_enabled,
-            self.history_window,
             len(self.history),
             bool(self.message_logger),
         )
@@ -955,8 +951,6 @@ class AgentSession:
             "oversized_latest_turn": retained.oversized_latest_turn,
             "world_state_sections": len(installed_world_state.sections),
             "attempts": model_result.attempts,
-            # dropped_compact_messages 保留兼容字段；hierarchical 路径恒为 0。
-            "dropped_compact_messages": model_result.dropped_messages,
             "compact_strategy": model_result.strategy,
             "summary_requests": model_result.summary_requests,
             "summary_prompt_tokens": model_result.summary_prompt_tokens,
