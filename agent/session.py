@@ -1074,6 +1074,9 @@ class AgentSession:
         # 第一步: 确定性静态 system prompt 段(不参与动态解析)
         static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
         # 第二步：生成具名运行时上下文块，session 会按内容指纹只追加变化项。
+        # 读取异常时沿用现有 baseline（error ≠ absent），不生成 removed 更新。
+        # 首轮无 baseline 时读取失败应跳过该 section 本轮不注入。
+        dynamic_failed = False
         try:
             dynamic_sections = self._run_context_coro(
                 get_dynamic_context_sections(
@@ -1090,8 +1093,11 @@ class AgentSession:
         except Exception:
             logger.exception("dynamic context prompt build failed")
             dynamic_sections = []
+            dynamic_failed = True
 
         # 把 session 自己生成的运行时状态也纳入同一套 section diff。
+        # 注意：dynamic_sections 发生读取异常时已回退为 []；
+        # error 语义由调用方自行决定是否保留 baseline。
         context_sections: List[tuple[str, str]] = list(dynamic_sections)
         if system_instructions and system_instructions.strip():
             context_sections.append(("runtime_instructions", system_instructions.strip()))
@@ -1110,22 +1116,30 @@ class AgentSession:
                 + state_text,
             ))
 
-        # 查询知识和 hook 运行时指令只对当前请求有效，不能成为跨轮 world state。
-        # 其余具名 section 保存实际文本，compact 和重启后都能精确恢复基线。
-        transient_names = {"knowledge", "runtime_instructions"}
+        # 分离持久 section 与 request-only section。
+        # request-only：仅加入本轮请求，不进入 history/transcript/compact baseline。
+        # persistent：进入 history context_update，后续回合可比较 baseline diff。
+        # error 时：状态未知，沿用旧 baseline，不生成变化或删除。
+        request_only_names: frozenset[str] = frozenset(
+            {"knowledge", "runtime_instructions", "session_state", "raw_environment"}
+        )
         persistent_sections: List[tuple[str, str]] = []
-        transient_sections: List[tuple[str, str]] = []
+        request_only_sections: List[tuple[str, str]] = []
         for name, text in context_sections:
-            if name and text and text.strip():
-                item = (str(name), text.strip())
-                if str(name) in transient_names:
-                    transient_sections.append(item)
-                else:
-                    persistent_sections.append(item)
+            if not name or not text or not text.strip():
+                continue
+            key = str(name).strip()
+            item = (key, text.strip())
+            if key in request_only_names:
+                request_only_sections.append(item)
+            else:
+                persistent_sections.append(item)
+        # persistent 部分做 diff，只有变化时才追加 context_update。
+        # request-only 部分无条件追加到本轮请求，但不会更新 baseline。
         current_world_state = WorldStateSnapshot.from_sections(persistent_sections)
         world_diff = current_world_state.diff(self._world_state_baseline)
-        changed_sections = [*world_diff.changed, *transient_sections]
-        removed_sections = world_diff.removed
+        changed_sections = list(world_diff.changed)
+        removed_sections = list(world_diff.removed)
 
         # 组装最终 messages 列表
         messages: List[Dict[str, Any]] = []
@@ -1143,8 +1157,9 @@ class AgentSession:
         # [1..N] 跨轮历史消息(来自前几轮 commit 到 history 的 user/assistant/tool)
         messages.extend(self._sliced_history_dicts())
 
-        # 仅当至少一个块变化或删除时追加 context update。基线等本轮成功提交后更新，
-        # 防止 preflight compact 重建 messages 时误以为新现场已经持久化。
+        # 仅当至少一个块变化或删除时追加 persistent context_update。
+        # 基线等本轮成功提交后更新，防止 preflight compact 重建 messages 时误以为
+        # 新现场已经持久化。
         context_text = (
             _format_context_sections(changed_sections, removed_sections)
             if changed_sections or removed_sections
@@ -1156,6 +1171,17 @@ class AgentSession:
             messages.append({
                 "role": "user",
                 "content": _format_context_update_text(context_text),
+            })
+
+        # request-only 部分无条件追加（不在 history 中跨轮累积）。
+        # 每个请求独立注入，上一轮的 request-only 不会留在下一轮的 history 前缀中。
+        # 这会在 durable history 尾部产生缓存断点，但避免了 request-only 内容
+        # 无限累积、过早触发 compact。
+        if request_only_sections:
+            request_text = _format_context_sections(request_only_sections, [])
+            messages.append({
+                "role": "user",
+                "content": _format_context_update_text(request_text),
             })
 
         # [final] 当前用户输入

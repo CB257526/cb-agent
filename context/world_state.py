@@ -1,9 +1,46 @@
-"""模型可见运行现场的持久化快照与增量比较。"""
+"""模型可见运行现场的持久化快照与增量比较。
+
+DynamicSectionResult 提供读取三元组：present（成功且存在）/ absent（确认不存在）/
+error（读取失败）。读取失败应保留 baseline 旧值，不能生成 removed 更新。
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
+
+
+@dataclass(frozen=True)
+class DynamicSectionResult:
+    """动态 section 的完整读取结果。
+
+    status:
+      - present: 读取成功且内容存在
+      - absent:  读取成功但确认不存在（如可选 section 无内容）
+      - error:   读取失败，不会生成 removed 更新
+
+    persistence:
+      - persistent:   进入 history context_update，后续回合可比较 baseline diff
+      - request_only: 仅加入本轮请求，不进入 history、transcript 或 compact baseline
+    """
+
+    name: str
+    status: Literal["present", "absent", "error"] = "present"
+    text: str = ""
+    error: str = ""
+    persistence: Literal["persistent", "request_only"] = "persistent"
+
+    @classmethod
+    def present(cls, name: str, text: str, *, persistence: str = "persistent") -> "DynamicSectionResult":
+        return cls(name=name, status="present", text=str(text or "").strip(), persistence=persistence)
+
+    @classmethod
+    def absent(cls, name: str) -> "DynamicSectionResult":
+        return cls(name=name, status="absent", persistence="persistent")
+
+    @classmethod
+    def error_result(cls, name: str, error: str = "") -> "DynamicSectionResult":
+        return cls(name=name, status="error", error=str(error or ""), persistence="persistent")
 
 
 @dataclass(frozen=True)
@@ -66,4 +103,9 @@ class WorldStateSnapshot:
 EMPTY_WORLD_STATE = WorldStateSnapshot(sections={})
 
 
-__all__ = ["EMPTY_WORLD_STATE", "WorldStateDiff", "WorldStateSnapshot"]
+__all__ = [
+    "DynamicSectionResult",
+    "EMPTY_WORLD_STATE",
+    "WorldStateDiff",
+    "WorldStateSnapshot",
+]

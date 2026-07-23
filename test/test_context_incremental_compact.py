@@ -117,6 +117,7 @@ def _context_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def test_world_state_diff_only_emits_changed_and_removed_sections():
+    """knowledge/request-only 单独一条 context_update，不参与 persistent diff。"""
     current = [("environment", "ENV-A"), ("knowledge", "KNOWLEDGE-A")]
 
     async def dynamic_sections(**_kwargs):
@@ -125,20 +126,28 @@ def test_world_state_diff_only_emits_changed_and_removed_sections():
     session = _session()
     with patch("agent.session.get_dynamic_context_sections", new=dynamic_sections):
         first = session._build_chat_messages(user_content="first", system_instructions="")
-        assert "ENV-A" in _context_messages(first)[0]["content"]
-        assert "KNOWLEDGE-A" in _context_messages(first)[0]["content"]
+        ctx_msgs = _context_messages(first)
+        # persistent 与 request-only 分两条：ENV 在前，knowledge 在后。
+        assert len(ctx_msgs) == 2
+        assert "ENV-A" in ctx_msgs[0]["content"]
+        assert "KNOWLEDGE-A" in ctx_msgs[1]["content"]
+        assert "KNOWLEDGE-A" not in ctx_msgs[0]["content"]
 
         session._world_state_baseline = session._pending_world_state
         second = session._build_chat_messages(user_content="second", system_instructions="")
-        # knowledge 与查询绑定，即使稳定也必须作为本轮临时上下文重新出现。
-        assert "KNOWLEDGE-A" in _context_messages(second)[0]["content"]
-        assert "ENV-A" not in _context_messages(second)[0]["content"]
+        ctx_msgs2 = _context_messages(second)
+        # ENV 不变 → 无 persistent 更新；knowledge 仍作为唯一 request-only 消息出现。
+        assert len(ctx_msgs2) == 1
+        assert "ENV-A" not in ctx_msgs2[0]["content"]
+        assert "KNOWLEDGE-A" in ctx_msgs2[0]["content"]
 
         current[:] = [("environment", "ENV-B")]
         third = session._build_chat_messages(user_content="third", system_instructions="")
-        update = _context_messages(third)[0]["content"]
-        assert "ENV-B" in update
-        assert "KNOWLEDGE-A" not in update
+        ctx_msgs3 = _context_messages(third)
+        # knowledge 已从 current 移除，只剩 ENV-B 的 persistent 更新。
+        assert len(ctx_msgs3) == 1
+        assert "ENV-B" in ctx_msgs3[0]["content"]
+        assert "KNOWLEDGE-A" not in ctx_msgs3[0]["content"]
 
 
 def test_restart_recovers_actual_world_state_snapshot():
