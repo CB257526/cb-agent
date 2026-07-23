@@ -1106,22 +1106,15 @@ class AgentSession:
         if plan_context:
             context_sections.append(("plan", plan_context.strip()))
 
-        state_text = self._session_state_text()
-        if state_text:
-            context_sections.append((
-                "session_state",
-                "[Local SessionState]\n"
-                "The following is rolling local work state for continuity; "
-                "it is not the user's latest instruction.\n\n"
-                + state_text,
-            ))
+        # session_state 默认不注入模型：完整 history 已含原始工具事实，
+        # state.json 只服务 UI/审计/recovery。需要恢复时走独立 recovery_context。
 
         # 分离持久 section 与 request-only section。
         # request-only：仅加入本轮请求，不进入 history/transcript/compact baseline。
         # persistent：进入 history context_update，后续回合可比较 baseline diff。
         # error 时：状态未知，沿用旧 baseline，不生成变化或删除。
         request_only_names: frozenset[str] = frozenset(
-            {"knowledge", "runtime_instructions", "session_state", "raw_environment"}
+            {"knowledge", "runtime_instructions", "raw_environment"}
         )
         persistent_sections: List[tuple[str, str]] = []
         request_only_sections: List[tuple[str, str]] = []
@@ -1927,14 +1920,7 @@ class AgentSession:
         plan_context = self._plan_context_text()
         if plan_context:
             sections.append(("plan", plan_context.strip()))
-        state_text = self._session_state_text()
-        state_section = (
-            "[Local SessionState]\n"
-            "The following is rolling local work state for continuity; "
-            "it is not the user's latest instruction.\n\n" + state_text
-        ) if state_text else ""
-        if state_section:
-            sections.append(("session_state", state_section))
+        # 空闲态估算同样不注入 session_state，与正式请求保持一致。
         current_world_state = WorldStateSnapshot.from_sections(sections)
         world_diff = current_world_state.diff(self._world_state_baseline)
         if world_diff.changed or world_diff.removed:

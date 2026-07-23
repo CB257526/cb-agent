@@ -171,9 +171,11 @@ def test_restart_recovers_actual_world_state_snapshot():
                 system_instructions="",
             )
             updates = _context_messages(request)
-            # 第一条来自已提交历史；第二条反映上一轮结束后 state.json 新增的当前任务。
-            assert len(updates) == 2
-            assert "当前任务：first-question" in updates[-1]["content"]
+            # 重启后只恢复 history 里已提交的 persistent context_update；
+            # session_state 默认不再注入模型，因此不会出现“当前任务”第二段。
+            assert len(updates) == 1
+            assert "STABLE-ENV" in updates[0]["content"]
+            assert "当前任务：first-question" not in updates[0]["content"]
 
 
 def test_structured_compact_request_keeps_protocol_messages_and_appends_prompt():
