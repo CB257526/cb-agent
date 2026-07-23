@@ -1,8 +1,11 @@
 """Codex 风格的本地上下文压缩核心。
 
 压缩请求始终使用结构化消息历史，并在末尾追加一条交接摘要指令。这里不把历史
-序列化为文本，也不提前构造旧式摘要输入切片；只有请求确实装不进当前模型窗口
-时，才从最旧的协议完整段开始移除。
+序列化为文本，也不提前构造旧式摘要输入切片。
+
+当单次摘要请求装不进 hard limit 时，按 user 回合协议段做 hierarchical
+map/reduce：每条 source 消息至少进入一次摘要请求；命中预算上限则整体失败，
+禁止未摘要丢弃最旧消息。
 """
 
 from __future__ import annotations
@@ -73,14 +76,28 @@ def _validated_summary_from_response(response: Any) -> str:
     return summary
 
 
+class CompactionBudgetExceeded(CompactionError):
+    """hierarchical compact 命中 chunk/请求/token 硬上限时抛出。
+
+    上层必须保持 history / compact 快照 / world state 完全不变。
+    """
+
+
 @dataclass(frozen=True)
 class CompactionModelResult:
-    """一次结构化摘要请求的结果。"""
+    """一次结构化摘要（single-pass 或 hierarchical map/reduce）的结果。"""
 
     summary: str
     attempts: int
     request_messages: list[dict[str, Any]]
-    dropped_messages: int
+    # 旧字段保留兼容；hierarchical 路径不再丢弃未摘要消息，恒为 0。
+    dropped_messages: int = 0
+    strategy: str = "single_pass"
+    summary_requests: int = 0
+    summary_prompt_tokens: int = 0
+    summary_output_tokens: int = 0
+    source_message_count: int = 0
+    covered_message_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -276,42 +293,6 @@ def _flatten(units: Sequence[Sequence[Message]]) -> list[Message]:
     return [message for unit in units for message in unit]
 
 
-def _shrink_largest_message_content(units: list[list[Message]]) -> bool:
-    """把当前请求中最大的文本正文缩短一半，并保持协议外壳不变。"""
-
-    largest: tuple[int, int, Optional[int], str] | None = None
-    for unit_index, unit in enumerate(units):
-        for message_index, message in enumerate(unit):
-            content = message.content
-            candidates: list[tuple[Optional[int], str]] = []
-            if isinstance(content, str):
-                candidates.append((None, content))
-            elif isinstance(content, list):
-                for part_index, part in enumerate(content):
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        candidates.append((part_index, str(part.get("text") or "")))
-            for part_index, text in candidates:
-                if len(text) <= 1:
-                    continue
-                if largest is None or len(text) > len(largest[3]):
-                    largest = (unit_index, message_index, part_index, text)
-    if largest is None:
-        return False
-    unit_index, message_index, part_index, content = largest
-    cloned = copy.deepcopy(units[unit_index][message_index])
-    shortened = content[: max(1, len(content) // 2)].rstrip() + "…"
-    if part_index is None:
-        cloned.content = shortened
-    else:
-        cloned_parts = list(cloned.content) if isinstance(cloned.content, list) else []
-        cloned_part = dict(cloned_parts[part_index])
-        cloned_part["text"] = shortened
-        cloned_parts[part_index] = cloned_part
-        cloned.content = cloned_parts
-    units[unit_index][message_index] = cloned
-    return True
-
-
 def _is_context_overflow_error(error: BaseException) -> bool:
     """保守识别 OpenAI-compatible provider 的上下文超限错误。"""
 
@@ -326,6 +307,150 @@ def _is_context_overflow_error(error: BaseException) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _default_compaction_budgets(
+    hard_limit_tokens: int,
+    *,
+    max_output_tokens: int,
+) -> dict[str, int]:
+    """hierarchical compact 的默认硬上限（可被调用方覆盖）。"""
+
+    hard = max(1, int(hard_limit_tokens))
+    out = max(1, int(max_output_tokens))
+    return {
+        "max_chunks": 8,
+        "max_summary_requests": 12,
+        "max_total_prompt_tokens": 4 * hard,
+        "max_total_completion_tokens": min(64 * 1024, 4 * out),
+    }
+
+
+def _build_summary_request_messages(
+    *,
+    system_message: Optional[dict[str, Any]],
+    history_messages: Sequence[Message],
+) -> list[dict[str, Any]]:
+    """构造一次摘要请求：可选 system + 结构化历史 + 交接指令。"""
+
+    request_messages: list[dict[str, Any]] = []
+    if system_message:
+        request_messages.append(dict(system_message))
+    request_messages.extend(message.to_dict() for message in history_messages)
+    request_messages.append({"role": "user", "content": SUMMARIZATION_PROMPT})
+    return request_messages
+
+
+def _response_usage_tokens(response: Any) -> tuple[int, int]:
+    """从 provider usage 提取 prompt/completion tokens；缺失时返回 (0, 0)。"""
+
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0, 0
+    prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion = int(getattr(usage, "completion_tokens", 0) or 0)
+    return max(0, prompt), max(0, completion)
+
+
+def _pack_units_into_chunks(
+    units: Sequence[Sequence[Message]],
+    *,
+    system_message: Optional[dict[str, Any]],
+    hard_limit_tokens: int,
+    estimate_request_tokens: Callable[[list[dict[str, Any]]], int],
+) -> list[list[list[Message]]]:
+    """把协议段尽量装入不超过 hard limit 的 chunk，保持 tool 配对完整。"""
+
+    limit = max(1, int(hard_limit_tokens))
+    chunks: list[list[list[Message]]] = []
+    current: list[list[Message]] = []
+
+    def _fits(candidate_units: Sequence[Sequence[Message]]) -> bool:
+        request = _build_summary_request_messages(
+            system_message=system_message,
+            history_messages=_flatten(candidate_units),
+        )
+        return estimate_request_tokens(request) <= limit
+
+    for unit in units:
+        unit_list = [list(unit)]
+        if not current:
+            if not _fits(unit_list):
+                raise CompactionError(
+                    "单条协议段超过摘要模型窗口，无法无丢失压缩；"
+                    "请创建新会话或换更大上下文窗口的模型"
+                )
+            current = unit_list
+            continue
+        candidate = [*current, list(unit)]
+        if _fits(candidate):
+            current = candidate
+        else:
+            chunks.append(current)
+            if not _fits(unit_list):
+                raise CompactionError(
+                    "单条协议段超过摘要模型窗口，无法无丢失压缩；"
+                    "请创建新会话或换更大上下文窗口的模型"
+                )
+            current = unit_list
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+class _CompactionBudgetTracker:
+    """跟踪 hierarchical compact 的请求次数与累计 token 预算。"""
+
+    def __init__(self, budgets: dict[str, int]) -> None:
+        self.max_chunks = int(budgets["max_chunks"])
+        self.max_summary_requests = int(budgets["max_summary_requests"])
+        self.max_total_prompt_tokens = int(budgets["max_total_prompt_tokens"])
+        self.max_total_completion_tokens = int(budgets["max_total_completion_tokens"])
+        self.summary_requests = 0
+        self.summary_prompt_tokens = 0
+        self.summary_output_tokens = 0
+        self.chunks_used = 0
+
+    def ensure_room_for_request(self, estimated_prompt_tokens: int) -> None:
+        if self.summary_requests + 1 > self.max_summary_requests:
+            raise CompactionBudgetExceeded(
+                f"compact 请求次数超过上限 ({self.max_summary_requests})"
+            )
+        if self.summary_prompt_tokens + max(0, estimated_prompt_tokens) > self.max_total_prompt_tokens:
+            raise CompactionBudgetExceeded(
+                f"compact 累计 prompt tokens 超过上限 ({self.max_total_prompt_tokens})"
+            )
+
+    def note_chunks(self, chunk_count: int) -> None:
+        self.chunks_used += max(0, int(chunk_count))
+        if self.chunks_used > self.max_chunks:
+            raise CompactionBudgetExceeded(
+                f"compact chunk 数超过上限 ({self.max_chunks})"
+            )
+
+    def settle(
+        self,
+        *,
+        estimated_prompt_tokens: int,
+        usage_prompt: int,
+        usage_completion: int,
+        estimated_completion_tokens: int,
+    ) -> None:
+        prompt = usage_prompt if usage_prompt > 0 else max(0, estimated_prompt_tokens)
+        completion = (
+            usage_completion if usage_completion > 0 else max(0, estimated_completion_tokens)
+        )
+        self.summary_requests += 1
+        self.summary_prompt_tokens += prompt
+        self.summary_output_tokens += completion
+        if self.summary_prompt_tokens > self.max_total_prompt_tokens:
+            raise CompactionBudgetExceeded(
+                f"compact 累计 prompt tokens 超过上限 ({self.max_total_prompt_tokens})"
+            )
+        if self.summary_output_tokens > self.max_total_completion_tokens:
+            raise CompactionBudgetExceeded(
+                f"compact 累计 completion tokens 超过上限 ({self.max_total_completion_tokens})"
+            )
+
+
 def run_local_compaction(
     *,
     llm: Any,
@@ -333,37 +458,44 @@ def run_local_compaction(
     history: Sequence[Message],
     hard_limit_tokens: int,
     estimate_request_tokens: Callable[[list[dict[str, Any]]], int],
+    budgets: Optional[dict[str, int]] = None,
 ) -> CompactionModelResult:
-    """执行 Codex 风格的结构化本地摘要，并在超窗时移除最旧协议段。"""
+    """执行 Codex 风格结构化摘要；超窗时无丢失分段 map/reduce。
+
+    正常路径优先 single-pass。只有摘要输入装不进 hard limit 时才启用 hierarchical：
+    按 user 回合协议段切 chunk → 局部 handoff → reduce 到唯一最终摘要。
+
+    不变量：source history 中每条消息至少进入一次真正发出的摘要请求；
+    命中预算上限时抛 CompactionBudgetExceeded，不返回局部 handoff。
+    """
 
     client = getattr(llm, "client", None)
     model = getattr(llm, "model", None)
     if client is None or not model:
         raise CompactionError("当前模型没有可用的非流式客户端")
 
-    units = _history_units(history)
-    dropped_messages = 0
-    attempts = 0
-    while True:
-        active_history = _flatten(units)
-        request_messages: list[dict[str, Any]] = []
-        if system_message:
-            request_messages.append(dict(system_message))
-        request_messages.extend(message.to_dict() for message in active_history)
-        request_messages.append({"role": "user", "content": SUMMARIZATION_PROMPT})
+    source_messages = list(history)
+    source_count = len(source_messages)
+    if source_count == 0:
+        raise CompactionError("没有可压缩的历史消息")
 
-        if estimate_request_tokens(request_messages) > max(1, int(hard_limit_tokens)):
-            if len(units) > 1:
-                removed = units.pop(0)
-                dropped_messages += len(removed)
-                continue
-            # 单个用户回合或工具结果就可能超过窗口。此时保留角色、tool_call_id
-            # 和调用配对，只逐步缩短最大的正文，直到请求能够交给摘要模型。
-            if not _shrink_largest_message_content(units):
-                raise CompactionError("压缩请求即使缩短超大消息后仍超过模型窗口")
-            continue
+    hard_limit = max(1, int(hard_limit_tokens))
+    max_output = int(getattr(llm, "max_output_tokens", 16 * 1024) or 16 * 1024)
+    tracker = _CompactionBudgetTracker(
+        {**_default_compaction_budgets(hard_limit, max_output_tokens=max_output), **(budgets or {})}
+    )
+    covered_ids: set[int] = set()
+    last_request: list[dict[str, Any]] = []
 
-        attempts += 1
+    def _mark_covered(messages: Sequence[Message]) -> None:
+        for message in messages:
+            covered_ids.add(id(message))
+
+    def _call_summary(request_messages: list[dict[str, Any]]) -> str:
+        nonlocal last_request
+        estimated_prompt = max(0, int(estimate_request_tokens(request_messages)))
+        tracker.ensure_room_for_request(estimated_prompt)
+        last_request = list(request_messages)
         request_kwargs: dict[str, Any] = {
             "model": model,
             "stream": False,
@@ -375,30 +507,110 @@ def run_local_compaction(
         else:
             output_param = str(getattr(llm, "output_token_param", "max_tokens") or "max_tokens")
             if output_param != "none":
-                request_kwargs[output_param] = int(getattr(llm, "max_output_tokens", 16 * 1024))
+                request_kwargs[output_param] = max_output
         try:
             response = client.chat.completions.create(**request_kwargs)
         except Exception as error:
             if _is_context_overflow_error(error):
-                if len(units) > 1:
-                    removed = units.pop(0)
-                    dropped_messages += len(removed)
-                    continue
-                if _shrink_largest_message_content(units):
-                    continue
+                raise CompactionError(
+                    "摘要请求超过模型窗口，且无法在不丢消息的前提下继续压缩"
+                ) from error
             raise CompactionError(f"本地压缩请求失败: {error}") from error
+        usage_prompt, usage_completion = _response_usage_tokens(response)
+        # provider 不返回 usage 时，completion 用输出上限的保守估算结算。
+        tracker.settle(
+            estimated_prompt_tokens=estimated_prompt,
+            usage_prompt=usage_prompt,
+            usage_completion=usage_completion,
+            estimated_completion_tokens=max_output if usage_completion <= 0 else usage_completion,
+        )
+        return _validated_summary_from_response(response)
 
-        summary = _validated_summary_from_response(response)
+    def _result(summary: str, *, strategy: str) -> CompactionModelResult:
+        covered = min(source_count, len(covered_ids))
+        if covered < source_count:
+            raise CompactionError(
+                f"compact 覆盖不完整: covered={covered} source={source_count}"
+            )
         return CompactionModelResult(
             summary=summary,
-            attempts=attempts,
-            request_messages=request_messages,
-            dropped_messages=dropped_messages,
+            attempts=tracker.summary_requests,
+            request_messages=last_request,
+            dropped_messages=0,
+            strategy=strategy,
+            summary_requests=tracker.summary_requests,
+            summary_prompt_tokens=tracker.summary_prompt_tokens,
+            summary_output_tokens=tracker.summary_output_tokens,
+            source_message_count=source_count,
+            covered_message_count=covered,
         )
+
+    units = _history_units(source_messages)
+    single_request = _build_summary_request_messages(
+        system_message=system_message,
+        history_messages=source_messages,
+    )
+    # 仅本地估算的初始 single-pass 探测不计 summary_requests。
+    if estimate_request_tokens(single_request) <= hard_limit:
+        _mark_covered(source_messages)
+        summary = _call_summary(single_request)
+        return _result(summary, strategy="single_pass")
+
+    # ---- hierarchical map/reduce ----
+    # 工作队列元素：要么是原始协议段 list[Message]，要么是已生成的局部 summary Message。
+    work_units: list[list[Message]] = [list(unit) for unit in units]
+    while True:
+        if not work_units:
+            raise CompactionError("hierarchical compact 工作队列为空")
+        probe = _build_summary_request_messages(
+            system_message=system_message,
+            history_messages=_flatten(work_units),
+        )
+        if estimate_request_tokens(probe) <= hard_limit:
+            for unit in work_units:
+                _mark_covered(unit)
+            summary = _call_summary(probe)
+            return _result(summary, strategy="hierarchical")
+
+        chunks = _pack_units_into_chunks(
+            work_units,
+            system_message=system_message,
+            hard_limit_tokens=hard_limit,
+            estimate_request_tokens=estimate_request_tokens,
+        )
+        if len(chunks) <= 1:
+            # 装不进但仍是一整块：单段本身超窗（已在 pack 中校验）或估算抖动。
+            raise CompactionError(
+                "历史无法拆成可摘要的多个 chunk，且单次请求超过 hard limit"
+            )
+        tracker.note_chunks(len(chunks))
+        next_units: list[list[Message]] = []
+        for chunk in chunks:
+            chunk_messages = _flatten(chunk)
+            _mark_covered(chunk_messages)
+            request = _build_summary_request_messages(
+                system_message=system_message,
+                history_messages=chunk_messages,
+            )
+            partial = _call_summary(request)
+            # 中间层 handoff 不用最终 SUMMARY_PREFIX（过长会导致 reduce 再次超窗）。
+            # 最终返回的是纯文本 summary，由 session 侧 make_summary_message 包装。
+            next_units.append([
+                Message(
+                    role=MessageRole.USER,
+                    content=f"[hierarchical partial handoff]\n{partial}",
+                    metadata={
+                        "kind": COMPACTION_SUMMARY_KIND,
+                        "reason": "hierarchical_map",
+                    },
+                )
+            ])
+        work_units = next_units
 
 
 __all__ = [
     "COMPACTION_SUMMARY_KIND",
+    "CompactionBudgetExceeded",
     "CompactionError",
     "CompactionModelResult",
     "RetainedHistory",

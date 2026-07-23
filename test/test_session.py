@@ -658,8 +658,8 @@ class TestAgentSessionBasic(unittest.TestCase):
     def test_preflight_auto_compact_when_full_request_exceeds_budget(self):
         """验证 preflight 只在完整请求超过安全上下文预算时触发 compact。
 
-        场景：模型窗口 20000，默认输出预留 4000，动态 soft limit 为 12800，
-        注入 16500 × "word " 让 request_tokens 超过 soft limit，然后发 chat。
+        场景：模型窗口 20000，默认输出预留 4000，动态 soft limit 为 12800。
+        注入多条可装入 hard limit 的中等消息，合计超过 soft limit。
 
         预期行为：
         - chat 正常返回 "ok"（compact 成功释放空间后继续）
@@ -680,8 +680,12 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             from core.message import Message
 
-            # 注入大量文本让 request_tokens 超过 context_budget
-            s.history.append(Message.create_user_message("word " * 16500))
+            # 多条中等 user/assistant 回合：合计超 soft limit，但单段不超 hard limit。
+            # 单条超大用户消息会按无丢失策略直接失败，不再静默缩短正文。
+            chunk = "word " * 2200
+            for idx in range(4):
+                s.history.append(Message.create_user_message(f"turn-{idx} {chunk}"))
+                s.history.append(Message.create_assistant_message(f"reply-{idx} {chunk}"))
             answer = s.chat("continue")
 
             self.assertEqual(answer, "ok")
