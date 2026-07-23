@@ -158,11 +158,18 @@ class TestMultimodalInput(unittest.TestCase):
                     processor=FakeProcessor(),
                 )
 
-        convert.assert_called_once()
-        self.assertIn("# Note", str(prompt.request_content))
-        self.assertIn("# Note", prompt.history_text)
-        self.assertEqual(prompt.attachments[0].modality, "text")
-        self.assertEqual(prompt.attachments[0].routed_as, "markdown")
+            convert.assert_called_once()
+            self.assertIn("# Note", str(prompt.request_content))
+            # history 含 preview/manifest，完整正文在 artifact
+            self.assertIn("# Note", prompt.history_text)
+            self.assertEqual(prompt.attachments[0].modality, "text")
+            self.assertEqual(prompt.attachments[0].routed_as, "markdown")
+            self.assertTrue(prompt.attachments[0].artifact_path)
+            self.assertTrue(Path(prompt.attachments[0].artifact_path).exists())
+            self.assertEqual(
+                Path(prompt.attachments[0].artifact_path).read_text(encoding="utf-8"),
+                "# Note\n\nhello",
+            )
 
     def test_document_attachment_uses_markdown_route(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -181,11 +188,59 @@ class TestMultimodalInput(unittest.TestCase):
                     processor=FakeProcessor(),
                 )
 
-        convert.assert_called_once()
-        self.assertIn("# Paper", str(prompt.request_content))
-        self.assertIn("# Paper", prompt.history_text)
-        self.assertEqual(prompt.attachments[0].modality, "document")
-        self.assertEqual(prompt.attachments[0].routed_as, "markdown")
+            convert.assert_called_once()
+            self.assertIn("# Paper", str(prompt.request_content))
+            self.assertIn("# Paper", prompt.history_text)
+            self.assertEqual(prompt.attachments[0].modality, "document")
+            self.assertEqual(prompt.attachments[0].routed_as, "markdown")
+            self.assertTrue(prompt.attachments[0].artifact_path)
+
+    def test_large_document_persists_artifact_history_keeps_preview_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "huge.md"
+            tail = "TAIL-MARKER-UNIQUE"
+            body = ("HEAD\n" + ("x" * 200_000) + "\n" + tail)
+            path.write_text(body, encoding="utf-8")
+            prompt = process_multimodal_prompt(
+                text="读附件",
+                attachments=[{"path": str(path)}],
+                model="text-test",
+                cwd=Path(td),
+                soft_limit_tokens=8_000,
+            )
+            art = prompt.attachments[0].artifact_path
+            self.assertTrue(art)
+            full = Path(art).read_text(encoding="utf-8")
+            self.assertIn(tail, full)
+            self.assertEqual(len(full), len(body))
+            # history / request 不得包含整份 200K 正文
+            self.assertLess(len(prompt.history_text), 50_000)
+            self.assertNotIn(tail, prompt.history_text)
+            self.assertIn("artifact=", prompt.history_text)
+            req = str(prompt.request_content)
+            self.assertIn("artifact=", req)
+            self.assertIn("file_read", req)
+
+    def test_multi_attachment_preview_respects_aggregate_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            paths = []
+            for i in range(3):
+                p = Path(td) / f"a{i}.txt"
+                p.write_text(("B" * 20_000) + f"END{i}", encoding="utf-8")
+                paths.append(p)
+            prompt = process_multimodal_prompt(
+                text="x",
+                attachments=[{"path": str(p)} for p in paths],
+                model="text-test",
+                cwd=Path(td),
+                soft_limit_tokens=2_000,  # 很小 → 聚合 preview 有界
+            )
+            total_preview = sum(a.preview_chars for a in prompt.attachments)
+            self.assertLessEqual(total_preview, 20_000)
+            # 每个附件都有 artifact
+            for a in prompt.attachments:
+                self.assertTrue(a.artifact_path)
+                self.assertGreater(a.full_chars, a.preview_chars)
 
     def test_sanitize_replaces_data_uri_without_mutating_original(self) -> None:
         original = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abcdef"}}]

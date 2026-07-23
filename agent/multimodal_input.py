@@ -23,7 +23,11 @@ from utils.multimodal import MultimodalProcessor
 IMAGE_MIME_MAP = MultimodalProcessor.IMAGE_MIME_MAP
 AUDIO_MIME_MAP = MultimodalProcessor.AUDIO_MIME_MAP
 DEFAULT_ATTACHMENT_MAX_MB = 20
-DEFAULT_ATTACHMENT_TEXT_MAX_CHARS = 120_000
+# 兼容旧 env 名：现表示「所有附件 preview 合计」字符预算，而非单文件 120K 整文注入。
+DEFAULT_ATTACHMENT_TEXT_MAX_CHARS = 24_000
+DEFAULT_ATTACHMENT_PREVIEW_MIN_CHARS = 2_000
+DEFAULT_ATTACHMENT_PREVIEW_MAX_CHARS = 48_000
+DEFAULT_ATTACHMENT_SOFT_LIMIT_RATIO = 0.08
 TEXT_ATTACHMENT_EXTENSIONS = {
     ".txt",
     ".md",
@@ -86,8 +90,11 @@ class ProcessedAttachment:
     size: int
     content_hash: str
     source: str = "direct"
-    text: str = ""
+    text: str = ""  # 模型可见 preview 或 OCR/ASR 摘要；不是完整正文
     routed_as: str = "text"
+    artifact_path: str = ""  # 完整 Markdown/转录 artifact；空表示未落盘
+    full_chars: int = 0
+    preview_chars: int = 0
 
 
 @dataclass
@@ -135,6 +142,7 @@ def process_multimodal_prompt(
     cwd: Optional[Path] = None,
     processor: Optional[MultimodalProcessor] = None,
     history_text: Optional[str] = None,
+    soft_limit_tokens: Optional[int] = None,
 ) -> ProcessedMultimodalPrompt:
     """把用户文本和附件转换成“请求内容 + 跨轮摘要”。
 
@@ -142,9 +150,9 @@ def process_multimodal_prompt(
     transcript、compact 和 context_window_usage 使用。二者分开可以避免 data URI
     被长期保存或参与动态上下文估算。
 
-    ``history_text`` 参数用于通讯软件这类入口：当前轮请求需要带上平台来源头部，
-    方便模型知道消息来自 QQ/微信群；但长期会话恢复只应保留用户真正说的话。
-    这里让调用方传入“干净落盘文本”，附件仍只处理一次，避免重复 OCR/ASR。
+    文本/文档附件：完整 Markdown 写入
+    ``.cbagent/attachments/<content_hash>/content.md``；请求与 history 只注入
+    manifest + 聚合预算内的 preview，不再整文 120K 注入。
     """
     clean_text = str(text or "").strip()
     clean_history_text = str(history_text if history_text is not None else clean_text).strip()
@@ -171,6 +179,11 @@ def process_multimodal_prompt(
     if clean_history_text:
         history_lines.append(clean_history_text)
 
+    aggregate_budget = _attachment_aggregate_budget_chars(
+        soft_limit_tokens=soft_limit_tokens,
+        user_text_chars=len(clean_text),
+    )
+    remaining_preview = aggregate_budget
     attachment_notes: List[str] = []
     for idx, item in enumerate(raw_attachments, start=1):
         attachment = _process_one_attachment(
@@ -181,7 +194,9 @@ def process_multimodal_prompt(
             image_native=image_native,
             request_parts=request_parts,
             attachment_notes=attachment_notes,
+            remaining_preview_budget=remaining_preview,
         )
+        remaining_preview = max(0, remaining_preview - max(0, attachment.preview_chars))
         processed.append(attachment)
         history_lines.extend(_history_lines_for_attachment(idx, attachment))
 
@@ -212,6 +227,7 @@ def _process_one_attachment(
     image_native: bool,
     request_parts: List[Dict[str, Any]],
     attachment_notes: List[str],
+    remaining_preview_budget: int,
 ) -> ProcessedAttachment:
     if not isinstance(item, dict):
         raise MultimodalInputError(f"附件 #{index} 必须是对象。")
@@ -239,9 +255,11 @@ def _process_one_attachment(
         request_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
         base.text = "图片已原生发送给支持视觉输入的模型。"
         base.routed_as = "image_url"
+        base.full_chars = 0
+        base.preview_chars = 0
         attachment_notes.append(
             f"[附件 #{index}: image {path.name}] 图片将作为视觉输入发送给模型；"
-            "跨轮历史只保留此摘要。"
+            "跨轮历史只保留此摘要，base64 不会进入 history/transcript。"
         )
         return base
 
@@ -252,9 +270,22 @@ def _process_one_attachment(
             raise MultimodalInputError(
                 f"图片附件 {path.name} OCR/视觉描述失败，请检查 OCR_API_KEY/OCR_BASE_URL 配置。"
             )
-        request_parts.append({"type": "text", "text": f"[附件 #{index}: image {path.name}]\n{text}"})
-        base.text = text
+        artifact = _persist_text_artifact(cwd, content_hash, text, kind="ocr")
+        preview = _clip_preview(text, remaining_preview_budget)
+        block = _manifest_block(
+            index=index,
+            attachment=base,
+            artifact_path=artifact,
+            full_chars=len(text),
+            preview=preview,
+            modality_label="image/ocr",
+        )
+        request_parts.append({"type": "text", "text": block})
+        base.text = preview
         base.routed_as = "ocr"
+        base.artifact_path = artifact
+        base.full_chars = len(text)
+        base.preview_chars = len(preview)
         return base
 
     if modality == "audio":
@@ -264,18 +295,43 @@ def _process_one_attachment(
             raise MultimodalInputError(
                 f"音频附件 {path.name} ASR 转录失败，请检查 ASR_API_KEY/ASR_BASE_URL 配置。"
             )
-        request_parts.append({"type": "text", "text": f"[附件 #{index}: audio {path.name}]\n{text}"})
-        base.text = text
+        artifact = _persist_text_artifact(cwd, content_hash, text, kind="asr")
+        preview = _clip_preview(text, remaining_preview_budget)
+        block = _manifest_block(
+            index=index,
+            attachment=base,
+            artifact_path=artifact,
+            full_chars=len(text),
+            preview=preview,
+            modality_label="audio/asr",
+        )
+        request_parts.append({"type": "text", "text": block})
+        base.text = preview
         base.routed_as = "asr"
+        base.artifact_path = artifact
+        base.full_chars = len(text)
+        base.preview_chars = len(preview)
         return base
 
     markdown = _convert_attachment_to_markdown(path, modality=modality)
-    markdown = _limit_attachment_text(markdown, path.name)
     if not markdown.strip():
         raise MultimodalInputError(f"附件 {path.name} 转换为 Markdown 后没有可用文本。")
-    request_parts.append({"type": "text", "text": f"[附件 #{index}: {modality} {path.name}]\n{markdown}"})
-    base.text = markdown
+    artifact = _persist_text_artifact(cwd, content_hash, markdown, kind="markdown")
+    preview = _clip_preview(markdown, remaining_preview_budget)
+    block = _manifest_block(
+        index=index,
+        attachment=base,
+        artifact_path=artifact,
+        full_chars=len(markdown),
+        preview=preview,
+        modality_label=modality,
+    )
+    request_parts.append({"type": "text", "text": block})
+    base.text = preview
     base.routed_as = "markdown"
+    base.artifact_path = artifact
+    base.full_chars = len(markdown)
+    base.preview_chars = len(preview)
     return base
 
 
@@ -386,19 +442,96 @@ def _read_text_attachment(path: Path) -> str:
     return data.decode("utf-8", errors="replace").strip()
 
 
-def _limit_attachment_text(text: str, file_name: str) -> str:
+def _attachment_aggregate_budget_chars(
+    *,
+    soft_limit_tokens: Optional[int],
+    user_text_chars: int,
+) -> int:
+    """所有附件 preview 合计字符预算。
+
+    优先用 soft_limit 的比例，再夹在 min/max 与 env 默认之间，并扣掉当前用户文字。
+    """
     raw = os.getenv("CBAGENT_ATTACHMENT_TEXT_MAX_CHARS")
     try:
-        limit = int(raw) if raw else DEFAULT_ATTACHMENT_TEXT_MAX_CHARS
+        env_default = int(raw) if raw else DEFAULT_ATTACHMENT_TEXT_MAX_CHARS
     except ValueError:
-        limit = DEFAULT_ATTACHMENT_TEXT_MAX_CHARS
-    limit = max(1000, limit)
-    if len(text) <= limit:
+        env_default = DEFAULT_ATTACHMENT_TEXT_MAX_CHARS
+    env_default = max(DEFAULT_ATTACHMENT_PREVIEW_MIN_CHARS, env_default)
+
+    if soft_limit_tokens and soft_limit_tokens > 0:
+        # 粗略 1 token ≈ 4 chars；附件预算 = soft_limit 的 8%。
+        ratio_budget = int(soft_limit_tokens * 4 * DEFAULT_ATTACHMENT_SOFT_LIMIT_RATIO)
+        budget = max(
+            DEFAULT_ATTACHMENT_PREVIEW_MIN_CHARS,
+            min(DEFAULT_ATTACHMENT_PREVIEW_MAX_CHARS, ratio_budget, env_default),
+        )
+    else:
+        budget = min(DEFAULT_ATTACHMENT_PREVIEW_MAX_CHARS, env_default)
+
+    # 用户正文先占用一部分预算，避免附件把当前输入顶爆。
+    return max(DEFAULT_ATTACHMENT_PREVIEW_MIN_CHARS // 2, budget - max(0, user_text_chars))
+
+
+def _persist_text_artifact(cwd: Path, content_hash: str, text: str, *, kind: str) -> str:
+    """把完整转换文本写入 .cbagent/attachments/<hash>/content.md。"""
+    root = Path(cwd).resolve() / ".cbagent" / "attachments" / content_hash
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / "content.md"
+        path.write_text(text, encoding="utf-8", errors="replace")
+        meta = root / "meta.txt"
+        meta.write_text(f"kind={kind}\nchars={len(text)}\n", encoding="utf-8")
+        return str(path.resolve())
+    except OSError as error:
+        raise MultimodalInputError(
+            f"附件 artifact 落盘失败（hash={content_hash}）：{error}"
+        ) from error
+
+
+def _clip_preview(text: str, budget: int) -> str:
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
         return text
-    return (
-        text[:limit].rstrip()
-        + f"\n\n[附件 {file_name} 的 Markdown 文本超过 {limit} 字符，已截断。]"
-    )
+    return text[:budget].rstrip()
+
+
+def _manifest_block(
+    *,
+    index: int,
+    attachment: ProcessedAttachment,
+    artifact_path: str,
+    full_chars: int,
+    preview: str,
+    modality_label: str,
+) -> str:
+    lines = [
+        f"[附件 #{index}: {modality_label} {attachment.file_name}]",
+        f"path={attachment.path}",
+        f"hash={attachment.content_hash}",
+        f"size_bytes={attachment.size}",
+        f"full_chars={full_chars}",
+        f"artifact={artifact_path}",
+        f"preview_chars={len(preview)}",
+        (
+            f"续读: file_read(path={artifact_path!r}, head=100) "
+            "或 start_line/end_line / start_char/end_char / start_byte/end_byte"
+        ),
+    ]
+    if preview:
+        lines.append("")
+        lines.append(preview)
+        if len(preview) < full_chars:
+            lines.append("")
+            lines.append(
+                f"... [preview 已截断；完整内容见 artifact，共 {full_chars} 字符] ..."
+            )
+    else:
+        lines.append("")
+        lines.append(
+            f"... [聚合 preview 预算已用尽；完整内容见 artifact，共 {full_chars} 字符] ..."
+        )
+    return "\n".join(lines)
 
 
 def _normal_source(value: Any) -> str:
@@ -415,14 +548,20 @@ def _sanitize_data_uri(value: str) -> str:
 
 
 def _history_lines_for_attachment(index: int, item: ProcessedAttachment) -> List[str]:
+    """history 只保留 manifest + 短 preview，不保存完整 Markdown 正文。"""
     header = (
         f"[附件摘要 #{index}] modality={item.modality} file={item.file_name} "
         f"source={item.source} routed_as={item.routed_as} "
         f"size={item.size} hash={item.content_hash}"
     )
+    if item.artifact_path:
+        header += f" artifact={item.artifact_path} full_chars={item.full_chars}"
+    lines = [header]
     if item.text:
-        return [header, item.text]
-    return [header]
+        # history 再限一次，避免 OCR/ASR 过长
+        preview = item.text if len(item.text) <= 2000 else item.text[:2000] + "…"
+        lines.append(preview)
+    return lines
 
 
 __all__ = [
