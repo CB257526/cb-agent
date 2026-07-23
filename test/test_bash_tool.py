@@ -610,6 +610,91 @@ class TestFileRead(unittest.TestCase):
         res = json.loads(FileReadTool().run({"path": "/no/such/file"}))
         self.assertIn("error", res)
 
+    def test_head_has_more_and_continuation(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.txt"
+            p.write_text("\n".join(f"line{i}" for i in range(20)))
+            res = json.loads(FileReadTool().run({"path": str(p), "head": 5}))
+            self.assertTrue(res["has_more"])
+            self.assertEqual(res["next_start_line"], 6)
+            self.assertIsNone(res.get("total_lines"))
+            self.assertEqual(res["file_size_bytes"], p.stat().st_size)
+
+            page2 = json.loads(FileReadTool().run({
+                "path": str(p), "start_line": res["next_start_line"], "end_line": 10,
+            }))
+            self.assertIn("line5", page2["content"])
+            self.assertIn("line9", page2["content"])
+            self.assertNotIn("line4", page2["content"])
+            self.assertTrue(page2["has_more"])
+            self.assertEqual(page2["next_start_line"], 11)
+
+    def test_byte_range_pages_without_overlap(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "bin.txt"
+            body = ("你好" * 100) + "MARKER" + ("世界" * 100)
+            raw = body.encode("utf-8")
+            p.write_bytes(raw)
+            # 第一页从 0 开始
+            page1 = json.loads(FileReadTool().run({
+                "path": str(p), "start_byte": 0, "end_byte": 80,
+            }))
+            self.assertEqual(page1["mode"].startswith("byte_range-"), True)
+            self.assertIn("byte_range", page1)
+            cursor = page1["next_start_byte"]
+            self.assertIsNotNone(cursor)
+            page2 = json.loads(FileReadTool().run({
+                "path": str(p), "start_byte": cursor,
+            }))
+            # 两页拼接应覆盖 MARKER（可能跨页）
+            joined = page1["content"] + page2["content"]
+            self.assertIn("MARKER", joined)
+
+    def test_head_does_not_materialize_full_line_list(self):
+        """head 只迭代所需行；用受控 file wrapper 统计 readline 次数。"""
+        import tools.tools.file_read_tool as fr_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "big.txt"
+            p.write_text("\n".join(f"L{i}" for i in range(5000)))
+
+            real_open = Path.open
+            reads = {"n": 0}
+
+            class CountingFile:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __iter__(self):
+                    for line in self._inner:
+                        reads["n"] += 1
+                        yield line
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return self._inner.__exit__(*a)
+
+                def readline(self, *a, **k):
+                    reads["n"] += 1
+                    return self._inner.readline(*a, **k)
+
+            def fake_open(self, *a, **k):
+                return CountingFile(real_open(self, *a, **k))
+
+            original = Path.open
+            try:
+                Path.open = fake_open  # type: ignore[method-assign]
+                res = json.loads(FileReadTool().run({"path": str(p), "head": 10}))
+            finally:
+                Path.open = original  # type: ignore[method-assign]
+
+            self.assertEqual(res["returned_lines"], 10)
+            # 读够 10 行后还应再读 1 行以判断 has_more，绝不应接近 5000。
+            self.assertLessEqual(reads["n"], 20)
+            self.assertTrue(res["has_more"])
+
 
 class TestBackground(unittest.TestCase):
 
