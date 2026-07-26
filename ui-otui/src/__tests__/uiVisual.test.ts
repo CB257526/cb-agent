@@ -269,7 +269,7 @@ describe("OTUI 视觉帧", () => {
       toolArgs: { patch: "更新主题" },
       toolResult: JSON.stringify({
         __display__: "修改成功",
-        diff: "--- a/theme.ts\n+++ b/theme.ts\n-old\n+new",
+        diff: "--- a/theme.ts\n+++ b/theme.ts\n@@ -1,1 +1,1 @@\n-old\n+new",
       }),
       toolDone: true,
       toolDuration: 0.42,

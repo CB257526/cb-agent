@@ -122,6 +122,40 @@ class TestMultimodalInput(unittest.TestCase):
         self.assertIn("图像 OCR 文本", prompt.history_text)
         self.assertEqual(prompt.attachments[0].routed_as, "ocr")
 
+    def test_active_model_image_ability_overrides_duplicate_model_id_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "shot.png"
+            path.write_bytes(b"png bytes")
+            processor = FakeProcessor()
+            prompt = process_multimodal_prompt(
+                text="识别图片",
+                attachments=[{"path": str(path)}],
+                model="mm-test",
+                image_ability=False,
+                cwd=Path(td),
+                processor=processor,
+            )
+        self.assertEqual(prompt.attachments[0].routed_as, "ocr")
+        self.assertEqual(len(processor.images), 1)
+
+    def test_native_images_respect_aggregate_visual_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "shot.png"
+            path.write_bytes(b"png bytes")
+            with patch(
+                "agent.multimodal_input._estimate_native_image_tokens",
+                return_value=10_000,
+            ):
+                with self.assertRaisesRegex(MultimodalInputError, "视觉预算超限"):
+                    process_multimodal_prompt(
+                        text="看图",
+                        attachments=[{"path": str(path)}],
+                        model="mm-test",
+                        image_ability=True,
+                        soft_limit_tokens=20_000,
+                        cwd=Path(td),
+                    )
+
     def test_audio_always_uses_asr_text(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "voice.mp3"

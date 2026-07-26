@@ -137,10 +137,8 @@ exports[`OTUI 视觉帧 展开工具使用树状输入输出和差异 1`] = `
 • ⌄ apply_patch  patch="更新主题"  ✓ 0.42s
     │ IN   更新主题
     │ OUT  修改成功
-    └ DIFF --- a/theme.ts
-           +++ b/theme.ts
-           -old
-           +new"
+     1 - old
+     1 + new"
 `;
 
 exports[`OTUI 视觉帧 活动问询停靠在输入框上方 1`] = `

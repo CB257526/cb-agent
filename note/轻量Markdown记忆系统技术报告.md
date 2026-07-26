@@ -1,6 +1,6 @@
 # Markdown 记忆与指令预算技术报告
 
-> 更新于 2026-07-23。对应 `context/memory/*`、`context/sections/dynamic_sections.py`。
+> 更新于 2026-07-26。对应 `context/memory/*`、`context/sections/dynamic_sections.py`。
 
 ## 1. 分层文件（实际加载顺序）
 
@@ -21,7 +21,7 @@
 | 本轮检索知识 | `knowledge` | request_only |
 
 每轮构建前 `reset_cache(reason=memory_sections_realtime_reload)`，保证文件修改尽快可见。  
-读取失败 → 向上抛错，由 dynamic section **error** 语义处理（不发 removed）。  
+读取失败 → 抛出 `MemoryReadError`，由 dynamic section **error** 语义处理（不发 removed）。文件明明存在却打不开时，禁止返回空内容并伪装 absent。
 `MemoryBudgetError`（Managed 装不下）→ **阻止本轮请求**，禁止半截 Managed。
 
 ## 3. 严格预算 `enforce_memory_budget`
@@ -36,7 +36,9 @@
 单文件：
 
 - `MAX_FILE_BYTES`（256KB）约束“是否完整进 prompt”的策略，**不再**在 `@include` 解析前静默截断。
-- include 扫描硬上限 `MAX_INCLUDE_SCAN_BYTES`（2MB）；超过则读失败并打日志，避免尾部 include 静默消失。
+- include 扫描硬上限 `MAX_INCLUDE_SCAN_BYTES`（2MB）；超过则抛 `MemoryReadError`，避免尾部 include 静默消失。
+
+首轮没有可沿用的 `instructions` baseline 时，`MemoryReadError` 会一路阻止模型请求；已有 baseline 时保留旧值并记录 error，下一次成功读取后再产生正常 diff。
 
 ## 4. Formatter
 

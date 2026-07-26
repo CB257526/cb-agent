@@ -187,6 +187,28 @@ def _persist_full_result(
         return None
 
 
+def _build_persistence_failure_payload(
+    *,
+    tool_name: str,
+    total_chars: int,
+    total_tokens: int,
+    total_bytes: int,
+    scope: str,
+) -> str:
+    """构造明确失败结果，不把不可恢复的截断 preview 伪装成成功输出。"""
+    return json.dumps({
+        "error": "工具结果超过模型可见上限，且完整内容持久化失败；本次结果不可用。",
+        "result_cap_persist_failed": True,
+        "truncated": True,
+        "scope": scope,
+        "tool_name": tool_name,
+        "total_chars": total_chars,
+        "total_tokens": total_tokens,
+        "total_bytes": total_bytes,
+        "hint": "请检查 .cbagent 目录写权限后重新执行工具，不能依赖本条不完整结果。",
+    }, ensure_ascii=False)
+
+
 def _build_truncated_payload(
     result: str,
     tool_name: str,
@@ -271,12 +293,15 @@ def cap_single_result(
     # 正常超限：持久化 + 替换为 preview
     persisted_path = _persist_full_result(result, call_id, persist_dir)
     if persisted_path is None:
-        # 持久化失败时仍必须遵守模型可见预算，退化为 token/字节双限内联截断。
-        truncated = _truncate_inline(
-            result,
-            f"\n...[超过 {MAX_SINGLE_RESULT_TOKENS} token 上限已截断，持久化失败]",
+        tokens, size_bytes = _result_size(result)
+        failed = _build_persistence_failure_payload(
+            tool_name=tool_name,
+            total_chars=len(result),
+            total_tokens=tokens,
+            total_bytes=size_bytes,
+            scope="single",
         )
-        return truncated, False
+        return failed, False
 
     payload = _build_truncated_payload(result, tool_name, persisted_path)
     logger.info(
@@ -338,12 +363,16 @@ def cap_batch_results(
             # 其它工具维持现有语义：全文落盘，模型只接收稳定的头尾 preview。
             persisted_path = _persist_full_result(current, r.call_id, persist_dir)
             if persisted_path is None:
-                new_result = _truncate_inline(
-                    current,
-                    f"\n...[批量结果超过 {MAX_BATCH_RESULT_TOKENS} token 上限，已截断]",
-                    max_tokens=MAX_SINGLE_RESULT_TOKENS // 4,
-                    max_bytes=MAX_SINGLE_RESULT_BYTES // 4,
+                current_tokens, current_bytes = _result_size(current)
+                new_result = _build_persistence_failure_payload(
+                    tool_name=r.name,
+                    total_chars=len(current),
+                    total_tokens=current_tokens,
+                    total_bytes=current_bytes,
+                    scope="batch",
                 )
+                if hasattr(r, "is_error"):
+                    r.is_error = True
             else:
                 new_result = _build_truncated_payload(current, r.name, persisted_path)
                 logger.info(

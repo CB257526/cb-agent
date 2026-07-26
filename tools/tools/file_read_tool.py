@@ -220,42 +220,49 @@ class FileReadTool(Tool):
         lines: List[str] = []
         has_more = False
         next_start_line: Optional[int] = None
+        chars_before_line = 0
         with path.open("r", encoding="utf-8", errors="replace", newline="") as fp:
             for line_no, raw in enumerate(fp, start=1):
                 if line_no > n:
                     has_more = True
                     next_start_line = line_no
                     break
-                lines.append(self._strip_newline(raw))
-                content_so_far = "\n".join(lines)
-                if self._utf8_len(content_so_far) > MAX_OUTPUT_BYTES:
-                    content, _ = self._truncate_to_output_limit(content_so_far)
-                    # 预算截断后从下一行续读；若本行已是最后请求行，再 peek 文件是否还有内容。
-                    has_more = True
-                    next_start_line = line_no + 1
+                line_text = self._strip_newline(raw)
+                candidate = "\n".join([*lines, line_text])
+                if self._utf8_len(candidate) > MAX_OUTPUT_BYTES:
+                    if not lines:
+                        # 单行本身超限时必须切换到字符游标；返回下一行会永久跳过本行尾部。
+                        payload = self._read_char_range(
+                            path,
+                            chars_before_line + 1,
+                            None,
+                            file_size,
+                        )
+                        payload["mode"] = f"head-{n}"
+                        payload["start_line"] = line_no
+                        payload["end_line"] = line_no
+                        return payload
                     return self._line_payload(
                         mode=f"head-{n}",
-                        content=content,
+                        content="\n".join(lines),
                         returned_lines=len(lines),
                         has_more=True,
-                        next_start_line=next_start_line,
+                        next_start_line=line_no,
                         truncated=True,
                         start_line=1,
-                        end_line=line_no,
+                        end_line=line_no - 1,
                     )
+                lines.append(line_text)
+                chars_before_line += len(raw)
 
         content = "\n".join(lines)
-        content, truncated = self._truncate_to_output_limit(content)
-        if truncated:
-            has_more = True
-            next_start_line = (len(lines) + 1) if lines else 1
         return self._line_payload(
             mode=f"head-{n}",
             content=content,
             returned_lines=len(lines),
             has_more=has_more,
             next_start_line=next_start_line if has_more else None,
-            truncated=truncated,
+            truncated=False,
             start_line=1 if lines else None,
             end_line=len(lines) if lines else None,
         )
@@ -273,31 +280,43 @@ class FileReadTool(Tool):
         has_more = False
         next_start_line: Optional[int] = None
         last_line_no = 0
+        chars_before_line = 0
         with path.open("r", encoding="utf-8", errors="replace", newline="") as fp:
             for line_no, raw in enumerate(fp, start=1):
                 last_line_no = line_no
                 if line_no < s:
+                    chars_before_line += len(raw)
                     continue
                 if e is not None and line_no > e:
                     has_more = True
                     next_start_line = line_no
                     break
-                lines.append(self._strip_newline(raw))
-                content_so_far = "\n".join(lines)
-                if self._utf8_len(content_so_far) > MAX_OUTPUT_BYTES:
-                    content, _ = self._truncate_to_output_limit(content_so_far)
-                    has_more = True
-                    next_start_line = line_no + 1
+                line_text = self._strip_newline(raw)
+                candidate = "\n".join([*lines, line_text])
+                if self._utf8_len(candidate) > MAX_OUTPUT_BYTES:
+                    if not lines:
+                        payload = self._read_char_range(
+                            path,
+                            chars_before_line + 1,
+                            None,
+                            file_size,
+                        )
+                        payload["mode"] = f"range-{s}-{e if e is not None else 'eof'}"
+                        payload["start_line"] = line_no
+                        payload["end_line"] = line_no
+                        return payload
                     return self._line_payload(
                         mode=f"range-{s}-{e if e is not None else 'eof'}",
-                        content=content,
+                        content="\n".join(lines),
                         returned_lines=len(lines),
                         has_more=True,
-                        next_start_line=next_start_line,
+                        next_start_line=line_no,
                         truncated=True,
                         start_line=s,
-                        end_line=line_no,
+                        end_line=line_no - 1,
                     )
+                lines.append(line_text)
+                chars_before_line += len(raw)
             else:
                 # 到 EOF
                 if e is not None and last_line_no >= e:
@@ -312,10 +331,6 @@ class FileReadTool(Tool):
         # 若未指定 end 且读到 EOF：has_more=False
         # 若 break 因为 line_no > e：已设 has_more
         content = "\n".join(lines)
-        content, truncated = self._truncate_to_output_limit(content)
-        if truncated and not has_more:
-            has_more = True
-            next_start_line = (s + len(lines)) if lines else s
         mode_end = e if e is not None else (s + len(lines) - 1 if lines else s)
         return self._line_payload(
             mode=f"range-{s}-{mode_end}",
@@ -323,7 +338,7 @@ class FileReadTool(Tool):
             returned_lines=len(lines),
             has_more=has_more,
             next_start_line=next_start_line,
-            truncated=truncated,
+            truncated=False,
             start_line=s if lines else None,
             end_line=(s + len(lines) - 1) if lines else None,
         )
@@ -413,11 +428,12 @@ class FileReadTool(Tool):
                 if reached_end:
                     break
 
-        content = "".join(out_chars)
-        content, truncated = self._truncate_to_output_limit(content)
-        actual_end = cs + len(out_chars) - 1 if out_chars else cs - 1
-        # 循环内若因 ce/预算提前 break 已设置 has_more；此处只补预算二次截断。
-        if truncated and not has_more:
+        source_content = "".join(out_chars)
+        content, truncated, retained_chars = self._truncate_prefix_with_source_count(
+            source_content
+        )
+        actual_end = cs + retained_chars - 1 if retained_chars else cs - 1
+        if truncated:
             has_more = True
             next_start_char = actual_end + 1
         if not has_more:
@@ -429,6 +445,7 @@ class FileReadTool(Tool):
             "content": content,
             "returned_lines": len(content.splitlines()) if content else 0,
             "returned_chars": len(content),
+            "source_chars_returned": retained_chars,
             "char_range": [cs, max(cs, actual_end)] if out_chars else [cs, cs - 1],
             "truncated": truncated,
             "has_more": has_more,
@@ -476,13 +493,9 @@ class FileReadTool(Tool):
                 peek = fp.read(1)
                 more = bool(peek) or (sb + len(data)) < file_size
 
-        content = data.decode("utf-8", errors="replace")
-        content, truncated = self._truncate_to_output_limit(content)
-        consumed = len(data)
+        content, truncated, consumed = self._decode_bytes_with_cursor(data)
         next_byte = sb + consumed
         if truncated:
-            # 截断后 cursor 按实际返回内容的近似字节
-            next_byte = sb + len(content.encode("utf-8", errors="replace"))
             more = True
         has_more = more or truncated
         if next_byte >= file_size:
@@ -593,3 +606,47 @@ class FileReadTool(Tool):
         clipped = encoded[:budget] if budget else b""
         clipped_text = clipped.decode("utf-8", errors="ignore")
         return clipped_text + marker, True
+
+    @staticmethod
+    def _truncate_prefix_with_source_count(content: str) -> Tuple[str, bool, int]:
+        """按字节预算截断字符串，并返回真正展示的源字符数。
+
+        continuation cursor 只能计算源内容，不能把本地追加的截断提示算进去。
+        """
+        encoded = content.encode("utf-8", errors="replace")
+        if len(encoded) <= MAX_OUTPUT_BYTES:
+            return content, False, len(content)
+        marker = (
+            f"\n... [超过 {MAX_OUTPUT_BYTES} 字节已截断，"
+            "可用 start_char/end_char 或 start_byte/end_byte 继续分段读取] ..."
+        )
+        budget = max(0, MAX_OUTPUT_BYTES - len(marker.encode("utf-8")))
+        clipped_text = encoded[:budget].decode("utf-8", errors="ignore")
+        return clipped_text + marker, True, len(clipped_text)
+
+    @staticmethod
+    def _decode_bytes_with_cursor(data: bytes) -> Tuple[str, bool, int]:
+        """把原始字节解码到输出预算内，并返回准确消费的原始字节数。"""
+        decoded = data.decode("utf-8", errors="replace")
+        if len(decoded.encode("utf-8", errors="replace")) <= MAX_OUTPUT_BYTES:
+            return decoded, False, len(data)
+
+        marker = (
+            f"\n... [超过 {MAX_OUTPUT_BYTES} 字节已截断，"
+            "请用 next_start_byte 继续读取] ..."
+        )
+        marker_bytes = len(marker.encode("utf-8"))
+        low, high = 0, len(data)
+        best_text = ""
+        best_bytes = 0
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = data[:middle].decode("utf-8", errors="replace")
+            size = len(candidate.encode("utf-8", errors="replace")) + marker_bytes
+            if size <= MAX_OUTPUT_BYTES:
+                best_text = candidate
+                best_bytes = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best_text + marker, True, best_bytes

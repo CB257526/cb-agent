@@ -321,7 +321,13 @@ class ModelConfigManager:
         current_key = current_key or ""
         current_model = current_model or ""
         return [
-            choice.public_dict(current=choice.key == current_key or choice.model_id == current_model)
+            choice.public_dict(
+                current=(
+                    choice.key == current_key
+                    if current_key
+                    else choice.model_id == current_model
+                )
+            )
             for choice in self.choices
         ]
 

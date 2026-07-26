@@ -76,6 +76,24 @@ class TestModelConfigManager(unittest.TestCase):
         keys = [choice.key for choice in manager.choices]
         self.assertEqual(keys, ["openai:gpt-a", "openai-2:gpt-b"])
 
+    def test_duplicate_model_ids_only_mark_active_choice_current(self) -> None:
+        manager = ModelConfigManager.from_provider_dicts(Path("models.json"), [
+            {
+                "name": "Provider A",
+                "models": {"same-model": {"max_tokens": 128_000}},
+            },
+            {
+                "name": "Provider B",
+                "models": {"same-model": {"max_tokens": 1_000_000}},
+            },
+        ])
+        active_key = manager.choices[1].key
+        public = manager.public_models(
+            current_key=active_key,
+            current_model="same-model",
+        )
+        self.assertEqual([item["current"] for item in public], [False, True])
+
     def test_load_accepts_python_literal_booleans(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "models.json"

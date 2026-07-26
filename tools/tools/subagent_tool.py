@@ -639,7 +639,7 @@ class AgentTaskTool(Tool):
         if action is None:
             return "缺少必填参数 action"
         if not isinstance(action, str):
-            return f"action 必须是字符串，实际类型: {type(action).__name__}"
+            return f"参数无效：action 必须是字符串，实际类型: {type(action).__name__}"
         if action not in allowed:
             return f"action 非法: {action!r}，可选值: {', '.join(sorted(allowed))}"
 

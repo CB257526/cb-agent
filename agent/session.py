@@ -34,7 +34,6 @@ import copy
 import json
 import logging
 import math
-import re
 import threading
 import time
 import uuid
@@ -88,7 +87,7 @@ from context import (
     get_dynamic_context_sections,
     get_static_system_prompt,
 )
-from context.world_state import EMPTY_WORLD_STATE, WorldStateSnapshot
+from context.world_state import DynamicSectionResult, EMPTY_WORLD_STATE, WorldStateSnapshot
 from core.message import Message, MessageRole
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
@@ -253,28 +252,6 @@ def _format_context_sections(
     for name in removed_sections:
         parts.append(f'<context-section name="{name}" state="removed" />')
     return "\n\n".join(parts)
-
-
-def _strip_plan_sections_from_context_update(content: Any) -> Any:
-    """Remove persisted Plan Mode sections from historical context updates.
-
-    PlanStateStore is the source of truth for pending/approved plans and is
-    injected fresh every turn. Keeping old plan sections in active history would
-    duplicate the plan once per turn after full-history restore.
-    """
-    if not isinstance(content, str) or "[Plan Mode " not in content:
-        return content
-    text = content
-    for header in ("Plan Mode Instructions", "Plan Mode State"):
-        text = re.sub(
-            rf"\n?\[{re.escape(header)}\][\s\S]*?(?=\n\n\[[^\]\n]+\]|\n</context-update>|$)",
-            "",
-            text,
-        )
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    if text == "<context-update>\n</context-update>":
-        return ""
-    return text
 
 
 def _make_context_update_message(
@@ -1074,10 +1051,9 @@ class AgentSession:
 
         # 第一步: 确定性静态 system prompt 段(不参与动态解析)
         static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
-        # 第二步：生成具名运行时上下文块，session 会按内容指纹只追加变化项。
-        # 读取异常时沿用现有 baseline（error ≠ absent），不生成 removed 更新。
-        # 首轮无 baseline 时读取失败应跳过该 section 本轮不注入。
-        dynamic_failed = False
+        # 第二步：生成带三态与持久化语义的运行时上下文块。
+        # builder 整体异常时保留全部旧 baseline；不能把未知状态解释成全部删除。
+        dynamic_builder_error: Optional[BaseException] = None
         try:
             dynamic_sections = self._run_context_coro(
                 get_dynamic_context_sections(
@@ -1091,46 +1067,71 @@ class AgentSession:
                     memory_query=memory_query,
                 )
             )
-        except Exception:
+        except Exception as error:
             logger.exception("dynamic context prompt build failed")
             dynamic_sections = []
-            dynamic_failed = True
+            dynamic_builder_error = error
 
-        # 把 session 自己生成的运行时状态也纳入同一套 section diff。
-        # 注意：dynamic_sections 发生读取异常时已回退为 []；
-        # error 语义由调用方自行决定是否保留 baseline。
-        context_sections: List[tuple[str, str]] = list(dynamic_sections)
+        # 把 Session 自己生成的运行时状态纳入同一套显式结果。
+        context_sections: List[DynamicSectionResult] = list(dynamic_sections)
         if system_instructions and system_instructions.strip():
-            context_sections.append(("runtime_instructions", system_instructions.strip()))
+            context_sections.append(DynamicSectionResult.present(
+                "runtime_instructions",
+                system_instructions.strip(),
+                persistence="request_only",
+            ))
 
         plan_context = self._plan_context_text()
         if plan_context:
-            context_sections.append(("plan", plan_context.strip()))
+            context_sections.append(DynamicSectionResult.present("plan", plan_context.strip()))
+        else:
+            context_sections.append(DynamicSectionResult.absent("plan"))
 
         # session_state 默认不注入模型：完整 history 已含原始工具事实，
         # state.json 只服务 UI/审计/recovery。需要恢复时走独立 recovery_context。
 
-        # 分离持久 section 与 request-only section。
-        # request-only：仅加入本轮请求，不进入 history/transcript/compact baseline。
-        # persistent：进入 history context_update，后续回合可比较 baseline diff。
-        # error 时：状态未知，沿用旧 baseline，不生成变化或删除。
-        request_only_names: frozenset[str] = frozenset(
-            {"knowledge", "runtime_instructions", "raw_environment"}
-        )
-        persistent_sections: List[tuple[str, str]] = []
+        # persistence 是唯一分流依据。persistent 从旧 baseline 副本开始应用三态：
+        # present 覆盖、absent 删除、error 保留；request_only 只进入当前请求。
+        persistent_values = dict(self._world_state_baseline.sections)
         request_only_sections: List[tuple[str, str]] = []
-        for name, text in context_sections:
-            if not name or not text or not text.strip():
+        for section in context_sections:
+            if not isinstance(section, DynamicSectionResult):
+                raise TypeError("动态上下文必须返回 DynamicSectionResult")
+            key = str(section.name or "").strip()
+            if not key:
                 continue
-            key = str(name).strip()
-            item = (key, text.strip())
-            if key in request_only_names:
-                request_only_sections.append(item)
-            else:
-                persistent_sections.append(item)
+            if section.persistence == "request_only":
+                if section.status == "present" and section.text.strip():
+                    request_only_sections.append((key, section.text.strip()))
+                elif section.status == "error":
+                    logger.warning("request-only section 读取失败: name=%s error=%s", key, section.error)
+                continue
+            if section.status == "present" and section.text.strip():
+                persistent_values[key] = section.text.strip()
+            elif section.status == "absent":
+                persistent_values.pop(key, None)
+            elif section.status == "error":
+                logger.warning("persistent section 读取失败，沿用 baseline: name=%s error=%s", key, section.error)
+                if key == "instructions" and key not in self._world_state_baseline.sections:
+                    raise RuntimeError(
+                        "关键 instructions 首次读取失败，已阻止本轮模型请求: "
+                        f"{section.error or 'unknown error'}"
+                    )
+
+        if (
+            dynamic_builder_error is not None
+            and self.ctx_enabled
+            and self.memory_loader is not None
+            and "instructions" not in self._world_state_baseline.sections
+        ):
+            raise RuntimeError(
+                "动态上下文整体构建失败，且没有可沿用的 instructions baseline，"
+                "已阻止本轮模型请求"
+            ) from dynamic_builder_error
+
         # persistent 部分做 diff，只有变化时才追加 context_update。
         # request-only 部分无条件追加到本轮请求，但不会更新 baseline。
-        current_world_state = WorldStateSnapshot.from_sections(persistent_sections)
+        current_world_state = WorldStateSnapshot(sections=persistent_values)
         world_diff = current_world_state.diff(self._world_state_baseline)
         changed_sections = list(world_diff.changed)
         removed_sections = list(world_diff.removed)
@@ -1208,7 +1209,10 @@ class AgentSession:
             raise error
         return result.get("value")
 
-    def _baseline_dynamic_sections(self, enabled_tools: frozenset[str]) -> List[tuple[str, str]]:
+    def _baseline_dynamic_sections(
+        self,
+        enabled_tools: frozenset[str],
+    ) -> List[DynamicSectionResult]:
         """读取不依赖下一条用户输入的动态 sections，供空闲态 Context 估算。"""
         try:
             sections = self._run_context_coro(
@@ -1230,23 +1234,7 @@ class AgentSession:
 
     def _sliced_history_dicts(self) -> List[Dict[str, Any]]:
         """返回当前已经安装的完整 active replacement history。"""
-        dicts: List[Dict[str, Any]] = []
-        for m in self.history:
-            item = m.to_dict()
-            metadata = m.metadata if isinstance(m.metadata, dict) else {}
-            if (
-                isinstance(item, dict)
-                and item.get("role") == "user"
-                and isinstance(item.get("content"), str)
-                and "<context-update>" in item.get("content", "")
-                # 只清理旧版本整块注入的 Plan Mode 文本。新格式具备完整现场快照，
-                # plan section 必须留在 history 中，否则会破坏恢复基线。
-                and WORLD_STATE_SNAPSHOT_KEY not in metadata
-            ):
-                item["content"] = _strip_plan_sections_from_context_update(item.get("content"))
-                if not str(item.get("content") or "").strip():
-                    continue
-            dicts.append(item)
+        dicts = [message.to_dict() for message in self.history]
         drop_orphan_tool_messages(dicts)
         return dicts
 
@@ -1476,11 +1464,18 @@ class AgentSession:
             # 运行时通知只服务本轮模型，不应伪装成用户原话写入 transcript/history。
             else explicit_skill_query
         ) # 从持久化用户文本或用户查询中获取历史文本
+        active_model = getattr(self.llm, "active_model_config", None)
         multimodal_prompt = process_multimodal_prompt(
             text=user_query,
             attachments=attachments,
             model=getattr(self.llm, "model", None),
             history_text=history_source_text,
+            soft_limit_tokens=self._context_limits()["soft_limit_tokens"],
+            image_ability=(
+                bool(active_model.image_ability)
+                if active_model is not None and hasattr(active_model, "image_ability")
+                else None
+            ),
         ) # 处理多模态输入，生成请求内容和历史文本
         request_content = multimodal_prompt.request_content
         history_user_text = multimodal_prompt.history_text
@@ -1659,6 +1654,9 @@ class AgentSession:
             "history_replaced": False,
             "audit_protocol": [],
             "turn_prefix_messages": turn_prefix_messages,
+            # 运行时通知和图片只属于当前请求；mid-turn compact 后要重新挂回请求，
+            # 但绝不能进入摘要 source、replacement history 或 transcript。
+            "request_only_inflight": [],
         }
 
         # 工具调用次数，最终回答，工具轨迹，本轮压缩事件。
@@ -1892,7 +1890,22 @@ class AgentSession:
         limits_fn = getattr(self.llm, "active_context_limits", None)
         if callable(limits_fn):
             try:
-                return dict(limits_fn())
+                candidate = dict(limits_fn())
+                required = {
+                    "full_window_tokens",
+                    "max_output_tokens",
+                    "estimation_margin_tokens",
+                    "soft_limit_tokens",
+                    "hard_limit_tokens",
+                }
+                if required.issubset(candidate) and all(
+                    int(candidate[key]) > 0 for key in required - {"estimation_margin_tokens"}
+                ):
+                    return candidate
+                logger.warning(
+                    "active_context_limits 返回字段不完整，回退 ConstantLLM: keys=%s",
+                    sorted(candidate),
+                )
             except Exception:
                 logger.exception("读取 active_context_limits 失败，回退 ConstantLLM")
         return ConstantLLM.context_limits(getattr(self.llm, "model", None))
@@ -1913,16 +1926,28 @@ class AgentSession:
         messages.extend(self._sliced_history_dicts())
 
         # 空闲态使用同一份 world state 规则计算下一请求会新增的现场内容。
-        sections: List[tuple[str, str]] = [
-            (str(name), str(text or "").strip())
-            for name, text in self._baseline_dynamic_sections(enabled_tools)
-            if name and str(text or "").strip() and str(name) != "knowledge"
-        ]
+        persistent_values = dict(self._world_state_baseline.sections)
+        for section in self._baseline_dynamic_sections(enabled_tools):
+            if not isinstance(section, DynamicSectionResult):
+                logger.error("空闲态动态上下文返回了非法类型: %s", type(section).__name__)
+                continue
+            if section.persistence != "persistent":
+                continue
+            key = str(section.name or "").strip()
+            if not key:
+                continue
+            if section.status == "present" and section.text.strip():
+                persistent_values[key] = section.text.strip()
+            elif section.status == "absent":
+                persistent_values.pop(key, None)
+            # error 明确保留旧值；空闲态只做估算，不在这里阻断 UI payload。
         plan_context = self._plan_context_text()
         if plan_context:
-            sections.append(("plan", plan_context.strip()))
+            persistent_values["plan"] = plan_context.strip()
+        else:
+            persistent_values.pop("plan", None)
         # 空闲态估算同样不注入 session_state，与正式请求保持一致。
-        current_world_state = WorldStateSnapshot.from_sections(sections)
+        current_world_state = WorldStateSnapshot(sections=persistent_values)
         world_diff = current_world_state.diff(self._world_state_baseline)
         if world_diff.changed or world_diff.removed:
             messages.append({
@@ -2243,6 +2268,8 @@ class AgentSession:
         """把已提交 history 与当前 in-flight 工具链一起做正式 compact。"""
         offset = int(loop_state["commit_offset"])
         inflight = self._extract_inflight_messages(messages, offset)
+        request_only = self._extract_request_only_inflight_messages(messages, offset)
+        loop_state["request_only_inflight"].extend(request_only)
         if loop_state["history_replaced"]:
             source_history = [*self.history, *inflight]
         else:
@@ -2270,7 +2297,11 @@ class AgentSession:
             message for message in messages
             if isinstance(message, dict) and message.get("role") == "system"
         ][:1]
-        messages[:] = [*system_messages, *self._sliced_history_dicts()]
+        messages[:] = [
+            *system_messages,
+            *self._sliced_history_dicts(),
+            *copy.deepcopy(loop_state["request_only_inflight"]),
+        ]
         loop_state["commit_offset"] = len(messages)
         after_raw = self._estimate_request_tokens(messages, tools_schema)
         return {
@@ -2469,8 +2500,10 @@ class AgentSession:
                     raise
                 compact_event = self._mid_turn_compact(
                     messages=messages,
+                    tools_schema=tools_schema,
                     loop_state=loop_state,
                     round_idx=round_idx,
+                    request_tokens=calibrated_tokens,
                 )
                 if compact_event is None:
                     exc.round_idx = round_idx
@@ -2855,15 +2888,17 @@ class AgentSession:
         messages: List[Dict[str, Any]],
         offset: int,
     ) -> List[Message]:
-        """提取当前回合尚未进入 history 的 user/assistant/tool 消息。"""
+        """提取当前回合尚未进入 history 的 durable assistant/tool 协议链。
+
+        offset 后出现的 user 都是运行时通知或图片；真实用户输入已经由
+        turn_prefix_messages 单独表示，不能在这里仅凭 role=user 纳入 compact。
+        """
         out: List[Message] = []
         for raw in messages[offset:]:
             if not isinstance(raw, dict):
                 continue
             role = raw.get("role")
-            if role == "user":
-                out.append(Message(role=MessageRole.USER, content=raw.get("content")))
-            elif role == "assistant":
+            if role == "assistant":
                 content = raw.get("content")
                 tool_calls = raw.get("tool_calls")
                 if not content and not tool_calls:
@@ -2883,6 +2918,22 @@ class AgentSession:
                     tool_output=str(raw.get("content") or ""),
                 ))
         return out
+
+    @staticmethod
+    def _extract_request_only_inflight_messages(
+        messages: List[Dict[str, Any]],
+        offset: int,
+    ) -> List[Dict[str, Any]]:
+        """提取工具循环中新追加的 request-only user 消息。
+
+        这些消息在 compact 成功后仍需供当前回合下一次 think 使用，所以保留原始
+        多模态结构；它们只回挂到内存请求，不参与任何持久化。
+        """
+        return [
+            copy.deepcopy(raw)
+            for raw in messages[offset:]
+            if isinstance(raw, dict) and raw.get("role") == "user"
+        ]
 
     @staticmethod
     def _messages_tail_is_final_answer(messages: Sequence[Message], final_answer: str) -> bool:

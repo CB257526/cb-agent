@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
@@ -28,7 +30,7 @@ from agent.executor import ToolExecutor
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore
 from constant.llm.constant_llm import ConstantLLM
-from context.world_state import WorldStateSnapshot
+from context.world_state import DynamicSectionResult, WorldStateSnapshot
 from core.message import Message, MessageRole
 
 
@@ -118,7 +120,14 @@ def _context_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def test_world_state_diff_only_emits_changed_and_removed_sections():
     """knowledge/request-only 单独一条 context_update，不参与 persistent diff。"""
-    current = [("environment", "ENV-A"), ("knowledge", "KNOWLEDGE-A")]
+    current = [
+        DynamicSectionResult.present("environment", "ENV-A"),
+        DynamicSectionResult.present(
+            "knowledge",
+            "KNOWLEDGE-A",
+            persistence="request_only",
+        ),
+    ]
 
     async def dynamic_sections(**_kwargs):
         return list(current)
@@ -141,7 +150,10 @@ def test_world_state_diff_only_emits_changed_and_removed_sections():
         assert "ENV-A" not in ctx_msgs2[0]["content"]
         assert "KNOWLEDGE-A" in ctx_msgs2[0]["content"]
 
-        current[:] = [("environment", "ENV-B")]
+        current[:] = [
+            DynamicSectionResult.present("environment", "ENV-B"),
+            DynamicSectionResult.absent("knowledge", persistence="request_only"),
+        ]
         third = session._build_chat_messages(user_content="third", system_instructions="")
         ctx_msgs3 = _context_messages(third)
         # knowledge 已从 current 移除，只剩 ENV-B 的 persistent 更新。
@@ -150,9 +162,48 @@ def test_world_state_diff_only_emits_changed_and_removed_sections():
         assert "KNOWLEDGE-A" not in ctx_msgs3[0]["content"]
 
 
+def test_dynamic_error_preserves_baseline_without_removed_update():
+    async def dynamic_sections(**_kwargs):
+        return [
+            DynamicSectionResult.error_result("instructions", "temporary read failure"),
+            DynamicSectionResult.error_result("environment", "temporary stat failure"),
+        ]
+
+    session = _session()
+    session._world_state_baseline = WorldStateSnapshot.from_sections([
+        ("instructions", "CRITICAL-INSTRUCTIONS"),
+        ("environment", "STABLE-ENV"),
+    ])
+    with patch("agent.session.get_dynamic_context_sections", new=dynamic_sections):
+        request = session._build_chat_messages(
+            user_content="continue",
+            system_instructions="",
+        )
+
+    updates = _context_messages(request)
+    assert not any('state="removed"' in str(message.get("content") or "") for message in updates)
+    assert session._pending_world_state.sections == {
+        "instructions": "CRITICAL-INSTRUCTIONS",
+        "environment": "STABLE-ENV",
+    }
+
+
+def test_first_instructions_error_blocks_request():
+    async def dynamic_sections(**_kwargs):
+        return [DynamicSectionResult.error_result("instructions", "managed file unreadable")]
+
+    session = _session()
+    with patch("agent.session.get_dynamic_context_sections", new=dynamic_sections):
+        with pytest.raises(RuntimeError, match="关键 instructions 首次读取失败"):
+            session._build_chat_messages(
+                user_content="continue",
+                system_instructions="",
+            )
+
+
 def test_restart_recovers_actual_world_state_snapshot():
     async def dynamic_sections(**_kwargs):
-        return [("environment", "STABLE-ENV")]
+        return [DynamicSectionResult.present("environment", "STABLE-ENV")]
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / ".cbagent" / "sessions"
@@ -237,7 +288,7 @@ def test_consecutive_compactions_send_previous_handoff_as_structured_history():
 
 def test_manual_compact_resets_baseline_and_next_turn_reinjects_full_state():
     async def dynamic_sections(**_kwargs):
-        return [("environment", "STABLE-ENV")]
+        return [DynamicSectionResult.present("environment", "STABLE-ENV")]
 
     session = _session(summaries=["handoff"])
     session.history = [_user("Q" * 20000), _assistant("A" * 20000)]
@@ -274,6 +325,53 @@ def test_mid_turn_compact_installs_full_world_state_before_summary():
     )
     assert "ENV-NOW" in str(context_message.content)
     assert session.history.index(context_message) < len(session.history) - 1
+
+
+def test_mid_turn_compact_replays_request_only_image_without_persisting_it():
+    session = _session(summaries=["handoff"])
+    tool_calls = [{
+        "id": "call-image",
+        "type": "function",
+        "function": {"name": "load_image", "arguments": "{}"},
+    }]
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect image"},
+        {"role": "assistant", "content": None, "tool_calls": tool_calls},
+        {
+            "role": "tool",
+            "tool_call_id": "call-image",
+            "name": "load_image",
+            "content": "queued",
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,SECRETBASE64"},
+            }],
+        },
+    ]
+    loop_state = {
+        "commit_offset": 2,
+        "history_replaced": False,
+        "audit_protocol": [],
+        "turn_prefix_messages": [_user("inspect image")],
+        "request_only_inflight": [],
+    }
+
+    event = session._mid_turn_compact(
+        messages,
+        [],
+        loop_state,
+        round_idx=1,
+        request_tokens=10_000,
+    )
+
+    assert event is not None
+    assert "SECRETBASE64" not in str([message.to_dict() for message in session.history])
+    assert "SECRETBASE64" in str(messages)
+    assert "SECRETBASE64" in str(loop_state["request_only_inflight"])
 
 
 def test_compact_failure_keeps_history_and_snapshot_unchanged():

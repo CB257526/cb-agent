@@ -25,6 +25,7 @@ const RESULT_MAX = 800;
 const ARGS_MAX = 400;
 const DIFF_VIEW_MAX_LINES = 28;
 const FILE_TOOLS = new Set(["file_edit", "file_write"]);
+const DIFF_TOOLS = new Set(["file_edit", "file_write", "apply_patch"]);
 
 // 行背景：用低饱和索引色，适配终端调色板（避免 truecolor 在浅色主题发灰）
 const DIFF_ADDED_BG = RGBA.fromIndex(22); // deep green-ish
@@ -58,6 +59,7 @@ export function ToolBlock(props: { item: ChatItem }) {
 
   const toolName = () => item().toolName || "unknown";
   const isFileTool = () => FILE_TOOLS.has(toolName());
+  const supportsDiff = () => DIFF_TOOLS.has(toolName());
   const parsed = createMemo(() => parseToolResult(item().toolResult));
 
   const statusColor = () =>
@@ -113,7 +115,7 @@ export function ToolBlock(props: { item: ChatItem }) {
   });
 
   const fileDiff = createMemo(() => {
-    if (!isFileTool()) return null as DiffViewModel | null;
+    if (!supportsDiff()) return null as DiffViewModel | null;
     const raw = parsed().diff || "";
     if (!raw.trim()) return null;
     return prepareDiffForView(raw);

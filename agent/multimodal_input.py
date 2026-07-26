@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import math
 import mimetypes
 import os
 import warnings
@@ -28,6 +29,10 @@ DEFAULT_ATTACHMENT_TEXT_MAX_CHARS = 24_000
 DEFAULT_ATTACHMENT_PREVIEW_MIN_CHARS = 2_000
 DEFAULT_ATTACHMENT_PREVIEW_MAX_CHARS = 48_000
 DEFAULT_ATTACHMENT_SOFT_LIMIT_RATIO = 0.08
+DEFAULT_ATTACHMENT_MAX_COUNT = 16
+DEFAULT_VISUAL_TOKEN_BUDGET = 8_000
+DEFAULT_VISUAL_TOKEN_BUDGET_MAX = 16_000
+DEFAULT_VISUAL_SOFT_LIMIT_RATIO = 0.10
 TEXT_ATTACHMENT_EXTENSIONS = {
     ".txt",
     ".md",
@@ -95,6 +100,7 @@ class ProcessedAttachment:
     artifact_path: str = ""  # 完整 Markdown/转录 artifact；空表示未落盘
     full_chars: int = 0
     preview_chars: int = 0
+    estimated_tokens: int = 0  # 原生视觉输入的保守 token 估算；文本 preview 仍由统一 tokenizer 统计
 
 
 @dataclass
@@ -143,6 +149,7 @@ def process_multimodal_prompt(
     processor: Optional[MultimodalProcessor] = None,
     history_text: Optional[str] = None,
     soft_limit_tokens: Optional[int] = None,
+    image_ability: Optional[bool] = None,
 ) -> ProcessedMultimodalPrompt:
     """把用户文本和附件转换成“请求内容 + 跨轮摘要”。
 
@@ -167,9 +174,21 @@ def process_multimodal_prompt(
             attachments=[],
         )
 
+    max_count_raw = os.getenv("CBAGENT_ATTACHMENT_MAX_COUNT")
+    try:
+        max_count = int(max_count_raw) if max_count_raw else DEFAULT_ATTACHMENT_MAX_COUNT
+    except ValueError:
+        max_count = DEFAULT_ATTACHMENT_MAX_COUNT
+    if len(raw_attachments) > max(1, max_count):
+        raise MultimodalInputError(
+            f"附件数量 {len(raw_attachments)} 超过本轮上限 {max(1, max_count)}。"
+        )
+
     workdir = Path(cwd) if cwd is not None else _default_cwd()
     mm_processor = processor or MultimodalProcessor()
-    image_native = model_supports_image(model)
+    # Session 传入的 ActiveModelConfig 能区分同名模型的不同 provider；仅旧调用方
+    # 缺少该值时才按 model id 回退全局默认。
+    image_native = bool(image_ability) if image_ability is not None else model_supports_image(model)
     request_parts: List[Dict[str, Any]] = []
     history_lines: List[str] = []
     processed: List[ProcessedAttachment] = []
@@ -184,6 +203,8 @@ def process_multimodal_prompt(
         user_text_chars=len(clean_text),
     )
     remaining_preview = aggregate_budget
+    visual_budget = _visual_token_budget(soft_limit_tokens)
+    visual_tokens_used = 0
     attachment_notes: List[str] = []
     for idx, item in enumerate(raw_attachments, start=1):
         attachment = _process_one_attachment(
@@ -197,6 +218,13 @@ def process_multimodal_prompt(
             remaining_preview_budget=remaining_preview,
         )
         remaining_preview = max(0, remaining_preview - max(0, attachment.preview_chars))
+        visual_tokens_used += max(0, attachment.estimated_tokens)
+        if visual_tokens_used > visual_budget:
+            raise MultimodalInputError(
+                "原生图片聚合视觉预算超限："
+                f"estimated={visual_tokens_used} tokens, budget={visual_budget} tokens。"
+                "请减少图片数量、降低分辨率或分批发送。"
+            )
         processed.append(attachment)
         history_lines.extend(_history_lines_for_attachment(idx, attachment))
 
@@ -257,6 +285,7 @@ def _process_one_attachment(
         base.routed_as = "image_url"
         base.full_chars = 0
         base.preview_chars = 0
+        base.estimated_tokens = _estimate_native_image_tokens(path, len(file_bytes))
         attachment_notes.append(
             f"[附件 #{index}: image {path.name}] 图片将作为视觉输入发送给模型；"
             "跨轮历史只保留此摘要，base64 不会进入 history/transcript。"
@@ -470,6 +499,38 @@ def _attachment_aggregate_budget_chars(
 
     # 用户正文先占用一部分预算，避免附件把当前输入顶爆。
     return max(DEFAULT_ATTACHMENT_PREVIEW_MIN_CHARS // 2, budget - max(0, user_text_chars))
+
+
+def _visual_token_budget(soft_limit_tokens: Optional[int]) -> int:
+    """按当前模型 soft limit 计算所有原生图片共享的视觉预算。"""
+    if soft_limit_tokens and soft_limit_tokens > 0:
+        return max(
+            512,
+            min(
+                DEFAULT_VISUAL_TOKEN_BUDGET_MAX,
+                int(soft_limit_tokens * DEFAULT_VISUAL_SOFT_LIMIT_RATIO),
+            ),
+        )
+    return DEFAULT_VISUAL_TOKEN_BUDGET
+
+
+def _estimate_native_image_tokens(path: Path, size_bytes: int) -> int:
+    """按图片尺寸估算视觉 token，无法读取尺寸时按文件字节数保守回退。"""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+        width = max(1, int(width))
+        height = max(1, int(height))
+        scale = min(1.0, 2048 / max(width, height))
+        scaled_width = max(1, int(math.ceil(width * scale)))
+        scaled_height = max(1, int(math.ceil(height * scale)))
+        tiles = math.ceil(scaled_width / 512) * math.ceil(scaled_height / 512)
+        return 85 + 170 * max(1, tiles)
+    except Exception:
+        # 不同 provider 的视觉计费不同；尺寸不可得时宁可高估，避免 base64 被短占位符掩盖。
+        return max(512, min(8_192, math.ceil(max(1, size_bytes) / 4096)))
 
 
 def _persist_text_artifact(cwd: Path, content_hash: str, text: str, *, kind: str) -> str:

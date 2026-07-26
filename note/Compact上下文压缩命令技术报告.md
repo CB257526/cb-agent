@@ -1,6 +1,6 @@
 # Compact 上下文压缩技术报告
 
-> 更新于 2026-07-23。描述当前代码（`agent/compaction.py`、`agent/session.py`、`agent/work_context.py`），不再包含“丢弃最旧消息未摘要”“dropped_compact_messages 有语义”等已删除行为。
+> 更新于 2026-07-26。描述当前代码（`agent/compaction.py`、`agent/session.py`、`agent/work_context.py`），不再包含“丢弃最旧消息未摘要”“dropped_compact_messages 有语义”等已删除行为。
 
 ## 1. 目标
 
@@ -29,6 +29,8 @@
 | 模型降档 | 切换到更小窗口 | 按旧模型摘要、按目标模型算 replacement |
 
 摘要模型使用当前 `self.llm` 的非流式客户端；输出上限走模型配置的 `max_output_tokens` / `output_token_param`。
+
+工具循环在每次 think 前按完整请求估算值检查 soft limit。达到阈值时，compact source 同时包含已提交 history 与尚未提交的 assistant/tool 协议链；成功后重建当前请求并继续同一回合。
 
 ## 3. 结构化摘要请求
 
@@ -67,6 +69,8 @@ max_total_completion_tokens = min(64K, 4 * max_output_tokens)
 
 任一上限命中 → `CompactionBudgetExceeded`（`CompactionError` 子类）→ **不安装**局部 summary。
 
+每次真正调用 provider **之前**，同时预扣本次 estimated prompt 与 `max_output_tokens` completion 预算；不能等响应返回后才发现总预算已经超限。provider 返回 usage 后再用实际值结算，缺 usage 时维持保守估算。
+
 单条协议段本身超 hard limit → `CompactionError`，禁止静默砍用户/assistant 正文。
 
 ### 4.3 覆盖率
@@ -83,9 +87,13 @@ session 返回的 compact payload **不再**包含 `dropped_compact_messages`。
 ## 5. Replacement 与 world state
 
 - 保留回合数由 `dynamic_retained_token_target(soft_limit)` 与 soft limit 剩余空间共同约束。
+- retention 预算装不下最新完整回合时，设置 `oversized_latest_turn=true` 并只安装已经完整读取 source 的摘要；禁止裁剪最新 user/assistant/tool 链后伪装成完整回合。
 - mid-turn compact 把当前 pending/baseline world state 装回 replacement，便于同工具回合继续。
+- mid-turn 中的图片、hook/subagent 通知等 request-only user 消息不进入 compact source、replacement 或 transcript；compact 成功后原样回挂当前内存请求。
 - manual/pre-turn 通常清空 baseline，下一轮完整重注入 durable section。
 - 成功后：`history = replacement`，清理 MemoryLoader 缓存，写 compact 快照（v3：`transcript_cursor_seq`、`target_model` 等）。
+
+provider 异常保留类型化分类：只有明确的 `LLMInvalidRequestError` 才允许模型降档路径尝试目标模型；未知错误不通过字符串匹配触发 compact 或重试。
 
 ## 6. 与缓存的关系
 

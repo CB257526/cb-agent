@@ -7,7 +7,7 @@ error（读取失败）。读取失败应保留 baseline 旧值，不能生成 r
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
+from typing import Literal, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -31,16 +31,38 @@ class DynamicSectionResult:
     persistence: Literal["persistent", "request_only"] = "persistent"
 
     @classmethod
-    def present(cls, name: str, text: str, *, persistence: str = "persistent") -> "DynamicSectionResult":
+    def present(
+        cls,
+        name: str,
+        text: str,
+        *,
+        persistence: Literal["persistent", "request_only"] = "persistent",
+    ) -> "DynamicSectionResult":
         return cls(name=name, status="present", text=str(text or "").strip(), persistence=persistence)
 
     @classmethod
-    def absent(cls, name: str) -> "DynamicSectionResult":
-        return cls(name=name, status="absent", persistence="persistent")
+    def absent(
+        cls,
+        name: str,
+        *,
+        persistence: Literal["persistent", "request_only"] = "persistent",
+    ) -> "DynamicSectionResult":
+        return cls(name=name, status="absent", persistence=persistence)
 
     @classmethod
-    def error_result(cls, name: str, error: str = "") -> "DynamicSectionResult":
-        return cls(name=name, status="error", error=str(error or ""), persistence="persistent")
+    def error_result(
+        cls,
+        name: str,
+        error: str = "",
+        *,
+        persistence: Literal["persistent", "request_only"] = "persistent",
+    ) -> "DynamicSectionResult":
+        return cls(
+            name=name,
+            status="error",
+            error=str(error or ""),
+            persistence=persistence,
+        )
 
 
 @dataclass(frozen=True)

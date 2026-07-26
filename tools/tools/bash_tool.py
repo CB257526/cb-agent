@@ -613,6 +613,10 @@ class BashTool(Tool):
         is_error = exit_code != 0
         if semantic and semantic["status"] == "ok":
             is_error = False
+        # 截断后无法可靠落盘或命中硬上限时，命令本身即使退出码为 0，
+        # 本次工具结果也不可作为完整事实使用，必须显式标记失败。
+        if processed.persist_error or processed.hard_limit_exceeded:
+            is_error = True
 
         return json.dumps({
             "stdout": processed.stdout,

@@ -40,8 +40,10 @@ import threading
 from typing import Any, Dict, Optional, TextIO
 
 from agent.cancel import CancelToken
+from agent.compaction import CompactionProviderError
 from agent.event_bus import EventBus
 from agent.events import Event, ModelChanged, PermissionModeChanged
+from agent.llm_errors import LLMInvalidRequestError
 from agent.session import AgentSession
 from agent.transport.jsonrpc import StdioTransport, make_event_message, make_response
 from constant.llm.constant_llm import ConstantLLM
@@ -863,9 +865,11 @@ class Gateway:
             try:
                 self.session.compact_context(**compact_kwargs)
             except Exception as compact_error:
-                error_text = str(compact_error).lower()
-                invalid_request = "invalid" in error_text or "400" in error_text
-                if not invalid_request or runtime_snapshot is None:
+                typed_invalid_request = (
+                    isinstance(compact_error, CompactionProviderError)
+                    and isinstance(compact_error.llm_error, LLMInvalidRequestError)
+                )
+                if not typed_invalid_request or runtime_snapshot is None:
                     raise
                 # 旧模型拒绝压缩请求时，切到目标模型重试；重试失败必须回滚模型。
                 model = switch_model(model_key)

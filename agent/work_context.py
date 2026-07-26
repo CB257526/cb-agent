@@ -275,6 +275,44 @@ def _message_payload_to_message(payload: Dict[str, Any]) -> Optional[Message]:
     return msg
 
 
+def _normalize_legacy_plan_context(messages: Sequence[Message]) -> List[Message]:
+    """在历史加载边界一次性清理旧版整块 Plan Mode 注入。
+
+    新格式 context_update 带 world_state_snapshot，必须原样保留 plan section。
+    这里处理的是没有快照元数据的旧消息，避免每次 provider 请求前重复跑正则。
+    """
+    normalized: List[Message] = []
+    for message in messages:
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        content = message.content
+        role = message.role.value if hasattr(message.role, "value") else str(message.role)
+        if (
+            role != "user"
+            or not isinstance(content, str)
+            or "<context-update>" not in content
+            or "[Plan Mode " not in content
+            or isinstance(metadata.get("world_state_snapshot"), dict)
+        ):
+            normalized.append(message)
+            continue
+
+        text = content
+        for header in ("Plan Mode Instructions", "Plan Mode State"):
+            text = re.sub(
+                rf"\n?\[{re.escape(header)}\][\s\S]*?"
+                r"(?=\n\n\[[^\]\n]+\]|\n</context-update>|$)",
+                "",
+                text,
+            )
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if text == "<context-update>\n</context-update>" or not text:
+            continue
+        cloned = deepcopy(message)
+        cloned.content = text
+        normalized.append(cloned)
+    return normalized
+
+
 def _messages_from_transcript_item(item: Dict[str, Any]) -> List[Message]:
     """把 transcript.jsonl 的单轮记录还原成 history 消息序列。
 
@@ -1370,6 +1408,7 @@ class LocalSessionStore:
 
         if not messages:
             return []
+        messages = _normalize_legacy_plan_context(messages)
         return drop_orphan_tool_message_objects(messages)
 
     def _select_transcript_records_after_compact(
@@ -1510,6 +1549,9 @@ class LocalSessionStore:
 
         item = {
             "ts": _now_iso(),
+            # 中断回合也是新写入的正式 transcript 记录，必须使用稳定序号；
+            # 不能依赖物理行 ordinal，否则删坏行后 v3 cursor 会改变含义。
+            "turn_seq": self._next_transcript_turn_seq(self.active_dir),
             "turn_id": active_turn_id,
             "user_query": user_query,
             "final_answer": final_answer,
@@ -1520,6 +1562,8 @@ class LocalSessionStore:
         with (self.active_dir / "transcript.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
             f.flush()
+            if _transcript_fsync_enabled():
+                os.fsync(f.fileno())
 
         self._bump_turn(user_query=user_query)
         self.save_state(self.state)

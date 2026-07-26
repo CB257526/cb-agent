@@ -49,7 +49,6 @@ export function ReasoningBlock(props: {
 
   const fullText = createMemo(() => chunks().map((c) => c.text).join(""));
   const summary = createMemo(() => summaryFromText(fullText()));
-  const charCount = createMemo(() => fullText().length);
 
   return (
     <box
@@ -70,7 +69,6 @@ export function ReasoningBlock(props: {
           <Show when={!expanded()}>
             <span style={{ fg: theme.text, attributes: textAttributes.mutedItalic }}>
               {`  ${summary()}`}
-              {charCount() > 0 ? `  (${charCount()} chars)` : ""}
             </span>
           </Show>
         </text>

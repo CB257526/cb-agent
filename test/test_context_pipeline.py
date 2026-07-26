@@ -20,6 +20,7 @@ from context.prompts.builder import (
     get_static_system_prompt,
     get_system_prompt,
 )
+from context.world_state import DynamicSectionResult
 from core.message import Message, MessageRole
 
 
@@ -63,20 +64,21 @@ def test_dynamic_context_returns_named_sections_in_stable_order(tmp_path: Path):
         language="Chinese",
     ))
 
-    assert [name for name, _ in sections] == [
+    present = [section for section in sections if section.status == "present"]
+    assert [section.name for section in present] == [
         "session_guidance",
         "current_date",
         "environment",
         "language",
     ]
-    text = "\n\n".join(content for _, content in sections)
+    text = "\n\n".join(section.text for section in present)
     assert "Available tools: bash, file_read." in text
     assert "# Current date" in text
     assert "# Environment" in text
     assert f"Working directory: {tmp_path.resolve()}" in text
     assert "# Language" in text
     # 时间块只保留日期和时区，不应包含每秒变化的时分秒。
-    date_text = dict(sections)["current_date"]
+    date_text = next(section.text for section in present if section.name == "current_date")
     assert "Current local time" not in date_text
 
 
@@ -159,7 +161,7 @@ def test_compaction_selects_complete_turns_from_newest_backwards():
     ]
 
 
-def test_oversized_latest_turn_keeps_user_and_final_answer_only():
+def test_oversized_latest_turn_does_not_install_partial_raw_turn():
     call = {
         "id": "call_big",
         "type": "function",
@@ -175,7 +177,5 @@ def test_oversized_latest_turn_keeps_user_and_final_answer_only():
     selection = select_retained_history(newest, token_budget=300)
 
     assert selection.oversized_latest_turn
-    assert [_text(message) for message in selection.messages] == [
-        "latest-user",
-        "latest-final",
-    ]
+    assert selection.messages == []
+    assert selection.tokens == 0

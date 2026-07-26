@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
+
+from ..world_state import DynamicSectionResult
 
 from ..sections.dynamic_sections import (
     current_time_section,
@@ -62,27 +64,86 @@ async def get_dynamic_context_sections(
     language: Optional[str] = None,
     budget_directive: Optional[str] = None,
     memory_query: str = "",
-) -> list[tuple[str, str]]:
-    """返回有序的运行时上下文块。
+) -> list[DynamicSectionResult]:
+    """返回有序且带三态、持久化语义的运行时上下文块。
 
-    名称是跨轮指纹键，文本是模型可见内容。顺序固定，确保相同状态生成相同请求。
+    每个可选持久块都必须明确返回 ``absent``，读取异常则返回 ``error``。
+    Session 因此不需要根据 section 名猜测持久化方式，也不会把异常误判为删除。
     """
-    sections: list[tuple[str, str]] = [
-        (
+
+    def _sync_section(
+        name: str,
+        loader: Callable[[], Optional[str]],
+        *,
+        persistence: Literal["persistent", "request_only"] = "persistent",
+    ) -> DynamicSectionResult:
+        try:
+            text = loader()
+        except Exception as error:  # noqa: BLE001
+            return DynamicSectionResult.error_result(
+                name,
+                str(error),
+                persistence=persistence,
+            )
+        if text and str(text).strip():
+            return DynamicSectionResult.present(
+                name,
+                str(text),
+                persistence=persistence,
+            )
+        return DynamicSectionResult.absent(
+            name,
+            persistence=persistence,
+        )
+
+    sections: list[DynamicSectionResult] = [
+        _sync_section(
             "session_guidance",
-            session_guidance_section(
+            lambda: session_guidance_section(
                 enabled_tools=enabled_tools,
                 skill_commands=skill_commands,
             ),
         ),
     ]
     if memory_loader is not None:
-        sections.extend(await memory_sections(memory_loader, query=memory_query))
+        try:
+            memory_values = await memory_sections(memory_loader, query=memory_query)
+        except Exception as error:  # noqa: BLE001
+            # instructions 是关键持久块；knowledge 只影响本次检索，失败时不污染 baseline。
+            sections.extend([
+                DynamicSectionResult.error_result("instructions", str(error)),
+                DynamicSectionResult.error_result(
+                    "knowledge",
+                    str(error),
+                    persistence="request_only",
+                ),
+            ])
+        else:
+            memory_map = {name: text for name, text in memory_values}
+            instructions = str(memory_map.get("instructions") or "").strip()
+            knowledge = str(memory_map.get("knowledge") or "").strip()
+            sections.append(
+                DynamicSectionResult.present("instructions", instructions)
+                if instructions
+                else DynamicSectionResult.absent("instructions")
+            )
+            sections.append(
+                DynamicSectionResult.present(
+                    "knowledge",
+                    knowledge,
+                    persistence="request_only",
+                )
+                if knowledge
+                else DynamicSectionResult.absent(
+                    "knowledge",
+                    persistence="request_only",
+                )
+            )
     sections.extend([
-        ("current_date", current_time_section()),
-        (
+        _sync_section("current_date", current_time_section),
+        _sync_section(
             "environment",
-            env_info_section(
+            lambda: env_info_section(
                 model=model,
                 cwd=cwd,
                 additional_directories=additional_directories,
@@ -90,18 +151,24 @@ async def get_dynamic_context_sections(
         ),
     ])
 
-    optional_sections = [
-        ("language", language_section(language)),
-        ("mcp_instructions", mcp_instructions_section(mcp_clients)),
-        ("token_budget", token_budget_section(budget_directive=budget_directive)),
-    ]
-    sections.extend((name, text) for name, text in optional_sections if text and text.strip())
-    return [(name, text.strip()) for name, text in sections if text and text.strip()]
+    sections.extend([
+        _sync_section("language", lambda: language_section(language)),
+        _sync_section("mcp_instructions", lambda: mcp_instructions_section(mcp_clients)),
+        _sync_section(
+            "token_budget",
+            lambda: token_budget_section(budget_directive=budget_directive),
+        ),
+    ])
+    return sections
 
 
 async def get_dynamic_context_prompt(**kwargs: Any) -> list[str]:
     """兼容入口：只返回动态块文本。"""
-    return [text for _, text in await get_dynamic_context_sections(**kwargs)]
+    return [
+        section.text
+        for section in await get_dynamic_context_sections(**kwargs)
+        if section.status == "present" and section.text
+    ]
 
 
 async def get_system_prompt(

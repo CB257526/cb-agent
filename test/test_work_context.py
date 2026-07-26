@@ -451,6 +451,8 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
 
             transcript = (store.active_dir / "transcript.jsonl").read_text(encoding="utf-8")
             self.assertIn("图片下载失败，请重试", transcript)
+            archived = json.loads(transcript.splitlines()[-1])
+            self.assertEqual(archived["turn_seq"], 1)
             active = (store.active_dir / "active_turn.jsonl").read_text(encoding="utf-8")
             self.assertIn("继续", active)
             self.assertNotIn("图片下载失败，请重试", active)

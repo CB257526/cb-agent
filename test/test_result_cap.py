@@ -37,6 +37,7 @@ class FakeToolCallResult:
     call_id: str
     name: str
     result: str
+    is_error: bool = False
 
 
 class TestCapSingleResult(unittest.TestCase):
@@ -116,7 +117,8 @@ class TestCapSingleResult(unittest.TestCase):
     def test_file_read_persisted_result_no_double_persist(self):
         """file_read 超限时保持 JSON 与分页元数据，不复制原始文件。"""
         # 模拟 file_read 返回 JSON，path 指向 tool_results/
-        fake_content = "测" * (MAX_SINGLE_RESULT_TOKENS + 2000)
+        # 用 UTF-8 byte 硬上限稳定触发，避免测试依赖本机是否已缓存 tiktoken 编码器。
+        fake_content = "测" * (MAX_SINGLE_RESULT_BYTES // 3 + 2000)
         persisted_path = "/project/.cbagent/tool_results/call_prev.txt"
         tool_result = json.dumps({
             "path": persisted_path,
@@ -175,6 +177,21 @@ class TestCapSingleResult(unittest.TestCase):
         self.assertTrue(payload["preview_head"].startswith("HEAD_START_"))
         # 尾部应以 _TAIL_END 结尾
         self.assertTrue(payload["preview_tail"].endswith("_TAIL_END"))
+
+    def test_persistence_failure_returns_explicit_error_without_preview(self):
+        result = "secret" * MAX_SINGLE_RESULT_BYTES
+        with patch("agent.result_cap._persist_full_result", return_value=None):
+            capped, persisted = cap_single_result(
+                result,
+                "call_persist_fail",
+                "search",
+                self.persist_dir,
+            )
+        payload = json.loads(capped)
+        self.assertFalse(persisted)
+        self.assertTrue(payload["result_cap_persist_failed"])
+        self.assertIn("error", payload)
+        self.assertNotIn("preview_head", payload)
 
 
 class TestCapBatchResults(unittest.TestCase):

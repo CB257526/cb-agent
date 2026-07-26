@@ -650,6 +650,57 @@ class TestFileRead(unittest.TestCase):
             joined = page1["content"] + page2["content"]
             self.assertIn("MARKER", joined)
 
+    def test_byte_range_large_page_cursor_has_no_gap(self):
+        """截断提示不能被计入源字节 cursor。"""
+        from tools.tools.file_read_tool import MAX_OUTPUT_BYTES
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "large-bytes.txt"
+            raw = bytes(65 + (index % 26) for index in range(MAX_OUTPUT_BYTES * 3))
+            p.write_bytes(raw)
+            page1 = json.loads(FileReadTool().run({"path": str(p), "start_byte": 0}))
+            source1 = page1["content"].split("\n... [超过", 1)[0].encode("utf-8")
+            cursor = page1["next_start_byte"]
+            self.assertEqual(cursor, len(source1))
+
+            page2 = json.loads(FileReadTool().run({
+                "path": str(p),
+                "start_byte": cursor,
+                "end_byte": cursor + 64,
+            }))
+            self.assertEqual(page2["content"].encode("utf-8"), raw[cursor:cursor + 64])
+
+    def test_char_range_large_page_cursor_has_no_gap(self):
+        """字符分页截断后从最后一个真实源字符继续。"""
+        from tools.tools.file_read_tool import MAX_OUTPUT_BYTES
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "large-chars.txt"
+            text = "".join(chr(65 + index % 26) for index in range(MAX_OUTPUT_BYTES * 3))
+            p.write_text(text, encoding="utf-8")
+            page1 = json.loads(FileReadTool().run({"path": str(p), "start_char": 1}))
+            source1 = page1["content"].split("\n... [超过", 1)[0]
+            cursor = page1["next_start_char"]
+            self.assertEqual(cursor, len(source1) + 1)
+
+            page2 = json.loads(FileReadTool().run({
+                "path": str(p),
+                "start_char": cursor,
+                "end_char": cursor + 63,
+            }))
+            self.assertEqual(page2["content"], text[len(source1):len(source1) + 64])
+
+    def test_long_single_line_head_returns_character_cursor(self):
+        from tools.tools.file_read_tool import MAX_OUTPUT_BYTES
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "single-line.txt"
+            p.write_text("x" * (MAX_OUTPUT_BYTES * 2), encoding="utf-8")
+            page = json.loads(FileReadTool().run({"path": str(p), "head": 1}))
+            self.assertTrue(page["truncated"])
+            self.assertIsNone(page["next_start_line"])
+            self.assertIsNotNone(page["next_start_char"])
+
     def test_head_does_not_materialize_full_line_list(self):
         """head 只迭代所需行；用受控 file wrapper 统计 readline 次数。"""
         import tools.tools.file_read_tool as fr_mod

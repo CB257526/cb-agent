@@ -10,10 +10,14 @@ map/reduce：每条 source 消息至少进入一次摘要请求；命中预算�
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
+from agent.llm_errors import (
+    LLMContextOverflowError,
+    LLMRequestError,
+    classify_llm_exception,
+)
 from context import count_tokens
 from core.message import Message, MessageRole
 
@@ -38,6 +42,14 @@ CONTEXT_UPDATE_KIND = "context_update"
 
 class CompactionError(RuntimeError):
     """表示压缩请求无法生成可安装的新历史。"""
+
+
+class CompactionProviderError(CompactionError):
+    """摘要 provider 请求失败，并保留结构化错误供上层决策。"""
+
+    def __init__(self, message: str, llm_error: LLMRequestError) -> None:
+        super().__init__(message)
+        self.llm_error = llm_error
 
 
 _TOOL_CALL_PROTOCOL_MARKERS = (
@@ -173,35 +185,6 @@ def _split_protocol_turns(messages: Sequence[Message]) -> list[list[Message]]:
     return turns
 
 
-def _last_final_assistant(turn: Sequence[Message]) -> Optional[Message]:
-    """返回回合中最后一条不带工具调用的助手正文。"""
-
-    for message in reversed(turn):
-        if message_role(message) != "assistant" or message.tool_calls:
-            continue
-        if isinstance(message.content, str) and message.content.strip():
-            return message
-    return None
-
-
-def _clip_message_content(message: Message, token_budget: int) -> Message:
-    """复制消息，并仅在超预算时裁剪可见正文。"""
-
-    cloned = copy.deepcopy(message)
-    text = cloned.content if isinstance(cloned.content, str) else str(cloned.content or "")
-    if not text or count_tokens(text) <= token_budget:
-        return cloned
-    low, high = 0, len(text)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if count_tokens(text[:middle]) <= token_budget:
-            low = middle
-        else:
-            high = middle - 1
-    cloned.content = text[:low].rstrip() + "…"
-    return cloned
-
-
 def select_retained_history(
     messages: Sequence[Message],
     *,
@@ -219,24 +202,11 @@ def select_retained_history(
     newest = turns[-1]
     newest_tokens = estimate_message_tokens(newest)
     if newest_tokens > budget:
-        endpoints = [newest[0]]
-        final_message = _last_final_assistant(newest)
-        if final_message is not None and final_message is not newest[0]:
-            endpoints.append(final_message)
-        overhead = estimate_message_tokens([
-            _clip_message_content(message, 0) for message in endpoints
-        ])
-        available = max(0, budget - overhead)
-        allocations = [available] if len(endpoints) == 1 else [available // 2, available - available // 2]
-        retained = [
-            _clip_message_content(message, allocation)
-            for message, allocation in zip(endpoints, allocations)
-        ]
-        while retained and estimate_message_tokens(retained) > budget:
-            retained.pop()
+        # 该回合已经完整进入摘要请求；replacement 预算装不下时宁可只保留摘要，
+        # 也不能把 user/assistant/tool 协议链裁成看似完整的半截原始回合。
         return RetainedHistory(
-            messages=retained,
-            tokens=estimate_message_tokens(retained),
+            messages=[],
+            tokens=0,
             oversized_latest_turn=True,
         )
 
@@ -291,20 +261,6 @@ def _flatten(units: Sequence[Sequence[Message]]) -> list[Message]:
     """把协议段恢复成消息序列。"""
 
     return [message for unit in units for message in unit]
-
-
-def _is_context_overflow_error(error: BaseException) -> bool:
-    """保守识别 OpenAI-compatible provider 的上下文超限错误。"""
-
-    text = str(error).lower()
-    markers = (
-        "context window",
-        "maximum context",
-        "context length",
-        "too many tokens",
-        "max_tokens",
-    )
-    return any(marker in text for marker in markers)
 
 
 def _default_compaction_budgets(
@@ -409,7 +365,11 @@ class _CompactionBudgetTracker:
         self.summary_output_tokens = 0
         self.chunks_used = 0
 
-    def ensure_room_for_request(self, estimated_prompt_tokens: int) -> None:
+    def ensure_room_for_request(
+        self,
+        estimated_prompt_tokens: int,
+        estimated_completion_tokens: int,
+    ) -> None:
         if self.summary_requests + 1 > self.max_summary_requests:
             raise CompactionBudgetExceeded(
                 f"compact 请求次数超过上限 ({self.max_summary_requests})"
@@ -417,6 +377,13 @@ class _CompactionBudgetTracker:
         if self.summary_prompt_tokens + max(0, estimated_prompt_tokens) > self.max_total_prompt_tokens:
             raise CompactionBudgetExceeded(
                 f"compact 累计 prompt tokens 超过上限 ({self.max_total_prompt_tokens})"
+            )
+        if (
+            self.summary_output_tokens + max(0, estimated_completion_tokens)
+            > self.max_total_completion_tokens
+        ):
+            raise CompactionBudgetExceeded(
+                f"compact 累计 completion tokens 超过上限 ({self.max_total_completion_tokens})"
             )
 
     def note_chunks(self, chunk_count: int) -> None:
@@ -494,7 +461,7 @@ def run_local_compaction(
     def _call_summary(request_messages: list[dict[str, Any]]) -> str:
         nonlocal last_request
         estimated_prompt = max(0, int(estimate_request_tokens(request_messages)))
-        tracker.ensure_room_for_request(estimated_prompt)
+        tracker.ensure_room_for_request(estimated_prompt, max_output)
         last_request = list(request_messages)
         request_kwargs: dict[str, Any] = {
             "model": model,
@@ -511,11 +478,20 @@ def run_local_compaction(
         try:
             response = client.chat.completions.create(**request_kwargs)
         except Exception as error:
-            if _is_context_overflow_error(error):
+            typed_error = classify_llm_exception(
+                error,
+                provider=str(getattr(llm, "provider", "") or ""),
+                model_key=str(getattr(llm, "current_model_key", "") or ""),
+                model_id=str(model or ""),
+            )
+            if isinstance(typed_error, LLMContextOverflowError):
                 raise CompactionError(
                     "摘要请求超过模型窗口，且无法在不丢消息的前提下继续压缩"
-                ) from error
-            raise CompactionError(f"本地压缩请求失败: {error}") from error
+                ) from typed_error
+            raise CompactionProviderError(
+                f"本地压缩请求失败: {typed_error}",
+                typed_error,
+            ) from typed_error
         usage_prompt, usage_completion = _response_usage_tokens(response)
         # provider 不返回 usage 时，completion 用输出上限的保守估算结算。
         tracker.settle(
@@ -612,6 +588,7 @@ __all__ = [
     "COMPACTION_SUMMARY_KIND",
     "CompactionBudgetExceeded",
     "CompactionError",
+    "CompactionProviderError",
     "CompactionModelResult",
     "RetainedHistory",
     "SUMMARY_PREFIX",

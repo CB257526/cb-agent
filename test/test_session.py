@@ -30,8 +30,14 @@ if sys.platform == "win32":
         pass
 
 from agent.cancel import get_current_cancel_token
-from agent.compaction import COMPACTION_SUMMARY_KIND, SUMMARY_PREFIX, make_summary_message
+from agent.compaction import (
+    COMPACTION_SUMMARY_KIND,
+    SUMMARY_PREFIX,
+    estimate_message_tokens,
+    make_summary_message,
+)
 from agent.event_bus import EventBus, collect_all
+from agent.llm_errors import LLMContextOverflowError
 from agent.events import (
     Cancelled, ContextWindowUpdated, Done, Error, ReasoningDelta, RoundEnd, RoundStart,
     TextDelta, TokenUsage,
@@ -89,6 +95,9 @@ class FakeLLM:
         if not self.results:
             raise AssertionError("FakeLLM.think 调用次数超出 results")
         result = self.results.pop(0)
+        # 允许测试把结构化 provider 异常放进结果队列，覆盖真实 think 的抛错路径。
+        if isinstance(result, BaseException):
+            raise result
         # 模拟流式 emit：reasoning 先于 text
         if event_bus is not None:
             if self.emit_reasoning:
@@ -626,6 +635,9 @@ class TestAgentSessionBasic(unittest.TestCase):
                     ),
                     metadata={"kind": "context_update"},
                 ))
+                # 旧格式只在加载迁移边界规范化；请求组装本身不再运行正则改写。
+                from agent.work_context import _normalize_legacy_plan_context
+                s.history = _normalize_legacy_plan_context(s.history)
 
                 sliced = json.dumps(s._sliced_history_dicts(), ensure_ascii=False)
                 self.assertNotIn(unique, sliced)
@@ -635,10 +647,9 @@ class TestAgentSessionBasic(unittest.TestCase):
                 first_request = json.dumps(llm.calls[0]["messages"], ensure_ascii=False)
                 self.assertEqual(first_request.count(unique), 1)
 
-                # 本轮落进 history 的 context_update 不应包含 plan 文本。
+                # 迁移后的旧 plan 已删除，新格式只保留一份具名 plan section。
                 history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
-                # 旧格式 plan 段保留审计，新格式再追加一次具名 plan section。
-                self.assertEqual(history_dump.count(unique), 2)
+                self.assertEqual(history_dump.count(unique), 1)
 
                 s.chat("second")
                 second_request = json.dumps(llm.calls[1]["messages"], ensure_ascii=False)
@@ -856,7 +867,9 @@ class TestAgentSessionBasic(unittest.TestCase):
                 "is_tool": True,
                 "is_reasoning": False,
                 "image_ability": False,
-                "max_tokens": 12000,
+                # 小窗口仍需给静态 system、摘要指令和单条 10K 工具结果留出空间；
+                # 15K 会让工具结果越过 soft limit，但仍可完整装入 compact hard limit。
+                "max_tokens": 15000,
                 "max_output_tokens": 2000,
             }
             llm = FakeLLM([
@@ -899,6 +912,35 @@ class TestAgentSessionBasic(unittest.TestCase):
                 ConstantLLM.llm_dict.pop("fake", None)
             else:
                 ConstantLLM.llm_dict["fake"] = original
+
+    def test_provider_overflow_compacts_and_retries_same_round(self):
+        """provider 明确报告超窗时，正式 compact 后应使用完整参数重试同一轮。"""
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            llm = FakeLLM([
+                LLMContextOverflowError("context_length_exceeded"),
+                {"answer": "重试成功", "tool_calls": []},
+            ])
+            session = AgentSession(
+                llm=llm,
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=self.bus,
+                ctx_enabled=False,
+                session_store=store,
+            )
+
+            answer = session.chat("请在 provider 超窗后继续")
+
+            self.assertEqual(answer, "重试成功")
+            self.assertEqual(len(llm.calls), 2)
+            self.assertTrue(any(
+                SUMMARY_PREFIX in str(message.get("content") or "")
+                for message in llm.calls[1]["messages"]
+            ))
+            dones = [event for event in self.events if isinstance(event, Done)]
+            compact_events = (dones[-1].auto_compact or {}).get("events", [])
+            self.assertTrue(any(event.get("reason") == "mid_turn" for event in compact_events))
 
     def test_session_store_restores_history_and_clear_deletes_active(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1227,7 +1269,13 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertGreaterEqual(len(s.export_history()), 4)
             history_before_compact = len(s.history)
 
-            with patch("agent.session.dynamic_retained_token_target", return_value=40):
+            # 直接以最新完整回合的真实估算值作为保留预算，避免测试结果依赖
+            # tiktoken 在线编码器或离线字符估算的差异。
+            latest_turn_tokens = estimate_message_tokens(s.history[-2:])
+            with patch(
+                "agent.session.dynamic_retained_token_target",
+                return_value=latest_turn_tokens,
+            ):
                 payload = s.compact_context()
             self.assertEqual(payload["before_messages"], history_before_compact)
             self.assertEqual(payload["after_messages"], 3)

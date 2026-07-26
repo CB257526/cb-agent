@@ -17,6 +17,9 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -259,3 +262,13 @@ def test_include_after_256k_not_silently_dropped(tmp_path: Path):
     paths = [str(f.path) for f in out]
     assert any(p.endswith("tail_include.md") for p in paths)
     assert any("INCLUDED-MARKER" in f.content for f in out)
+
+
+def test_existing_memory_read_failure_is_not_treated_as_absent(tmp_path: Path):
+    from context.memory.loader import MemoryReadError
+
+    path = tmp_path / "CLAUDE.md"
+    path.write_text("critical", encoding="utf-8")
+    with patch.object(Path, "read_bytes", side_effect=OSError("temporary io error")):
+        with pytest.raises(MemoryReadError, match="读取失败"):
+            asyncio.run(_process_memory_file(path, "Project", processed=set()))

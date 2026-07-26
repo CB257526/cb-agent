@@ -177,6 +177,21 @@ def _stringify_tool_result(result: Any) -> str:
         return str(result)
 
 
+def _result_declares_error(result: str) -> bool:
+    """读取工具或 result cap 返回的结构化错误标记。"""
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and (
+            payload.get("is_error") is True
+            or payload.get("result_cap_persist_failed") is True
+        )
+    )
+
+
 # ========== 调度器 ==========
 
 
@@ -652,6 +667,8 @@ class ToolExecutor:
         # 成功和异常结果都必须经过统一 10K token 上限。异常文本同样可能携带
         # 超长 stderr 或第三方响应，不能绕过模型上下文的最终安全边界。
         result = self._cap_model_visible_result(result, call_id=call_id, name=name)
+        if _result_declares_error(result):
+            is_error = True
 
         if self._bus is not None:
             self._bus.emit(ToolComplete(

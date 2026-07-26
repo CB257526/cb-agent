@@ -57,7 +57,11 @@ class MemoryBudgetError(RuntimeError):
     """Managed 指令无法完整纳入预算时抛出，调用方应阻止本次请求。"""
 
 
-def _safe_read_text(path: Path) -> Optional[str]:
+class MemoryReadError(RuntimeError):
+    """已发现的 memory 文件无法可靠读取或完整扫描。"""
+
+
+def _safe_read_text(path: Path) -> str:
     """读 markdown 全文（含 @include 扫描所需内容）。
 
     不再在 include 解析前静默截断 256KB：超大文件要么完整读入（≤2MB），
@@ -65,8 +69,8 @@ def _safe_read_text(path: Path) -> Optional[str]:
     """
     try:
         raw = path.read_bytes()
-    except OSError:
-        return None
+    except OSError as error:
+        raise MemoryReadError(f"memory 文件读取失败: {path}: {error}") from error
     if len(raw) > MAX_INCLUDE_SCAN_BYTES:
         logger.error(
             "memory 文件超过 include 扫描上限 (%s bytes > %s): %s",
@@ -74,11 +78,11 @@ def _safe_read_text(path: Path) -> Optional[str]:
             MAX_INCLUDE_SCAN_BYTES,
             path,
         )
-        return None
-    try:
-        return raw.decode("utf-8", errors="replace")
-    except Exception:
-        return None
+        raise MemoryReadError(
+            f"memory 文件超过 include 扫描上限: {path} "
+            f"({len(raw)} > {MAX_INCLUDE_SCAN_BYTES} bytes)"
+        )
+    return raw.decode("utf-8", errors="replace")
 
 
 async def _process_memory_file(
@@ -100,16 +104,14 @@ async def _process_memory_file(
         return []
     try:
         resolved = path.resolve()
-    except OSError:
-        return []
+    except OSError as error:
+        raise MemoryReadError(f"memory 路径解析失败: {path}: {error}") from error
     key = str(resolved)
     if key in processed:
         return []
     processed.add(key)
 
     raw = await asyncio.to_thread(_safe_read_text, resolved)
-    if raw is None:
-        return []
     meta, body = parse_frontmatter(raw)
     body = strip_block_html_comments(body)
     if not body.strip():
@@ -521,6 +523,7 @@ def enforce_memory_budget(
 __all__ = [
     "MemoryLoader",
     "MemoryBudgetError",
+    "MemoryReadError",
     "MemoryBudgetReport",
     "MAX_INCLUDE_DEPTH",
     "MAX_MEMORY_CHARACTER_COUNT",
