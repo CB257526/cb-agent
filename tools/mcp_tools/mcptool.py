@@ -9,6 +9,12 @@ from fastmcp import FastMCP
 
 from tools.tool import Tool
 from tools.toolParameter import ToolParameter
+from agent.cancel import CancellationReason, CancelToken, ToolCancelledError
+from agent.tool_execution import (
+    ToolCancellationMode,
+    ToolExecutionContext,
+    ToolTimeoutPolicy,
+)
 
 load_dotenv()
 
@@ -35,6 +41,8 @@ class MCPTool(Tool):
     旧实现只保存 `server_command`，因此 `mcp.json` 里的 HTTP/SSE 配置会在这里丢失。
     现在统一保存 `server_config`，stdio/http/sse 都经由同一个 MCPClient 入口连接。
     """
+
+    cancellation_mode = ToolCancellationMode.RUNTIME
 
     def __init__(
         self,
@@ -82,6 +90,9 @@ class MCPTool(Tool):
         self._persistent_loop: Optional[asyncio.AbstractEventLoop] = None
         self._persistent_client = None
         self._persistent_thread: Optional[threading.Thread] = None
+        # 一个 MCP session 上只允许一个在途调用。取消时连接会整体失效，
+        # 串行化可以避免误伤共享同一 transport 的其他调用。
+        self._call_lock = threading.Lock()
 
         if not self.server_config and not self.server_command and server is None:
             self.server = self._create_builtin_server()
@@ -91,7 +102,12 @@ class MCPTool(Tool):
         if description is None:
             description = self._generate_description()
 
-        super().__init__(name=name, description=description)
+        timeout_value = self.server_config.get("tool_timeout_sec", ...)
+        super().__init__(
+            name=name,
+            description=description,
+            default_timeout_seconds=timeout_value,
+        )
 
     def _prepare_env(
         self,
@@ -234,7 +250,7 @@ class MCPTool(Tool):
             for tool_info in self._available_tools
         ]
 
-    def _ensure_client(self):
+    def _ensure_client(self, context: Optional[ToolExecutionContext] = None):
         """确保外部 MCP server 的持久化客户端已连接。"""
         if self._persistent_client is not None:
             return
@@ -259,7 +275,19 @@ class MCPTool(Tool):
 
         future = asyncio.run_coroutine_threadsafe(connect(), self._persistent_loop)
         try:
-            self._persistent_client = future.result(timeout=30)
+            while True:
+                try:
+                    self._persistent_client = future.result(timeout=0.05)
+                    break
+                except concurrent.futures.TimeoutError:
+                    if context is not None and context.cancellation.is_cancelled():
+                        future.cancel()
+                        raise ToolCancelledError(
+                            context.cancellation.reason
+                            or CancellationReason.USER_CANCELLED,
+                            "MCP 连接建立已取消",
+                            effect_state="none",
+                        )
         except Exception as e:
             if self._persistent_loop is not None:
                 self._persistent_loop.call_soon_threadsafe(self._persistent_loop.stop)
@@ -269,9 +297,11 @@ class MCPTool(Tool):
                 self._persistent_loop.close()
             self._persistent_loop = None
             self._persistent_thread = None
+            if isinstance(e, ToolCancelledError):
+                raise
             raise RuntimeError(f"MCP 持久化连接失败: {e}")
 
-    def close(self):
+    def close(self, grace_seconds: float = 10.0):
         """关闭持久化 MCP 客户端连接。"""
         if self._persistent_client is None:
             return
@@ -285,14 +315,14 @@ class MCPTool(Tool):
         try:
             if self._persistent_loop is not None:
                 future = asyncio.run_coroutine_threadsafe(disconnect(), self._persistent_loop)
-                future.result(timeout=10)
+                future.result(timeout=max(0.05, grace_seconds))
         except Exception:
             pass
 
         if self._persistent_loop is not None:
             self._persistent_loop.call_soon_threadsafe(self._persistent_loop.stop)
         if self._persistent_thread is not None:
-            self._persistent_thread.join(timeout=5)
+            self._persistent_thread.join(timeout=max(0.05, grace_seconds))
         if self._persistent_loop is not None:
             try:
                 self._persistent_loop.close()
@@ -362,41 +392,120 @@ class MCPTool(Tool):
 
         return f"错误：不支持的操作 '{action}'"
 
-    def _run_via_persistent_client(self, action: str, parameters: Dict[str, Any]) -> str:
+    def _run_via_persistent_client(
+        self,
+        action: str,
+        parameters: Dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> str:
         async def run_op():
-            return await self._execute_on_client(self._persistent_client, action, parameters)
+            remaining = context.remaining_seconds()
+            operation = self._execute_on_client(
+                self._persistent_client, action, parameters
+            )
+            if remaining is None:
+                return await operation
+            return await asyncio.wait_for(operation, timeout=remaining)
 
         future = asyncio.run_coroutine_threadsafe(run_op(), self._persistent_loop)
-        return future.result()
+        unsubscribe = context.cancellation.add_cancel_callback(
+            lambda _reason: future.cancel()
+        )
+        try:
+            while True:
+                try:
+                    return future.result(timeout=0.05)
+                except concurrent.futures.TimeoutError:
+                    if context.cancellation.is_cancelled():
+                        future.cancel()
+                        raise ToolCancelledError(
+                            context.cancellation.reason
+                            or CancellationReason.USER_CANCELLED,
+                            "MCP 调用已取消",
+                            effect_state="may_have_occurred",
+                        )
+                except concurrent.futures.CancelledError:
+                    raise ToolCancelledError(
+                        context.cancellation.reason
+                        or CancellationReason.USER_CANCELLED,
+                        "MCP 调用已取消",
+                        effect_state="may_have_occurred",
+                    )
+                except TimeoutError:
+                    context.cancellation.cancel(CancellationReason.TOOL_TIMEOUT)
+                    raise ToolCancelledError(
+                        CancellationReason.TOOL_TIMEOUT,
+                        "MCP 调用超时",
+                        effect_state="may_have_occurred",
+                    )
+        finally:
+            unsubscribe()
 
-    def _run_via_temp_client(self, action: str, parameters: Dict[str, Any]) -> str:
+    def _run_via_temp_client(
+        self,
+        action: str,
+        parameters: Dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> str:
         from tools.mcp_tools.client import MCPClient
 
         async def run_mcp_operation():
             async with MCPClient(self._client_source(), self.server_args, env=self.env) as client:
-                return await self._execute_on_client(client, action, parameters)
+                operation = self._execute_on_client(client, action, parameters)
+                remaining = context.remaining_seconds()
+                if remaining is None:
+                    return await operation
+                return await asyncio.wait_for(operation, timeout=remaining)
 
+        loop = asyncio.new_event_loop()
+        task = loop.create_task(run_mcp_operation())
+        unsubscribe = context.cancellation.add_cancel_callback(
+            lambda _reason: loop.call_soon_threadsafe(task.cancel)
+        )
         try:
-            try:
-                asyncio.get_running_loop()
-
-                def run_in_thread():
-                    new_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(new_loop)
-                    try:
-                        return new_loop.run_until_complete(run_mcp_operation())
-                    finally:
-                        new_loop.close()
-
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    return executor.submit(run_in_thread).result()
-            except RuntimeError:
-                return asyncio.run(run_mcp_operation())
-        except Exception as e:
-            return f"MCP 异步操作失败: {e}"
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            raise ToolCancelledError(
+                context.cancellation.reason
+                or CancellationReason.USER_CANCELLED,
+                "MCP 调用已取消",
+                effect_state="may_have_occurred",
+            )
+        except TimeoutError:
+            context.cancellation.cancel(CancellationReason.TOOL_TIMEOUT)
+            raise ToolCancelledError(
+                CancellationReason.TOOL_TIMEOUT,
+                "MCP 调用超时",
+                effect_state="may_have_occurred",
+            )
+        finally:
+            unsubscribe()
+            asyncio.set_event_loop(None)
+            loop.close()
 
     def run(self, parameters: Dict[str, Any]) -> str:
-        """执行 MCP 操作。"""
+        """兼容直接调用；主执行链使用 run_with_context。"""
+        seconds = ToolTimeoutPolicy().resolve(
+            tool_name=self.name,
+            arguments=parameters,
+            tool_default_seconds=self.default_timeout_seconds,
+        )
+        deadline = ToolTimeoutPolicy.deadline_after(seconds)
+        child = CancelToken(deadline=deadline)
+        context = ToolExecutionContext(
+            turn_id="", round_idx=0, call_id="direct_mcp",
+            tool_name=self.name, cancellation=child, deadline=deadline,
+        )
+        try:
+            return self.run_with_context(parameters, context)
+        finally:
+            child.close()
+
+    def run_with_context(
+        self, parameters: Dict[str, Any], context: ToolExecutionContext
+    ) -> str:
+        """执行 MCP 操作，并让取消直接传播到在途 coroutine。"""
         action = str(parameters.get("action", "")).lower()
         if not action and "tool_name" in parameters:
             action = "call_tool"
@@ -405,14 +514,43 @@ class MCPTool(Tool):
         if not action:
             return "错误：必须指定 action 参数或 tool_name 参数"
 
+        if context.cancellation.is_cancelled():
+            raise ToolCancelledError(
+                context.cancellation.reason
+                or CancellationReason.USER_CANCELLED,
+                "MCP 调用在发送请求前被取消",
+                effect_state="none",
+            )
+        while not self._call_lock.acquire(timeout=0.05):
+            if context.cancellation.is_cancelled():
+                raise ToolCancelledError(
+                    context.cancellation.reason
+                    or CancellationReason.USER_CANCELLED,
+                    "MCP 调用在等待同 server 前序调用时被取消",
+                    effect_state="none",
+                )
         try:
+            if context.cancellation.is_cancelled():
+                raise ToolCancelledError(
+                    context.cancellation.reason
+                    or CancellationReason.USER_CANCELLED,
+                    "MCP 调用在发送请求前被取消",
+                    effect_state="none",
+                )
             if self._is_external_server():
-                self._ensure_client()
+                self._ensure_client(context)
                 if self._persistent_client is not None:
-                    return self._run_via_persistent_client(action, parameters)
-            return self._run_via_temp_client(action, parameters)
-        except Exception as e:
-            return f"MCP 操作失败: {e}"
+                    return self._run_via_persistent_client(
+                        action, parameters, context
+                    )
+            return self._run_via_temp_client(action, parameters, context)
+        except ToolCancelledError as exc:
+            # 取消或超时后的协议状态不可证明仍同步，必须丢弃连接。
+            if exc.effect_state != "none":
+                self.close(grace_seconds=0.1)
+            raise
+        finally:
+            self._call_lock.release()
 
     def get_parameters(self) -> List[ToolParameter]:
         return [

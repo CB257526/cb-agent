@@ -430,6 +430,8 @@ class TestGatewayDispatch(unittest.TestCase):
                 cancel_event=token.event,
             )
             response = json.loads(out.getvalue().strip())
+            self.assertTrue(response["result"]["accepted"])
+            self.assertFalse(response["result"]["completed"])
             self.assertEqual(response["result"]["closed_streams"], 1)
         finally:
             bus.unsubscribe(gateway._on_event)

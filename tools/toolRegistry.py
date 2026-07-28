@@ -1,11 +1,13 @@
 """工具注册表 - HelloAgents原生工具系统"""
 
 import copy
+import inspect
 import logging
 import threading
-from typing import Optional, Any, Callable, Iterable
+from typing import Any, Callable, Dict, Iterable, List, Optional
+
+from agent.tool_execution import ToolCancellationMode, ToolExecutionContext
 from .tool import Tool
-from typing import List, Dict
 
 
 logger = logging.getLogger(__name__)
@@ -83,41 +85,12 @@ class ToolRegistry:
             func_info = self._functions.get(name)
         return func_info["func"] if func_info else None
 
-    def execute_tool(self, name: str, input_text: str) -> str:
-        """
-        执行工具
-
-        Args:
-            name: 工具名称
-            input_text: 输入参数
-
-        Returns:
-            工具执行结果
-        """
-        # 优先查找Tool对象
-        with self._lock:
-            tool = self._tools.get(name)
-            func_info = self._functions.get(name)
-
-        if tool is not None:
-            try:
-                # 简化参数传递，直接传入字符串
-                return tool.run({"input": input_text})
-            except Exception as e:
-                return f"错误：执行工具 '{name}' 时发生异常: {str(e)}"
-
-        # 查找函数工具
-        elif func_info is not None:
-            func = func_info["func"]
-            try:
-                return func(input_text)
-            except Exception as e:
-                return f"错误：执行工具 '{name}' 时发生异常: {str(e)}"
-
-        else:
-            return f"错误：未找到名为 '{name}' 的工具。"
-    
-    def execute_tool(self, name: str, input_dict: dict[str, Any]) -> str:
+    def execute_tool(
+        self,
+        name: str,
+        input_dict: dict[str, Any],
+        context: Optional[ToolExecutionContext] = None,
+    ) -> str:
         """
         执行工具
 
@@ -128,28 +101,50 @@ class ToolRegistry:
         Returns:
             工具执行结果
         """
-        # 优先查找Tool对象
         with self._lock:
             tool = self._tools.get(name)
             func_info = self._functions.get(name)
 
         if tool is not None:
-            try:
-                # 直接传入字典参数
-                return tool.run(input_dict)
-            except Exception as e:
-                return f"错误：执行工具 '{name}' 时发生异常: {str(e)}"
+            # 新主路径始终使用带上下文的入口。异常不能在注册表中转成普通文本，
+            # 否则执行器无法区分失败、用户取消和超时。
+            if context is not None:
+                return tool.run_with_context(input_dict, context)
+            return tool.run(input_dict)
 
-        # 查找函数工具
         elif func_info is not None:
             func = func_info["func"]
-            try:
-                return func(input_dict)
-            except Exception as e:
-                return f"错误：执行工具 '{name}' 时发生异常: {str(e)}"
+            if context is not None:
+                # 函数工具只有明确声明第二个参数时才传入上下文。通过签名判断可以
+                # 避免把工具内部真正抛出的 TypeError 误判为旧接口。
+                try:
+                    signature = inspect.signature(func)
+                    parameters = signature.parameters.values()
+                    accepts_context = any(
+                        item.kind in (item.VAR_POSITIONAL, item.VAR_KEYWORD)
+                        for item in parameters
+                    ) or len(signature.parameters) >= 2
+                except (TypeError, ValueError):
+                    # 部分 C 扩展可调用对象没有 Python 签名，只能沿用旧接口。
+                    accepts_context = False
+                if accepts_context:
+                    return func(input_dict, context)
+            return func(input_dict)
 
         else:
-            return f"错误：未找到名为 '{name}' 的工具。"
+            raise KeyError(f"未找到名为 '{name}' 的工具")
+
+    def get_execution_profile(self, name: str) -> tuple[ToolCancellationMode, Any]:
+        """返回工具的取消模式和实例级默认超时。"""
+
+        with self._lock:
+            tool = self._tools.get(name)
+        if tool is None:
+            return ToolCancellationMode.BLOCKING, ...
+        return (
+            getattr(tool, "cancellation_mode", ToolCancellationMode.BLOCKING),
+            getattr(tool, "default_timeout_seconds", ...),
+        )
 
     def get_tools_description(self) -> str:
         """

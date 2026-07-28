@@ -495,7 +495,7 @@ class AgentSession:
         return [
             _history_message_to_payload(m)
             for m in self.history
-            if _message_kind(m) != CONTEXT_UPDATE_KIND
+            if _message_kind(m) not in {CONTEXT_UPDATE_KIND, "turn_aborted"}
         ]
 
     def list_sessions(self) -> List[Dict[str, Any]]:
@@ -953,9 +953,9 @@ class AgentSession:
 
         Args:
             cancel_token: 可选取消令牌。调 .cancel() 后：
-              - LLM 流式：下一个 chunk 边界停下，emit Cancelled(where=llm_stream)
-              - 工具循环：当前工具跑完后停下（不打断已运行工具），emit Cancelled
-                + RoundEnd(final=True)，返回已积累的部分答案
+              - LLM 流式：主动关闭连接，在统一落盘后 emit Cancelled
+              - 工具循环：Bash/MCP 会收到运行时取消；普通进程内工具协作退出或等待返回
+              - 所有工具终态和 transcript 提交后统一 emit Cancelled
               - 进入新一轮 think 之前会 abort 整个循环
             没传则新建一个空 token——chat 内部自己用，不会被外部触发。
 
@@ -1657,6 +1657,7 @@ class AgentSession:
             # 运行时通知和图片只属于当前请求；mid-turn compact 后要重新挂回请求，
             # 但绝不能进入摘要 source、replacement history 或 transcript。
             "request_only_inflight": [],
+            "turn_id": turn_id,
         }
 
         # 工具调用次数，最终回答，工具轨迹，本轮压缩事件。
@@ -1741,6 +1742,32 @@ class AgentSession:
         else:
             committed_turn_messages = list(self.history[history_commit_start:])
 
+        if token.is_cancelled():
+            # 中断标记进入模型 history 和 transcript，但 export_history 会过滤它，
+            # 因此前端不会把内部控制消息误画成用户输入。标记必须位于所有工具
+            # 终态之后，下一轮模型才能把它解释为整个回合的最终边界。
+            cancel_reason = (
+                token.reason.value
+                if getattr(token, "reason", None) is not None
+                else "user_cancelled"
+            )
+            abort_marker = Message(
+                role=MessageRole.USER,
+                content=f"<turn_aborted reason=\"{cancel_reason}\" />",
+                metadata={
+                    "kind": "turn_aborted",
+                    "reason": cancel_reason,
+                    "interrupted": True,
+                },
+            )
+            self.history.append(abort_marker)
+            committed_turn_messages.append(abort_marker)
+            if self.session_store is not None:
+                try:
+                    self.session_store.record_active_turn_aborted(reason=cancel_reason)
+                except Exception:
+                    logger.exception("记录 active turn 中断标记失败")
+
         # trace_collector 来自本轮工具循环,只服务 state.json 结构化字段提取
         # (files_seen / files_modified / recent_commands / decisions / pending)。
         # 不再生成 work_record 文本,因为原始工具消息已通过 history 累积传递。
@@ -1804,6 +1831,12 @@ class AgentSession:
                 {"last_assistant_message": final_answer or ""},
                 round_idx=rounds_used,
             )
+
+        # 中断事件必须晚于 transcript/history 提交，前端收到后即可安全释放 busy。
+        if token.is_cancelled():
+            self.event_bus.emit(Cancelled(
+                where="session", round_idx=rounds_used,
+            ))
 
         # Done 事件：让前端知道整轮结束
         elapsed = time.perf_counter() - chat_started
@@ -2382,9 +2415,6 @@ class AgentSession:
                     partial_answer,
                     round_idx=final_round_idx,
                 )
-                self.event_bus.emit(Cancelled(
-                    where="session_loop", round_idx=round_idx,
-                ))
                 self.event_bus.emit(RoundEnd(
                     round_idx=final_round_idx,
                     has_tool_calls=False, final=True,
@@ -2684,14 +2714,27 @@ class AgentSession:
             # token 透传给 executor：串行/并发模式下都在工具间做 cancel 检查
             # Plan Mode: 传入 PlanExecutionPolicy，在 executor 层硬拒绝写入工具。
             # execute 模式下 _plan_execution_policy() 返回 None，正常执行。
-            def _record_completed_tool_checkpoint(exec_result) -> None:
-                """单个工具完成后立即写运行中检查点。"""
+            def _record_tool_started_checkpoint(exec_context, arguments) -> None:
+                """工具进入运行函数前立即写开始检查点。"""
                 if self.session_store is None:
                     return
                 try:
-                    # 这里使用 exec_result.call_id，而不是外层 tool_calls 的 zip
-                    # 顺序。并行工具完成顺序不固定，call_id 才是稳定配对键。
-                    self.session_store.record_active_tool_completed(
+                    self.session_store.record_active_tool_started(
+                        round_idx=round_idx,
+                        tool_call_id=str(exec_context.call_id or ""),
+                        tool_name=str(exec_context.tool_name or ""),
+                        arguments=dict(arguments or {}),
+                    )
+                except Exception:
+                    logger.exception("记录 active tool 开始检查点失败")
+
+            def _record_terminal_tool_checkpoint(exec_result) -> None:
+                """单个工具进入唯一终态后立即写运行中检查点。"""
+                if self.session_store is None:
+                    return
+                try:
+                    # 并行完成顺序不固定，call_id 是唯一稳定配对键。
+                    self.session_store.record_active_tool_terminal(
                         round_idx=round_idx,
                         tool_message=Message.create_tool_message(
                             tool_call_id=str(exec_result.call_id or ""),
@@ -2703,17 +2746,25 @@ class AgentSession:
                             ),
                             is_error=exec_result.is_error,
                         ),
+                        status=exec_result.status.value,
+                        effect_state=exec_result.effect_state.value,
+                        cancel_reason=(
+                            exec_result.cancel_reason.value
+                            if exec_result.cancel_reason is not None else ""
+                        ),
                         is_error=exec_result.is_error,
                     )
                 except Exception:
-                    logger.exception("记录 active tool 完成检查点失败")
+                    logger.exception("记录 active tool 终态检查点失败")
 
             results = self.executor.execute(
                 tool_calls,
                 round_idx=round_idx,
                 cancel_token=token,
                 execution_policy=self.tool_execution_policy or self._plan_execution_policy(),
-                result_callback=_record_completed_tool_checkpoint,
+                result_callback=_record_terminal_tool_checkpoint,
+                start_callback=_record_tool_started_checkpoint,
+                turn_id=str(loop_state.get("turn_id") or ""),
             )
             for call, exec_result in zip(tool_calls, results):
                 # 完整工具结果按 OpenAI tool calling 协议回灌给本轮 messages,
@@ -3061,6 +3112,7 @@ class AgentSession:
             )
         except Exception:
             logger.exception("本地会话落盘失败")
+            raise
 
     def _auto_update_memory_and_knowledge(
         self,

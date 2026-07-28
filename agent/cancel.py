@@ -1,85 +1,211 @@
-"""统一中断令牌
+"""统一的回合取消上下文。
 
-让 agent 调用链（LLM 流式 / 工具执行）共享同一份"是否应中止"信号。
-
-设计：
-- CancelToken 包装一个 threading.Event，提供 cancel() / is_cancelled() / wait()
-  三个方法，跨线程使用安全
-- 通过 ContextVar 暴露给当前调用栈中的工具——工具内部不需要显式接受 token
-  参数，调用 get_current_cancel_token() 即可拿到
-- AgentSession 在 chat() 入口创建 token 并 set 到 ContextVar；ToolExecutor
-  通过 contextvars.copy_context() 把 token 传到 worker thread
-
-使用：
-    token = CancelToken()
-    set_current_cancel_token(token)   # 在主线程调用
-    ...
-    # 在某个工具或 LLM 流式循环里：
-    if get_current_cancel_token().is_cancelled():
-        raise Cancelled()
-
-或者直接传给 LLM.think(..., cancel_event=token.event)。
+取消不仅是一位布尔值。工具运行时需要知道取消原因、发生时间和剩余截止时间，
+还需要在取消发生的线程中立即收到通知，才能关闭网络请求或终止子进程。
 """
 
 from __future__ import annotations
 
 import contextvars
 import threading
-from typing import Optional
+import time
+from enum import Enum
+from typing import Callable, Dict, Optional
 
 
-class CancelToken:
-    """轻量中断令牌，包 threading.Event。"""
+class CancellationReason(str, Enum):
+    """取消原因。字符串枚举便于直接写入 JSON 日志。"""
 
-    __slots__ = ("_event",)
+    USER_CANCELLED = "user_cancelled"
+    TOOL_TIMEOUT = "tool_timeout"
+    SESSION_SHUTDOWN = "session_shutdown"
+    PARENT_CANCELLED = "parent_cancelled"
 
-    def __init__(self) -> None:
+
+class ToolCancelledError(RuntimeError):
+    """工具在可控边界观察到取消时抛出的结构化异常。"""
+
+    def __init__(
+        self,
+        reason: CancellationReason,
+        message: str = "工具执行已取消",
+        *,
+        partial_output: str = "",
+        effect_state: str = "unknown",
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.partial_output = partial_output
+        self.effect_state = effect_state
+
+
+class CancellationContext:
+    """线程安全的取消上下文，支持父子传播和运行时回调。"""
+
+    def __init__(
+        self,
+        *,
+        deadline: Optional[float] = None,
+        parent: Optional["CancellationContext"] = None,
+    ) -> None:
         self._event = threading.Event()
+        self._lock = threading.RLock()
+        self._reason: Optional[CancellationReason] = None
+        self._cancelled_at: Optional[float] = None
+        self._deadline = deadline
+        self._callbacks: Dict[int, Callable[[CancellationReason], None]] = {}
+        self._next_callback_id = 1
+        self._parent_unsubscribe: Optional[Callable[[], None]] = None
+        if parent is not None:
+            # 父回合取消时，子工具必须使用父级真实原因，不能误报成工具超时。
+            self._parent_unsubscribe = parent.add_cancel_callback(self.cancel)
+            if parent.is_cancelled():
+                self.cancel(parent.reason or CancellationReason.PARENT_CANCELLED)
 
     @property
     def event(self) -> threading.Event:
-        """暴露底层 Event，给 LLM.think(cancel_event=...) 直接用。"""
         return self._event
 
-    def cancel(self) -> None:
-        """触发中断。多次调用幂等。"""
-        self._event.set()
+    @property
+    def reason(self) -> Optional[CancellationReason]:
+        with self._lock:
+            return self._reason
+
+    @property
+    def cancelled_at(self) -> Optional[float]:
+        with self._lock:
+            return self._cancelled_at
+
+    @property
+    def deadline(self) -> Optional[float]:
+        return self._deadline
+
+    def cancel(
+        self,
+        reason: CancellationReason | str = CancellationReason.USER_CANCELLED,
+    ) -> bool:
+        """幂等触发取消；仅第一次调用负责通知运行时。"""
+
+        normalized = (
+            reason if isinstance(reason, CancellationReason)
+            else CancellationReason(str(reason))
+        )
+        with self._lock:
+            if self._event.is_set():
+                return False
+            self._reason = normalized
+            self._cancelled_at = time.time()
+            self._event.set()
+            callbacks = list(self._callbacks.values())
+            self._callbacks.clear()
+        for callback in callbacks:
+            try:
+                callback(normalized)
+            except Exception:
+                # 取消路径不能因为某个运行时清理失败而阻断其他清理回调。
+                continue
+        return True
 
     def is_cancelled(self) -> bool:
-        return self._event.is_set()
+        if self._event.is_set():
+            return True
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            self.cancel(CancellationReason.TOOL_TIMEOUT)
+            return True
+        return False
 
     def wait(self, timeout: Optional[float] = None) -> bool:
-        """阻塞等到 cancel；timeout 秒后还没 cancel 返回 False。"""
-        return self._event.wait(timeout)
+        if self.is_cancelled():
+            return True
+        wait_for = timeout
+        remaining = self.remaining_seconds()
+        if remaining is not None:
+            wait_for = remaining if wait_for is None else min(wait_for, remaining)
+        triggered = self._event.wait(wait_for)
+        return triggered or self.is_cancelled()
+
+    def remaining_seconds(self) -> Optional[float]:
+        if self._deadline is None:
+            return None
+        return max(0.0, self._deadline - time.monotonic())
+
+    def throw_if_cancelled(self) -> None:
+        if self.is_cancelled():
+            raise ToolCancelledError(
+                self.reason or CancellationReason.USER_CANCELLED
+            )
+
+    def child(self, *, deadline: Optional[float] = None) -> "CancellationContext":
+        return CancellationContext(deadline=deadline, parent=self)
+
+    def add_cancel_callback(
+        self, callback: Callable[[CancellationReason], None]
+    ) -> Callable[[], None]:
+        """注册立即取消回调，并返回可幂等调用的注销函数。"""
+
+        with self._lock:
+            if self._event.is_set():
+                reason = self._reason or CancellationReason.USER_CANCELLED
+                callback_id = 0
+            else:
+                callback_id = self._next_callback_id
+                self._next_callback_id += 1
+                self._callbacks[callback_id] = callback
+                reason = None
+        if reason is not None:
+            callback(reason)
+
+        def unsubscribe() -> None:
+            if callback_id:
+                with self._lock:
+                    self._callbacks.pop(callback_id, None)
+
+        return unsubscribe
+
+    def close(self) -> None:
+        """解除父级订阅，避免完成工具长期滞留在父回调表中。"""
+
+        unsubscribe = self._parent_unsubscribe
+        self._parent_unsubscribe = None
+        if unsubscribe is not None:
+            unsubscribe()
 
     def reset(self) -> None:
-        """清除 cancel 状态。一般不用，新会话直接造新 token 更清晰。"""
-        self._event.clear()
+        """仅为旧调用方兼容保留；新回合应创建新的上下文。"""
+
+        with self._lock:
+            self._reason = None
+            self._cancelled_at = None
+            self._event.clear()
 
 
-# ContextVar：让工具/LLM 不显式传 token 也能拿到
-_current_token: contextvars.ContextVar[Optional[CancelToken]] = (
+# 保留旧名称，现有调用方会自动获得新的取消能力。
+CancelToken = CancellationContext
+
+_current_token: contextvars.ContextVar[Optional[CancellationContext]] = (
     contextvars.ContextVar("cb_agent_cancel_token", default=None)
 )
 
 
-def set_current_cancel_token(token: Optional[CancelToken]) -> contextvars.Token:
-    """绑到当前 context。返回的 Token 用于 reset。"""
+def set_current_cancel_token(
+    token: Optional[CancellationContext],
+) -> contextvars.Token:
     return _current_token.set(token)
 
 
-def get_current_cancel_token() -> Optional[CancelToken]:
-    """取当前 context 的 token，未绑定返回 None。"""
+def get_current_cancel_token() -> Optional[CancellationContext]:
     return _current_token.get()
 
 
 def reset_current_cancel_token(reset_token: contextvars.Token) -> None:
-    """配对 set_current_cancel_token 用。"""
     _current_token.reset(reset_token)
 
 
 __all__ = [
+    "CancellationContext",
+    "CancellationReason",
     "CancelToken",
+    "ToolCancelledError",
     "set_current_cancel_token",
     "get_current_cancel_token",
     "reset_current_cancel_token",

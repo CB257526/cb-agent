@@ -1,17 +1,40 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List
 from .toolParameter import ToolParameter
+from agent.tool_execution import ToolCancellationMode, ToolExecutionContext
 class Tool(ABC):
     """工具基类"""
 
-    def __init__(self, name: str, description: str):
+    cancellation_mode = ToolCancellationMode.BLOCKING
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        *,
+        default_timeout_seconds: Any = ...,
+    ):
         self.name = name
         self.description = description
+        self.default_timeout_seconds = default_timeout_seconds
 
     @abstractmethod
     def run(self, parameters: Dict[str, Any]) -> str:
         """执行工具"""
         pass
+
+    def run_with_context(
+        self,
+        parameters: Dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> str:
+        """新执行入口；旧工具默认复用同步实现。
+
+        旧工具属于不可安全终止的进程内代码，因此只在开始前检查取消。需要在
+        运行中响应取消的工具必须覆盖本方法，并声明对应 cancellation_mode。
+        """
+        context.throw_if_cancelled()
+        return self.run(parameters)
 
     @abstractmethod
     def get_parameters(self) -> List[ToolParameter]:

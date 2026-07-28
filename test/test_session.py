@@ -382,7 +382,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
         self.assertEqual(answer, "")
         self.assertEqual(len(llm.calls), 1)
-        self.assertTrue(any(isinstance(e, Cancelled) and e.where == "session_loop" for e in self.events))
+        self.assertTrue(any(isinstance(e, Cancelled) and e.where == "session" for e in self.events))
         dones = [e for e in self.events if isinstance(e, Done)]
         self.assertTrue(dones)
         self.assertTrue(dones[-1].cancelled)
@@ -1007,13 +1007,15 @@ class TestAgentSessionBasic(unittest.TestCase):
                 round_idx=1,
                 assistant_message=Message.create_assistant_message(tool_calls=[call]),
             )
-            store.record_active_tool_completed(
+            store.record_active_tool_terminal(
                 round_idx=1,
                 tool_message=Message.create_tool_message(
                     tool_call_id="call_active",
                     tool_name="file_read",
                     tool_output=json.dumps({"path": "active.txt", "content": "abc"}, ensure_ascii=False),
                 ),
+                status="completed",
+                effect_state="completed",
             )
 
             restored = AgentSession(
@@ -1031,7 +1033,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             sliced = restored._sliced_history_dicts()
             roles = [m.get("role") for m in sliced]
-            self.assertEqual(roles, ["user", "assistant", "tool"])
+            self.assertEqual(roles, ["user", "assistant", "tool", "user"])
             self.assertEqual(sliced[1]["tool_calls"][0]["id"], "call_active")
             self.assertEqual(sliced[2]["tool_call_id"], "call_active")
 
@@ -1049,13 +1051,15 @@ class TestAgentSessionBasic(unittest.TestCase):
                 round_idx=1,
                 assistant_message=Message.create_assistant_message(tool_calls=[call]),
             )
-            store.record_active_tool_completed(
+            store.record_active_tool_terminal(
                 round_idx=1,
                 tool_message=Message.create_tool_message(
                     tool_call_id="call_download",
                     tool_name="bash",
                     tool_output="已创建 search_download.py",
                 ),
+                status="completed",
+                effect_state="completed",
             )
 
             resumed = AgentSession(
@@ -1121,10 +1125,15 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             self.assertEqual(
                 [m.role.value if hasattr(m.role, "value") else str(m.role) for m in visible],
-                ["user", "assistant", "tool"],
+                ["user", "assistant", "tool", "tool", "user"],
             )
-            self.assertEqual([tc["id"] for tc in visible[1].tool_calls], ["call_first"])
+            self.assertEqual(
+                [tc["id"] for tc in visible[1].tool_calls],
+                ["call_first", "call_second"],
+            )
             self.assertEqual(visible[2].tool_call_id, "call_first")
+            self.assertEqual(json.loads(str(visible[3].content))["status"], "unknown")
+            self.assertEqual((visible[4].metadata or {}).get("kind"), "turn_aborted")
 
     def test_final_answer_checkpoint_survives_transcript_commit_interruption(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1151,7 +1160,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             visible = [
                 message for message in restored.history
-                if (message.metadata or {}).get("kind") != "context_update"
+                if (message.metadata or {}).get("kind")
+                not in {"context_update", "turn_aborted"}
             ]
 
             self.assertEqual(
@@ -1195,7 +1205,7 @@ class TestAgentSessionBasic(unittest.TestCase):
                 round_idx=1,
                 assistant_message=Message.create_assistant_message(tool_calls=[call]),
             )
-            store.record_active_tool_completed(
+            store.record_active_tool_terminal(
                 round_idx=1,
                 tool_message=Message.create_tool_message(
                     "call_error",
@@ -1203,6 +1213,8 @@ class TestAgentSessionBasic(unittest.TestCase):
                     '{"error":"denied"}',
                     is_error=True,
                 ),
+                status="failed",
+                effect_state="unknown",
                 is_error=True,
             )
 

@@ -26,19 +26,31 @@ import logging
 import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from agent.cancel import CancelToken
+from agent.cancel import (
+    CancellationReason,
+    CancelToken,
+    ToolCancelledError,
+)
 from agent.event_bus import EventBus
-from agent.events import Cancelled, ToolComplete, ToolStart
+from agent.events import ToolComplete, ToolStart
 from agent.platforms.permissions import (
     check_platform_tool_permission,
     permission_denied_payload,
 )
-from agent.result_cap import cap_batch_results, cap_single_result
+from agent.result_cap import cap_single_result
+from agent.tool_execution import (
+    ToolCancellationMode,
+    ToolEffectState,
+    ToolExecutionContext,
+    ToolTerminalStatus,
+    ToolTimeoutPolicy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +117,8 @@ def should_parallelize(tool_calls: List[Dict[str, Any]]) -> bool:
 # ========== 单工具执行 ==========
 
 
-# Tool registry 接口最小描述：只用 execute_tool(name, args) -> str
-ToolRunner = Callable[[str, Dict[str, Any]], str]
+# runner 可以是旧的二参数函数，也可以是新的三参数 ToolRegistry.execute_tool。
+ToolRunner = Callable[..., str]
 
 
 @dataclass
@@ -118,6 +130,17 @@ class ToolCallResult:
     result: str               # 工具的 run() 返回（通常 JSON 字符串）
     duration_seconds: float
     is_error: bool
+    status: ToolTerminalStatus = ToolTerminalStatus.COMPLETED
+    effect_state: ToolEffectState = ToolEffectState.COMPLETED
+    cancel_reason: Optional[CancellationReason] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # 兼容旧测试和扩展代码中只传 is_error 的构造方式。
+        if self.is_error and self.status == ToolTerminalStatus.COMPLETED:
+            self.status = ToolTerminalStatus.FAILED
+        self.is_error = self.status != ToolTerminalStatus.COMPLETED
 
 
 def _parse_arguments(raw: str) -> Dict[str, Any]:
@@ -205,6 +228,7 @@ class ToolExecutor:
         max_workers: int = 4,
         persist_dir: Optional[Path] = None,
         hook_manager: Optional[Any] = None,
+        timeout_policy: Optional[ToolTimeoutPolicy] = None,
     ) -> None:
         """
         Args:
@@ -221,6 +245,18 @@ class ToolExecutor:
         self._max_workers = max_workers
         self._persist_dir = persist_dir or Path(os.getcwd()) / ".cbagent" / "tool_results"
         self._hook_manager = hook_manager
+        self._timeout_policy = timeout_policy or ToolTimeoutPolicy()
+        # 线程池由执行器持有，避免 with ThreadPoolExecutor 在取消路径上隐式等待。
+        # 调用本身仍会等待 blocking 工具安全结束，不会把未知副作用线程遗留后台。
+        self._pool = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="cb-tool",
+        )
+        runner_owner = getattr(runner, "__self__", None)
+        self._profile_resolver = getattr(runner_owner, "get_execution_profile", None)
+        # 真实 ToolRegistry 同时提供执行画像和三参数入口。测试或扩展代码可能用
+        # MagicMock 替换 execute_tool；此时只保留二参数兼容，避免 *args 签名误判。
+        self._runner_accepts_context = callable(self._profile_resolver)
 
     def execute(
         self,
@@ -229,6 +265,8 @@ class ToolExecutor:
         cancel_token: Optional[CancelToken] = None,
         execution_policy: Optional[Any] = None,
         result_callback: Optional[Callable[[ToolCallResult], None]] = None,
+        start_callback: Optional[Callable[[ToolExecutionContext, Dict[str, Any]], None]] = None,
+        turn_id: str = "",
     ) -> List[ToolCallResult]:
         """执行一批 tool_calls，返回**保持 tool_calls 输入顺序**的结果列表。
 
@@ -236,13 +274,9 @@ class ToolExecutor:
         tool_call_id 对应一个 tool 消息），这里返回结果保序，方便 AgentSession
         直接 zip。
 
-        cancel_token 行为：
-          - 串行：在每个工具开始前看一眼。已被 cancel 则剩余 tool_calls 全部
-            填一个"已取消"的占位结果（保留 call_id 让回灌不破协议）
-          - 并行：所有 future 都正常 submit / 等回；submit 之前最后一次看
-            token——已 cancel 就一个都不发，全部填占位。已 submit 的工具不
-            被强制中止（线程池不可中断；这跟 LLM 流式不一样，工具进程要靠它
-            自己的超时机制处理硬中断）
+        已运行的工具通过子取消上下文收到即时通知；尚未运行的调用生成
+        cancelled_before_start 终态。普通 blocking 工具无法安全杀线程，因此取消后
+        仍等待它返回；Bash/MCP 等 runtime 工具会在上下文回调中主动清理。
 
         execution_policy（Plan Mode 服务端工具管控）：
           传入一个可调用策略对象（如 PlanExecutionPolicy），在 _run_one 中
@@ -266,11 +300,13 @@ class ToolExecutor:
         # submit 前最后一次窗口：已 cancel 就直接全部占位
         if cancel_token is not None and cancel_token.is_cancelled():
             logger.info("executor cancelled before submit: round=%s calls=%s", round_idx, len(tool_calls))
-            if self._bus is not None:
-                self._bus.emit(Cancelled(where="executor", round_idx=round_idx))
-            return [
-                self._cancelled_placeholder(tc) for tc in tool_calls
+            results = [
+                self._cancelled_before_start(tc, cancel_token, round_idx)
+                for tc in tool_calls
             ]
+            for result in results:
+                self._notify_result_callback(result_callback, result)
+            return results
 
         if should_parallelize(tool_calls):
             logger.info("executor mode: parallel round=%s calls=%s", round_idx, len(tool_calls))
@@ -280,6 +316,8 @@ class ToolExecutor:
                 cancel_token,
                 execution_policy,
                 result_callback,
+                start_callback,
+                turn_id,
             )
         else:
             logger.info("executor mode: serial round=%s calls=%s", round_idx, len(tool_calls))
@@ -289,19 +327,12 @@ class ToolExecutor:
                 cancel_token,
                 execution_policy,
                 result_callback,
+                start_callback,
+                turn_id,
             )
 
-        # 批量总量上限是 cb-agent 在单条 Codex 风格 cap 之外的额外兜底。
-        # 此时 results 尚未返回给 AgentSession，也从未追加进发给模型的 messages，
-        # 因此这里只规范化本轮新结果，不会改写已发送前缀或破坏 provider cache。
-        # result_callback 已经在单个工具完成时通知过一次；这里如果批量 cap 又改写
-        # 了结果，需要用同一个 call_id 再通知一次，让 active_turn 中的最终结果与
-        # 后续回灌给模型的 messages 保持一致。
-        before_batch_cap = [r.result for r in results]
-        cap_batch_results(results, self._persist_dir)
-        for before, result in zip(before_batch_cap, results):
-            if result.result != before:
-                self._notify_result_callback(result_callback, result)
+        # 每条结果在发事件和写终态前已经执行统一上限；此处不再做会造成同一
+        # call_id 二次终态写入的批量改写。
         return results
 
     # ---------- 串行 ----------
@@ -313,6 +344,8 @@ class ToolExecutor:
         cancel_token: Optional[CancelToken],
         execution_policy: Optional[Any],
         result_callback: Optional[Callable[[ToolCallResult], None]],
+        start_callback: Optional[Callable[[ToolExecutionContext, Dict[str, Any]], None]],
+        turn_id: str,
     ) -> List[ToolCallResult]:
         """串行执行一批 tool_calls。
 
@@ -320,20 +353,20 @@ class ToolExecutor:
         保证 OpenAI 协议每个 tool_call_id 都有对应的 tool 消息回灌。
         """
         results: List[ToolCallResult] = []
-        cancel_emitted = False
         for tc in tool_calls:
             if cancel_token is not None and cancel_token.is_cancelled():
-                if self._bus is not None and not cancel_emitted:
-                    self._bus.emit(Cancelled(where="executor", round_idx=round_idx))
-                    cancel_emitted = True
                 logger.info(
                     "executor skipped tool after cancel: round=%s name=%s",
                     round_idx,
                     tc.get("function", {}).get("name", ""),
                 )
-                results.append(self._cancelled_placeholder(tc))
+                result = self._cancelled_before_start(tc, cancel_token, round_idx)
+                results.append(result)
+                self._notify_result_callback(result_callback, result)
                 continue
-            result = self._run_one(tc, round_idx, execution_policy=execution_policy)
+            result = self._run_one(
+                tc, round_idx, execution_policy, cancel_token, start_callback, turn_id
+            )
             results.append(result)
             self._notify_result_callback(result_callback, result)
         return results
@@ -347,46 +380,56 @@ class ToolExecutor:
         cancel_token: Optional[CancelToken],
         execution_policy: Optional[Any],
         result_callback: Optional[Callable[[ToolCallResult], None]],
+        start_callback: Optional[Callable[[ToolExecutionContext, Dict[str, Any]], None]],
+        turn_id: str,
     ) -> List[ToolCallResult]:
         # 每个 worker 拿一份 ctx 副本：同一个 contextvars.Context 不能并发
         # 多次 ctx.run（会抛 "context already entered"）。我们在主线程抓
         # 状态，给每个 worker 各 copy_context() 一份独立 ctx。
-        max_workers = min(len(tool_calls), self._max_workers)
         results: List[Optional[ToolCallResult]] = [None] * len(tool_calls)
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="cb-tool",
-        ) as ex:
-            futs = {
-                ex.submit(
-                    contextvars.copy_context().run,
-                    self._run_one, tc, round_idx, execution_policy,
-                ): i
-                for i, tc in enumerate(tool_calls)
-            }
-            first_base_error: Optional[BaseException] = None
-            first_base_error_traceback = None
-            for fut in as_completed(futs):
-                idx = futs[fut]
+        futs: Dict[Future, int] = {
+            self._pool.submit(
+                contextvars.copy_context().run,
+                self._run_one, tc, round_idx, execution_policy,
+                cancel_token, start_callback, turn_id,
+            ): i
+            for i, tc in enumerate(tool_calls)
+        }
+        pending = set(futs)
+        first_base_error: Optional[BaseException] = None
+        first_base_error_traceback = None
+        while pending:
+            done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+            if cancel_token is not None and cancel_token.is_cancelled():
+                # 只取消尚未进入 worker 的任务；已运行任务由其子上下文负责清理。
+                for future in tuple(pending):
+                    if future.cancel():
+                        idx = futs[future]
+                        result = self._cancelled_before_start(
+                            tool_calls[idx], cancel_token, round_idx
+                        )
+                        results[idx] = result
+                        pending.remove(future)
+                        self._notify_result_callback(result_callback, result)
+            for future in done:
+                idx = futs[future]
                 try:
-                    result = fut.result()
+                    result = future.result()
                 except BaseException as exc:
-                    # ThreadPoolExecutor 在退出 with 时本来就会等待全部任务结束。
-                    # 因此这里继续收集其它成功结果，不会额外延长当前异常路径，
-                    # 却能保证进程退出前把已经完成的工具检查点全部写下。
+                    # 仍继续收集其他已启动调用，确保成功工具先完成终态持久化。
                     if first_base_error is None:
                         first_base_error = exc
                         first_base_error_traceback = exc.__traceback__
                     continue
                 results[idx] = result
-                # 并行模式下按完成顺序通知持久化层，但返回值仍按 tool_calls
-                # 原始顺序组装，保证后续 OpenAI tool 消息回灌顺序不变。
                 self._notify_result_callback(result_callback, result)
-            if first_base_error is not None:
-                raise first_base_error.with_traceback(first_base_error_traceback)
-        # 这里不主动看 cancel_token：所有 future 已经 submit，让它们自然
-        # 结束更安全；token 是否被 set 由 cb_agents / session 在外层处理
-        return [r for r in results if r is not None]
+        if first_base_error is not None:
+            raise first_base_error.with_traceback(first_base_error_traceback)
+        return [result for result in results if result is not None]
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
     def _notify_result_callback(
@@ -472,6 +515,8 @@ class ToolExecutor:
             result=result,
             duration_seconds=0.0,
             is_error=True,
+            status=ToolTerminalStatus.FAILED,
+            effect_state=ToolEffectState.NONE,
         )
 
     def _platform_permission_denial(
@@ -509,6 +554,8 @@ class ToolExecutor:
         return ToolCallResult(
             call_id=call_id, name=name, arguments=args,
             result=result, duration_seconds=0.0, is_error=True,
+            status=ToolTerminalStatus.FAILED,
+            effect_state=ToolEffectState.NONE,
         )
 
     def _run_one(
@@ -516,6 +563,9 @@ class ToolExecutor:
         tool_call: Dict[str, Any],
         round_idx: int,
         execution_policy: Optional[Any] = None,
+        cancel_token: Optional[CancelToken] = None,
+        start_callback: Optional[Callable[[ToolExecutionContext, Dict[str, Any]], None]] = None,
+        turn_id: str = "",
     ) -> ToolCallResult:
         call_id = tool_call.get("id", "") or f"call_{uuid.uuid4().hex[:8]}"
         name = tool_call.get("function", {}).get("name", "")
@@ -585,6 +635,8 @@ class ToolExecutor:
                 return ToolCallResult(
                     call_id=call_id, name=name, arguments=args,
                     result=result, duration_seconds=0.0, is_error=True,
+                    status=ToolTerminalStatus.FAILED,
+                    effect_state=ToolEffectState.NONE,
                 )
             if outcome.updated_input is not None:
                 logger.info(
@@ -613,24 +665,115 @@ class ToolExecutor:
                 if denied is not None:
                     return denied
 
+        # Hook 可能改写 timeout 等参数，因此必须在所有策略检查完成后再解析
+        # deadline 并创建子取消上下文。被策略拒绝的调用也不会残留父级回调。
+        mode, tool_default = self._execution_profile(name)
+        timeout_seconds = self._timeout_policy.resolve(
+            tool_name=name,
+            arguments=args,
+            tool_default_seconds=tool_default,
+        )
+        deadline = self._timeout_policy.deadline_after(timeout_seconds)
+        parent = cancel_token or CancelToken()
+        child = parent.child(deadline=deadline)
+        context = ToolExecutionContext(
+            turn_id=turn_id,
+            round_idx=round_idx,
+            call_id=call_id,
+            tool_name=name,
+            cancellation=child,
+            deadline=deadline,
+        )
+
+        if start_callback is not None:
+            # 开始检查点是副作用工具的预写日志。写入失败时必须阻止工具启动，
+            # 否则重启后会把已经执行过的调用误判为 cancelled_before_start。
+            try:
+                start_callback(context, args)
+            except BaseException:
+                child.close()
+                raise
         if self._bus is not None:
             self._bus.emit(ToolStart(
                 call_id=call_id, name=name, arguments=args, round_idx=round_idx,
             ))
 
         start = time.perf_counter()
-        is_error = False
+        started_at = self._utc_now()
+        status = ToolTerminalStatus.COMPLETED
+        effect_state = ToolEffectState.COMPLETED
+        cancel_reason: Optional[CancellationReason] = None
+        runner_started = False
         try:
-            result = self._runner(name, args)
+            child.throw_if_cancelled()
+            runner_started = True
+            if self._runner_accepts_context:
+                result = self._runner(name, args, context)
+            else:
+                result = self._runner(name, args)
+            completed_at = time.time()
+            completed_monotonic = time.monotonic()
+            if child.is_cancelled():
+                reason = child.reason or CancellationReason.USER_CANCELLED
+                # 以工具函数返回的瞬间作为完成边界。取消早于该边界才赢得竞争；
+                # 迟到的用户取消不能覆盖已经完成的工具事实。
+                timeout_won = (
+                    reason == CancellationReason.TOOL_TIMEOUT
+                    and deadline is not None
+                    and deadline <= completed_monotonic
+                )
+                cancel_won = (
+                    child.cancelled_at is not None
+                    and child.cancelled_at <= completed_at
+                )
+                if timeout_won or cancel_won:
+                    raise ToolCancelledError(
+                        reason,
+                        partial_output=_stringify_tool_result(result),
+                        effect_state="may_have_occurred",
+                    )
+        except ToolCancelledError as exc:
+            cancel_reason = exc.reason
+            status = (
+                ToolTerminalStatus.TIMED_OUT
+                if exc.reason == CancellationReason.TOOL_TIMEOUT
+                else ToolTerminalStatus.CANCELLED
+            )
+            if not runner_started:
+                effect_state = ToolEffectState.NONE
+            else:
+                try:
+                    effect_state = ToolEffectState(exc.effect_state)
+                except ValueError:
+                    effect_state = ToolEffectState.UNKNOWN
+            result = self._terminal_payload(
+                status=status,
+                name=name,
+                call_id=call_id,
+                reason=exc.reason,
+                effect_state=effect_state,
+                partial_output=exc.partial_output,
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception("工具执行抛异常: name=%s call_id=%s", name, call_id)
             result = json.dumps(
                 {"error": f"工具执行异常: {type(e).__name__}: {e}"},
                 ensure_ascii=False,
             )
-            is_error = True
+            status = ToolTerminalStatus.FAILED
+            effect_state = ToolEffectState.UNKNOWN
+        finally:
+            child.close()
         duration = time.perf_counter() - start
+        if mode == ToolCancellationMode.BLOCKING and duration >= 0.1:
+            logger.warning(
+                "不可抢占工具执行较慢: name=%s call_id=%s duration=%.2fs",
+                name,
+                call_id,
+                duration,
+            )
         result = _stringify_tool_result(result)
+        is_error = status != ToolTerminalStatus.COMPLETED
 
         # PostToolUse hook：工具成功执行后触发，可注入额外上下文给模型。
         # additional_context 追加进 result JSON 的约定字段 _hook_context，零协议改动：
@@ -669,6 +812,8 @@ class ToolExecutor:
         result = self._cap_model_visible_result(result, call_id=call_id, name=name)
         if _result_declares_error(result):
             is_error = True
+            if status == ToolTerminalStatus.COMPLETED:
+                status = ToolTerminalStatus.FAILED
 
         if self._bus is not None:
             self._bus.emit(ToolComplete(
@@ -680,32 +825,79 @@ class ToolExecutor:
         return ToolCallResult(
             call_id=call_id, name=name, arguments=args,
             result=result, duration_seconds=duration, is_error=is_error,
+            status=status, effect_state=effect_state,
+            cancel_reason=cancel_reason, started_at=started_at,
+            finished_at=self._utc_now(),
         )
 
-    # ---------- cancel 占位 ----------
+    def _execution_profile(self, name: str) -> tuple[ToolCancellationMode, Any]:
+        if callable(self._profile_resolver):
+            return self._profile_resolver(name)
+        return ToolCancellationMode.BLOCKING, ...
 
-    def _cancelled_placeholder(self, tool_call: Dict[str, Any]) -> ToolCallResult:
-        """生成一个"被取消"的占位 ToolCallResult。
+    @staticmethod
+    def _terminal_payload(
+        *,
+        status: ToolTerminalStatus,
+        name: str,
+        call_id: str,
+        reason: CancellationReason | str,
+        effect_state: ToolEffectState,
+        partial_output: str = "",
+    ) -> str:
+        """生成模型可见的稳定终态结构。"""
 
-        OpenAI 协议要求每个 tool_call_id 必须有对应的 tool 消息回灌，否则
-        下一轮 think 直接 400。这里用 is_error=True + 简短 JSON 既保留
-        协议合法性，也告诉模型"这个工具因用户取消没跑"。
-        """
+        return json.dumps({
+            "status": status.value,
+            "tool": name,
+            "call_id": call_id,
+            "reason": reason.value if isinstance(reason, CancellationReason) else str(reason),
+            "effect_state": effect_state.value,
+            "partial_output": partial_output,
+        }, ensure_ascii=False)
+
+    def _cancelled_before_start(
+        self,
+        tool_call: Dict[str, Any],
+        cancel_token: Optional[CancelToken],
+        round_idx: int,
+    ) -> ToolCallResult:
+        """为未启动调用生成成对终态，避免产生孤立 tool_call。"""
         call_id = tool_call.get("id", "") or f"call_{uuid.uuid4().hex[:8]}"
         name = tool_call.get("function", {}).get("name", "")
         raw_args = tool_call.get("function", {}).get("arguments", "{}")
         args = _parse_arguments(raw_args)
-        return ToolCallResult(
+        reason = (
+            cancel_token.reason
+            if cancel_token is not None and cancel_token.reason is not None
+            else CancellationReason.USER_CANCELLED
+        )
+        result = ToolCallResult(
             call_id=call_id,
             name=name,
             arguments=args,
-            result=json.dumps(
-                {"cancelled": True, "reason": "user requested cancel"},
-                ensure_ascii=False,
+            result=self._terminal_payload(
+                status=ToolTerminalStatus.CANCELLED_BEFORE_START,
+                name=name, call_id=call_id, reason=reason,
+                effect_state=ToolEffectState.NONE,
             ),
             duration_seconds=0.0,
             is_error=True,
+            status=ToolTerminalStatus.CANCELLED_BEFORE_START,
+            effect_state=ToolEffectState.NONE,
+            cancel_reason=reason,
+            finished_at=self._utc_now(),
         )
+        if self._bus is not None:
+            self._bus.emit(ToolComplete(
+                call_id=call_id,
+                name=name,
+                result=result.result,
+                duration_seconds=0.0,
+                is_error=True,
+                round_idx=round_idx,
+            ))
+        return result
 
 
 __all__ = [

@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -12,6 +13,20 @@ logger = logging.getLogger(__name__)
 
 # 匹配 ${VAR} 或 ${VAR:-default} 形式的占位符
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _validate_tool_timeout(server_name: str, value: Any) -> Any:
+    """校验 MCP 工具超时；0 和 null 分别表示禁用和未配置。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"MCP server {server_name} 的 tool_timeout_sec 必须是数字")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(
+            f"MCP server {server_name} 的 tool_timeout_sec 必须是大于等于 0 的有限数字"
+        )
+    return value
 
 
 def _load_env_for_mcp_config(mcp_json_path: Path) -> None:
@@ -122,7 +137,7 @@ def _build_stdio_config(server_name: str, server_config: Dict[str, Any]) -> Dict
         raise ValueError(f"MCP server {server_name} 使用 stdio transport 时必须配置 command")
     if not isinstance(args, list):
         raise ValueError(f"MCP server {server_name} 的 args 必须是数组")
-    return {
+    result = {
         "name": server_name,
         "transport": "stdio",
         "command": command,
@@ -131,6 +146,11 @@ def _build_stdio_config(server_name: str, server_config: Dict[str, Any]) -> Dict
         "env": server_config.get("env"),
         "cwd": server_config.get("cwd"),
     }
+    if "tool_timeout_sec" in server_config:
+        result["tool_timeout_sec"] = _validate_tool_timeout(
+            server_name, server_config.get("tool_timeout_sec")
+        )
+    return result
 
 
 def _build_remote_config(server_name: str, server_config: Dict[str, Any], transport: str) -> Dict[str, Any]:
@@ -148,7 +168,7 @@ def _build_remote_config(server_name: str, server_config: Dict[str, Any], transp
     headers = server_config.get("headers")
     if headers is None and isinstance(request_init, dict):
         headers = request_init.get("headers")
-    return {
+    result = {
         "name": server_name,
         "transport": transport,
         "url": url,
@@ -157,6 +177,11 @@ def _build_remote_config(server_name: str, server_config: Dict[str, Any], transp
         "verify": server_config.get("verify"),
         "sse_read_timeout": server_config.get("sse_read_timeout"),
     }
+    if "tool_timeout_sec" in server_config:
+        result["tool_timeout_sec"] = _validate_tool_timeout(
+            server_name, server_config.get("tool_timeout_sec")
+        )
+    return result
 
 
 def load_mcp_server_configs(

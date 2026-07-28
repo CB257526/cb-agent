@@ -29,7 +29,7 @@ if sys.platform == "win32":
         pass
 
 from agent.cancel import (
-    CancelToken,
+    CancellationReason, CancelToken,
     get_current_cancel_token,
     set_current_cancel_token,
     reset_current_cancel_token,
@@ -40,6 +40,7 @@ from agent.executor import (
     READ_ONLY_IF_ACTION, READ_ONLY_TOOLS,
     ToolCallResult, ToolExecutor, should_parallelize,
 )
+from agent.tool_execution import ToolCancellationMode, ToolTerminalStatus
 from agent.result_cap import MAX_SINGLE_RESULT_BYTES
 from agent.plan_policy import PlanExecutionPolicy
 from agent.platforms.context import (
@@ -140,6 +141,26 @@ class TestExecutorSerial(unittest.TestCase):
         self.assertEqual([r.name for r in results], ["file_read", "bash", "search"])
         self.assertEqual(order, ["file_read", "bash", "search"])
 
+    def test_cancelled_before_start_returns_paired_terminal_results(self):
+        """取消发生在提交前时，每个 tool_call 都必须得到成对终态。"""
+        token = CancelToken()
+        token.cancel()
+        callbacks = []
+        ex = ToolExecutor(lambda _name, _args: "不应执行")
+
+        results = ex.execute(
+            [_tc("bash", call_id="call_a"), _tc("search", call_id="call_b")],
+            cancel_token=token,
+            result_callback=callbacks.append,
+        )
+
+        self.assertEqual([item.call_id for item in results], ["call_a", "call_b"])
+        self.assertEqual(len(callbacks), 2)
+        self.assertTrue(all(
+            item.status == ToolTerminalStatus.CANCELLED_BEFORE_START
+            for item in results
+        ))
+
     def test_emits_start_and_complete(self):
         def runner(name, args):
             return "{}"
@@ -210,9 +231,11 @@ class TestExecutorSerial(unittest.TestCase):
             raise AssertionError("denied plan-mode tool should not execute")
 
         ex = ToolExecutor(runner, self.bus)
+        token = CancelToken()
         results = ex.execute(
             [_tc("bash", '{"command":"rm file"}', call_id="call_plan_deny")],
             round_idx=3,
+            cancel_token=token,
             execution_policy=PlanExecutionPolicy(),
         )
 
@@ -233,6 +256,66 @@ class TestExecutorSerial(unittest.TestCase):
         self.assertEqual(starts[0].call_id, "call_plan_deny")
         self.assertEqual(completes[0].call_id, "call_plan_deny")
         self.assertTrue(completes[0].is_error)
+        self.assertEqual(len(token._callbacks), 0)
+
+    def test_hook_rewritten_timeout_builds_final_execution_context(self):
+        """Hook 改写后的参数必须用于创建最终工具 deadline。"""
+
+        class RewritingHookManager:
+            def has_event(self, event_name):
+                return event_name == "PreToolUse"
+
+            def fire(self, _event_name, _payload, **_kwargs):
+                return type("HookOutcome", (), {
+                    "blocked": False,
+                    "updated_input": {"command": "echo hi", "timeout": 50},
+                })()
+
+        class ContextRunner:
+            def __init__(self):
+                self.remaining = None
+
+            def get_execution_profile(self, _name):
+                return ToolCancellationMode.COOPERATIVE, ...
+
+            def execute_tool(self, _name, _args, context):
+                self.remaining = context.remaining_seconds()
+                return "{}"
+
+        runner = ContextRunner()
+        ex = ToolExecutor(
+            runner.execute_tool,
+            self.bus,
+            hook_manager=RewritingHookManager(),
+        )
+        ex.execute([_tc("bash", '{"command":"echo original"}')])
+
+        self.assertIsNotNone(runner.remaining)
+        self.assertGreater(runner.remaining, 0)
+        self.assertLessEqual(runner.remaining, 0.05)
+
+    def test_started_checkpoint_failure_prevents_tool_execution(self):
+        """预写日志失败时不能启动可能产生副作用的工具。"""
+        calls = []
+        token = CancelToken()
+
+        def runner(name, args):
+            calls.append((name, args))
+            return "{}"
+
+        def fail_checkpoint(_context, _arguments):
+            raise OSError("disk full")
+
+        ex = ToolExecutor(runner, self.bus)
+        with self.assertRaisesRegex(OSError, "disk full"):
+            ex.execute(
+                [_tc("bash")],
+                cancel_token=token,
+                start_callback=fail_checkpoint,
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(len(token._callbacks), 0)
 
     def test_hook_rewrite_is_rechecked_by_subagent_policy(self):
         """Hook 改写后的最终参数不能绕过子代理工作区权限。"""
@@ -376,6 +459,20 @@ class TestExecutorParallel(unittest.TestCase):
 
 
 class TestCancelTokenContextVars(unittest.TestCase):
+    def test_child_inherits_parent_reason_and_runs_callback_once(self):
+        parent = CancelToken()
+        child = parent.child()
+        reasons = []
+        child.add_cancel_callback(reasons.append)
+
+        parent.cancel(CancellationReason.SESSION_SHUTDOWN)
+        parent.cancel(CancellationReason.USER_CANCELLED)
+
+        self.assertTrue(child.is_cancelled())
+        self.assertEqual(child.reason, CancellationReason.SESSION_SHUTDOWN)
+        self.assertEqual(reasons, [CancellationReason.SESSION_SHUTDOWN])
+        child.close()
+
     def test_basic_cancel(self):
         token = CancelToken()
         self.assertFalse(token.is_cancelled())

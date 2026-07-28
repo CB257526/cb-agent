@@ -4,7 +4,7 @@
 1. agent → UI：订阅 EventBus 所有事件 → 序列化成 JSON-RPC notification → 写 stdout
 2. UI → agent：阻塞读 stdin，按 method 分发：
    - prompt.submit  → 在 asyncio loop 上启动 session.chat_async（不阻塞 stdin 读循环）
-   - session.cancel → 直接 set 当前 token（threading.Event.set 线程安全）
+   - session.cancel → 触发回合取消并关闭活跃 LLM 流；最终完成由事件通知
    - session.compact → 投递到工作线程压缩上下文，stdin 继续处理查询 RPC
    - session.set_model → 投递到工作线程切模，兼容降档前的 compact
    - session.mcp_status → 查询 MCP 后台连接进度
@@ -298,7 +298,11 @@ class Gateway:
         if token is None:
             logger.info("cancel requested but no active token: id=%s", rpc_id)
             if rpc_id is not None:
-                self.transport.write(make_response(rpc_id, result={"cancelled": False}))
+                self.transport.write(make_response(rpc_id, result={
+                    "accepted": False,
+                    "completed": True,
+                    "closed_streams": 0,
+                }))
             return
         token.cancel()
         logger.info("cancel requested: id=%s", rpc_id)
@@ -319,9 +323,13 @@ class Gateway:
         if rpc_id is not None:
             self.transport.write(make_response(
                 rpc_id,
-                result={"cancelled": True, "closed_streams": closed_streams},
+                result={
+                    "accepted": True,
+                    "completed": False,
+                    "closed_streams": closed_streams,
+                },
             ))
-        logger.info("cancel completed: id=%s closed_streams=%s", rpc_id, closed_streams)
+        logger.info("cancel accepted: id=%s closed_streams=%s", rpc_id, closed_streams)
 
     def _handle_quit(self, rpc_id: Any) -> None:
         logger.info("quit requested: id=%s", rpc_id)

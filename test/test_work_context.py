@@ -224,16 +224,18 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                 round_idx=1,
                 assistant_message=_assistant(tool_calls=tool_calls),
             )
-            store.record_active_tool_completed(
+            store.record_active_tool_terminal(
                 round_idx=1,
                 tool_message=_tool("call_read", "file_read", "{\"content\":\"abc\"}"),
+                status="completed",
+                effect_state="completed",
             )
 
             restored = LocalSessionStore(root)
             history = restored.load_latest_history()
             roles = [m.role.value if hasattr(m.role, "value") else str(m.role) for m in history]
 
-            self.assertEqual(roles, ["user", "assistant", "tool"])
+            self.assertEqual(roles, ["user", "assistant", "tool", "user"])
             self.assertEqual(history[1].tool_calls[0]["id"], "call_read")
             self.assertEqual(history[2].tool_call_id, "call_read")
             self.assertTrue((history[1].metadata or {}).get("interrupted"))
@@ -256,10 +258,11 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                     reasoning_content="工具规划思考",
                 ),
             )
-            # 模拟旧格式：错误状态只通过事件参数传入，tool Message 本身仍是默认 false。
-            store.record_active_tool_completed(
+            store.record_active_tool_terminal(
                 round_idx=1,
                 tool_message=_tool("call_failed", "file_read", '{"error":"denied"}'),
+                status="failed",
+                effect_state="unknown",
                 is_error=True,
             )
             store.record_active_assistant_final(
@@ -274,7 +277,7 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
 
             self.assertEqual(
                 [m.role.value if hasattr(m.role, "value") else str(m.role) for m in history],
-                ["user", "assistant", "tool", "assistant"],
+                ["user", "assistant", "tool", "assistant", "user"],
             )
             self.assertEqual(history[1].reasoning_content, "工具规划思考")
             self.assertEqual(history[1].to_dict()["reasoning_content"], "工具规划思考")
@@ -282,8 +285,9 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
             self.assertEqual(history[3].content, "已恢复最终回答")
             self.assertEqual(history[3].reasoning_content, "最终回答思考")
             self.assertTrue((history[3].metadata or {}).get("interrupted"))
+            self.assertEqual((history[-1].metadata or {}).get("kind"), "turn_aborted")
 
-    def test_active_turn_partial_multi_tool_restores_only_completed_call(self):
+    def test_active_turn_partial_multi_tool_synthesizes_unknown_call(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -304,18 +308,31 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                 round_idx=1,
                 assistant_message=_assistant(tool_calls=tool_calls),
             )
-            store.record_active_tool_completed(
+            store.record_active_tool_started(
+                round_idx=1,
+                tool_call_id="call_running",
+                tool_name="bash",
+                arguments={"command": "sleep 10"},
+            )
+            store.record_active_tool_terminal(
                 round_idx=1,
                 tool_message=_tool("call_done", "file_read", "{\"content\":\"abc\"}"),
+                status="completed",
+                effect_state="completed",
             )
 
             history = LocalSessionStore(root).load_latest_history()
 
-            self.assertEqual(len(history), 3)
-            self.assertEqual([tc["id"] for tc in history[1].tool_calls], ["call_done"])
+            self.assertEqual(len(history), 5)
+            self.assertEqual(
+                [tc["id"] for tc in history[1].tool_calls],
+                ["call_done", "call_running"],
+            )
             self.assertEqual(history[2].tool_call_id, "call_done")
+            self.assertEqual(history[3].tool_call_id, "call_running")
+            self.assertEqual(json.loads(str(history[3].content))["status"], "unknown")
             dumped = json.dumps([m.to_dict() for m in history], ensure_ascii=False)
-            self.assertNotIn("call_running", dumped)
+            self.assertIn("call_running", dumped)
 
     def test_append_turn_clears_active_turn_checkpoint(self):
         with tempfile.TemporaryDirectory() as td:
@@ -441,9 +458,11 @@ class TestPersistAndRestoreMessages(unittest.TestCase):
                 round_idx=1,
                 assistant_message=_assistant(tool_calls=tool_calls),
             )
-            store.record_active_tool_completed(
+            store.record_active_tool_terminal(
                 round_idx=1,
                 tool_message=_tool("call_old", "file_read", "已重新获取图片"),
+                status="completed",
+                effect_state="completed",
             )
 
             store.save_pending_user_message("继续", turn_id="new_turn")

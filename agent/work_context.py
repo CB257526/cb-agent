@@ -497,11 +497,9 @@ def _mark_interrupted_message(message: Message) -> Message:
 def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Message]:
     """把运行中检查点还原成一段协议合法的 history。
 
-    active_turn.jsonl 记录未完成回合的安全边界：用户输入、assistant 规划出的
-    tool_calls、已经完成的 tool 结果，以及已经完整生成的最终回答。恢复工具轨迹
-    时最重要的约束是 OpenAI tool calling 协议合法性：每条 role=tool 前面必须
-    有声明同一 tool_call_id 的 assistant.tool_calls。因此这里会主动丢弃没有
-    完成结果的 tool_call，只恢复“assistant 声明 + 对应 tool 结果”成对出现的部分。
+    恢复时不能丢弃已开始但状态未知的工具，否则下一轮模型可能重复执行具有副作用
+    的操作。每个保留的 assistant.tool_call 都会合成一个终态 tool 消息：未开始为
+    cancelled_before_start，已开始但没有终态为 unknown。
     """
     if not events:
         return []
@@ -535,9 +533,19 @@ def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Mess
         return out
     out.append(_mark_interrupted_message(user_message))
 
-    completed_by_round: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    terminal_by_round: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    started_by_round: Dict[str, set[str]] = {}
     for event in scoped_events[1:]:
-        if not isinstance(event, dict) or event.get("type") != "tool_completed":
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        round_key = str(event.get("round_idx") or "")
+        call_id = str(event.get("tool_call_id") or "")
+        if event_type == "tool_started" and call_id:
+            started_by_round.setdefault(round_key, set()).add(call_id)
+            continue
+        # tool_completed 仅为旧 journal 读取兼容；新主路径只写 tool_terminal。
+        if event_type not in {"tool_terminal", "tool_completed"}:
             continue
         tool_payload = event.get("tool_payload")
         if not isinstance(tool_payload, dict):
@@ -549,14 +557,13 @@ def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Mess
         )
         if not call_id:
             continue
-        round_key = str(event.get("round_idx") or "")
         restored_tool_payload = deepcopy(tool_payload)
         # 兼容本提交早期格式：错误状态最初只写在事件顶层，没有放进 tool_payload。
         restored_tool_payload["is_error"] = bool(
             restored_tool_payload.get("is_error")
             or event.get("is_error")
         )
-        completed_by_round.setdefault(round_key, {})[call_id] = restored_tool_payload
+        terminal_by_round.setdefault(round_key, {})[call_id] = restored_tool_payload
 
     for event in scoped_events[1:]:
         if not isinstance(event, dict) or event.get("type") != "assistant_tool_calls":
@@ -568,21 +575,38 @@ def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Mess
         if not isinstance(raw_calls, list) or not raw_calls:
             continue
         round_key = str(event.get("round_idx") or "")
-        completed = completed_by_round.get(round_key, {})
-        filtered_calls: List[Dict[str, Any]] = []
+        terminal = terminal_by_round.get(round_key, {})
+        started = started_by_round.get(round_key, set())
+        paired_calls: List[Dict[str, Any]] = []
         for call in raw_calls:
             if not isinstance(call, dict):
                 continue
             call_id = str(call.get("id") or "")
-            if call_id and call_id in completed:
-                filtered_calls.append(deepcopy(call))
-        if not filtered_calls:
+            if call_id:
+                paired_calls.append(deepcopy(call))
+                if call_id not in terminal:
+                    name = str((call.get("function") or {}).get("name") or "")
+                    status = "unknown" if call_id in started else "cancelled_before_start"
+                    effect_state = "unknown" if call_id in started else "none"
+                    terminal[call_id] = {
+                        "role": "tool",
+                        "content": json.dumps({
+                            "status": status,
+                            "tool": name,
+                            "call_id": call_id,
+                            "reason": "process_interrupted",
+                            "effect_state": effect_state,
+                            "partial_output": "",
+                        }, ensure_ascii=False),
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "is_error": True,
+                    }
+        if not paired_calls:
             continue
 
-        # 只把已完成的 call 放回 assistant.tool_calls。这样即使模型一次规划了
-        # 多个工具，崩溃时只完成了一部分，恢复后的协议消息仍然完全配对。
         paired_assistant_payload = deepcopy(assistant_payload)
-        paired_assistant_payload["tool_calls"] = filtered_calls
+        paired_assistant_payload["tool_calls"] = paired_calls
         assistant_message = _message_payload_to_message(paired_assistant_payload)
         if assistant_message is None:
             continue
@@ -590,9 +614,9 @@ def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Mess
 
         # tool 结果按原 assistant.tool_calls 顺序回放，而不是按完成先后。这样恢复
         # 出来的 history 更贴近 provider 原始协议顺序，也便于后续孤儿清理兜底。
-        for call in filtered_calls:
+        for call in paired_calls:
             call_id = str(call.get("id") or "")
-            tool_message = _message_payload_to_message(completed.get(call_id, {}))
+            tool_message = _message_payload_to_message(terminal.get(call_id, {}))
             if tool_message is not None:
                 out.append(_mark_interrupted_message(tool_message))
 
@@ -611,6 +635,21 @@ def _messages_from_active_turn_events(events: List[Dict[str, Any]]) -> List[Mess
             final_message = _message_payload_to_message(final_payload)
             if final_message is not None:
                 out.append(_mark_interrupted_message(final_message))
+
+    aborted_event = next((
+        event for event in reversed(scoped_events[1:])
+        if isinstance(event, dict) and event.get("type") == "turn_aborted"
+    ), None)
+    reason = (
+        str(aborted_event.get("reason") or "process_interrupted")
+        if isinstance(aborted_event, dict) else "process_interrupted"
+    )
+    marker = Message(
+        role=MessageRole.USER,
+        content=f"<turn_aborted reason=\"{reason}\" />",
+        metadata={"kind": "turn_aborted", "reason": reason, "interrupted": True},
+    )
+    out.append(marker)
 
     return out
 
@@ -1479,7 +1518,7 @@ class LocalSessionStore:
 
         active_turn.jsonl 的语义是“当前未完成的一轮”，所以新一轮开始时会重置
         旧文件，只写入第一条 turn_started。后续 assistant_tool_calls、
-        tool_completed 和 assistant_final 仍然按 JSONL 追加，保证每个可恢复
+        tool_started、tool_terminal 和 assistant_final 按 JSONL 追加，保证每个可恢复
         边界都能及时写入文件对象。
         """
 
@@ -1609,31 +1648,59 @@ class LocalSessionStore:
             "assistant_payload": payload,
         })
 
-    def record_active_tool_completed(
+    def record_active_tool_started(
+        self,
+        *,
+        round_idx: int,
+        tool_call_id: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+    ) -> None:
+        """在工具真正进入执行函数前写入开始边界。"""
+        if not tool_call_id:
+            return
+        self._append_active_turn_event({
+            "type": "tool_started",
+            "round_idx": int(round_idx),
+            "tool_call_id": str(tool_call_id),
+            "tool_name": str(tool_name),
+            "arguments": _summarize_arguments(str(tool_name), arguments),
+        })
+
+    def record_active_tool_terminal(
         self,
         *,
         round_idx: int,
         tool_message: Message,
+        status: str,
+        effect_state: str,
+        cancel_reason: str = "",
         is_error: bool = False,
     ) -> None:
-        """记录一个已经完成并回灌到 messages 的工具结果。
-
-        这条事件是恢复边界：只有写到这里的工具，重启后才会重新进入 history。
-        如果进程正在执行工具但尚未写入本事件，恢复时会按用户要求直接丢弃。
-        """
+        """记录完成、失败、取消、超时等唯一工具终态。"""
 
         payload = _message_to_persist_payload(tool_message)
         call_id = str(payload.get("tool_call_id") or "")
         if not call_id:
             return
         self._append_active_turn_event({
-            "type": "tool_completed",
+            "type": "tool_terminal",
             "round_idx": int(round_idx),
             "tool_call_id": call_id,
             "tool_name": str(payload.get("tool_name") or ""),
             "is_error": bool(is_error),
+            "status": str(status),
+            "effect_state": str(effect_state),
+            "cancel_reason": str(cancel_reason or ""),
             "tool_payload": payload,
         })
+
+    def record_active_turn_aborted(self, *, reason: str) -> None:
+        """在正式归档前持久化回合中断标记并按策略执行 fsync。"""
+        self._append_active_turn_event({
+            "type": "turn_aborted",
+            "reason": str(reason or "user_cancelled"),
+        }, force_fsync=True)
 
     def clear_active_turn(self) -> None:
         """清理当前运行中回合检查点。"""
@@ -1647,7 +1714,9 @@ class LocalSessionStore:
         except Exception:
             logger.exception("清理 active_turn.jsonl 失败")
 
-    def _append_active_turn_event(self, event: Dict[str, Any]) -> None:
+    def _append_active_turn_event(
+        self, event: Dict[str, Any], *, force_fsync: bool = False
+    ) -> None:
         """向 active_turn.jsonl 追加一条事件并 flush。
 
         这里不 fsync，保持和 transcript 当前写入成本一致；但每条工具完成事件都会
@@ -1662,6 +1731,8 @@ class LocalSessionStore:
         with (self.active_dir / "active_turn.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
             f.flush()
+            if force_fsync or _transcript_fsync_enabled():
+                os.fsync(f.fileno())
 
     def _read_active_turn_events(self, session_dir: Path) -> List[Dict[str, Any]]:
         """读取运行中检查点 JSONL，坏行直接跳过。"""

@@ -35,7 +35,7 @@ if sys.platform == "win32":
 
 from agent.cancel import CancelToken
 from agent.event_bus import EventBus
-from agent.events import Cancelled, Done, RoundEnd, RoundStart
+from agent.events import Cancelled, Done, RoundEnd, RoundStart, ToolComplete
 from agent.executor import ToolExecutor, should_parallelize
 from agent.session import AgentSession
 
@@ -200,11 +200,15 @@ class TestExecutorCancel(unittest.TestCase):
         )
         self.assertEqual(call_count["n"], 1)
         self.assertEqual(len(results), 2)
-        # 第二条是 cancelled 占位
+        # 第二条未开始，必须得到成对的取消终态。
         self.assertTrue(results[1].is_error)
-        self.assertIn("cancelled", results[1].result)
-        # 至少一个 Cancelled 事件
-        self.assertTrue(any(isinstance(e, Cancelled) for e in events))
+        self.assertIn("cancelled_before_start", results[1].result)
+        # 执行器只发工具终态；整个回合的 Cancelled 由 Session 落盘后统一发送。
+        terminal = [
+            event for event in events
+            if isinstance(event, ToolComplete) and event.call_id == "c2"
+        ]
+        self.assertEqual(len(terminal), 1)
 
     def test_pre_submit_cancel_all_placeholders(self):
         """execute 入口已 cancel → 全部占位，runner 一次都不调。"""

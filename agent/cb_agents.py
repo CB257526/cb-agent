@@ -13,7 +13,7 @@ from constant.llm.constant_llm import ConstantLLM
 from constant.llm.model_config import ActiveModelConfig, ModelChoice, ModelConfigManager
 from agent.event_bus import EventBus
 from agent.events import (
-    Cancelled, ReasoningDelta, TextDelta, TokenUsage, ToolCallPlanned,
+    ReasoningDelta, TextDelta, TokenUsage, ToolCallPlanned,
 )
 from agent.llm_errors import LLMRequestError, classify_llm_exception
 # 加载安装目录中的 .env，避免全局 cbagent 启动时误读用户工作目录的 .env。
@@ -875,7 +875,7 @@ class CbAgentsLLM:
                  'usage': Dict | None, 'cancelled': bool}
 
         event_bus: 可选事件总线。流式 chunk 会经它发出 TextDelta/ReasoningDelta/
-                   TokenUsage/ToolCallPlanned/Cancelled 事件。前端订阅它替代 print。
+                   TokenUsage/ToolCallPlanned 事件。回合取消由 AgentSession 统一收尾。
                    传 None 时维持旧行为（直接 print 到 stdout）。
         cancel_event: 可选 threading.Event。每收一个 chunk 检查一次，set 则中止
                       流式读取并返回已累积内容（带 cancelled=True 标记）。
@@ -944,7 +944,6 @@ class CbAgentsLLM:
         collected_content: List[str] = []
         accumulated = ""
         last_usage = None
-        cancelled_emitted = False
         request_kwargs = {
             "model": self.model,
             "messages": messages,
@@ -963,9 +962,6 @@ class CbAgentsLLM:
         ):
             # cancel 检查放最前面，确保下一个 chunk 边界一定能出
             if cancel_event is not None and cancel_event.is_set():
-                if event_bus is not None:
-                    event_bus.emit(Cancelled(where="llm_stream", round_idx=round_idx))
-                cancelled_emitted = True
                 break
 
             # usage 通常在最后一个 chunk（choices 为空）出现
@@ -991,15 +987,6 @@ class CbAgentsLLM:
                     ))
         if event_bus is None:
             print()  # 在流式输出结束后换行（旧行为）
-        if (
-            cancel_event is not None
-            and cancel_event.is_set()
-            and event_bus is not None
-            and not cancelled_emitted
-        ):
-            # 取消可能发生在“等待下一个 chunk”的空档。此时 for 循环不会再进入上面的
-            # chunk 边界检查，所以这里补发一次事件，让 TUI 能明确显示中断状态。
-            event_bus.emit(Cancelled(where="llm_stream", round_idx=round_idx))
 
         # 推 token usage 事件
         if last_usage is not None and event_bus is not None:
@@ -1059,7 +1046,6 @@ class CbAgentsLLM:
         # 按 index 累积 tool_calls 分片
         tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
         last_usage = None
-        cancelled_emitted = False
         request_kwargs = {
             "model": self.model,
             "messages": messages,
@@ -1082,9 +1068,6 @@ class CbAgentsLLM:
         ):
             # cancel 检查放最前面：保证下一 chunk 边界能优雅退出
             if cancel_event is not None and cancel_event.is_set():
-                if event_bus is not None:
-                    event_bus.emit(Cancelled(where="llm_stream", round_idx=round_idx))
-                cancelled_emitted = True
                 break
 
             # usage 通常在 stream 末尾的"choices 为空"chunk 上
@@ -1151,15 +1134,6 @@ class CbAgentsLLM:
 
         if event_bus is None and printed_prefix:
             print()  # 流式正文末尾补换行（旧行为）
-        if (
-            cancel_event is not None
-            and cancel_event.is_set()
-            and event_bus is not None
-            and not cancelled_emitted
-        ):
-            # 如果取消发生在空闲等待期，_iter_chat_stream 会直接结束生成器；
-            # 补发 Cancelled 可以让 UI 不必猜测“为什么流突然结束”。
-            event_bus.emit(Cancelled(where="llm_stream", round_idx=round_idx))
 
         content = "".join(content_parts)
         reasoning_content = "".join(reasoning_parts) or None

@@ -22,7 +22,17 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from agent.cancel import get_current_cancel_token
+from agent.cancel import (
+    CancellationReason,
+    CancelToken,
+    ToolCancelledError,
+    get_current_cancel_token,
+)
+from agent.tool_execution import (
+    ToolCancellationMode,
+    ToolExecutionContext,
+    ToolTimeoutPolicy,
+)
 from tools.tool import Tool, ToolParameter
 from tools.tools.bash_security import check_fatal, check_warnings, parse_pipeline
 from tools.tools.bash_semantics import lookup_semantic
@@ -144,6 +154,26 @@ def _stop_process_tree(proc: subprocess.Popen) -> tuple[str, str]:
         return "", "[进程已终止，输出丢失]"
 
 
+def _cancel_process_tree(proc: subprocess.Popen) -> None:
+    """从取消请求线程终止进程组，但不读取子进程管道。
+
+    stdout/stderr 只能由执行 Bash 的线程统一回收，否则取消线程和执行线程同时
+    调用 communicate 会产生数据竞争。这里按 Codex 的节奏先发 TERM，等待 50ms
+    后再向进程组发 KILL。
+    """
+    if not _signal_process_tree(proc, force=False):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    time.sleep(0.05)
+    if not _signal_process_tree(proc, force=True):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _clip(s: str, n: int) -> str:
     """字符级截断，超长追加提示。"""
     if len(s) <= n:
@@ -252,6 +282,8 @@ class BashTool(Tool):
     内置危险命令检测（致命拦截 + 警告）、退出码语义解释、cwd 持久化。
     """
 
+    cancellation_mode = ToolCancellationMode.RUNTIME
+
     def __init__(
         self,
         session: Optional[BashSession] = None,
@@ -316,7 +348,12 @@ class BashTool(Tool):
             return False
         timeout = parameters.get("timeout")
         if timeout is not None:
-            if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 600000:
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or timeout < 0
+                or timeout > 600000
+            ):
                 return False
         cwd = parameters.get("cwd")
         if cwd is not None and not isinstance(cwd, str):
@@ -382,6 +419,50 @@ class BashTool(Tool):
             return bool(self._dangerously_skip_permissions)
 
     def run(self, parameters: Dict[str, Any]) -> str:
+        """兼容直接调用；主执行链使用 run_with_context。"""
+        timeout_ms = parameters.get("timeout", 120000)
+        timeout_seconds = (
+            None if timeout_ms in {None, 0}
+            else float(timeout_ms) / 1000.0
+        )
+        deadline = ToolTimeoutPolicy.deadline_after(timeout_seconds)
+        parent = get_current_cancel_token() or CancelToken()
+        child = parent.child(deadline=deadline)
+        context = ToolExecutionContext(
+            turn_id="", round_idx=0, call_id="direct_bash",
+            tool_name=self.name, cancellation=child, deadline=deadline,
+        )
+        try:
+            return self.run_with_context(parameters, context)
+        except ToolCancelledError as exc:
+            # 直接调用 run() 的旧代码依赖 Bash JSON 字段；主 Agent 不走这里，
+            # 而是通过 run_with_context 把结构化异常交给 ToolExecutor 生成统一终态。
+            try:
+                partial = json.loads(exc.partial_output or "{}")
+            except json.JSONDecodeError:
+                partial = {}
+            timed_out = exc.reason == CancellationReason.TOOL_TIMEOUT
+            return json.dumps({
+                "stdout": str(partial.get("stdout") or ""),
+                "stderr": str(partial.get("stderr") or str(exc)),
+                "exit_code": int(partial.get("exit_code") or -1),
+                "cwd": self._session.cwd,
+                "interrupted": not timed_out,
+                "timeout": timed_out,
+                "is_error": True,
+                "background": False,
+                "__display__": _build_bash_display(
+                    interrupted=not timed_out, timeout=timed_out
+                ),
+            }, ensure_ascii=False)
+        finally:
+            child.close()
+
+    def run_with_context(
+        self,
+        parameters: Dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> str:
         """执行 Shell 命令。
 
         流程：
@@ -395,7 +476,6 @@ class BashTool(Tool):
             }, ensure_ascii=False)
 
         command = parameters["command"].strip()
-        timeout = parameters.get("timeout", 120000) / 1000.0
         run_in_background = bool(parameters.get("run_in_background", False))
         override_cwd = parameters.get("cwd")
 
@@ -556,8 +636,6 @@ class BashTool(Tool):
 
         # 前台同步
         proc = None
-        interrupted = False
-        timed_out = False
         stdout = ""
         stderr = ""
         exit_code = -1
@@ -571,23 +649,71 @@ class BashTool(Tool):
                 text=True, encoding="utf-8", errors="replace",
                 **process_group_options,
             )
-            stdout, stderr = proc.communicate(timeout=timeout)
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            if proc:
-                logger.warning("Bash 命令超时，开始清理独立进程组: pid=%s timeout=%.2fs", proc.pid, timeout)
-                stdout, stderr = _stop_process_tree(proc)
-            else:
-                stdout, stderr = "", "[超时]"
-            exit_code = -1
+            # 注册后若取消已经发生，add_cancel_callback 会立即执行清理回调，
+            # 因而不存在“进程已启动但尚未订阅取消”的竞态窗口。
+            unsubscribe = context.cancellation.add_cancel_callback(
+                lambda _reason: _cancel_process_tree(proc)
+            )
+            try:
+                while True:
+                    try:
+                        stdout, stderr = proc.communicate(timeout=0.05)
+                        exit_code = proc.returncode
+                        if context.cancellation.is_cancelled():
+                            # 取消回调可能恰好让 communicate 正常返回；此时仍必须
+                            # 以取消终态收尾，不能把被信号结束误记为普通命令失败。
+                            reason = (
+                                context.cancellation.reason
+                                or CancellationReason.USER_CANCELLED
+                            )
+                            raise ToolCancelledError(
+                                reason,
+                                "Bash 命令超时"
+                                if reason == CancellationReason.TOOL_TIMEOUT
+                                else "Bash 命令被用户中断",
+                                partial_output=json.dumps({
+                                    "stdout": stdout or "",
+                                    "stderr": stderr or "",
+                                    "exit_code": exit_code,
+                                }, ensure_ascii=False),
+                                effect_state="may_have_occurred",
+                            )
+                        break
+                    except subprocess.TimeoutExpired:
+                        if context.cancellation.is_cancelled():
+                            # 取消回调已经完成 TERM/KILL；这里只负责回收管道。
+                            stdout, stderr = proc.communicate(timeout=2)
+                            reason = (
+                                context.cancellation.reason
+                                or CancellationReason.USER_CANCELLED
+                            )
+                            partial = json.dumps({
+                                "stdout": stdout or "",
+                                "stderr": stderr or "",
+                                "exit_code": proc.returncode,
+                            }, ensure_ascii=False)
+                            raise ToolCancelledError(
+                                reason,
+                                "Bash 命令超时"
+                                if reason == CancellationReason.TOOL_TIMEOUT
+                                else "Bash 命令被用户中断",
+                                partial_output=partial,
+                                effect_state="may_have_occurred",
+                            )
+            finally:
+                unsubscribe()
         except KeyboardInterrupt:
-            interrupted = True
             if proc:
                 stdout, stderr = _stop_process_tree(proc)
-            if not stderr:
-                stderr = "[用户中断]"
-            exit_code = -1
+            raise ToolCancelledError(
+                CancellationReason.USER_CANCELLED,
+                partial_output=json.dumps({
+                    "stdout": stdout or "", "stderr": stderr or ""
+                }, ensure_ascii=False),
+                effect_state="may_have_occurred",
+            )
+        except ToolCancelledError:
+            raise
         except Exception as e:
             stdout, stderr = "", str(e)
             exit_code = -1
@@ -623,8 +749,8 @@ class BashTool(Tool):
             "stderr": processed.stderr,
             "exit_code": exit_code,
             "cwd": self._session.cwd,
-            "interrupted": interrupted,
-            "timeout": timed_out,
+            "interrupted": False,
+            "timeout": False,
             "is_error": is_error,
             "semantic": semantic,
             "background": False,
@@ -649,8 +775,8 @@ class BashTool(Tool):
                 stderr=processed.stderr,
                 exit_code=exit_code,
                 is_error=is_error,
-                interrupted=interrupted,
-                timeout=timed_out,
+                interrupted=False,
+                timeout=False,
             ),
         }, ensure_ascii=False)
 

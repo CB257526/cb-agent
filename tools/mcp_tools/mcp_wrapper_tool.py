@@ -7,10 +7,13 @@ MCP工具包装器 - 将单个MCP工具包装成HelloAgents Tool
 
 from typing import Dict, Any, Optional, List
 from tools.tool import Tool, ToolParameter
+from agent.tool_execution import ToolCancellationMode, ToolExecutionContext
 
 
 class MCPWrappedTool(Tool):
     """
+
+    cancellation_mode = ToolCancellationMode.RUNTIME
     MCP工具包装器 - 将单个MCP工具包装成HelloAgents Tool
     
     这个类将MCP服务器的一个工具（如 read_file）包装成一个独立的Tool对象。
@@ -56,7 +59,8 @@ class MCPWrappedTool(Tool):
         # 初始化父类
         super().__init__(
             name=tool_name,
-            description=description
+            description=description,
+            default_timeout_seconds=mcp_tool.default_timeout_seconds,
         )
     
     def _parse_input_schema(self, input_schema: Dict[str, Any]) -> List[ToolParameter]:
@@ -129,3 +133,13 @@ class MCPWrappedTool(Tool):
         # 调用父MCP工具
         return self.mcp_tool.run(mcp_params)
 
+    def run_with_context(
+        self, params: Dict[str, Any], context: ToolExecutionContext
+    ) -> str:
+        """把展开工具的调用身份和取消上下文原样交给父 MCP server。"""
+        mcp_params = {
+            "action": "call_tool",
+            "tool_name": self.mcp_tool_name,
+            "arguments": params,
+        }
+        return self.mcp_tool.run_with_context(mcp_params, context)

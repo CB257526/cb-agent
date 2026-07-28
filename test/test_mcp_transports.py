@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import socket
 import subprocess
@@ -22,6 +23,7 @@ if _ROOT not in sys.path:
 from tools.mcp_tools.client import MCPClient
 from tools.mcp_tools.mcptool import MCPTool
 from tools.mcp_tools.mcptools_add import load_mcp_server_configs
+from agent.cancel import CancellationReason, ToolCancelledError
 
 
 def _free_port() -> int:
@@ -95,6 +97,43 @@ def _running_http_server(script: Path, port: int) -> Iterator[None]:
 
 
 class TestMCPServerConfig(unittest.TestCase):
+    def test_tool_timeout_is_preserved_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            config_path = Path(td) / "mcp.json"
+            config_path.write_text(json.dumps({
+                "mcpServers": {
+                    "timed": {
+                        "command": "python",
+                        "args": ["server.py"],
+                        "tool_timeout_sec": 3.5,
+                    },
+                }
+            }), encoding="utf-8")
+            server = load_mcp_server_configs(str(config_path))[0]
+            self.assertEqual(server["tool_timeout_sec"], 3.5)
+
+            config_path.write_text(json.dumps({
+                "mcpServers": {
+                    "broken": {
+                        "command": "python",
+                        "tool_timeout_sec": True,
+                    },
+                }
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tool_timeout_sec"):
+                load_mcp_server_configs(str(config_path))
+
+            config_path.write_text(json.dumps({
+                "mcpServers": {
+                    "broken": {
+                        "command": "python",
+                        "tool_timeout_sec": float("nan"),
+                    },
+                }
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "有限数字"):
+                load_mcp_server_configs(str(config_path))
+
     def test_load_mcp_server_configs_supports_stdio_http_and_sse(self) -> None:
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"TOKEN": "secret-token"}):
             config_path = Path(td) / "mcp.json"
@@ -210,6 +249,30 @@ class TestMCPServerConfig(unittest.TestCase):
 
 
 class TestMCPToolTransports(unittest.TestCase):
+    def test_memory_mcp_hanging_tool_obeys_deadline(self) -> None:
+        """挂起 MCP coroutine 必须按工具 deadline 取消，不能无界等待。"""
+        from fastmcp import FastMCP
+
+        server = FastMCP("timeout-test")
+
+        @server.tool()
+        async def hang() -> str:
+            await asyncio.Event().wait()
+            return "unreachable"
+
+        tool = MCPTool(
+            name="timeout",
+            server=server,
+            server_config={"tool_timeout_sec": 0.05},
+            strict_discovery=True,
+        )
+        started = time.perf_counter()
+        with self.assertRaises(ToolCancelledError) as caught:
+            tool.get_expanded_tools()[0].run({})
+
+        self.assertLess(time.perf_counter() - started, 2)
+        self.assertEqual(caught.exception.reason, CancellationReason.TOOL_TIMEOUT)
+
     def _assert_wrapped_echo(self, name: str, config: Dict[str, object], expected: str) -> None:
         tool = MCPTool(name=name, server_config=config, strict_discovery=True)
         try:

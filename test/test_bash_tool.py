@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -21,7 +22,11 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent.cancel import CancelToken, reset_current_cancel_token, set_current_cancel_token
+from agent.cancel import (
+    CancellationReason, CancelToken, ToolCancelledError,
+    reset_current_cancel_token, set_current_cancel_token,
+)
+from agent.tool_execution import ToolExecutionContext
 from tools.tools.bash_security import (
     parse_pipeline, check_fatal, check_warnings,
 )
@@ -1329,6 +1334,36 @@ class TestBashDisplay(unittest.TestCase):
             self.assertIn("hello", data["__display__"])
             # __display__ 不应是结构化 JSON，而是裸文本
             self.assertNotIn("\"stdout\"", data["__display__"])
+
+    @unittest.skipIf(os.name == "nt", "Windows 进程组取消由 taskkill 分支单独处理")
+    def test_runtime_cancel_terminates_foreground_process_group(self):
+        """显式取消必须结束真实前台命令，而不是等待原始 sleep 完成。"""
+        tool = BashTool(dangerously_skip_permissions=True)
+        token = CancelToken()
+        context = ToolExecutionContext(
+            turn_id="turn_cancel", round_idx=1, call_id="call_sleep",
+            tool_name="bash", cancellation=token, deadline=None,
+        )
+        errors = []
+
+        def run_tool():
+            try:
+                tool.run_with_context({"command": "sleep 30"}, context)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_tool)
+        started = time.perf_counter()
+        worker.start()
+        time.sleep(0.2)
+        token.cancel(CancellationReason.USER_CANCELLED)
+        worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertLess(time.perf_counter() - started, 3)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ToolCancelledError)
+        self.assertEqual(errors[0].reason, CancellationReason.USER_CANCELLED)
 
 
 if __name__ == "__main__":
