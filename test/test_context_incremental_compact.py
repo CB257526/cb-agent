@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import tempfile
 from pathlib import Path
@@ -21,6 +22,7 @@ from agent.compaction import (
 )
 from agent.event_bus import EventBus
 from agent.executor import ToolExecutor
+from agent.media_store import MediaBlobStore
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore
 from constant.llm.constant_llm import ConstantLLM
@@ -198,6 +200,37 @@ def test_restart_restores_world_state_from_canonical_journal():
     assert "STABLE-ENV" not in _context_text(prepared.messages)
 
 
+def test_restart_migrates_legacy_data_uri_once() -> None:
+    """旧图片 history 在重启边界迁移一次，后续恢复不得重复创建 generation。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+        first = _session(store=store)
+        data_uri = "data:image/png;base64," + base64.b64encode(b"legacy-image").decode("ascii")
+        first._append_history([
+            Message(
+                role=MessageRole.USER,
+                content=[{
+                    "type": "image_url",
+                    "image_url": {"url": data_uri},
+                }],
+            ),
+            _assistant("done"),
+        ], turn_id="legacy")
+
+        restarted = _session(store=LocalSessionStore(store.root))
+        first_generation = restarted.history.generation
+        logical = str(restarted.history.logical_messages())
+        provider = str(restarted._provider_request_messages())
+        assert "image_ref" in logical
+        assert data_uri not in logical
+        assert data_uri in provider
+        assert first_generation == 1
+
+        restarted_again = _session(store=LocalSessionStore(store.root))
+        assert restarted_again.history.generation == first_generation
+
+
 def test_compact_summarizes_only_evicted_prefix_and_retains_latest_turn():
     session = _session(summaries=["PREFIX-HANDOFF"])
     session._append_history([_user("OLD-Q"), _assistant("OLD-A")], turn_id="old")
@@ -322,6 +355,44 @@ def test_compaction_message_estimate_does_not_count_data_uri_as_text():
         }],
     )
     assert estimate_message_tokens([image]) < 1000
+
+
+def test_compact_retained_tail_keeps_image_ref_restorable():
+    """compact 只摘要旧前缀，最近完整回合的 ImageRef 必须原样保留。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        session = _session(summaries=["OLD-HANDOFF"])
+        session.media_store = MediaBlobStore(Path(td) / "media")
+        ref = session.media_store.put_bytes(
+            b"image bytes",
+            mime_type="image/png",
+            file_name="recent.png",
+        )
+        session._append_history([
+            _user("OLD-Q " + "old " * 5000),
+            _assistant("OLD-A " + "old " * 5000),
+        ], turn_id="old")
+        session._append_history([
+            Message(
+                role=MessageRole.USER,
+                content=[
+                    {"type": "text", "text": "RECENT-Q"},
+                    {"type": "image_ref", "image_ref": ref.to_dict()},
+                ],
+            ),
+            _assistant("RECENT-A"),
+        ], turn_id="recent")
+
+        with patch("agent.session.dynamic_retained_token_target", return_value=1000):
+            result = session.compact_context(reason="auto")
+
+        assert result["no_op"] is False
+        logical = str(session.history.logical_messages())
+        provider = str(session._provider_request_messages())
+        assert "RECENT-Q" in logical
+        assert "image_ref" in logical
+        assert "data:image/png;base64," not in logical
+        assert "data:image/png;base64," in provider
 
 
 def test_compact_failure_keeps_history_and_generation_unchanged():

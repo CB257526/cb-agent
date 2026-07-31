@@ -121,6 +121,29 @@ class TestMessageLogger(unittest.TestCase):
         self.assertEqual(event["tools"][0]["function"]["name"], "bash")
         self.assertEqual(event["response"]["answer"], "ok")
 
+    def test_logger_always_redacts_image_data_uri(self) -> None:
+        """调用方误传原始 provider payload 时，日志器也必须自行拦截 base64。"""
+
+        raw_uri = "data:image/png;base64,abcdef"
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "messages.log"
+            logger = MessageLogger(path, mode="full")
+            try:
+                logger.log([{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": raw_uri},
+                    }],
+                }])
+            finally:
+                logger.close()
+            text = path.read_text(encoding="utf-8")
+
+        self.assertNotIn(raw_uri, text)
+        self.assertNotIn("abcdef", text)
+        self.assertIn("data-uri omitted", text)
+
     def test_non_full_mode_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(ValueError):

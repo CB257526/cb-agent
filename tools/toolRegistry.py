@@ -90,7 +90,7 @@ class ToolRegistry:
         name: str,
         input_dict: dict[str, Any],
         context: Optional[ToolExecutionContext] = None,
-    ) -> str:
+    ) -> Any:
         """
         执行工具
 

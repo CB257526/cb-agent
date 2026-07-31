@@ -21,13 +21,14 @@ ContextVars 跨线程传播：
 from __future__ import annotations
 
 import contextvars
+import copy
 import json
 import logging
 import os
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -48,6 +49,7 @@ from agent.tool_execution import (
     ToolCancellationMode,
     ToolEffectState,
     ToolExecutionContext,
+    ToolModelResult,
     ToolTerminalStatus,
     ToolTimeoutPolicy,
 )
@@ -118,7 +120,7 @@ def should_parallelize(tool_calls: List[Dict[str, Any]]) -> bool:
 
 
 # runner 可以是旧的二参数函数，也可以是新的三参数 ToolRegistry.execute_tool。
-ToolRunner = Callable[..., str]
+ToolRunner = Callable[..., Any]
 
 
 @dataclass
@@ -135,6 +137,8 @@ class ToolCallResult:
     cancel_reason: Optional[CancellationReason] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    # 结构化内容不塞进 role=tool；session 会在全部 tool 终态之后生成正式 bridge。
+    model_content: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # 兼容旧测试和扩展代码中只传 is_error 的构造方式。
@@ -704,6 +708,7 @@ class ToolExecutor:
         effect_state = ToolEffectState.COMPLETED
         cancel_reason: Optional[CancellationReason] = None
         runner_started = False
+        model_content: List[Dict[str, Any]] = []
         try:
             child.throw_if_cancelled()
             runner_started = True
@@ -711,6 +716,9 @@ class ToolExecutor:
                 result = self._runner(name, args, context)
             else:
                 result = self._runner(name, args)
+            if isinstance(result, ToolModelResult):
+                model_content = copy.deepcopy(list(result.content))
+                result = result.text
             completed_at = time.time()
             completed_monotonic = time.monotonic()
             if child.is_cancelled():
@@ -733,6 +741,7 @@ class ToolExecutor:
                         effect_state="may_have_occurred",
                     )
         except ToolCancelledError as exc:
+            model_content = []
             cancel_reason = exc.reason
             status = (
                 ToolTerminalStatus.TIMED_OUT
@@ -755,6 +764,7 @@ class ToolExecutor:
                 partial_output=exc.partial_output,
             )
         except Exception as e:  # noqa: BLE001
+            model_content = []
             logger.exception("工具执行抛异常: name=%s call_id=%s", name, call_id)
             result = json.dumps(
                 {"error": f"工具执行异常: {type(e).__name__}: {e}"},
@@ -812,6 +822,7 @@ class ToolExecutor:
         result = self._cap_model_visible_result(result, call_id=call_id, name=name)
         if _result_declares_error(result):
             is_error = True
+            model_content = []
             if status == ToolTerminalStatus.COMPLETED:
                 status = ToolTerminalStatus.FAILED
 
@@ -828,6 +839,7 @@ class ToolExecutor:
             status=status, effect_state=effect_state,
             cancel_reason=cancel_reason, started_at=started_at,
             finished_at=self._utc_now(),
+            model_content=model_content,
         )
 
     def _execution_profile(self, name: str) -> tuple[ToolCancellationMode, Any]:

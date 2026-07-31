@@ -28,12 +28,6 @@ from subagent.permissions import SubagentExecutionPolicy
 from subagent.registry import SubagentRegistry
 from tools.toolRegistry import ToolRegistry
 from tools.tools.bash_session import get_session, reset_session
-from tools.tools.pending_images import (
-    drain_images,
-    queue_image,
-    reset_pending_image_buffer,
-    set_pending_image_buffer,
-)
 from tools.tools.local_search import (
     GlobTool,
     reset_search_ignore_dirs,
@@ -831,20 +825,6 @@ class TestAgentSessionRuntimeUpdates(unittest.TestCase):
 
             self.assertEqual(scoped["files"], ["src/visible.txt"])
             self.assertIn(".cbagent/private.txt", unscoped["files"])
-
-    def test_pending_images_are_isolated_between_nested_agent_contexts(self) -> None:
-        outer_token = set_pending_image_buffer()
-        try:
-            queue_image(call_id="outer", image_part={"type": "image_url"}, file_name="outer.png")
-            inner_token = set_pending_image_buffer()
-            try:
-                queue_image(call_id="inner", image_part={"type": "image_url"}, file_name="inner.png")
-                self.assertEqual([item["call_id"] for item in drain_images()], ["inner"])
-            finally:
-                reset_pending_image_buffer(inner_token)
-            self.assertEqual([item["call_id"] for item in drain_images()], ["outer"])
-        finally:
-            reset_pending_image_buffer(outer_token)
 
     def test_injects_parent_progress_and_child_mailbox_before_think(self) -> None:
         manager = MagicMock()

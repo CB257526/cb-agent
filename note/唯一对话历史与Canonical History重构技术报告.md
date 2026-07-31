@@ -68,7 +68,7 @@ state.json 中的恢复辅助字段
 
 ```text
 本用户回合冻结的 system message
-+ ConversationHistory.provider_messages()
++ ConversationHistory.provider_messages(media_store)
 + 本用户回合冻结的 tools schema
 ```
 
@@ -88,7 +88,8 @@ system 和 tools 在用户回合开始时冻结。后台 MCP 注册、权限、S
 
 - `prepare_batch()`：深拷贝消息，分配 `item_id`、`turn_id` 和协议摘要；
 - `append_prepared()`：追加已经成功写 journal 的消息；
-- `provider_messages()`：生成本次 provider 请求的深拷贝；
+- `logical_messages()`：生成不展开 ImageRef 的 journal/诊断副本；
+- `provider_messages(media_store)`：展开 ImageRef 并生成本次 provider 请求的深拷贝；
 - `snapshot()`：为 compact、估算和审计生成稳定快照；
 - `replace_prepared()`：只接受严格递增的 generation；
 - `clear_memory()`：仅用于已提交的会话创建或清理边界。

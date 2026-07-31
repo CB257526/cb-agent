@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union
 from .toolParameter import ToolParameter
-from agent.tool_execution import ToolCancellationMode, ToolExecutionContext
+from agent.tool_execution import ToolCancellationMode, ToolExecutionContext, ToolModelResult
 class Tool(ABC):
     """工具基类"""
 
@@ -19,7 +19,7 @@ class Tool(ABC):
         self.default_timeout_seconds = default_timeout_seconds
 
     @abstractmethod
-    def run(self, parameters: Dict[str, Any]) -> str:
+    def run(self, parameters: Dict[str, Any]) -> Union[str, ToolModelResult]:
         """执行工具"""
         pass
 
@@ -27,7 +27,7 @@ class Tool(ABC):
         self,
         parameters: Dict[str, Any],
         context: ToolExecutionContext,
-    ) -> str:
+    ) -> Union[str, ToolModelResult]:
         """新执行入口；旧工具默认复用同步实现。
 
         旧工具属于不可安全终止的进程内代码，因此只在开始前检查取消。需要在

@@ -379,6 +379,115 @@ def test_history_journal_does_not_reuse_completed_tool_checkpoint():
         assert "禁止自动重放" in str(tools[1].content)
 
 
+def test_history_journal_recovers_tool_model_content_bridge_once():
+    """进程在 bridge 追加前退出时，ImageRef 必须随工具 checkpoint 一起恢复。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        journal = HistoryJournal(lambda: root)
+        history = ConversationHistory()
+        call = {
+            "id": "call-image",
+            "type": "function",
+            "function": {"name": "load_image", "arguments": "{}"},
+        }
+        journal.append(
+            history,
+            [
+                Message(role="user", content="查看图片"),
+                Message.create_assistant_message(tool_calls=[call]),
+            ],
+            turn_id="image-turn",
+        )
+        journal.checkpoint_tool_result(
+            history,
+            Message.create_tool_message(
+                "call-image",
+                "load_image",
+                '{"status":"ok"}',
+                model_content=[{
+                    "type": "image_ref",
+                    "image_ref": {
+                        "schema_version": 1,
+                        "blob_id": "sha256:" + "a" * 64,
+                        "sha256": "a" * 64,
+                        "mime_type": "image/png",
+                        "byte_size": 10,
+                        "file_name": "screen.png",
+                    },
+                }],
+            ),
+            turn_id="image-turn",
+        )
+
+        recovered = HistoryJournal(lambda: root).recover()
+        bridge = next(
+            message
+            for message in recovered.history
+            if (message.metadata or {}).get("kind") == "tool_image_bridge"
+        )
+        assert bridge.metadata["tool_call_ids"] == ["call-image"]
+        assert any(part.get("type") == "image_ref" for part in bridge.content)
+
+        recovered_again = HistoryJournal(lambda: root).recover()
+        bridges = [
+            message
+            for message in recovered_again.history
+            if (message.metadata or {}).get("kind") == "tool_image_bridge"
+        ]
+        assert len(bridges) == 1
+
+
+def test_history_journal_recovers_bridge_after_tool_batch_commit() -> None:
+    """tool 批次已提交但 bridge 未提交时，也必须从 tool metadata 恢复图片。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        journal = HistoryJournal(lambda: root)
+        history = ConversationHistory()
+        call = {
+            "id": "call-image-batch",
+            "type": "function",
+            "function": {"name": "load_image", "arguments": "{}"},
+        }
+        journal.append(
+            history,
+            [
+                Message(role="user", content="查看图片"),
+                Message.create_assistant_message(tool_calls=[call]),
+            ],
+            turn_id="image-batch-turn",
+        )
+        journal.append(
+            history,
+            [Message.create_tool_message(
+                "call-image-batch",
+                "load_image",
+                '{"status":"ok"}',
+                model_content=[{
+                    "type": "image_ref",
+                    "image_ref": {
+                        "schema_version": 1,
+                        "blob_id": "sha256:" + "b" * 64,
+                        "sha256": "b" * 64,
+                        "mime_type": "image/png",
+                        "byte_size": 10,
+                        "file_name": "batch.png",
+                    },
+                }],
+            )],
+            turn_id="image-batch-turn",
+        )
+
+        recovered = HistoryJournal(lambda: root).recover()
+        bridge = next(
+            message
+            for message in recovered.history
+            if (message.metadata or {}).get("kind") == "tool_image_bridge"
+        )
+        assert bridge.metadata["tool_call_ids"] == ["call-image-batch"]
+
+
 def test_legacy_v3_migration_uses_turn_seq_cursor_once():
     with tempfile.TemporaryDirectory() as td:
         session_dir = Path(td)

@@ -1,5 +1,9 @@
 # load_image 图像加载工具技术报告
 
+> 历史版本说明（2026-07-31）：本文记录旧的 `pending_images` 实现，该旁路已经删除。
+> 当前实现使用 `ToolModelResult`、工具 checkpoint 和正式 `tool_image_bridge` history；
+> 请以 `note/多模态图像历史与缓存重构技术报告.md` 为准。
+
 ## 目标
 
 给 agent 增加一个 `load_image` 工具，让模型在执行任务过程中按需读取图片。需求里模型分两类，工具据此分两条路：

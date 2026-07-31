@@ -1,10 +1,10 @@
 """多模态输入处理层单测。
 
 这些测试只验证 cb-agent 自己的协议边界，不调用真实 OCR/ASR API：
-- 支持视觉的主模型：图片以 image_url 进入当前请求；
+- 支持视觉的主模型：history 保存 ImageRef，provider 边界展开 image_url；
 - 纯文本主模型：图片先转成文本摘要；
 - 音频始终转 ASR 文本；
-- canonical history 保存真实模型输入；token/log 侧使用脱敏副本。
+- canonical history 不保存 base64；token/log 侧使用脱敏副本。
 """
 
 from __future__ import annotations
@@ -20,7 +20,9 @@ from agent.multimodal_input import (
     process_multimodal_prompt,
     sanitize_multimodal_payload,
 )
+from agent.media_store import MediaBlobStore
 from constant.llm.constant_llm import ConstantLLM
+from core.message import Message, MessageRole
 
 
 class FakeProcessor:
@@ -82,10 +84,11 @@ class TestMultimodalInput(unittest.TestCase):
         else:
             ConstantLLM.llm_dict["text-test"] = self._old_text
 
-    def test_image_native_route_builds_model_visible_data_uri(self) -> None:
+    def test_image_native_route_builds_image_ref_and_provider_data_uri(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "shot.png"
             path.write_bytes(b"png bytes")
+            media_store = MediaBlobStore(Path(td) / ".cbagent" / "media")
 
             prompt = process_multimodal_prompt(
                 text="看图",
@@ -93,13 +96,27 @@ class TestMultimodalInput(unittest.TestCase):
                 model="mm-test",
                 cwd=Path(td),
                 processor=FakeProcessor(),
+                media_store=media_store,
             )
+            self.assertIsInstance(prompt.request_content, list)
+            image_parts = [p for p in prompt.request_content if p.get("type") == "image_ref"]
+            self.assertEqual(len(image_parts), 1)
+            self.assertEqual(prompt.attachments[0].routed_as, "image_ref")
+            self.assertNotIn("base64", str(prompt.request_content))
 
-        self.assertIsInstance(prompt.request_content, list)
-        image_parts = [p for p in prompt.request_content if p.get("type") == "image_url"]
-        self.assertEqual(len(image_parts), 1)
-        self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
-        self.assertEqual(prompt.attachments[0].routed_as, "image_url")
+            provider = Message(
+                role=MessageRole.USER,
+                content=prompt.request_content,
+            ).to_provider_dict(media_store)
+            provider_images = [
+                part for part in provider["content"]
+                if part.get("type") == "image_url"
+            ]
+            self.assertTrue(
+                provider_images[0]["image_url"]["url"].startswith(
+                    "data:image/png;base64,"
+                )
+            )
 
     def test_text_model_image_route_uses_processor_text(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -140,7 +157,7 @@ class TestMultimodalInput(unittest.TestCase):
             path = Path(td) / "shot.png"
             path.write_bytes(b"png bytes")
             with patch(
-                "agent.multimodal_input._estimate_native_image_tokens",
+                "agent.media_store.estimate_image_visual_tokens",
                 return_value=10_000,
             ):
                 with self.assertRaisesRegex(MultimodalInputError, "视觉预算超限"):

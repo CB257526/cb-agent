@@ -92,11 +92,24 @@ class ConversationHistory(Sequence[Message]):
         self._verify_all()
         return tuple(message.model_copy(deep=True) for message in self._items)
 
-    def provider_messages(self) -> list[dict[str, Any]]:
-        """从唯一历史生成一次性 provider payload。"""
+    def logical_messages(self) -> list[dict[str, Any]]:
+        """返回不展开 ImageRef 的逻辑消息，供 journal 校验和本地诊断。"""
 
         self._verify_all()
         return [copy.deepcopy(message.to_dict()) for message in self._items]
+
+    def provider_messages(self, media_store: Any = None) -> list[dict[str, Any]]:
+        """从唯一逻辑历史生成一次性 provider payload。
+
+        无图片的旧调用可省略 ``media_store``；一旦 history 含 ImageRef，缺少存储
+        会显式失败，禁止把项目内部内容块误发给 OpenAI-compatible provider。
+        """
+
+        self._verify_all()
+        return [
+            copy.deepcopy(message.to_provider_dict(media_store))
+            for message in self._items
+        ]
 
     def prepare_batch(
         self,

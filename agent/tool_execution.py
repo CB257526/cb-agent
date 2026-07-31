@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
 
 from agent.cancel import CancellationContext
+from core.media import ImageRef
 
 
 class ToolCancellationMode(str, Enum):
@@ -32,6 +33,27 @@ class ToolEffectState(str, Enum):
     COMPLETED = "completed"
     MAY_HAVE_OCCURRED = "may_have_occurred"
     UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ToolModelResult:
+    """工具同时返回文本终态和仅供模型使用的结构化内容。"""
+
+    text: str
+    content: tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        """当前只允许可持久化 ImageRef，禁止工具绕过媒体安全边界。"""
+
+        normalized: list[Dict[str, Any]] = []
+        for part in self.content:
+            if not isinstance(part, dict) or part.get("type") != "image_ref":
+                raise ValueError("ToolModelResult 当前只支持 image_ref 内容块")
+            ref = ImageRef.from_dict(part.get("image_ref") or {})
+            # 重新生成规范字段，避免工具夹带未知键改变后续序列化结果。
+            normalized.append({"type": "image_ref", "image_ref": ref.to_dict()})
+        object.__setattr__(self, "text", str(self.text))
+        object.__setattr__(self, "content", tuple(normalized))
 
 
 @dataclass(frozen=True)
@@ -101,6 +123,7 @@ __all__ = [
     "ToolCancellationMode",
     "ToolEffectState",
     "ToolExecutionContext",
+    "ToolModelResult",
     "ToolTerminalStatus",
     "ToolTimeoutPolicy",
 ]

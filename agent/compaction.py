@@ -18,6 +18,8 @@ from agent.llm_errors import (
     LLMRequestError,
     classify_llm_exception,
 )
+from agent.compaction_view import build_compaction_view
+from agent.media_store import estimate_visual_tokens_in_payload
 from agent.multimodal_input import sanitize_multimodal_payload
 from context import count_tokens
 from core.message import Message, MessageRole
@@ -155,19 +157,21 @@ def is_real_user_message(message: Message) -> bool:
 
 
 def estimate_message_tokens(messages: Sequence[Message]) -> int:
-    """估算一组完整协议消息的文本 token 数，不把 data URI 当正文。"""
+    """估算完整协议消息的文本和视觉 token，不把 base64 当正文。"""
 
     if not messages:
         return 0
     import json
 
-    return count_tokens(
+    logical_payload = [message.to_dict() for message in messages]
+    text_tokens = count_tokens(
         json.dumps(
-            sanitize_multimodal_payload([message.to_dict() for message in messages]),
+            sanitize_multimodal_payload(logical_payload),
             ensure_ascii=False,
             default=str,
         )
     )
+    return text_tokens + estimate_visual_tokens_in_payload(logical_payload)
 
 
 def dynamic_retained_token_target(soft_limit_tokens: int) -> int:
@@ -349,7 +353,9 @@ def _build_summary_request_messages(
     request_messages: list[dict[str, Any]] = []
     if system_message:
         request_messages.append(dict(system_message))
-    request_messages.extend(message.to_dict() for message in history_messages)
+    # 摘要模型只看图片清单。retained tail 和 active turn 不走该视图，安装后仍
+    # 保存原始 ImageRef，并在下一次普通 provider 请求边界重新展开。
+    request_messages.extend(build_compaction_view(history_messages))
     request_messages.append({"role": "user", "content": SUMMARIZATION_PROMPT})
     return request_messages
 

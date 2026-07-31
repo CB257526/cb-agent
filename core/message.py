@@ -71,20 +71,27 @@ class Message(BaseModel):
         tool_name: str,
         tool_output: str,
         is_error: bool = False,
+        model_content: Optional[List[Dict[str, Any]]] = None,
     ) -> "Message":
         """工具结果消息，content 必须是纯字符串"""
+        metadata = (
+            {"model_content": model_content}
+            if model_content
+            else None
+        )
         return cls(
             role=MessageRole.TOOL,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             content=tool_output,
             is_error=is_error,
+            metadata=metadata,
         )
     
     # ---------- 序列化 ----------
     
     def to_dict(self) -> Dict[str, Any]:
-        """转为 OpenAI API 格式"""
+        """转为逻辑消息字典；其中 ``image_ref`` 不会被展开。"""
         if self.role == MessageRole.SYSTEM:
             return {"role": "system", "content": self.content}
         
@@ -108,3 +115,37 @@ class Message(BaseModel):
             }
         
         raise ValueError(f"Unknown role: {self.role}")
+
+    def to_provider_dict(self, media_store: Any = None) -> Dict[str, Any]:
+        """在 provider 边界展开不可变图片引用，不回写逻辑 history。"""
+
+        payload = self.to_dict()
+
+        def expand(value: Any) -> Any:
+            if isinstance(value, list):
+                return [expand(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            if value.get("type") == "image_ref":
+                if media_store is None:
+                    raise ValueError("provider 序列化 ImageRef 时缺少 MediaBlobStore")
+                ref_payload = value.get("image_ref")
+                from core.media import ImageRef
+
+                ref = (
+                    ref_payload
+                    if isinstance(ref_payload, ImageRef)
+                    else ImageRef.from_dict(ref_payload or {})
+                )
+                image_url: Dict[str, Any] = {
+                    "url": media_store.to_data_uri(ref),
+                }
+                if ref.detail:
+                    image_url["detail"] = ref.detail
+                return {
+                    "type": "image_url",
+                    "image_url": image_url,
+                }
+            return {key: expand(item) for key, item in value.items()}
+
+        return expand(payload)

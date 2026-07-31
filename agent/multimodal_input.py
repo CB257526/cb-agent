@@ -7,9 +7,7 @@ history，因此当前轮和后续轮不存在两种表示。日志与 UI 可以
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import math
 import mimetypes
 import os
 import warnings
@@ -19,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 from constant.llm.constant_llm import ConstantLLM
 from utils.multimodal import MultimodalProcessor
+from agent.media_store import MediaBlobStore
 
 
 IMAGE_MIME_MAP = MultimodalProcessor.IMAGE_MIME_MAP
@@ -101,6 +100,7 @@ class ProcessedAttachment:
     full_chars: int = 0
     preview_chars: int = 0
     estimated_tokens: int = 0  # 原生视觉输入的保守 token 估算；文本 preview 仍由统一 tokenizer 统计
+    image_ref: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -125,10 +125,9 @@ def model_supports_image(model: Optional[str]) -> bool:
 def sanitize_multimodal_payload(value: Any) -> Any:
     """复制并脱敏可能包含二进制数据的多模态 payload。
 
-    图片原生路由时，本轮 OpenAI message 会包含 ``data:image/...;base64,...``。
-    canonical history 会保存模型实际看见的 data URI，以维持下一请求的协议前缀。
-    token 文本估算、messages dump 和日志使用本函数生成的递归安全副本；替换只发生
-    在副本中，不会改动真正要发给模型或写入 history 的 ``messages``。
+    图片原生路由时，provider payload 会临时包含 ``data:image/...;base64,...``，
+    canonical history 只保存 ImageRef。token 文本估算、messages dump 和日志使用
+    本函数生成递归安全副本；替换不会改动真正请求或逻辑 history。
     """
     if isinstance(value, str):
         return _sanitize_data_uri(value)
@@ -148,11 +147,12 @@ def process_multimodal_prompt(
     processor: Optional[MultimodalProcessor] = None,
     soft_limit_tokens: Optional[int] = None,
     image_ability: Optional[bool] = None,
+    media_store: Optional[MediaBlobStore] = None,
 ) -> ProcessedMultimodalPrompt:
     """把用户文本和附件转换成唯一的模型可见请求内容。
 
-    ``request_content`` 会直接进入 canonical history。原生图片因此保留稳定 data
-    URI；日志和 UI 只能通过 ``sanitize_multimodal_payload`` 生成脱敏副本。
+    ``request_content`` 会直接进入 canonical history。原生图片保存稳定 ImageRef，
+    只有 provider serializer 会临时展开 data URI；日志和 UI 只能使用脱敏副本。
 
     文本/文档附件：完整 Markdown 写入
     ``.cbagent/attachments/<content_hash>/content.md``；请求只注入 manifest 与聚合
@@ -198,6 +198,7 @@ def process_multimodal_prompt(
     visual_budget = _visual_token_budget(soft_limit_tokens)
     visual_tokens_used = 0
     attachment_notes: List[str] = []
+    active_media_store = media_store or MediaBlobStore.for_workdir(workdir)
     for idx, item in enumerate(raw_attachments, start=1):
         attachment = _process_one_attachment(
             item=item,
@@ -208,6 +209,7 @@ def process_multimodal_prompt(
             request_parts=request_parts,
             attachment_notes=attachment_notes,
             remaining_preview_budget=remaining_preview,
+            media_store=active_media_store,
         )
         remaining_preview = max(0, remaining_preview - max(0, attachment.preview_chars))
         visual_tokens_used += max(0, attachment.estimated_tokens)
@@ -244,6 +246,7 @@ def _process_one_attachment(
     request_parts: List[Dict[str, Any]],
     attachment_notes: List[str],
     remaining_preview_budget: int,
+    media_store: MediaBlobStore,
 ) -> ProcessedAttachment:
     if not isinstance(item, dict):
         raise MultimodalInputError(f"附件 #{index} 必须是对象。")
@@ -264,16 +267,19 @@ def _process_one_attachment(
     )
 
     if modality == "image" and image_native:
-        data_uri = "data:%s;base64,%s" % (
-            mime_type,
-            base64.b64encode(file_bytes).decode("utf-8"),
+        ref = media_store.put_bytes(
+            file_bytes,
+            mime_type=mime_type,
+            file_name=path.name,
+            source_kind=source,
         )
-        request_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+        request_parts.append({"type": "image_ref", "image_ref": ref.to_dict()})
         base.text = "图片已原生发送给支持视觉输入的模型。"
-        base.routed_as = "image_url"
+        base.routed_as = "image_ref"
         base.full_chars = 0
         base.preview_chars = 0
-        base.estimated_tokens = _estimate_native_image_tokens(path, len(file_bytes))
+        base.estimated_tokens = ref.visual_tokens
+        base.image_ref = ref.to_dict()
         attachment_notes.append(
             f"[附件 #{index}: image {path.name}] 图片将作为视觉输入发送给模型；"
             "后续请求继续使用 canonical history 中同一份图像内容。"
@@ -499,25 +505,6 @@ def _visual_token_budget(soft_limit_tokens: Optional[int]) -> int:
             ),
         )
     return DEFAULT_VISUAL_TOKEN_BUDGET
-
-
-def _estimate_native_image_tokens(path: Path, size_bytes: int) -> int:
-    """按图片尺寸估算视觉 token，无法读取尺寸时按文件字节数保守回退。"""
-    try:
-        from PIL import Image
-
-        with Image.open(path) as image:
-            width, height = image.size
-        width = max(1, int(width))
-        height = max(1, int(height))
-        scale = min(1.0, 2048 / max(width, height))
-        scaled_width = max(1, int(math.ceil(width * scale)))
-        scaled_height = max(1, int(math.ceil(height * scale)))
-        tiles = math.ceil(scaled_width / 512) * math.ceil(scaled_height / 512)
-        return 85 + 170 * max(1, tiles)
-    except Exception:
-        # 不同 provider 的视觉计费不同；尺寸不可得时宁可高估，避免 base64 被短占位符掩盖。
-        return max(512, min(8_192, math.ceil(max(1, size_bytes) / 4096)))
 
 
 def _persist_text_artifact(cwd: Path, content_hash: str, text: str, *, kind: str) -> str:

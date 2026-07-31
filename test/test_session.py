@@ -253,26 +253,42 @@ class TestAgentSessionBasic(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 image = Path(td) / "shot.png"
                 image.write_bytes(b"image bytes")
+                store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
                 llm = FakeLLM([
                     {"answer": "看到了", "tool_calls": []},
                     {"answer": "继续", "tool_calls": []},
                 ])
-                s = self._make_session(llm)
+                s = self._make_session(llm, session_store=store)
 
                 s.chat("图里有什么", attachments=[{"path": str(image), "source": "direct"}])
+                image.unlink()
                 s.chat("继续说明")
 
-            first_messages = llm.calls[0]["messages"]
-            last_user = first_messages[-1]
-            self.assertIsInstance(last_user["content"], list)
-            image_parts = [p for p in last_user["content"] if p.get("type") == "image_url"]
-            self.assertEqual(len(image_parts), 1)
-            self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+                first_messages = llm.calls[0]["messages"]
+                last_user = first_messages[-1]
+                self.assertIsInstance(last_user["content"], list)
+                image_parts = [p for p in last_user["content"] if p.get("type") == "image_url"]
+                self.assertEqual(len(image_parts), 1)
+                self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
 
-            second_messages = llm.calls[1]["messages"]
-            self.assertEqual(first_messages, second_messages[:len(first_messages)])
-            history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
-            self.assertIn("data:image/png;base64,", history_dump)
+                second_messages = llm.calls[1]["messages"]
+                self.assertEqual(first_messages, second_messages[:len(first_messages)])
+                history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
+                self.assertIn('"type": "image_ref"', history_dump)
+                self.assertNotIn("data:image", history_dump)
+                journal_dump = (store.active_dir / "history.jsonl").read_text(encoding="utf-8")
+                self.assertIn('"type": "image_ref"', journal_dump)
+                self.assertNotIn("data:image", journal_dump)
+
+                restored = self._make_session(
+                    FakeLLM([]),
+                    session_store=LocalSessionStore(store.root),
+                )
+                restored_request = restored._provider_request_messages()
+                self.assertEqual(
+                    second_messages,
+                    restored_request[:len(second_messages)],
+                )
 
         finally:
             if original is None:

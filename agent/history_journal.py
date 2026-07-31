@@ -14,6 +14,10 @@ from core.conversation_history import ConversationHistory, freeze_history_messag
 from core.message import Message
 from agent.message_protocol import validate_tool_protocol
 from agent.compaction import is_real_user_message
+from agent.tool_model_content import (
+    build_tool_model_content_bridge,
+    tool_model_content_call_ids,
+)
 
 
 JOURNAL_VERSION = 4
@@ -344,7 +348,7 @@ class HistoryJournal:
         history = ConversationHistory(items, generation=generation)
         try:
             validate_tool_protocol(
-                history.provider_messages(),
+                history.logical_messages(),
                 allow_pending_tail=True,
             )
         except ValueError as error:
@@ -356,11 +360,32 @@ class HistoryJournal:
             tool_checkpoints,
         )
         incomplete_turn_id = _incomplete_latest_turn_id(items)
-        if recovered_tools or incomplete_turn_id:
+        recovery_turn_id = recovered_turn_id or incomplete_turn_id
+        # 工具 checkpoint 已持久化 ImageRef，但进程可能在正式 bridge append 前退出。
+        # 恢复时只补尚未被现有 bridge 覆盖的 call id，且必须位于全部 tool 终态之后。
+        recovery_turn_items = [
+            message
+            for message in items
+            if recovery_turn_id
+            and str((message.metadata or {}).get("turn_id") or "") == recovery_turn_id
+        ]
+        tool_messages_with_content = [
+            message
+            for message in [*recovery_turn_items, *recovered_tools]
+            if (
+                message.role.value if hasattr(message.role, "value") else str(message.role)
+            ) == "tool"
+        ]
+        recovered_bridge = build_tool_model_content_bridge(
+            tool_messages_with_content,
+            excluded_call_ids=tool_model_content_call_ids(recovery_turn_items),
+        )
+        if recovered_tools or recovered_bridge is not None or incomplete_turn_id:
             # 工具终态和回合中止边界必须同事件提交。若进程在写入中途再次崩溃，
             # 下一次恢复会丢弃半写尾行并根据 checkpoints 重建同一批消息。
             recovery_batch = [
                 *recovered_tools,
+                *([recovered_bridge] if recovered_bridge is not None else []),
                 Message(
                     role="user",
                     content=(
@@ -379,7 +404,7 @@ class HistoryJournal:
             self.append(
                 history,
                 recovery_batch,
-                turn_id=recovered_turn_id or incomplete_turn_id,
+                turn_id=recovery_turn_id,
                 event_kind="recovery_tool_results",
             )
             if recovered_tools:
@@ -406,7 +431,7 @@ class HistoryJournal:
         if not prepared:
             return []
         prospective = [
-            *history.provider_messages(),
+            *history.logical_messages(),
             *(message.to_dict() for message in prepared),
         ]
         tail = prepared[-1]

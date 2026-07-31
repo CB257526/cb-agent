@@ -53,10 +53,6 @@ from subagent.context import (
     reset_current_parent_session_id,
     set_current_parent_session_id,
 )
-from tools.tools.pending_images import (
-    reset_pending_image_buffer,
-    set_pending_image_buffer,
-)
 from agent.cb_agents import CbAgentsLLM
 from agent.compaction import (
     CompactionError,
@@ -81,10 +77,18 @@ from agent.events import (
 from agent.executor import ToolExecutor
 from agent.message_logger import MessageLogger
 from agent.multimodal_input import process_multimodal_prompt, sanitize_multimodal_payload
+from agent.media_store import (
+    MediaBlobStore,
+    estimate_visual_tokens_in_payload,
+    migrate_legacy_data_uri_messages,
+    reset_current_media_store,
+    set_current_media_store,
+)
 from agent.plan_parser import PlanSegment, ProposedPlanParser, split_proposed_plan_text
 from agent.plan_policy import PLAN_READ_ACTIONS, PLAN_READ_TOOLS, PlanExecutionPolicy
 from agent.plan_state import PlanStateStore
 from agent.question_registry import QuestionRegistry
+from agent.tool_model_content import build_tool_model_content_bridge
 from constant.llm.constant_llm import ConstantLLM
 from context import (
     MemoryLoader,
@@ -167,9 +171,13 @@ def _message_content_to_text(content: Any) -> str:
             item_type = item.get("type")
             if item_type == "text":
                 parts.append(str(item.get("text") or ""))
+            elif item_type == "image_ref":
+                ref = item.get("image_ref") if isinstance(item.get("image_ref"), dict) else {}
+                file_name = str(ref.get("file_name") or "")
+                parts.append(f"[image: {file_name}]" if file_name else "[image]")
             elif item_type == "image_url":
-                url = (item.get("image_url") or {}).get("url", "")
-                parts.append(f"[image: {url}]" if url else "[image]")
+                # 旧会话可能仍含 data URI；UI 投影不能把图片正文带进 RPC payload。
+                parts.append("[image]")
             elif item_type == "audio_url":
                 url = (item.get("audio_url") or {}).get("url", "")
                 parts.append(f"[audio: {url}]" if url else "[audio]")
@@ -465,6 +473,13 @@ class AgentSession:
         self.ctx_enabled = ctx_enabled
         # active history 始终全量发送；超窗只通过正式 compact 释放，禁止按消息数裁剪。
         self.session_store = session_store
+        # 所有会话共享项目级 blob，但当前回合通过 ContextVar 绑定，避免工具线程
+        # 或并行 Agent 把图片写入另一个会话的媒体目录。
+        self.media_store = (
+            MediaBlobStore.for_session_store(session_store)
+            if session_store is not None
+            else MediaBlobStore.for_workdir(Path.cwd())
+        )
         # provider usage 到达时用 round_idx 找回同一请求的原始估算，既用于 Context
         # 精确刷新，也用于按 provider/model 校准本地 tokenizer 的系统性偏差。
         self._request_token_estimates: Dict[int, int] = {}
@@ -506,6 +521,11 @@ class AgentSession:
                     ),
                 )
                 self.history = recovery.history
+                self._migrate_recovered_image_history(
+                    self.history,
+                    self._history_journal,
+                )
+                self.media_store.validate_messages(self.history.snapshot())
                 if recovery.warnings:
                     logger.warning("canonical history 恢复警告: %s", recovery.warnings)
             except Exception as error:
@@ -535,6 +555,28 @@ class AgentSession:
             len(self.history),
             bool(self.message_logger),
         )
+
+    def _migrate_recovered_image_history(
+        self,
+        history: ConversationHistory,
+        journal: HistoryJournal,
+    ) -> int:
+        """把旧 data URI 迁移到新 generation，保留旧 journal 作为审计事实。"""
+
+        replacement, migrated_count = migrate_legacy_data_uri_messages(
+            history.snapshot(),
+            self.media_store,
+        )
+        if not migrated_count:
+            return 0
+        journal.replace(
+            history,
+            replacement,
+            reason="legacy_image_ref_migration",
+            metadata={"migrated_images": migrated_count},
+        )
+        logger.info("已把 %s 个旧 data URI 迁移为 ImageRef", migrated_count)
+        return migrated_count
 
     def _append_history(
         self,
@@ -876,9 +918,8 @@ class AgentSession:
     def switch_session(self, session_id: str) -> Dict[str, Any]:
         """切换到已有会话并恢复它最近的普通 history。
 
-        这一步只读该 session 目录下的 history journal/state；不会把当前会话内容
-        保存到目标会话，也不会生成额外 history 事件。会话隔离边界完全由
-        LocalSessionStore.switch_session 的目录校验保证。
+        这一步读取目标 session 的 history journal/state；若发现旧版 data URI，
+        会先在目标 journal 追加一次显式迁移 replacement。除此以外不会生成消息。
         """
         if self.session_store is None:
             raise RuntimeError("local session store is not enabled")
@@ -889,10 +930,12 @@ class AgentSession:
         recovery = target_journal.recover(
             legacy_loader=lambda: load_legacy_history(target_dir),
         )
+        self._migrate_recovered_image_history(recovery.history, target_journal)
+        self.media_store.validate_messages(recovery.history.snapshot())
         summary = self.session_store.switch_session(session_id)
         self.history = recovery.history
         if self._history_journal is not None:
-            self._history_journal.last_event_seq = recovery.last_event_seq
+            self._history_journal.last_event_seq = target_journal.last_event_seq
         if recovery.warnings:
             logger.warning("canonical history 恢复警告: %s", recovery.warnings)
         self._world_state_baseline = _world_state_from_history(self.history)
@@ -1006,10 +1049,10 @@ class AgentSession:
         if system_message:
             fixed_messages.append(system_message)
         if world_state_message is not None:
-            fixed_messages.append(world_state_message.to_dict())
+            fixed_messages.append(world_state_message.to_provider_dict(self.media_store))
         if active_turn_id:
             fixed_messages.extend(
-                message.to_dict()
+                message.to_provider_dict(self.media_store)
                 for message in compact_source
                 if ConversationHistory.turn_id(message) == active_turn_id
             )
@@ -1075,7 +1118,8 @@ class AgentSession:
             replacement_history.append(summary_message)
 
             post_messages = ([system_message] if system_message else []) + [
-                message.to_dict() for message in replacement_history
+                message.to_provider_dict(self.media_store)
+                for message in replacement_history
             ]
             post_tokens = self._estimate_request_tokens(post_messages, tools_schema)
             if post_tokens <= install_limits["soft_limit_tokens"]:
@@ -1182,7 +1226,7 @@ class AgentSession:
         # ToolExecutor 的并发分支会 copy_context 给 worker 用同一份 ContextVar
         ctx_token = set_current_cancel_token(token)
         parent_ctx_token = set_current_parent_session_id(self.current_runtime_session_id())
-        image_ctx_token = set_pending_image_buffer()
+        media_ctx_token = set_current_media_store(self.media_store)
         try:
             return self._chat_impl(
                 user_query,
@@ -1191,7 +1235,7 @@ class AgentSession:
                 persistent_user_text=persistent_user_text,
             )
         finally:
-            reset_pending_image_buffer(image_ctx_token)
+            reset_current_media_store(media_ctx_token)
             reset_current_parent_session_id(parent_ctx_token)
             reset_current_cancel_token(ctx_token)
             self.current_cancel_token = None
@@ -1364,8 +1408,11 @@ class AgentSession:
         )
         if stable_system is not None:
             messages.append(stable_system)
-        messages.extend(self.history.provider_messages())
-        messages.extend(copy.deepcopy(message.to_dict()) for message in extra_messages)
+        messages.extend(self.history.provider_messages(self.media_store))
+        messages.extend(
+            copy.deepcopy(message.to_provider_dict(self.media_store))
+            for message in extra_messages
+        )
         validate_tool_protocol(
             messages,
             allow_pending_tail=allow_pending_tool_tail,
@@ -1690,6 +1737,7 @@ class AgentSession:
                 if active_model is not None and hasattr(active_model, "image_ability")
                 else None
             ),
+            media_store=self.media_store,
         )
         request_content = multimodal_prompt.request_content
         explicit_skill_evidence = self._explicit_skill_evidence(explicit_skill_query)
@@ -2125,7 +2173,7 @@ class AgentSession:
             text = json.dumps(payload, ensure_ascii=False, default=str)
         except Exception:
             text = str(payload)
-        return count_tokens(text)
+        return count_tokens(text) + estimate_visual_tokens_in_payload(messages)
 
     def _request_context_window_usage(
         self,
@@ -2517,7 +2565,7 @@ class AgentSession:
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        sanitize_multimodal_payload(request_messages),
+                        request_messages,
                         tools=tools_schema,
                         label=f"第 {round_idx} 轮 think 前",
                     )
@@ -2597,7 +2645,7 @@ class AgentSession:
                 plan_bus.finish(round_idx)
             if self.message_logger is not None:
                 try:
-                    logged_messages = sanitize_multimodal_payload(request_messages)
+                    logged_messages = list(request_messages)
                     assistant_payload = _llm_result_to_assistant_payload(result)
                     if assistant_payload is not None:
                         logged_messages.append(assistant_payload)
@@ -2733,6 +2781,7 @@ class AgentSession:
                         tool_name=str(exec_result.name),
                         tool_output=tool_content,
                         is_error=exec_result.is_error,
+                        model_content=exec_result.model_content,
                     ),
                     turn_id=turn_id,
                 )
@@ -2757,6 +2806,7 @@ class AgentSession:
                     tool_name=str(exec_result.name),
                     tool_output=tool_content,
                     is_error=exec_result.is_error,
+                    model_content=exec_result.model_content,
                 ))
                 trace_collector.add_tool_result(
                     call=call,
@@ -2772,7 +2822,13 @@ class AgentSession:
                 turn_id=turn_id,
                 event_kind="tool_results",
             )
-            self._append_pending_images_to_history(turn_id)
+            model_content_bridge = build_tool_model_content_bridge(tool_messages)
+            if model_content_bridge is not None:
+                self._append_history(
+                    [model_content_bridge],
+                    turn_id=turn_id,
+                    event_kind="tool_model_content",
+                )
             current_messages = self._provider_request_messages(
                 system_message=request_system_message,
             )
@@ -2786,7 +2842,7 @@ class AgentSession:
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        sanitize_multimodal_payload(current_messages),
+                        current_messages,
                         tools=tools_schema,
                         label=f"round {round_idx} after tool results",
                     )
@@ -2828,51 +2884,6 @@ class AgentSession:
         )
 
     # ---------- 辅助 ----------
-
-    def _append_pending_images_to_history(self, turn_id: str) -> None:
-        """把 ``load_image`` 产生的图片桥接消息正式追加到唯一 history。
-
-        load_image 工具在视觉模型下不能用返回值带图（role=tool 不接受 image_url），
-        因而仍需合成 user 消息。关键变化是：它不能只存在于临时请求数组，否则
-        下一工具轮或下一用户回合会失去模型已经看过的图片证据。
-        """
-        try:
-            from tools.tools.pending_images import drain_images
-            pending = drain_images()
-        except Exception:
-            logger.exception("drain pending images 失败，已忽略")
-            return
-        if not pending:
-            return
-
-        content: List[Dict[str, Any]] = []
-        for item in pending:
-            image_part = item.get("image_part")
-            if not isinstance(image_part, dict):
-                continue
-            file_name = item.get("file_name") or "image"
-            content.append({"type": "text", "text": f"图片加载成功：{file_name}"})
-            content.append(image_part)
-        if not content:
-            return
-
-        self._append_history(
-            [Message(
-                role=MessageRole.USER,
-                content=content,
-                metadata={
-                    "kind": "tool_image_bridge",
-                    "tool_call_ids": [
-                        str(item.get("call_id") or "")
-                        for item in pending
-                        if item.get("call_id")
-                    ],
-                },
-            )],
-            turn_id=turn_id,
-            event_kind="tool_images",
-        )
-        logger.info("injected %s pending image(s) as user message", len(pending))
 
     @staticmethod
     def _format_llm_request_error(exc: LLMRequestError) -> str:
