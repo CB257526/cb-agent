@@ -8,7 +8,7 @@ __pycache__/
 .playwright-mcp/
 .codegraph/
 hatch-run-*/
-
+关于上下文维护重构建议.md
 # C extensions
 *.so
 
@@ -243,3 +243,6 @@ assets/stickers/
 models.json
 .DS_Store
 待改进问题.md
+
+
+上下文协议连续性与隐式改写问题清单.md
