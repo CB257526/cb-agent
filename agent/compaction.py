@@ -38,6 +38,14 @@ SUMMARY_PREFIX = """Another language model started to solve this problem and pro
 
 COMPACTION_SUMMARY_KIND = "context_compaction"
 CONTEXT_UPDATE_KIND = "context_update"
+NON_TURN_USER_KINDS = {
+    CONTEXT_UPDATE_KIND,
+    COMPACTION_SUMMARY_KIND,
+    "context_evidence",
+    "plan_state",
+    "tool_image_bridge",
+    "turn_failed",
+}
 
 
 class CompactionError(RuntimeError):
@@ -101,9 +109,6 @@ class CompactionModelResult:
 
     summary: str
     attempts: int
-    request_messages: list[dict[str, Any]]
-    # 旧字段保留兼容；hierarchical 路径不再丢弃未摘要消息，恒为 0。
-    dropped_messages: int = 0
     strategy: str = "single_pass"
     summary_requests: int = 0
     summary_prompt_tokens: int = 0
@@ -113,11 +118,14 @@ class CompactionModelResult:
 
 
 @dataclass(frozen=True)
-class RetainedHistory:
-    """压缩后保留的最近原始回合。"""
+class CompactionPartition:
+    """一次 compact 的旧前缀、保留尾部和活动回合分区。"""
 
-    messages: list[Message]
-    tokens: int
+    summarized_prefix: list[Message]
+    retained_tail: list[Message]
+    active_turn: list[Message]
+    retained_tokens: int
+    active_tokens: int
     oversized_latest_turn: bool = False
 
 
@@ -140,7 +148,7 @@ def is_real_user_message(message: Message) -> bool:
 
     return (
         message_role(message) == "user"
-        and message_kind(message) not in {CONTEXT_UPDATE_KIND, COMPACTION_SUMMARY_KIND}
+        and message_kind(message) not in NON_TURN_USER_KINDS
     )
 
 
@@ -167,62 +175,111 @@ def dynamic_retained_token_target(soft_limit_tokens: int) -> int:
     return min(128 * 1024, max(16 * 1024, soft_limit // 10))
 
 
-def _split_protocol_turns(messages: Sequence[Message]) -> list[list[Message]]:
-    """把可保留历史拆成以真实用户输入开头的协议完整回合。"""
+def _message_turn_id(message: Message) -> str:
+    """读取 canonical journal 为消息分配的用户回合标识。"""
 
-    cleaned = [
-        message
-        for message in messages
-        if message_kind(message) not in {CONTEXT_UPDATE_KIND, COMPACTION_SUMMARY_KIND}
-    ]
-    user_positions = [
-        index for index, message in enumerate(cleaned) if is_real_user_message(message)
-    ]
-    turns: list[list[Message]] = []
-    for position, start in enumerate(user_positions):
-        end = user_positions[position + 1] if position + 1 < len(user_positions) else len(cleaned)
-        turns.append(cleaned[start:end])
-    return turns
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return str(metadata.get("turn_id") or "")
 
 
-def select_retained_history(
+def _split_complete_units(messages: Sequence[Message]) -> list[list[Message]]:
+    """把旧历史拆成不可再细分的完整回合单元。
+
+    v4 消息优先按 ``turn_id`` 分组。一次性迁移的旧消息可能没有该字段，此时退回
+    真实 user 边界；assistant.tool_calls 与后续 tool 结果始终留在同一单元内。
+    """
+
+    units: list[list[Message]] = []
+    current: list[Message] = []
+    current_turn_id = ""
+    for message in messages:
+        turn_id = _message_turn_id(message)
+        if turn_id:
+            if current and current_turn_id and turn_id != current_turn_id:
+                units.append(current)
+                current = []
+            elif current and not current_turn_id and is_real_user_message(message):
+                units.append(current)
+                current = []
+            current.append(message)
+            current_turn_id = turn_id
+            continue
+
+        if is_real_user_message(message) and current:
+            units.append(current)
+            current = [message]
+            current_turn_id = ""
+        else:
+            current.append(message)
+    if current:
+        units.append(current)
+    return units
+
+
+def partition_history_for_compaction(
     messages: Sequence[Message],
     *,
-    token_budget: int,
-) -> RetainedHistory:
-    """从最新回合向前选择原始历史，并保持工具协议块完整。"""
+    retained_token_budget: int,
+    active_turn_id: str = "",
+) -> CompactionPartition:
+    """选择要摘要的旧前缀，并原样保留最近完整回合与活动回合。
 
-    budget = max(0, int(token_budget))
-    if budget <= 0:
-        return RetainedHistory(messages=[], tokens=0)
-    turns = _split_protocol_turns(messages)
-    if not turns:
-        return RetainedHistory(messages=[], tokens=0)
+    活动回合从首次出现目标 ``turn_id`` 的位置一直保留到历史末尾。这样连续发生
+    多次 mid-turn compact 时，前一次插入且影响了后续采样的摘要也不会从当前任务
+    现场中消失。若最近旧回合本身超过预算，则不切半条协议链，只保留摘要。
+    """
 
-    newest = turns[-1]
-    newest_tokens = estimate_message_tokens(newest)
-    if newest_tokens > budget:
-        # 该回合已经完整进入摘要请求；replacement 预算装不下时宁可只保留摘要，
-        # 也不能把 user/assistant/tool 协议链裁成看似完整的半截原始回合。
-        return RetainedHistory(
-            messages=[],
-            tokens=0,
-            oversized_latest_turn=True,
+    source = list(messages)
+    active_start: Optional[int] = None
+    if active_turn_id:
+        active_start = next(
+            (
+                index
+                for index, message in enumerate(source)
+                if _message_turn_id(message) == active_turn_id
+            ),
+            None,
         )
+    old_history = source[:active_start] if active_start is not None else source
+    active_turn = (
+        [
+            message
+            for message in source[active_start:]
+            # 最新完整 world state 会在 replacement 前重新插入；活动回合内的旧
+            # context_update 若继续保留，会在它之后覆盖刚刷新的现场。
+            if message_kind(message) != CONTEXT_UPDATE_KIND
+        ]
+        if active_start is not None
+        else []
+    )
 
-    selected_reversed: list[list[Message]] = []
-    for turn in reversed(turns):
-        candidate_reversed = [*selected_reversed, list(turn)]
-        candidate = [message for item in reversed(candidate_reversed) for message in item]
+    units = _split_complete_units(old_history)
+    budget = max(0, int(retained_token_budget))
+    selected_count = 0
+    retained_tokens = 0
+    oversized_latest_turn = False
+    for unit in reversed(units):
+        candidate_units = units[len(units) - selected_count - 1:]
+        candidate = [item for group in candidate_units for item in group]
         candidate_tokens = estimate_message_tokens(candidate)
-        if selected_reversed and candidate_tokens > budget:
+        if candidate_tokens > budget:
+            if selected_count == 0:
+                oversized_latest_turn = True
             break
-        if not selected_reversed and candidate_tokens > budget:
-            break
-        selected_reversed.append(list(turn))
-    selected_reversed.reverse()
-    retained = [message for turn in selected_reversed for message in turn]
-    return RetainedHistory(messages=retained, tokens=estimate_message_tokens(retained))
+        selected_count += 1
+        retained_tokens = candidate_tokens
+
+    split_at = len(units) - selected_count
+    summarized_prefix = [item for unit in units[:split_at] for item in unit]
+    retained_tail = [item for unit in units[split_at:] for item in unit]
+    return CompactionPartition(
+        summarized_prefix=summarized_prefix,
+        retained_tail=retained_tail,
+        active_turn=active_turn,
+        retained_tokens=retained_tokens,
+        active_tokens=estimate_message_tokens(active_turn),
+        oversized_latest_turn=oversized_latest_turn,
+    )
 
 
 def make_summary_message(summary: str, *, reason: str) -> Message:
@@ -452,17 +509,14 @@ def run_local_compaction(
         {**_default_compaction_budgets(hard_limit, max_output_tokens=max_output), **(budgets or {})}
     )
     covered_ids: set[int] = set()
-    last_request: list[dict[str, Any]] = []
 
     def _mark_covered(messages: Sequence[Message]) -> None:
         for message in messages:
             covered_ids.add(id(message))
 
     def _call_summary(request_messages: list[dict[str, Any]]) -> str:
-        nonlocal last_request
         estimated_prompt = max(0, int(estimate_request_tokens(request_messages)))
         tracker.ensure_room_for_request(estimated_prompt, max_output)
-        last_request = list(request_messages)
         request_kwargs: dict[str, Any] = {
             "model": model,
             "stream": False,
@@ -511,8 +565,6 @@ def run_local_compaction(
         return CompactionModelResult(
             summary=summary,
             attempts=tracker.summary_requests,
-            request_messages=last_request,
-            dropped_messages=0,
             strategy=strategy,
             summary_requests=tracker.summary_requests,
             summary_prompt_tokens=tracker.summary_prompt_tokens,
@@ -590,7 +642,6 @@ __all__ = [
     "CompactionError",
     "CompactionProviderError",
     "CompactionModelResult",
-    "RetainedHistory",
     "SUMMARY_PREFIX",
     "SUMMARIZATION_PROMPT",
     "dynamic_retained_token_target",
@@ -598,5 +649,5 @@ __all__ = [
     "make_summary_message",
     "message_kind",
     "run_local_compaction",
-    "select_retained_history",
+    "partition_history_for_compaction",
 ]

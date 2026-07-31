@@ -75,7 +75,7 @@ async def get_dynamic_context_sections(
         name: str,
         loader: Callable[[], Optional[str]],
         *,
-        persistence: Literal["persistent", "request_only"] = "persistent",
+        scope: Literal["world_state", "turn_evidence"] = "world_state",
     ) -> DynamicSectionResult:
         try:
             text = loader()
@@ -83,17 +83,17 @@ async def get_dynamic_context_sections(
             return DynamicSectionResult.error_result(
                 name,
                 str(error),
-                persistence=persistence,
+                scope=scope,
             )
         if text and str(text).strip():
             return DynamicSectionResult.present(
                 name,
                 str(text),
-                persistence=persistence,
+                scope=scope,
             )
         return DynamicSectionResult.absent(
             name,
-            persistence=persistence,
+            scope=scope,
         )
 
     sections: list[DynamicSectionResult] = [
@@ -115,7 +115,7 @@ async def get_dynamic_context_sections(
                 DynamicSectionResult.error_result(
                     "knowledge",
                     str(error),
-                    persistence="request_only",
+                    scope="turn_evidence",
                 ),
             ])
         else:
@@ -131,12 +131,12 @@ async def get_dynamic_context_sections(
                 DynamicSectionResult.present(
                     "knowledge",
                     knowledge,
-                    persistence="request_only",
+                    scope="turn_evidence",
                 )
                 if knowledge
                 else DynamicSectionResult.absent(
                     "knowledge",
-                    persistence="request_only",
+                    scope="turn_evidence",
                 )
             )
     sections.extend([

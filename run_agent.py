@@ -85,10 +85,10 @@ from agent.hooks import HookManager, load_hooks_config  # Hook 管理器及其�
 from agent.executor import ToolExecutor            # 工具调用线程池调度器，并发执行 LLM 发起的工具调用
 from agent.platforms.messages import ConversationKey  # 通讯平台会话标识结构体（platform + kind + id）
 from agent.message_logger import MessageLogger      # LLM messages 日志记录器，将原始对话保存到 JSONL 文件
-from agent.session import AgentSession              # 会话核心类：管理历史、驱动 chat 循环、调用 ContextBuilder
+from agent.session import AgentSession              # 会话核心类：管理唯一历史并驱动工具循环
 from subagent import SubagentRegistry, SubagentTaskManager  # 子代理角色注册表和任务管理器
 from agent.usage_metrics import UsageMetricsRecorder  # token 使用量和工具调用次数统计
-from agent.work_context import LocalSessionStore, TraceSummarizer  # 本地会话持久化存储 + 工具调用轨迹摘要
+from agent.work_context import LocalSessionStore  # 本地会话状态与用量存储
 
 # --- LLM 配置常量与上下文构建器 ---
 from constant.llm.constant_llm import ConstantLLM  # 模型参数常量表（模型名→is_tool/is_reasoning/max_tokens 映射）
@@ -229,7 +229,7 @@ class AgentRunner:
     def __init__(
         self,
         use_mcp: bool = True,                     # True=启用 MCP 工具（若依赖未安装自动降级）
-        ctx_enabled: bool = True,                 # True=启用 ContextBuilder（GSSC 上下文构建管线）
+        ctx_enabled: bool = True,                 # True=启用动态上下文 section
         memory_system: str = "light",             # "light"=Markdown 记忆|"full"=RAG+向量|"off"=关闭
         communication_platform: str | None = None, # None=OTUI/JSON-RPC|"qq"=QQ/NapCat|"wechat"=微信OC
         dangerously_skip_permissions: bool = False,# True=跳过所有 Bash 权限确认和高危命令拦截
@@ -352,13 +352,9 @@ class AgentRunner:
             hook_manager=self.hook_manager,       # 钩子管理器
         )
 
-        # TraceSummarizer：当工具调用轨迹（trajectory）超过阈值时，
-        # 静默调用 LLM 压缩为摘要，避免上下文膨胀过快
-        self._trace_summarizer = TraceSummarizer(self.llm)
-
         # ---- Step 5: 会话核心（AgentSession） ----
         # 纯逻辑层：管理会话历史、驱动 chat 循环（think→tools→think...）、
-        # 调用 ContextBuilder 构建 system prompt。不关心输出目的地。
+        # 从稳定 system 外壳与 canonical history 生成请求，不关心输出目的地。
         self.session = self._create_agent_session(
             session_store=LocalSessionStore(
                 WORKSPACE_ROOT / ".cbagent" / "sessions"  # 会话持久化目录
@@ -493,10 +489,9 @@ class AgentRunner:
             task_manager=self.subagent_task_manager,    # 唯一任务状态源
             hook_manager=self.hook_manager,            # 共享钩子管理器
             cwd=WORKSPACE_ROOT,                        # 工作目录
-            ctx_enabled=self.ctx_enabled,              # 继承父会话的 ContextBuilder 开关
+            ctx_enabled=self.ctx_enabled,              # 继承父会话的动态上下文开关
             skill_manager=self._skill_manager,         # 共享 Skill 管理器
             bash_prompt_provider=self._memory_prompt_provider,  # Bash 提示提供器
-            trace_summarizer=self._trace_summarizer,   # 共享轨迹摘要器
             language="Chinese",                        # 子代理默认语言
             mcp_clients=None,                          # 暂不传递 MCP 客户端
             message_logger_factory=self._create_message_logger,  # 消息日志工厂函数
@@ -550,9 +545,8 @@ class AgentRunner:
             memory_loader=memory_loader,                   # 记忆加载器（可为 None）
             skill_manager=self._skill_manager,             # Skill 管理器
             bash_prompt_provider=self._memory_prompt_provider,  # Bash 提示提供器
-            ctx_enabled=self.ctx_enabled,                  # ContextBuilder 开关
+            ctx_enabled=self.ctx_enabled,                  # 动态上下文开关
             session_store=session_store,                   # 会话持久化存储
-            trace_summarizer=self._trace_summarizer,       # 轨迹摘要器
             message_logger=self._create_message_logger(message_logger_scope),  # 消息日志
             hook_manager=self.hook_manager,                # 钩子管理器
             subagent_task_registry=getattr(self, "subagent_task_registry", None),  # 子代理任务注册表
@@ -598,7 +592,6 @@ class AgentRunner:
         if conversation.kind == "private":  # 仅私聊需要持久化
             session_store = LocalSessionStore(
                 self._platform_session_store_root(conversation),
-                persist_trace_entries=False,  # 平台会话不记录工具调用轨迹，减少IO
             )
 
         session = self._create_agent_session(
@@ -1210,10 +1203,10 @@ def main() -> None:
         help="跳过 MCP 工具注册（调试加速）",
     )
 
-    # --no-ctx：禁用 ContextBuilder
+    # --no-ctx：禁用动态上下文 section
     parser.add_argument(
         "--no-ctx", action="store_true",
-        help="禁用 ContextBuilder（裸跑，记忆不参与拼 system）",
+        help="禁用动态上下文 section（裸跑，记忆不进入模型历史）",
     )
 
     # --memory-system：选择记忆系统
@@ -1238,7 +1231,7 @@ def main() -> None:
 
     # ---- 根据参数计算启动标志 ----
     use_mcp = not args.no_mcp                           # 是否启用 MCP
-    ctx_enabled = not args.no_ctx                       # 是否启用 ContextBuilder
+    ctx_enabled = not args.no_ctx                       # 是否启用动态上下文 section
     memory_system = args.memory_system                  # 记忆系统模式
 
     # 环境变量也参与评估，方便 Docker/systemd 等不便传命令行参数的环境

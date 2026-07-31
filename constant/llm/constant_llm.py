@@ -231,7 +231,7 @@ class ConstantLLM:
         """读取模型真实上下文窗口长度。
 
         这个方法是所有“上下文窗口”相关逻辑的统一入口。之前很多地方写死 8000，
-        会导致 TUI 显示、ContextBuilder 预算和自动 compact 阈值互相不一致。
+        会导致 TUI 显示、请求预算和自动 compact 阈值互相不一致。
 
         取值优先级:环境变量 MAX_TOKENS(支持 1024K / 1M 写法) > llm_dict[model]
         ["max_tokens"] > default/DEFAULT_MAX_TOKENS。换服务商后模型名对不上

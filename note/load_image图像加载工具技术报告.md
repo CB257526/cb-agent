@@ -81,7 +81,7 @@ load_image.run()  ──排队──►  pending_images 缓冲  ──drain─�
 - 不进 `history` / transcript / state，不落盘；
 - token 估算与自动 compact 走 `sanitize_multimodal_payload`，本就把 data URI 换成占位符再计数。
 
-这和用户附件图片（`agent/multimodal_input.py`）是同一条边界：当前轮请求可带 base64，跨轮上下文绝不保存 base64。
+这和用户附件图片（`agent/multimodal_input.py`）遵循同一条 canonical history 规则：模型实际看见的图像内容会原样进入 history，下一轮不得替换为 filepath、摘要或占位符。日志与 UI 仍只使用脱敏副本；未来去 base64 持久化需通过稳定 `ImageRef/MediaBlobStore` 单独实现。
 
 ## 图片类型适配
 

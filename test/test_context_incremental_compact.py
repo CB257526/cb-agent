@@ -1,10 +1,8 @@
-"""Codex 风格结构化 compact 与 world state 回归测试。"""
+"""Canonical history 的 world-state 与正式 compact 回归测试。"""
 
 from __future__ import annotations
 
-import json
-import os
-import sys
+import copy
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,17 +11,13 @@ from unittest.mock import patch
 
 import pytest
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
 from agent.compaction import (
     COMPACTION_SUMMARY_KIND,
     SUMMARY_PREFIX,
     SUMMARIZATION_PROMPT,
     CompactionError,
     dynamic_retained_token_target,
+    estimate_message_tokens,
 )
 from agent.event_bus import EventBus
 from agent.executor import ToolExecutor
@@ -35,53 +29,45 @@ from core.message import Message, MessageRole
 
 
 class FakeCompletions:
-    """记录静默摘要请求并返回可配置结果。"""
-
     def __init__(self, owner: "FakeLLM") -> None:
         self.owner = owner
 
     def create(self, **kwargs):
-        self.owner.compact_calls.append(kwargs)
+        self.owner.compact_calls.append(copy.deepcopy(kwargs))
         if self.owner.compact_error is not None:
             raise self.owner.compact_error
-        summary = self.owner.compact_summaries.pop(0) if self.owner.compact_summaries else "handoff"
+        summary = self.owner.summaries.pop(0) if self.owner.summaries else "handoff"
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=summary))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=summary, tool_calls=None))],
+            usage=None,
         )
 
 
 class FakeLLM:
-    """同时支持普通 think 与非流式 compact 请求。"""
-
-    def __init__(self, answers: list[str] | None = None, summaries: list[str] | None = None) -> None:
+    def __init__(self, answers=None, summaries=None) -> None:
         self.answers = list(answers or [])
-        self.compact_summaries = list(summaries or [])
+        self.summaries = list(summaries or [])
         self.calls: list[dict[str, Any]] = []
         self.compact_calls: list[dict[str, Any]] = []
         self.compact_error: Exception | None = None
         self.is_Function_Calling = True
-        self.model = "fake"
-        self.provider = "fake-provider"
+        self.model = "canonical-test-model"
+        self.provider = "test"
         self.max_output_tokens = 4096
         self.output_token_param = "max_tokens"
-        self.client = SimpleNamespace(
-            chat=SimpleNamespace(completions=FakeCompletions(self))
-        )
+        self.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions(self)))
 
-    def think(self, messages, tools=None, **kwargs):
-        self.calls.append({"messages": list(messages), "tools": tools})
+    def think(self, messages, tools=None, **_kwargs):
+        self.calls.append({"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools)})
         answer = self.answers.pop(0) if self.answers else "ok"
         return {"answer": answer, "tool_calls": []}
 
     def _apply_output_token_limit(self, request_kwargs):
-        if self.output_token_param == "none":
-            return
-        request_kwargs[self.output_token_param] = self.max_output_tokens
+        if self.output_token_param != "none":
+            request_kwargs[self.output_token_param] = self.max_output_tokens
 
 
 class FakeRegistry:
-    """提供稳定的最小工具注册表。"""
-
     def list_tools(self):
         return []
 
@@ -89,9 +75,9 @@ class FakeRegistry:
         return []
 
 
-def _session(*, store: LocalSessionStore | None = None, answers=None, summaries=None) -> AgentSession:
+def _session(*, store=None, answers=None, summaries=None) -> AgentSession:
     bus = EventBus()
-    llm = FakeLLM(answers, summaries)
+    llm = FakeLLM(answers=answers, summaries=summaries)
     return AgentSession(
         llm=llm,
         registry=FakeRegistry(),
@@ -110,345 +96,235 @@ def _assistant(text: str) -> Message:
     return Message.create_assistant_message(text)
 
 
-def _context_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        message for message in messages
-        if message.get("role") == "user"
-        and "<context-update>" in str(message.get("content") or "")
-    ]
+def _context_text(messages: tuple[Message, ...]) -> str:
+    return "\n".join(
+        str(message.content or "")
+        for message in messages
+        if (message.metadata or {}).get("kind") == "context_update"
+    )
 
 
-def test_world_state_diff_only_emits_changed_and_removed_sections():
-    """knowledge/request-only 单独一条 context_update，不参与 persistent diff。"""
-    current = [
-        DynamicSectionResult.present("environment", "ENV-A"),
-        DynamicSectionResult.present(
-            "knowledge",
-            "KNOWLEDGE-A",
-            persistence="request_only",
-        ),
-    ]
-
-    async def dynamic_sections(**_kwargs):
-        return list(current)
+def test_world_state_diff_and_turn_evidence_have_independent_lifecycles():
+    async def first_sections(**_kwargs):
+        return [
+            DynamicSectionResult.present("environment", "ENV-A"),
+            DynamicSectionResult.present("knowledge", "RAG-A", scope="turn_evidence"),
+        ]
 
     session = _session()
-    with patch("agent.session.get_dynamic_context_sections", new=dynamic_sections):
-        first = session._build_chat_messages(user_content="first", system_instructions="")
-        ctx_msgs = _context_messages(first)
-        # persistent 与 request-only 分两条：ENV 在前，knowledge 在后。
-        assert len(ctx_msgs) == 2
-        assert "ENV-A" in ctx_msgs[0]["content"]
-        assert "KNOWLEDGE-A" in ctx_msgs[1]["content"]
-        assert "KNOWLEDGE-A" not in ctx_msgs[0]["content"]
+    with patch("agent.session.get_dynamic_context_sections", new=first_sections):
+        first = session._prepare_turn_input(
+            user_content="first",
+            runtime_guidance="",
+            memory_query="first",
+        )
+    assert "ENV-A" in _context_text(first.messages)
+    assert any("RAG-A" in str(message.content) for message in first.messages)
+    session._append_history(first.messages, turn_id="turn-a")
+    session._world_state_baseline = first.world_state
 
-        session._world_state_baseline = session._pending_world_state
-        second = session._build_chat_messages(user_content="second", system_instructions="")
-        ctx_msgs2 = _context_messages(second)
-        # ENV 不变 → 无 persistent 更新；knowledge 仍作为唯一 request-only 消息出现。
-        assert len(ctx_msgs2) == 1
-        assert "ENV-A" not in ctx_msgs2[0]["content"]
-        assert "KNOWLEDGE-A" in ctx_msgs2[0]["content"]
-
-        current[:] = [
-            DynamicSectionResult.present("environment", "ENV-B"),
-            DynamicSectionResult.absent("knowledge", persistence="request_only"),
-        ]
-        third = session._build_chat_messages(user_content="third", system_instructions="")
-        ctx_msgs3 = _context_messages(third)
-        # knowledge 已从 current 移除，只剩 ENV-B 的 persistent 更新。
-        assert len(ctx_msgs3) == 1
-        assert "ENV-B" in ctx_msgs3[0]["content"]
-        assert "KNOWLEDGE-A" not in ctx_msgs3[0]["content"]
-
-
-def test_dynamic_error_preserves_baseline_without_removed_update():
-    async def dynamic_sections(**_kwargs):
+    async def second_sections(**_kwargs):
         return [
-            DynamicSectionResult.error_result("instructions", "temporary read failure"),
-            DynamicSectionResult.error_result("environment", "temporary stat failure"),
+            DynamicSectionResult.present("environment", "ENV-B"),
+            DynamicSectionResult.absent("knowledge", scope="turn_evidence"),
+        ]
+
+    with patch("agent.session.get_dynamic_context_sections", new=second_sections):
+        second = session._prepare_turn_input(
+            user_content="second",
+            runtime_guidance="",
+            memory_query="second",
+        )
+    update = _context_text(second.messages)
+    assert "ENV-B" in update
+    assert "knowledge" not in update
+    assert "RAG-A" not in str(second.messages)
+    assert "RAG-A" in str(session.history.provider_messages())
+
+
+def test_dynamic_read_error_preserves_world_state_baseline():
+    async def sections(**_kwargs):
+        return [
+            DynamicSectionResult.error_result("instructions", "temporary"),
+            DynamicSectionResult.error_result("environment", "temporary"),
         ]
 
     session = _session()
     session._world_state_baseline = WorldStateSnapshot.from_sections([
-        ("instructions", "CRITICAL-INSTRUCTIONS"),
-        ("environment", "STABLE-ENV"),
+        ("instructions", "KEEP-INSTRUCTIONS"),
+        ("environment", "KEEP-ENV"),
     ])
-    with patch("agent.session.get_dynamic_context_sections", new=dynamic_sections):
-        request = session._build_chat_messages(
+    with patch("agent.session.get_dynamic_context_sections", new=sections):
+        prepared = session._prepare_turn_input(
             user_content="continue",
-            system_instructions="",
+            runtime_guidance="",
+            memory_query="continue",
         )
-
-    updates = _context_messages(request)
-    assert not any('state="removed"' in str(message.get("content") or "") for message in updates)
-    assert session._pending_world_state.sections == {
-        "instructions": "CRITICAL-INSTRUCTIONS",
-        "environment": "STABLE-ENV",
-    }
+    assert prepared.world_state == session._world_state_baseline
+    assert not _context_text(prepared.messages)
 
 
-def test_first_instructions_error_blocks_request():
-    async def dynamic_sections(**_kwargs):
-        return [DynamicSectionResult.error_result("instructions", "managed file unreadable")]
+def test_first_instructions_error_blocks_before_history_append():
+    async def sections(**_kwargs):
+        return [DynamicSectionResult.error_result("instructions", "unreadable")]
 
     session = _session()
-    with patch("agent.session.get_dynamic_context_sections", new=dynamic_sections):
+    with patch("agent.session.get_dynamic_context_sections", new=sections):
         with pytest.raises(RuntimeError, match="关键 instructions 首次读取失败"):
-            session._build_chat_messages(
+            session._prepare_turn_input(
                 user_content="continue",
-                system_instructions="",
+                runtime_guidance="",
+                memory_query="continue",
             )
+    assert len(session.history) == 0
 
 
-def test_restart_recovers_actual_world_state_snapshot():
-    async def dynamic_sections(**_kwargs):
+def test_restart_restores_world_state_from_canonical_journal():
+    async def sections(**_kwargs):
         return [DynamicSectionResult.present("environment", "STABLE-ENV")]
 
     with tempfile.TemporaryDirectory() as td:
-        root = Path(td) / ".cbagent" / "sessions"
-        with (
-            patch("agent.session.get_dynamic_context_sections", new=dynamic_sections),
-            patch.object(AgentSession, "_build_system_instructions", return_value=""),
-        ):
-            first = _session(store=LocalSessionStore(root), answers=["first-answer"])
-            first.chat("first-question")
-            assert first._world_state_baseline.sections["environment"] == "STABLE-ENV"
-
+        root = Path(td) / "sessions"
+        with patch("agent.session.get_dynamic_context_sections", new=sections):
+            first = _session(store=LocalSessionStore(root), answers=["first"])
+            first.chat("question")
             restarted = _session(store=LocalSessionStore(root))
             assert restarted._world_state_baseline == first._world_state_baseline
-            request = restarted._build_chat_messages(
-                user_content="second-question",
-                system_instructions="",
+            prepared = restarted._prepare_turn_input(
+                user_content="next",
+                runtime_guidance="",
+                memory_query="next",
             )
-            updates = _context_messages(request)
-            # 重启后只恢复 history 里已提交的 persistent context_update；
-            # session_state 默认不再注入模型，因此不会出现“当前任务”第二段。
-            assert len(updates) == 1
-            assert "STABLE-ENV" in updates[0]["content"]
-            assert "当前任务：first-question" not in updates[0]["content"]
+    assert "STABLE-ENV" not in _context_text(prepared.messages)
 
 
-def test_structured_compact_request_keeps_protocol_messages_and_appends_prompt():
-    session = _session(summaries=["structured handoff"])
-    session.history = [
-        _user("inspect repository"),
-        Message.create_assistant_message(
-            tool_calls=[{
-                "id": "call-1",
-                "type": "function",
-                "function": {"name": "file_read", "arguments": '{"path":"a.py"}'},
-            }]
-        ),
-        Message.create_tool_message("call-1", "file_read", "FILE-MARKER"),
-        _assistant("finished inspection"),
-    ]
+def test_compact_summarizes_only_evicted_prefix_and_retains_latest_turn():
+    session = _session(summaries=["PREFIX-HANDOFF"])
+    session._append_history([_user("OLD-Q"), _assistant("OLD-A")], turn_id="old")
+    session._append_history([_user("NEW-Q"), _assistant("NEW-A")], turn_id="new")
+    latest_tokens = estimate_message_tokens(session.history[-2:])
+    with patch("agent.session.dynamic_retained_token_target", return_value=latest_tokens):
+        result = session.compact_context(reason="manual")
 
-    result = session.compact_context(reason="auto")
-
+    assert result["no_op"] is False
     request = session.llm.compact_calls[0]["messages"]
-    assert session.llm.compact_calls[0]["max_tokens"] == 4096
-    assert request[-1] == {"role": "user", "content": SUMMARIZATION_PROMPT}
-    assert any(message.get("tool_call_id") == "call-1" for message in request)
-    assert any(message.get("content") == "FILE-MARKER" for message in request)
-    assert request[-2]["content"] == "finished inspection"
-    assert result["summary"].startswith(SUMMARY_PREFIX)
+    request_text = str(request)
+    assert "OLD-Q" in request_text and "OLD-A" in request_text
+    assert "NEW-Q" not in request_text and "NEW-A" not in request_text
+    assert request[-1]["content"] == SUMMARIZATION_PROMPT
+    assert [message.content for message in session.history[:2]] == ["NEW-Q", "NEW-A"]
     assert (session.history[-1].metadata or {}).get("kind") == COMPACTION_SUMMARY_KIND
 
 
-def test_compact_respects_none_output_token_param():
-    """provider 配置为 none 时，摘要请求只做预算预留，不发送输出限制字段。"""
+def test_compact_summary_request_keeps_tool_protocol_complete():
+    session = _session(summaries=["TOOL-HANDOFF"])
+    calls = [{
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "file_read", "arguments": '{"path":"a.py"}'},
+    }]
+    session._append_history([
+        _user("inspect"),
+        Message.create_assistant_message(tool_calls=calls),
+        Message.create_tool_message("call-1", "file_read", "FILE-MARKER"),
+        _assistant("done"),
+    ], turn_id="old")
+    session._append_history([_user("latest"), _assistant("latest-answer")], turn_id="new")
+    with patch("agent.session.dynamic_retained_token_target", return_value=100):
+        session.compact_context(reason="auto")
+    roles = [message["role"] for message in session.llm.compact_calls[0]["messages"]]
+    assert roles[-5:] == ["user", "assistant", "tool", "assistant", "user"]
+
+
+def test_manual_compact_resets_baseline_and_next_turn_reinjects_full_snapshot():
+    async def sections(**_kwargs):
+        return [DynamicSectionResult.present("environment", "ENV-NOW")]
 
     session = _session(summaries=["handoff"])
+    session._append_history([_user("Q" * 20_000), _assistant("A" * 20_000)], turn_id="old")
+    session._world_state_baseline = WorldStateSnapshot.from_sections([("environment", "ENV-NOW")])
+    with (
+        patch("agent.session.get_dynamic_context_sections", new=sections),
+        patch("agent.session.dynamic_retained_token_target", return_value=100),
+    ):
+        session.compact_context(reason="manual")
+        prepared = session._prepare_turn_input(
+            user_content="next",
+            runtime_guidance="",
+            memory_query="next",
+        )
+    assert session._world_state_baseline.sections == {}
+    assert "ENV-NOW" in _context_text(prepared.messages)
+
+
+def test_mid_turn_compact_preserves_active_turn_and_places_summary_last():
+    async def latest_sections(**_kwargs):
+        return [DynamicSectionResult.present("environment", "ENV-NOW")]
+
+    session = _session(summaries=["OLD-HANDOFF"])
+    session._append_history([_user("OLD-Q"), _assistant("OLD-A")], turn_id="old")
+    session._append_history([
+        Message(
+            role=MessageRole.USER,
+            content="ENV-OLD",
+            metadata={"kind": "context_update"},
+        ),
+        _user("ACTIVE-Q"),
+        _assistant("ACTIVE-PROGRESS"),
+    ], turn_id="active")
+    session._world_state_baseline = WorldStateSnapshot.from_sections([("environment", "ENV-OLD")])
+    with (
+        patch("agent.session.dynamic_retained_token_target", return_value=0),
+        patch("agent.session.get_dynamic_context_sections", new=latest_sections),
+    ):
+        result = session.compact_context(reason="mid_turn", active_turn_id="active")
+    assert result["active_turn_tokens"] > 0
+    contents = [str(message.content or "") for message in session.history]
+    assert any("ENV-NOW" in content for content in contents)
+    assert not any("ENV-OLD" in content for content in contents)
+    assert "ACTIVE-Q" in contents
+    assert "ACTIVE-PROGRESS" in contents
+    assert SUMMARY_PREFIX in contents[-1]
+    assert "ACTIVE-Q" not in str(session.llm.compact_calls[0]["messages"])
+
+
+def test_mid_turn_compact_never_summarizes_only_active_turn():
+    session = _session(summaries=["should-not-run"])
+    session._append_history([_user("ACTIVE"), _assistant("PROGRESS")], turn_id="active")
+    result = session.compact_context(reason="mid_turn", active_turn_id="active")
+    assert result["no_op"] is True
+    assert session.llm.compact_calls == []
+
+
+def test_compact_failure_keeps_history_and_generation_unchanged():
+    session = _session()
+    session._append_history([_user("OLD"), _assistant("OLD-A")], turn_id="old")
+    session._append_history([_user("NEW"), _assistant("NEW-A")], turn_id="new")
+    before = session.history.snapshot()
+    generation = session.history.generation
+    session.llm.compact_error = RuntimeError("network unavailable")
+    with (
+        patch("agent.session.dynamic_retained_token_target", return_value=10),
+        pytest.raises(CompactionError),
+    ):
+        session.compact_context(reason="auto")
+    assert session.history.snapshot() == before
+    assert session.history.generation == generation
+
+
+def test_compact_none_output_parameter_is_not_sent():
+    session = _session(summaries=["handoff"])
     session.llm.output_token_param = "none"
-    session.history = [_user("task"), _assistant("progress")]
-
-    session.compact_context(reason="auto")
-
+    session._append_history([_user("OLD"), _assistant("OLD-A")], turn_id="old")
+    session._append_history([_user("NEW"), _assistant("NEW-A")], turn_id="new")
+    with patch("agent.session.dynamic_retained_token_target", return_value=10):
+        session.compact_context(reason="auto")
     request = session.llm.compact_calls[0]
     assert "max_tokens" not in request
     assert "max_completion_tokens" not in request
 
 
-def test_consecutive_compactions_send_previous_handoff_as_structured_history():
-    session = _session(summaries=["FIRST-HANDOFF", "SECOND-HANDOFF"])
-    session.history = [_user("FIRST-TASK"), _assistant("first-result")]
-    session.compact_context(reason="auto")
-    session.history.extend([_user("SECOND-TASK"), _assistant("second-result")])
-    session.compact_context(reason="auto")
-
-    second_request = session.llm.compact_calls[1]["messages"]
-    assert any(
-        SUMMARY_PREFIX in str(message.get("content") or "")
-        and "FIRST-HANDOFF" in str(message.get("content") or "")
-        for message in second_request
-    )
-    assert any(message.get("content") == "SECOND-TASK" for message in second_request)
-
-
-def test_manual_compact_resets_baseline_and_next_turn_reinjects_full_state():
-    async def dynamic_sections(**_kwargs):
-        return [DynamicSectionResult.present("environment", "STABLE-ENV")]
-
-    session = _session(summaries=["handoff"])
-    session.history = [_user("Q" * 20000), _assistant("A" * 20000)]
-    session._world_state_baseline = WorldStateSnapshot.from_sections([
-        ("environment", "STABLE-ENV")
-    ])
-    with (
-        patch("agent.session.get_dynamic_context_sections", new=dynamic_sections),
-        patch("agent.session.dynamic_retained_token_target", return_value=100),
-    ):
-        result = session.compact_context(reason="user_compact")
-        assert not result["no_op"]
-        assert session._world_state_baseline.sections == {}
-        request = session._build_chat_messages(user_content="next", system_instructions="")
-        assert "STABLE-ENV" in _context_messages(request)[0]["content"]
-
-
-def test_mid_turn_compact_installs_full_world_state_before_summary():
-    session = _session(summaries=["handoff"])
-    session.history = [_user("task"), _assistant("progress")]
-    session._pending_world_state = WorldStateSnapshot.from_sections([
-        ("environment", "ENV-NOW"),
-        ("plan", "PLAN-NOW"),
-    ])
-
-    result = session.compact_context(reason="mid_turn")
-
-    assert result["world_state_sections"] == 2
-    assert session._world_state_baseline.sections["environment"] == "ENV-NOW"
-    assert (session.history[-1].metadata or {}).get("kind") == COMPACTION_SUMMARY_KIND
-    context_message = next(
-        message for message in session.history
-        if (message.metadata or {}).get("kind") == "context_update"
-    )
-    assert "ENV-NOW" in str(context_message.content)
-    assert session.history.index(context_message) < len(session.history) - 1
-
-
-def test_mid_turn_compact_replays_request_only_image_without_persisting_it():
-    session = _session(summaries=["handoff"])
-    tool_calls = [{
-        "id": "call-image",
-        "type": "function",
-        "function": {"name": "load_image", "arguments": "{}"},
-    }]
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "inspect image"},
-        {"role": "assistant", "content": None, "tool_calls": tool_calls},
-        {
-            "role": "tool",
-            "tool_call_id": "call-image",
-            "name": "load_image",
-            "content": "queued",
-        },
-        {
-            "role": "user",
-            "content": [{
-                "type": "image_url",
-                "image_url": {"url": "data:image/png;base64,SECRETBASE64"},
-            }],
-        },
-    ]
-    loop_state = {
-        "commit_offset": 2,
-        "history_replaced": False,
-        "audit_protocol": [],
-        "turn_prefix_messages": [_user("inspect image")],
-        "request_only_inflight": [],
-    }
-
-    event = session._mid_turn_compact(
-        messages,
-        [],
-        loop_state,
-        round_idx=1,
-        request_tokens=10_000,
-    )
-
-    assert event is not None
-    assert "SECRETBASE64" not in str([message.to_dict() for message in session.history])
-    assert "SECRETBASE64" in str(messages)
-    assert "SECRETBASE64" in str(loop_state["request_only_inflight"])
-
-
-def test_compact_failure_keeps_history_and_snapshot_unchanged():
-    session = _session()
-    session.history = [_user("task"), _assistant("progress")]
-    session._world_state_baseline = WorldStateSnapshot.from_sections([("environment", "ENV")])
-    original_history = [message.model_copy(deep=True) for message in session.history]
-    session.llm.compact_error = RuntimeError("network unavailable")
-
-    try:
-        session.compact_context(reason="auto")
-    except CompactionError:
-        pass
-    else:
-        raise AssertionError("compact 应该失败")
-
-    assert session.history == original_history
-    assert session._world_state_baseline.sections == {"environment": "ENV"}
-
-
-def test_compact_v2_persists_replacement_history_and_world_state():
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td) / ".cbagent" / "sessions"
-        store = LocalSessionStore(root)
-        session = _session(store=store, summaries=["persisted handoff"])
-        session.history = [_user("task"), _assistant("progress")]
-        session._pending_world_state = WorldStateSnapshot.from_sections([("environment", "ENV")])
-
-        session.compact_context(reason="mid_turn")
-
-        compact = json.loads((store.active_dir / "compact.json").read_text(encoding="utf-8"))
-        # compact 快照升级为 v3：用 transcript_cursor_seq 替代列表下标 offset。
-        assert compact["version"] == 3
-        assert "transcript_cursor_seq" in compact
-        assert compact["world_state_snapshot"] == {"environment": "ENV"}
-        assert compact["replacement_history"][-1]["kind"] == COMPACTION_SUMMARY_KIND
-        restored = LocalSessionStore(root).load_latest_history()
-        assert (restored[-1].metadata or {}).get("kind") == COMPACTION_SUMMARY_KIND
-
-
-def test_legacy_compact_snapshot_is_ignored():
-    """破坏性升级后旧 compact 快照不得覆盖 transcript 事实。"""
-
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td) / ".cbagent" / "sessions"
-        store = LocalSessionStore(root)
-        store.append_turn(
-            user_query="真实问题",
-            final_answer="真实回答",
-            committed_messages=[_user("真实问题"), _assistant("真实回答")],
-        )
-        legacy = {
-            "summary": "LEGACY-SUMMARY",
-            "history": [{"role": "user", "content": "LEGACY-HISTORY"}],
-            "transcript_offset": 1,
-        }
-        (store.active_dir / "compact.json").write_text(
-            json.dumps(legacy, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-        restored = LocalSessionStore(root).load_latest_history()
-        text = "\n".join(str(message.content) for message in restored)
-        assert "真实问题" in text
-        assert "LEGACY-HISTORY" not in text
-
-
-def test_dynamic_retained_budget_uses_ten_percent_with_bounds():
-    assert dynamic_retained_token_target(128_000) == 16 * 1024
-    assert dynamic_retained_token_target(400_000) == 40_000
-    assert dynamic_retained_token_target(1_000_000) == 100_000
-    assert dynamic_retained_token_target(2_000_000) == 128 * 1024
-
-
-def test_model_downshift_uses_target_window_for_replacement_budget():
-    """旧大模型负责摘要，replacement 必须按目标小模型窗口收紧。"""
-
+def test_model_downshift_uses_target_window_for_replacement():
     original = ConstantLLM.llm_dict.get("small-target")
     ConstantLLM.llm_dict["small-target"] = {
         "is_tool": True,
@@ -457,24 +333,36 @@ def test_model_downshift_uses_target_window_for_replacement_budget():
         "max_output_tokens": 2_000,
     }
     try:
-        session = _session(summaries=["downshift handoff"])
-        session.history = [
-            _user(f"task-{index}-" + "word " * 4000)
-            if index % 2 == 0 else _assistant(f"answer-{index}-" + "word " * 4000)
-            for index in range(8)
-        ]
-
+        session = _session(summaries=["downshift"])
+        for index in range(4):
+            session._append_history([
+                _user(f"Q-{index}-" + "word " * 2500),
+                _assistant(f"A-{index}-" + "word " * 2500),
+            ], turn_id=f"turn-{index}")
         result = session.compact_context(
             reason="model_downshift",
             target_model="small-target",
         )
-
-        assert result["target_model"] == "small-target"
-        assert result["retained_target_tokens"] == 16 * 1024
-        messages, tools = session._baseline_request_parts()
-        assert session._estimate_request_tokens(messages, tools) <= 16_000
+        assert result["no_op"] is False
+        request_tokens = session._estimate_request_tokens(
+            session._provider_request_messages(),
+            [],
+        )
+        assert request_tokens <= ConstantLLM.context_limits("small-target")["soft_limit_tokens"]
     finally:
         if original is None:
             ConstantLLM.llm_dict.pop("small-target", None)
         else:
             ConstantLLM.llm_dict["small-target"] = original
+
+
+@pytest.mark.parametrize(
+    ("soft_limit", "expected"),
+    [
+        (8_000, 16 * 1024),
+        (400_000, 40_000),
+        (2_000_000, 128 * 1024),
+    ],
+)
+def test_dynamic_retained_target_scales_with_window(soft_limit, expected):
+    assert dynamic_retained_token_target(soft_limit) == expected

@@ -179,7 +179,7 @@ def test_plain_name_mentions_must_be_unique():
         assert [s.name for s in manager.collect_explicit_mentions("use $a:demo")] == ["a:demo"]
 
 
-def test_agent_session_appends_explicit_skill_content_to_current_turn_only():
+def test_agent_session_builds_explicit_skill_history_evidence():
     from agent.session import AgentSession
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -189,16 +189,12 @@ def test_agent_session_appends_explicit_skill_content_to_current_turn_only():
         session = AgentSession.__new__(AgentSession)
         session.skill_manager = manager
 
-        text_result = session._append_explicit_skill_content("please use $manual-skill", "please use $manual-skill")
-        list_result = session._append_explicit_skill_content(
-            [{"type": "text", "text": "please use $manual-skill"}],
-            "please use $manual-skill",
-        )
+        evidence = session._explicit_skill_evidence("please use $manual-skill")
 
-        assert "<skill name=\"manual-skill\">" in text_result
-        assert text_result.startswith("please use $manual-skill")
-        assert list_result[-1]["type"] == "text"
-        assert "<skill name=\"manual-skill\">" in list_result[-1]["text"]
+        assert len(evidence) == 1
+        assert "<skill name=\"manual-skill\">" in str(evidence[0].content)
+        assert (evidence[0].metadata or {}).get("kind") == "context_evidence"
+        assert (evidence[0].metadata or {}).get("section_name") == "skill:manual-skill"
 
 
 def test_bash_skill_script_observer_records_hits():

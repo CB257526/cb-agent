@@ -69,7 +69,6 @@ class SubagentRunner:
         ctx_enabled: bool = True, # 是否启用上下文管理
         skill_manager: Any = None, # 技能管理器
         bash_prompt_provider: Any = None, # Bash 提示提供器
-        trace_summarizer: Any = None, # 跟踪总结器
         language: Optional[str] = "Chinese", # 语言
         mcp_clients: Any = None, # MCP 客户端
         # 消息日志工厂函数
@@ -84,7 +83,6 @@ class SubagentRunner:
         self.ctx_enabled = ctx_enabled
         self.skill_manager = skill_manager
         self.bash_prompt_provider = bash_prompt_provider
-        self.trace_summarizer = trace_summarizer
         self.language = language
         self.mcp_clients = mcp_clients
         self.message_logger_factory = message_logger_factory
@@ -211,7 +209,6 @@ class SubagentRunner:
                 bash_prompt_provider=self.bash_prompt_provider, 
                 ctx_enabled=self.ctx_enabled, 
                 session_store=None,
-                trace_summarizer=self.trace_summarizer, # 子代理跟踪总结器
                 message_logger=message_logger,
                 language=self.language,
                 mcp_clients=self.mcp_clients, # 子代理 MCP 客户端

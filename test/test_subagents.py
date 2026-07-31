@@ -858,11 +858,14 @@ class TestAgentSessionRuntimeUpdates(unittest.TestCase):
             runtime_session_id="session-a",
             runtime_message_provider=lambda: ["补充要求"],
         )
-        messages = []
-        session._inject_runtime_messages(messages)
-        self.assertEqual(len(messages), 1)
-        self.assertIn("progress", messages[0]["content"])
-        self.assertIn("补充要求", messages[0]["content"])
+        session._inject_runtime_history("turn-a")
+        self.assertEqual(len(session.history), 1)
+        self.assertIn("progress", str(session.history[0].content))
+        self.assertIn("补充要求", str(session.history[0].content))
+        self.assertEqual(
+            (session.history[0].metadata or {}).get("kind"),
+            "context_evidence",
+        )
         manager.drain_parent_updates.assert_called_once_with("session-a")
 
     def test_runtime_session_id_is_recreated_after_clear(self) -> None:

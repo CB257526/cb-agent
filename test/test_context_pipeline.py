@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from constant.llm.constant_llm import ConstantLLM
-from agent.compaction import estimate_message_tokens, select_retained_history
+from agent.compaction import estimate_message_tokens, partition_history_for_compaction
 from context.budget.window import get_context_window_for_model
 from context.prompts.builder import (
     get_dynamic_context_prompt,
@@ -146,17 +146,17 @@ def test_compaction_selects_complete_turns_from_newest_backwards():
     ]
     budget = estimate_message_tokens(middle + newest)
 
-    selection = select_retained_history(
+    partition = partition_history_for_compaction(
         oldest + middle + newest,
-        token_budget=budget,
+        retained_token_budget=budget,
     )
 
-    retained_text = "\n".join(_text(message) for message in selection.messages)
+    retained_text = "\n".join(_text(message) for message in partition.retained_tail)
     assert "old-user" not in retained_text
     assert "middle-user" in retained_text
     assert "new-tool-result" in retained_text
-    assert selection.tokens <= budget
-    assert [message.tool_call_id for message in selection.messages if message.tool_call_id] == [
+    assert partition.retained_tokens <= budget
+    assert [message.tool_call_id for message in partition.retained_tail if message.tool_call_id] == [
         "call_new"
     ]
 
@@ -174,8 +174,11 @@ def test_oversized_latest_turn_does_not_install_partial_raw_turn():
         _assistant("latest-final"),
     ]
 
-    selection = select_retained_history(newest, token_budget=300)
+    partition = partition_history_for_compaction(
+        newest,
+        retained_token_budget=300,
+    )
 
-    assert selection.oversized_latest_turn
-    assert selection.messages == []
-    assert selection.tokens == 0
+    assert partition.oversized_latest_turn
+    assert partition.retained_tail == []
+    assert partition.retained_tokens == 0

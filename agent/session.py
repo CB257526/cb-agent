@@ -17,12 +17,15 @@ AgentRunner 的会话主流程组合起来，但**不直接做任何输出**—�
 - /xxx 斜杠命令：由具体前端处理
 - 渲染逻辑（颜色 / 面板）：由具体前端处理
 
-上下文工程模块对接 (Claude Code 对齐重构):
-- 旧 ContextBuilder/ContextPacket 已删除,改为 Chat Completions 专用构造:
-  首条稳定 system,随后追加历史、运行时 context update 和当前 user。
-- memory_loader 在 run_agent.py 装配; provider-specific system adapter 已删除。
-- _build_chat_messages 不再使用 GSSC 流水线;state/compact/work_record 链路
-  保留(用户决策: work_context.py 完整保留)。
+上下文工程模块对接：
+- ConversationHistory 是唯一的模型可见内存历史；普通运行只追加，正式 compact
+  才允许按 generation 事务替换。
+- 每次 provider 请求只临时组装“稳定 system 外壳 + canonical history”，不会在
+  组装阶段裁剪、重排、修补或改写历史。
+- history.jsonl 是唯一恢复事实源；旧 transcript/compact/active 文件只在首次
+  迁移时读取，正常运行不再维护双份状态。
+- memory_loader 在 run_agent.py 装配；work_context.py 只保留现场状态、usage、
+  token 校准和工具轨迹索引，不再负责对话历史。
 
 ToolRegistry / Executor / LLM 仍从外部传入,便于测试和换前端。
 """
@@ -37,6 +40,7 @@ import math
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -55,11 +59,12 @@ from tools.tools.pending_images import (
 )
 from agent.cb_agents import CbAgentsLLM
 from agent.compaction import (
+    CompactionError,
     dynamic_retained_token_target,
     estimate_message_tokens,
     make_summary_message,
+    partition_history_for_compaction,
     run_local_compaction,
-    select_retained_history,
 )
 from agent.llm_errors import (
     LLMContextOverflowError,
@@ -88,16 +93,18 @@ from context import (
     get_static_system_prompt,
 )
 from context.world_state import DynamicSectionResult, EMPTY_WORLD_STATE, WorldStateSnapshot
+from core.conversation_history import ConversationHistory
 from core.message import Message, MessageRole
 from skills.skill_manager import SkillManager
 from tools.toolRegistry import ToolRegistry
-from agent.message_protocol import drop_orphan_tool_messages
+from agent.message_protocol import validate_tool_protocol
 from agent.work_context import (
     LocalSessionStore,
-    RuleTraceSummarizer,
+    TraceStateIndexer,
     TraceCollector,
-    TraceSummarizer,
 )
+from agent.history_journal import HistoryJournal
+from agent.legacy_history_migrator import load_legacy_history
 logger = logging.getLogger(__name__)
 
 # metadata.kind 标记运行时上下文更新消息。这类消息不在 UI 中展示；compact 摘要
@@ -105,6 +112,18 @@ logger = logging.getLogger(__name__)
 # world state snapshot 单独负责。
 CONTEXT_UPDATE_KIND = "context_update" #标记一个user类型的消息是否属于section块更新的消息
 WORLD_STATE_SNAPSHOT_KEY = "world_state_snapshot"
+CONTEXT_EVIDENCE_KIND = "context_evidence"
+# 区分“调用方未提供请求外壳”和“本轮外壳明确为空”。后者也必须被冻结，不能
+# 在下一工具轮重新读取动态注册表。
+_REQUEST_SNAPSHOT_UNSET = object()
+
+
+@dataclass(frozen=True)
+class PreparedTurnInput:
+    """一次用户回合在写入唯一 history 前的不可变候选批次。"""
+
+    messages: tuple[Message, ...]
+    world_state: WorldStateSnapshot
 
 
 def _clip_preview_text(text: Any, limit: int = 1200) -> str:
@@ -190,11 +209,6 @@ def _history_message_to_payload(message: Message) -> Dict[str, Any]:
     return payload
 
 
-def _message_role_name(message: Message) -> str:
-    """返回 Message 的 role 字符串，兼容 Enum 和普通字符串两种形态。"""
-    return message.role.value if hasattr(message.role, "value") else str(message.role)
-
-
 def _message_kind(message: Message) -> str:
     """读取本地 message kind。
 
@@ -275,8 +289,24 @@ def _make_context_update_message(
     )
 
 
+def _make_context_evidence_message(name: str, text: str) -> Message:
+    """构造会进入 history、但不参与 world-state baseline 的回合证据。"""
+
+    key = str(name or "context").strip() or "context"
+    body = str(text or "").strip()
+    return Message(
+        role=MessageRole.USER,
+        content=(
+            f'<context-evidence name="{key}">\n'
+            f"{body}\n"
+            "</context-evidence>"
+        ),
+        metadata={"kind": CONTEXT_EVIDENCE_KIND, "section_name": key},
+    )
+
+
 def _llm_result_to_assistant_payload(result: Any) -> Optional[Dict[str, Any]]:
-    """Convert an LLM result into an assistant-role log payload."""
+    """把 LLM 结果转换成 assistant 角色的日志载荷。"""
     if isinstance(result, list):
         return {"role": "assistant", "content": result[0] if result else ""}
     if not isinstance(result, dict):
@@ -376,6 +406,22 @@ class AgentSession:
     # 工具调用循环最大轮数，防死循环
     MAX_TOOL_ROUNDS = 400
 
+    @property
+    def history(self) -> ConversationHistory:
+        """返回当前会话唯一的模型可见历史。"""
+
+        return self._history
+
+    @history.setter
+    def history(self, value: Any) -> None:
+        """兼容旧装配代码传入消息序列，但统一转换为 canonical 容器。"""
+
+        self._history = (
+            value
+            if isinstance(value, ConversationHistory)
+            else ConversationHistory(list(value or []))
+        )
+
     def __init__(
         self,
         llm: CbAgentsLLM,
@@ -385,9 +431,8 @@ class AgentSession:
         memory_loader: Optional[MemoryLoader] = None,
         skill_manager: Optional[SkillManager] = None,
         bash_prompt_provider=None,
-        ctx_enabled: bool = True,  #控制整个 GSSC 上下文构建管线是否启用
+        ctx_enabled: bool = True,  # 控制动态上下文 section 是否启用
         session_store: Optional[LocalSessionStore] = None,
-        trace_summarizer: Optional[TraceSummarizer] = None,
         message_logger: Optional[MessageLogger] = None,
         language: Optional[str] = "Chinese",
         mcp_clients=None,
@@ -427,7 +472,6 @@ class AgentSession:
         self._calibration_samples: Dict[str, int] = {}
         if not is_subagent:
             self.event_bus.subscribe(self._on_token_usage, TokenUsage)
-        self.trace_summarizer = trace_summarizer
         self.message_logger = message_logger
         self.language = language
         self.mcp_clients = mcp_clients
@@ -447,20 +491,28 @@ class AgentSession:
         self.hook_manager = hook_manager
         # SessionStart 只在「本会话首个 Prompt」触发一次，这个标志做去重。
         self._session_start_fired = False
-        self.rule_trace_summarizer = RuleTraceSummarizer()
-        self.history: List[Message] = []
-        self._pending_context_update_text = ""
-        self._pending_world_state = EMPTY_WORLD_STATE
+        self.trace_state_indexer = TraceStateIndexer()
+        self.history = ConversationHistory()
+        self._history_journal: Optional[HistoryJournal] = None
         self.plan_store = PlanStateStore(session_store=self.session_store)
         if self.session_store is not None:
+            self._history_journal = HistoryJournal(lambda: self.session_store.active_dir)
             try:
-                # 启动时恢复最近会话的完整协议历史。运行中断轮只恢复已经配对的
-                # assistant.tool_calls + role=tool，未完成调用会在存储层被过滤，
-                # 因此既能保留用户看到的工具现场，也不会制造孤儿工具消息。
-                self.history = self.session_store.load_latest_history()
-            except Exception:
-                logger.exception("本地会话历史恢复失败,忽略")
-                self.history = []
+                # 新格式只回放 canonical journal。旧 transcript/active/pending 仅在
+                # history.jsonl 不存在时由迁移入口读取一次，正常请求不再双读。
+                recovery = self._history_journal.recover(
+                    legacy_loader=lambda: load_legacy_history(
+                        self.session_store.active_dir
+                    ),
+                )
+                self.history = recovery.history
+                if recovery.warnings:
+                    logger.warning("canonical history 恢复警告: %s", recovery.warnings)
+            except Exception as error:
+                logger.exception("本地会话 canonical history 恢复失败")
+                raise RuntimeError(
+                    "本地会话历史恢复失败，已阻止启动以避免静默丢失上下文"
+                ) from error
         # 从最近一条 context update 恢复模型实际看过的 section 值。缺少新格式快照
         # 时按空基线处理，下一轮会完整注入一次。
         self._world_state_baseline = _world_state_from_history(self.history)
@@ -484,18 +536,86 @@ class AgentSession:
             bool(self.message_logger),
         )
 
+    def _append_history(
+        self,
+        messages: Sequence[Message],
+        *,
+        turn_id: str = "",
+        event_kind: str = "append",
+    ) -> List[Message]:
+        """把模型可见消息先写 journal，再推进唯一内存 history。"""
+
+        if not messages:
+            return []
+        if self._history_journal is not None:
+            # /clear 后首次模式切换或 chat 也可能先于其它 store 写入发生。
+            # journal 是模型历史的事务起点，因此它自己必须确保会话目录已创建。
+            if self.session_store is not None:
+                self.session_store.ensure_active()
+            return self._history_journal.append(
+                self.history,
+                messages,
+                turn_id=turn_id,
+                event_kind=event_kind,
+            )
+        return self.history.append_batch(messages, turn_id=turn_id)
+
+    def _replace_history(
+        self,
+        messages: Sequence[Message],
+        *,
+        reason: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Message]:
+        """事务安装正式 compact replacement。"""
+
+        if self._history_journal is not None:
+            if self.session_store is not None:
+                self.session_store.ensure_active()
+            return self._history_journal.replace(
+                self.history,
+                messages,
+                reason=reason,
+                metadata=metadata,
+            )
+        prepared = self.history.prepare_batch(messages)
+        self.history.replace_prepared(
+            prepared,
+            generation=self.history.generation + 1,
+        )
+        return prepared
+
+    def _reload_history(self) -> None:
+        """会话切换后从当前 active journal 恢复唯一历史。"""
+
+        if self.session_store is None or self._history_journal is None:
+            self.history = ConversationHistory()
+            return
+        recovery = self._history_journal.recover(
+            legacy_loader=lambda: load_legacy_history(self.session_store.active_dir),
+        )
+        self.history = recovery.history
+        if recovery.warnings:
+            logger.warning("canonical history 恢复警告: %s", recovery.warnings)
+
     # ---------- 公共入口 ----------
 
     def export_history(self) -> List[Dict[str, Any]]:
         """导出当前内存 history，供 RPC/TUI 在切换会话后重绘屏幕。
 
-        这不是给 LLM 的上下文构造函数；LLM 仍然走 ``self.history`` +
-        ContextBuilder。导出层只服务 UI，因此会丢弃协议字段并保留普通文本。
+        这不是给 LLM 的上下文构造函数；provider 请求始终直接派生自唯一 history。
+        导出层只服务 UI，因此会丢弃部分协议字段并保留可渲染文本。
         """
         return [
             _history_message_to_payload(m)
             for m in self.history
-            if _message_kind(m) not in {CONTEXT_UPDATE_KIND, "turn_aborted"}
+            if _message_kind(m) not in {
+                CONTEXT_UPDATE_KIND,
+                CONTEXT_EVIDENCE_KIND,
+                "plan_state",
+                "tool_image_bridge",
+                "turn_aborted",
+            }
         ]
 
     def list_sessions(self) -> List[Dict[str, Any]]:
@@ -638,13 +758,50 @@ class AgentSession:
         mode = str(self.plan_store.load(include_content=False).get("mode") or "execute")
         return mode if mode in {"execute", "plan"} else "execute"
 
+    def _append_plan_state_event(
+        self,
+        *,
+        action: str,
+        content: str,
+        state: Dict[str, Any],
+    ) -> None:
+        """把会影响后续模型行为的 Plan 状态变化记录为正式历史证据。"""
+
+        control_turn_id = f"plan-{uuid.uuid4().hex}"
+        self._append_history(
+            [Message(
+                role=MessageRole.USER,
+                content=(
+                    f'<plan-state action="{action}">\n'
+                    f"{str(content or '').strip()}\n"
+                    "</plan-state>"
+                ),
+                metadata={
+                    "kind": "plan_state",
+                    "action": action,
+                    "mode": str(state.get("mode") or ""),
+                    "status": str(state.get("status") or ""),
+                    "revision": int(state.get("revision") or 0),
+                },
+            )],
+            turn_id=control_turn_id,
+            event_kind="plan_state",
+        )
+
     def set_collaboration_mode(self, mode: str) -> Dict[str, Any]:
         """切换协作模式，emit PlanModeChanged 事件通知所有前端。
 
         mode 必须是 "execute" 或 "plan"。
         返回包含新 mode / plan_state / session 摘要的 payload。
         """
+        previous_mode = self.collaboration_mode()
         state = self.plan_store.set_mode(mode)
+        if previous_mode != state.get("mode"):
+            self._append_plan_state_event(
+                action="mode_changed",
+                content=f"协作模式从 {previous_mode} 切换为 {state.get('mode', mode)}。",
+                state=state,
+            )
         self.event_bus.emit(PlanModeChanged(mode=state.get("mode", mode), plan_state=state))
         return {
             "mode": state.get("mode", mode),
@@ -662,6 +819,15 @@ class AgentSession:
         """
         state = self.plan_store.approve()
         plan = str(state.get("approved_plan") or "")
+        self._append_plan_state_event(
+            action="approved",
+            content=(
+                f"用户已批准计划 revision={state.get('approved_revision')}。\n"
+                f"计划文件：{state.get('approved_path') or ''}\n"
+                "协作模式已切回 execute。"
+            ),
+            state=state,
+        )
         self.event_bus.emit(PlanApproved(plan=plan, plan_state=state))
         self.event_bus.emit(PlanModeChanged(mode="execute", plan_state=state))
         return {"approved": True, "mode": "execute", "plan": plan, "plan_state": state}
@@ -675,6 +841,14 @@ class AgentSession:
         emit PlanRejected + PlanModeChanged(plan)。
         """
         state = self.plan_store.reject(feedback)
+        self._append_plan_state_event(
+            action="rejected",
+            content=(
+                "用户拒绝了当前计划。\n"
+                f"反馈：{str(feedback or '').strip()}"
+            ),
+            state=state,
+        )
         self.event_bus.emit(PlanRejected(feedback=str(feedback or ""), plan_state=state))
         self.event_bus.emit(PlanModeChanged(mode="plan", plan_state=state))
         return {"rejected": True, "mode": "plan", "plan_state": state}
@@ -683,11 +857,9 @@ class AgentSession:
         """创建并切换到一个全新的空会话。
 
         新会话的隔离语义是：磁盘 active 指针切到新目录，同时内存 history 清空。
-        后续 chat 会写入新目录，不会继续追加旧 transcript。
+        后续 chat 会写入新目录，不会继续追加旧 history journal。
         """
-        self.history.clear()
-        self._pending_context_update_text = ""
-        self._pending_world_state = EMPTY_WORLD_STATE
+        self.history.clear_memory()
         self._world_state_baseline = EMPTY_WORLD_STATE
         if self.session_store is None:
             return {
@@ -699,6 +871,8 @@ class AgentSession:
                 "subagent_tasks": self._subagent_tasks_payload(),
             }
         summary = self.session_store.create_session()
+        if self._history_journal is not None:
+            self._history_journal.last_event_seq = 0
         return {
             "session": summary,
             "history": [],
@@ -711,16 +885,14 @@ class AgentSession:
     def switch_session(self, session_id: str) -> Dict[str, Any]:
         """切换到已有会话并恢复它最近的普通 history。
 
-        这一步只读该 session 目录下的 transcript/state；不会把当前会话内容保存到
-        目标会话，也不会生成新的 transcript 行。会话隔离边界完全由
+        这一步只读该 session 目录下的 history journal/state；不会把当前会话内容
+        保存到目标会话，也不会生成额外 history 事件。会话隔离边界完全由
         LocalSessionStore.switch_session 的目录校验保证。
         """
         if self.session_store is None:
             raise RuntimeError("local session store is not enabled")
         summary = self.session_store.switch_session(session_id)
-        self.history = self.session_store.load_latest_history()
-        self._pending_context_update_text = ""
-        self._pending_world_state = EMPTY_WORLD_STATE
+        self._reload_history()
         self._world_state_baseline = _world_state_from_history(self.history)
         # MemoryLoader 自身仍缓存文件解析结果，切换会话后需要显式失效。
         if self.memory_loader is not None:
@@ -740,13 +912,22 @@ class AgentSession:
     def compact_context(
         self,
         *,
-        source_history: Optional[Sequence[Message]] = None,
-        reason: str = "user_compact", #啥原因触发压缩
-        target_model: Optional[str] = None, #压缩完成后 继续对话的模型
+        reason: str = "user_compact",
+        active_turn_id: str = "",
+        target_model: Optional[str] = None,
         target_context_limits: Optional[Dict[str, int]] = None,
+        request_system_message: Any = _REQUEST_SNAPSHOT_UNSET,
+        request_tools_schema: Any = _REQUEST_SNAPSHOT_UNSET,
+        request_enabled_tools: Optional[frozenset[str]] = None,
     ) -> Dict[str, Any]:
-        """使用结构化历史生成 Codex 风格交接摘要并事务安装新 history。"""
-        compact_source = list(source_history) if source_history is not None else list(self.history)
+        """摘要将被淘汰的旧前缀，并事务安装 canonical replacement。
+
+        普通 compact 保留最近完整旧回合；mid-turn 还会把当前活动回合原样保留。
+        摘要请求、journal replacement 和内存 generation 任一步失败时，原 history
+        都保持不变。
+        """
+
+        compact_source = list(self.history.snapshot())
         before_messages = len(compact_source)
         if before_messages == 0:
             return {
@@ -761,7 +942,7 @@ class AgentSession:
                 "no_op": True,
             }
 
-        summary_limits = self._context_limits() #压缩模型的上下文窗口限制
+        summary_limits = self._context_limits()
         # Gateway 已经按唯一 ModelChoice.key 解析目标窗口时，必须直接使用该快照。
         # 仅兼容旧调用方时才按 model_id 回退，避免同名模型或自定义 provider 串配置。
         install_limits = (
@@ -770,9 +951,12 @@ class AgentSession:
             else ConstantLLM.context_limits(target_model)
             if target_model else summary_limits
         )
-        # 计算压缩后保留的 token 数
         retained_target = dynamic_retained_token_target(install_limits["soft_limit_tokens"])
-        if reason in {"manual", "user_compact"} and estimate_message_tokens(compact_source) <= retained_target:
+        source_tokens = estimate_message_tokens(compact_source)
+        if (
+            reason in {"manual", "user_compact"}
+            and source_tokens <= retained_target
+        ):
             return {
                 "session": self.current_session_payload().get("session"),
                 "history": self.export_history(),
@@ -781,134 +965,161 @@ class AgentSession:
                 "summary": "",
                 "before_messages": before_messages,
                 "after_messages": before_messages,
-                "retained_tokens": estimate_message_tokens(compact_source),
+                "retained_tokens": source_tokens,
                 "persisted": False,
                 "no_op": True,
             }
 
-        enabled_tools = frozenset(self._enabled_tools_for_prompt())
-        static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
-        static_system = "\n\n".join(part.strip() for part in static_parts if part and part.strip())
-        if self.system_prompt_addendum.strip():
-            static_system = (
-                f"{static_system}\n\n{self.system_prompt_addendum.strip()}"
-                if static_system else self.system_prompt_addendum.strip()
-            )
+        # mid-turn 必须沿用本用户回合首次请求的 system 快照。后台 MCP、权限或
+        # Skill 索引即使中途变化，也只能在下一用户回合形成明确缓存边界。
         system_message = (
-            {"role": "system", "content": static_system}
-            if static_system else None
+            self._static_system_message()
+            if request_system_message is _REQUEST_SNAPSHOT_UNSET
+            else copy.deepcopy(request_system_message)
         )
-        model_result = run_local_compaction(
-            llm=self.llm,
-            system_message=system_message,
-            history=compact_source,
-            hard_limit_tokens=summary_limits["hard_limit_tokens"],
-            estimate_request_tokens=lambda request: self._estimate_request_tokens(request, None),
-        )
-        summary_message = make_summary_message(model_result.summary, reason=reason)
-
-        # worldstate：就是section
-        # mid-turn 会马上继续同一工具回合，因此必须把当前完整现场放入 replacement
-        # history；manual/pre-turn 则清空基线，让下一条正常请求完整重注入。
-        # 确定要装配的section是当前回合最新的_pending_world_state还是_world_state_baseline
         installed_world_state = (
-            self._pending_world_state
-            if reason == "mid_turn" and self._pending_world_state.sections
-            else self._world_state_baseline if reason == "mid_turn" else EMPTY_WORLD_STATE
+            self._current_world_state_snapshot(enabled_tools=request_enabled_tools)
+            if reason == "mid_turn"
+            else EMPTY_WORLD_STATE
         )
 
         world_state_message = (
             _make_context_update_message(
-                # 更新上下文中的section，然后转化为字符串
                 _format_context_sections(list(installed_world_state.sections.items()), []),
                 installed_world_state,
             )
             if installed_world_state.sections else None
         )
-        tools_schema = self._stable_tools_schema(
-            self._filter_tools_schema_for_plan_mode(
-                self.registry.get_tools_description_openai_schema()
-                if self.llm.is_Function_Calling else None
+        tools_schema = (
+            self._stable_tools_schema(
+                self._filter_tools_schema_for_plan_mode(
+                    self.registry.get_tools_description_openai_schema()
+                    if self.llm.is_Function_Calling else None
+                )
             )
+            if request_tools_schema is _REQUEST_SNAPSHOT_UNSET
+            else copy.deepcopy(request_tools_schema)
         )
         fixed_messages: List[Dict[str, Any]] = []
-        # 装配系统提示词
         if system_message:
             fixed_messages.append(system_message)
-        # 装配当前的section
         if world_state_message is not None:
             fixed_messages.append(world_state_message.to_dict())
-        # 装配模型生成的摘要
-        fixed_messages.append(summary_message.to_dict())
+        if active_turn_id:
+            fixed_messages.extend(
+                message.to_dict()
+                for message in compact_source
+                if ConversationHistory.turn_id(message) == active_turn_id
+            )
         fixed_tokens = self._estimate_request_tokens(fixed_messages, tools_schema)
-
+        # 为交接摘要预留一块有界空间。实际摘要若更长，下面会扩大摘要前缀并重试
+        # 分区；绝不通过静默删除 retained_tail 来强行满足窗口。
+        summary_reserve = min(
+            16 * 1024,
+            max(2 * 1024, int(install_limits.get("max_output_tokens") or 0)),
+        )
         retained_budget = min(
             retained_target,
-            max(0, install_limits["soft_limit_tokens"] - fixed_tokens),
+            max(
+                0,
+                install_limits["soft_limit_tokens"] - fixed_tokens - summary_reserve,
+            ),
         )
 
-        def _replacement_for_budget(token_budget: int):
-            """按给定预算构造 replacement，并把 mid-turn 现场放在最后用户回合前。"""
+        model_result = None
+        partition = None
+        summary_message = None
+        replacement_history: List[Message] = []
+        post_tokens = 0
+        # 实际摘要长度不可预知。最多重新分区三次，每次新增的淘汰消息都会进入
+        # 新摘要请求；命中上限则显式失败，原 history 不会被替换。
+        for _attempt in range(3):
+            partition = partition_history_for_compaction(
+                compact_source,
+                retained_token_budget=retained_budget,
+                active_turn_id=active_turn_id if reason == "mid_turn" else "",
+            )
+            if not partition.summarized_prefix:
+                return {
+                    "session": self.current_session_payload().get("session"),
+                    "history": self.export_history(),
+                    "context_window": self.context_window_usage(),
+                    "plan_state": self.plan_state(),
+                    "summary": "",
+                    "before_messages": before_messages,
+                    "after_messages": before_messages,
+                    "retained_tokens": partition.retained_tokens,
+                    "active_turn_tokens": partition.active_tokens,
+                    "oversized_latest_turn": partition.oversized_latest_turn,
+                    "persisted": False,
+                    "no_op": True,
+                }
 
-            selected = select_retained_history(compact_source, token_budget=token_budget)
-            replacement = list(selected.messages)
+            model_result = run_local_compaction(
+                llm=self.llm,
+                system_message=system_message,
+                history=partition.summarized_prefix,
+                hard_limit_tokens=summary_limits["hard_limit_tokens"],
+                estimate_request_tokens=lambda request: self._estimate_request_tokens(
+                    request,
+                    None,
+                ),
+            )
+            summary_message = make_summary_message(model_result.summary, reason=reason)
+            replacement_history = [*partition.retained_tail]
             if world_state_message is not None:
-                insertion_index = next(
-                    (
-                        index
-                        for index in range(len(replacement) - 1, -1, -1)
-                        if _message_role_name(replacement[index]) == "user"
-                    ),
-                    len(replacement),
-                )
-                # 装配section
-                replacement.insert(insertion_index, world_state_message)
-            # 装配模型生成的摘要
-            replacement.append(summary_message)
-            return selected, replacement
+                replacement_history.append(world_state_message)
+            replacement_history.extend(partition.active_turn)
+            replacement_history.append(summary_message)
 
-        retained, replacement_history = _replacement_for_budget(retained_budget)
-        while retained_budget > 0 and retained.messages:
             post_messages = ([system_message] if system_message else []) + [
                 message.to_dict() for message in replacement_history
             ]
-            if self._estimate_request_tokens(post_messages, tools_schema) <= install_limits["soft_limit_tokens"]:
+            post_tokens = self._estimate_request_tokens(post_messages, tools_schema)
+            if post_tokens <= install_limits["soft_limit_tokens"]:
                 break
-            retained_budget = max(0, retained_budget * 3 // 4 - 1)
-            retained, replacement_history = _replacement_for_budget(retained_budget)
+            if not partition.retained_tail:
+                raise CompactionError(
+                    "当前活动回合与摘要已经超过目标模型 soft limit，"
+                    "拒绝压缩当前工具现场"
+                )
+            overflow = post_tokens - install_limits["soft_limit_tokens"]
+            retained_budget = max(0, retained_budget - max(1024, overflow * 2))
+        else:
+            raise CompactionError("compact 在三次完整重分区后仍无法满足目标窗口")
+
+        assert partition is not None
+        assert model_result is not None
+        assert summary_message is not None
         after_messages = len(replacement_history)
 
-        persisted = False
+        self._replace_history(
+            replacement_history,
+            reason=reason,
+            metadata={
+                "before_messages": before_messages,
+                "after_messages": after_messages,
+                "tokens_before": source_tokens,
+                "tokens_after": estimate_message_tokens(replacement_history),
+                "summarized_messages": len(partition.summarized_prefix),
+                "retained_messages": len(partition.retained_tail),
+                "active_turn_messages": len(partition.active_turn),
+                "target_model": str(
+                    target_model or getattr(self.llm, "model", "") or ""
+                ),
+            },
+        )
+        self._world_state_baseline = installed_world_state
         if self.session_store is not None:
             try:
-                from agent.work_context import _message_to_persist_payload
-                # 将这次compact事件落盘
-                self.session_store.save_compaction( 
-                    summary=str(summary_message.content or ""), # 模型输出摘要
-                    history_payload=[ # 新的history：replacement_history，包含当前section+被保留的message+摘要
-                        _message_to_persist_payload(message)
-                        for message in replacement_history
-                    ],
-                    before_messages=before_messages, # 压缩前后条数（用于 UI 展示压缩幅度）
-                    after_messages=after_messages,
-                    reason=reason, # 导致 compact 的原因
-                    model=str(getattr(self.llm, "model", "") or ""),
-                    target_model=str(target_model or getattr(self.llm, "model", "") or ""),
-                    provider=str(getattr(self.llm, "provider", "") or ""),
-                    world_state_snapshot=installed_world_state.to_payload(), # 装回的环境快照
-                    tokens_before=estimate_message_tokens(compact_source),
-                    tokens_after=estimate_message_tokens(replacement_history),
+                # state.json 只服务 UI。canonical journal 已提交后，状态预览失败
+                # 不能把一次成功 replacement 对外伪装成失败。
+                self.session_store.record_compaction_state(
+                    summary=str(summary_message.content or ""),
+                    reason=reason,
                 )
-                persisted = True
             except Exception:
-                logger.exception("本地会话 compact 快照落盘失败")
-                raise
-
-        # 只有落盘成功（或未启用持久化）后才替换内存，避免磁盘失败造成状态分裂。
-        self.history = replacement_history  # 新的history：replacement_history，包含当前section+被保留的message+摘要
-        self._pending_context_update_text = ""
-        self._pending_world_state = EMPTY_WORLD_STATE
-        self._world_state_baseline = installed_world_state
+                logger.exception("compact UI 状态更新失败")
         if self.memory_loader is not None:
             try:
                 self.memory_loader.reset_cache(reason=reason)
@@ -923,9 +1134,10 @@ class AgentSession:
             "summary": str(summary_message.content or ""),
             "before_messages": before_messages,
             "after_messages": after_messages,
-            "retained_tokens": retained.tokens,
+            "retained_tokens": partition.retained_tokens,
             "retained_target_tokens": retained_target,
-            "oversized_latest_turn": retained.oversized_latest_turn,
+            "active_turn_tokens": partition.active_tokens,
+            "oversized_latest_turn": partition.oversized_latest_turn,
             "world_state_sections": len(installed_world_state.sections),
             "attempts": model_result.attempts,
             "compact_strategy": model_result.strategy,
@@ -936,7 +1148,8 @@ class AgentSession:
             "covered_message_count": model_result.covered_message_count,
             "model": str(getattr(self.llm, "model", "") or ""),
             "target_model": str(target_model or getattr(self.llm, "model", "") or ""),
-            "persisted": persisted,
+            "post_request_tokens": post_tokens,
+            "persisted": self._history_journal is not None,
             "no_op": False,
         }
 
@@ -1007,57 +1220,53 @@ class AgentSession:
             persistent_user_text=persistent_user_text,
         )
 
-    def _build_chat_messages(
+    def _static_system_message(
+        self,
+        *,
+        enabled_tools: Optional[frozenset[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """构造稳定请求外壳中的 system message。"""
+
+        stable_enabled_tools = (
+            enabled_tools
+            if enabled_tools is not None
+            else frozenset(self._enabled_tools_for_prompt())
+        )
+        static_parts = get_static_system_prompt(enabled_tools=stable_enabled_tools)
+        static_system = "\n\n".join(part.strip() for part in static_parts if part and part.strip())
+        if self.system_prompt_addendum.strip():
+            static_system = (
+                f"{static_system}\n\n{self.system_prompt_addendum.strip()}"
+                if static_system else self.system_prompt_addendum.strip()
+            )
+        return {"role": "system", "content": static_system} if static_system else None
+
+    def _prepare_turn_input(
         self,
         *,
         user_content: Any,
-        system_instructions: str,  # 运行时补充指令，按具名 section 参与增量比较。
-        memory_query: str = "",
-    ) -> List[Dict[str, Any]]:
-        """构造 Chat Completions messages —— 稳定前缀 + 动态上下文分离。
+        runtime_guidance: str,
+        memory_query: str,
+        hook_context: str = "",
+        extra_evidence: Sequence[Message] = (),
+        enabled_tools: Optional[frozenset[str]] = None,
+    ) -> PreparedTurnInput:
+        """生成即将原子追加到 history 的用户回合批次。
 
-        **为什么拆分 system 为静态 + 动态两部分:**
-
-        Provider 端 prompt cache(DeepSeek/OpenAI/Anthropic 均支持)的缓存键是
-        messages 数组的前缀字节序列。如果 system message 里包含每轮变化的
-        内容(当前时间/env_info/CLAUDE.md),前缀就会变 → 缓存永远不命中。
-
-        拆分后的消息结构(从前到后):
-        1. role=system: 仅含确定性指令(intro/行为规则/工具使用/output 格式等),
-           相同 (model, enabled_tools, output_style) 组合下字节完全不变。
-           这是 provider 端缓存的关键 —— 只要前缀不变,后续 user 消息的
-           incremental prefilling 就能复用已有 KV cache。
-        2. role=user (历史轮次): 从 self.history 切片+窗口截断的跨轮对话
-           (含前几轮的 context_update 消息)。
-        3. role=user (<context-update>): 本轮运行时上下文 —— CLAUDE.md memory、
-           env_info、MCP 指令、技能列表、token 预算等。虽然 role=user,但
-           <context-update> 标签让模型知道这是环境信息而非用户指令。
-        4. role=user (当前): 用户本轮输入。
-
-        **context_update 的跨轮持久化机制:**
-
-        本轮 ctx update 的文本会暂存在 self._pending_context_update_text,
-        在 history commit 时(chat() 的工具循环结束后)作为一条独立的
-        context_update kind message 写入 history。下一轮 _build_chat_messages
-        通过 _sliced_history_dicts() 自然把它包含在历史里 → 完整前缀与
-        上一轮一致,provider 可以增量 prefill,只需算新增的一条 user message。
-
-        这意味着:首轮是 system + ctx_update + user_q → 模型看到 3 条。
-        第二轮的请求是 system + ctx_update(旧,来自 history) + ctx_update(新,本轮)
-        + user_q → 前缀 [system, ctx_update(旧)] 与上轮一致,缓存命中。
+        ``world_state`` 只描述当前仍成立的环境；RAG、hook 等回合证据同样进入
+        history，但不会污染下一次环境 diff 的基线。
         """
-        # Plan Mode 工具过滤：plan 模式下只暴露只读工具
-        enabled_tools = frozenset(self._enabled_tools_for_prompt())
 
-        # 第一步: 确定性静态 system prompt 段(不参与动态解析)
-        static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
-        # 第二步：生成带三态与持久化语义的运行时上下文块。
-        # builder 整体异常时保留全部旧 baseline；不能把未知状态解释成全部删除。
+        stable_enabled_tools = (
+            enabled_tools
+            if enabled_tools is not None
+            else frozenset(self._enabled_tools_for_prompt())
+        )
         dynamic_builder_error: Optional[BaseException] = None
         try:
             dynamic_sections = self._run_context_coro(
                 get_dynamic_context_sections(
-                    enabled_tools=enabled_tools,
+                    enabled_tools=stable_enabled_tools,
                     model=getattr(self.llm, "model", "") or "",
                     cwd=Path.cwd(),
                     memory_loader=self.memory_loader if self.ctx_enabled else None,
@@ -1072,46 +1281,41 @@ class AgentSession:
             dynamic_sections = []
             dynamic_builder_error = error
 
-        # 把 Session 自己生成的运行时状态纳入同一套显式结果。
         context_sections: List[DynamicSectionResult] = list(dynamic_sections)
-        if system_instructions and system_instructions.strip():
+        if runtime_guidance.strip():
             context_sections.append(DynamicSectionResult.present(
-                "runtime_instructions",
-                system_instructions.strip(),
-                persistence="request_only",
+                "runtime_guidance",
+                runtime_guidance.strip(),
             ))
-
         plan_context = self._plan_context_text()
-        if plan_context:
-            context_sections.append(DynamicSectionResult.present("plan", plan_context.strip()))
-        else:
-            context_sections.append(DynamicSectionResult.absent("plan"))
+        context_sections.append(
+            DynamicSectionResult.present("plan", plan_context.strip())
+            if plan_context else DynamicSectionResult.absent("plan")
+        )
 
-        # session_state 默认不注入模型：完整 history 已含原始工具事实，
-        # state.json 只服务 UI/审计/recovery。需要恢复时走独立 recovery_context。
+        world_values = dict(self._world_state_baseline.sections)
+        evidence: List[Message] = list(extra_evidence)
+        if hook_context.strip():
+            evidence.append(_make_context_evidence_message("hooks", hook_context))
 
-        # persistence 是唯一分流依据。persistent 从旧 baseline 副本开始应用三态：
-        # present 覆盖、absent 删除、error 保留；request_only 只进入当前请求。
-        persistent_values = dict(self._world_state_baseline.sections)
-        request_only_sections: List[tuple[str, str]] = []
         for section in context_sections:
             if not isinstance(section, DynamicSectionResult):
                 raise TypeError("动态上下文必须返回 DynamicSectionResult")
             key = str(section.name or "").strip()
             if not key:
                 continue
-            if section.persistence == "request_only":
+            if section.scope == "turn_evidence":
                 if section.status == "present" and section.text.strip():
-                    request_only_sections.append((key, section.text.strip()))
+                    evidence.append(_make_context_evidence_message(key, section.text))
                 elif section.status == "error":
-                    logger.warning("request-only section 读取失败: name=%s error=%s", key, section.error)
+                    logger.warning("回合证据读取失败: name=%s error=%s", key, section.error)
                 continue
             if section.status == "present" and section.text.strip():
-                persistent_values[key] = section.text.strip()
+                world_values[key] = section.text.strip()
             elif section.status == "absent":
-                persistent_values.pop(key, None)
+                world_values.pop(key, None)
             elif section.status == "error":
-                logger.warning("persistent section 读取失败，沿用 baseline: name=%s error=%s", key, section.error)
+                logger.warning("环境 section 读取失败，沿用 baseline: name=%s error=%s", key, section.error)
                 if key == "instructions" and key not in self._world_state_baseline.sections:
                     raise RuntimeError(
                         "关键 instructions 首次读取失败，已阻止本轮模型请求: "
@@ -1129,58 +1333,41 @@ class AgentSession:
                 "已阻止本轮模型请求"
             ) from dynamic_builder_error
 
-        # persistent 部分做 diff，只有变化时才追加 context_update。
-        # request-only 部分无条件追加到本轮请求，但不会更新 baseline。
-        current_world_state = WorldStateSnapshot(sections=persistent_values)
+        current_world_state = WorldStateSnapshot(sections=world_values)
         world_diff = current_world_state.diff(self._world_state_baseline)
-        changed_sections = list(world_diff.changed)
-        removed_sections = list(world_diff.removed)
+        batch: List[Message] = []
+        if world_diff.changed or world_diff.removed:
+            batch.append(_make_context_update_message(
+                _format_context_sections(world_diff.changed, world_diff.removed),
+                current_world_state,
+            ))
+        batch.extend(evidence)
+        batch.append(Message(role=MessageRole.USER, content=copy.deepcopy(user_content)))
+        return PreparedTurnInput(messages=tuple(batch), world_state=current_world_state)
 
-        # 组装最终 messages 列表
+    def _provider_request_messages(
+        self,
+        extra_messages: Sequence[Message] = (),
+        *,
+        allow_pending_tool_tail: bool = False,
+        system_message: Any = _REQUEST_SNAPSHOT_UNSET,
+    ) -> List[Dict[str, Any]]:
+        """从稳定外壳和唯一 history 生成一次性 provider 请求。"""
+
         messages: List[Dict[str, Any]] = []
-
-        # [0] 静态 system —— 稳定前缀,供 provider 端缓存
-        static_system = "\n\n".join(p.strip() for p in static_parts if p and p.strip())
-        if self.system_prompt_addendum.strip():
-            static_system = (
-                f"{static_system}\n\n{self.system_prompt_addendum.strip()}"
-                if static_system else self.system_prompt_addendum.strip()
-            )
-        if static_system:
-            messages.append({"role": "system", "content": static_system})
-
-        # [1..N] 跨轮历史消息(来自前几轮 commit 到 history 的 user/assistant/tool)
-        messages.extend(self._sliced_history_dicts())
-
-        # 仅当至少一个块变化或删除时追加 persistent context_update。
-        # 基线等本轮成功提交后更新，防止 preflight compact 重建 messages 时误以为
-        # 新现场已经持久化。
-        context_text = (
-            _format_context_sections(changed_sections, removed_sections)
-            if changed_sections or removed_sections
-            else ""
+        stable_system = (
+            self._static_system_message()
+            if system_message is _REQUEST_SNAPSHOT_UNSET
+            else copy.deepcopy(system_message)
         )
-        self._pending_context_update_text = context_text
-        self._pending_world_state = current_world_state
-        if context_text:
-            messages.append({
-                "role": "user",
-                "content": _format_context_update_text(context_text),
-            })
-
-        # request-only 部分无条件追加（不在 history 中跨轮累积）。
-        # 每个请求独立注入，上一轮的 request-only 不会留在下一轮的 history 前缀中。
-        # 这会在 durable history 尾部产生缓存断点，但避免了 request-only 内容
-        # 无限累积、过早触发 compact。
-        if request_only_sections:
-            request_text = _format_context_sections(request_only_sections, [])
-            messages.append({
-                "role": "user",
-                "content": _format_context_update_text(request_text),
-            })
-
-        # [final] 当前用户输入
-        messages.append({"role": "user", "content": user_content})
+        if stable_system is not None:
+            messages.append(stable_system)
+        messages.extend(self.history.provider_messages())
+        messages.extend(copy.deepcopy(message.to_dict()) for message in extra_messages)
+        validate_tool_protocol(
+            messages,
+            allow_pending_tail=allow_pending_tool_tail,
+        )
         return messages
 
     @staticmethod
@@ -1232,11 +1419,44 @@ class AgentSession:
             sections = []
         return list(sections)
 
-    def _sliced_history_dicts(self) -> List[Dict[str, Any]]:
-        """返回当前已经安装的完整 active replacement history。"""
-        dicts = [message.to_dict() for message in self.history]
-        drop_orphan_tool_messages(dicts)
-        return dicts
+    def _current_world_state_snapshot(
+        self,
+        *,
+        enabled_tools: Optional[frozenset[str]] = None,
+    ) -> WorldStateSnapshot:
+        """读取 compact 当下仍成立的完整现场，读取失败时沿用已见基线。"""
+
+        values = dict(self._world_state_baseline.sections)
+        stable_enabled_tools = (
+            enabled_tools
+            if enabled_tools is not None
+            else frozenset(self._enabled_tools_for_prompt())
+        )
+        for section in self._baseline_dynamic_sections(stable_enabled_tools):
+            if not isinstance(section, DynamicSectionResult):
+                logger.error("compact 动态上下文返回了非法类型: %s", type(section).__name__)
+                continue
+            if section.scope != "world_state":
+                continue
+            key = str(section.name or "").strip()
+            if not key:
+                continue
+            if section.status == "present" and section.text.strip():
+                values[key] = section.text.strip()
+            elif section.status == "absent":
+                values.pop(key, None)
+            elif section.status == "error":
+                logger.warning(
+                    "compact 现场读取失败，沿用 baseline: name=%s error=%s",
+                    key,
+                    section.error,
+                )
+        plan_context = self._plan_context_text().strip()
+        if plan_context:
+            values["plan"] = plan_context
+        else:
+            values.pop("plan", None)
+        return WorldStateSnapshot(sections=values)
 
     def _enabled_tools_for_prompt(self) -> List[str]:
         """返回当前模式下应暴露给 LLM 的工具名列表。
@@ -1302,7 +1522,10 @@ class AgentSession:
             serialized = json.dumps(entry, ensure_ascii=False, sort_keys=True, default=str)
             return name, serialized
 
-        return sorted(tools_schema, key=_sort_key)
+        return [
+            copy.deepcopy(entry)
+            for entry in sorted(tools_schema, key=_sort_key)
+        ]
 
     def _plan_tool_note(self, tool_name: str) -> str:
         """为 Plan Mode 下的工具生成 description 补充说明。
@@ -1421,264 +1644,163 @@ class AgentSession:
         attachments: Optional[List[Dict[str, Any]]] = None,
         persistent_user_text: Optional[str] = None,
     ) -> str:
+        del persistent_user_text  # 模型可见 user 与持久 history 不再使用两套文本。
         chat_started = time.perf_counter()
-        explicit_skill_query = user_query
-        # 后台任务完成通知 → 注入 user_query 前缀 + 发 BackgroundNotification 事件
-        user_query = self._prepend_runtime_notifications(user_query)
+        explicit_skill_query = str(user_query or "")
+        user_query = self._prepend_runtime_notifications(explicit_skill_query)
+        turn_id = uuid.uuid4().hex
 
-        # 生命周期 hook：SessionStart（本会话首个 Prompt，仅一次）+ UserPromptSubmit。
-        # 两者的 additional_context 收集起来，稍后追加进 system_instructions 注入模型；
-        # UserPromptSubmit blocked 则直接返回拒绝原因，不进 LLM。
         hook_extra_context = ""
         if self.hook_manager is not None:
             if not self._session_start_fired:
                 self._session_start_fired = True
                 if self.hook_manager.has_event("SessionStart"):
-                    ss = self.hook_manager.fire(
+                    outcome = self.hook_manager.fire(
                         "SessionStart",
                         {"source": "startup"},
                         matcher_value="startup",
                     )
-                    if ss.additional_context:
-                        hook_extra_context += ss.additional_context
+                    hook_extra_context = str(outcome.additional_context or "")
             if self.hook_manager.has_event("UserPromptSubmit"):
-                ups = self.hook_manager.fire(
-                    "UserPromptSubmit",
-                    {"prompt": user_query},
-                )
-                if ups.blocked or ups.stop:
-                    reason = ups.block_reason or "本次输入被 hooks 配置拦截。"
-                    logger.info("UserPromptSubmit hook 拦截本次输入: reason=%s", reason)
+                outcome = self.hook_manager.fire("UserPromptSubmit", {"prompt": user_query})
+                if outcome.blocked or outcome.stop:
+                    reason = outcome.block_reason or "本次输入被 hooks 配置拦截。"
                     self.event_bus.emit(Done(
                         final_answer=reason,
                         rounds_used=0,
                         cancelled=False,
                     ))
                     return reason
-                if ups.additional_context:
-                    hook_extra_context += ("\n" if hook_extra_context else "") + ups.additional_context
+                if outcome.additional_context:
+                    hook_extra_context += (
+                        ("\n" if hook_extra_context else "")
+                        + str(outcome.additional_context)
+                    )
 
-        history_source_text = (
-            str(persistent_user_text).strip()
-            if persistent_user_text is not None
-            # 运行时通知只服务本轮模型，不应伪装成用户原话写入 transcript/history。
-            else explicit_skill_query
-        ) # 从持久化用户文本或用户查询中获取历史文本
         active_model = getattr(self.llm, "active_model_config", None)
         multimodal_prompt = process_multimodal_prompt(
             text=user_query,
             attachments=attachments,
             model=getattr(self.llm, "model", None),
-            history_text=history_source_text,
             soft_limit_tokens=self._context_limits()["soft_limit_tokens"],
             image_ability=(
                 bool(active_model.image_ability)
                 if active_model is not None and hasattr(active_model, "image_ability")
                 else None
             ),
-        ) # 处理多模态输入，生成请求内容和历史文本
+        )
         request_content = multimodal_prompt.request_content
-        history_user_text = multimodal_prompt.history_text
-        request_content = self._append_explicit_skill_content(
-            request_content,
-            explicit_skill_query,
-        )
-        turn_id = uuid.uuid4().hex
-        logger.info(
-            "chat prepare: multimodal processed attachments=%s elapsed=%.2fs",
-            len(multimodal_prompt.attachments),
-            time.perf_counter() - chat_started,
-        )
-        if self.session_store is not None:
-            try:
-                # 通讯平台私聊会按“每条消息新建 AgentSession 对象”从磁盘恢复。
-                # 因此收到用户消息后先写 pending 记录：如果进程在 LLM 返回前崩溃，
-                # 下一次同一用户发消息时仍能从磁盘看到那条未完成输入。
-                self.session_store.save_pending_user_message(history_user_text, turn_id=turn_id)
-            except Exception:
-                logger.exception("保存 pending 用户消息失败")
-
-        stage_started = time.perf_counter() # 记录当前阶段开始时间
-        system_instructions = self._build_system_instructions() # 构建运行时指令
-        # 把 SessionStart / UserPromptSubmit hook 注入的上下文追加到运行时指令末尾，
-        # 让模型在本轮 system 补充段看到 hook 提供的额外信息。
-        if hook_extra_context:
-            system_instructions = (
-                f"{system_instructions}\n\n[hooks 注入上下文]\n{hook_extra_context}"
-                if system_instructions else
-                f"[hooks 注入上下文]\n{hook_extra_context}"
-            )
-        logger.info(
-            "chat prepare: runtime instructions built chars=%s elapsed=%.2fs total=%.2fs",
-            len(system_instructions or ""),
-            time.perf_counter() - stage_started,
-            time.perf_counter() - chat_started,
-        )
-        auto_compactions: List[Dict[str, Any]] = [] #收集自动压缩（auto compaction）事件
-        messages = self._build_chat_messages(
+        explicit_skill_evidence = self._explicit_skill_evidence(explicit_skill_query)
+        history_user_text = explicit_skill_query
+        enabled_tools_snapshot = frozenset(self._enabled_tools_for_prompt())
+        runtime_guidance = self._build_system_instructions()
+        prepared = self._prepare_turn_input(
             user_content=request_content,
-            system_instructions=system_instructions,
+            runtime_guidance=runtime_guidance,
             memory_query=history_user_text,
-        )
-        logger.info(
-            "chat prepare: context messages built messages=%s elapsed=%.2fs total=%.2fs",
-            len(messages),
-            time.perf_counter() - stage_started,
-            time.perf_counter() - chat_started,
+            hook_context=hook_extra_context,
+            extra_evidence=explicit_skill_evidence,
+            enabled_tools=enabled_tools_snapshot,
         )
 
-        stage_started = time.perf_counter()
-        tools_schema = (
-            self.registry.get_tools_description_openai_schema()
-            if self.llm.is_Function_Calling
-            else None
+        # system 与 tools schema 在本用户回合开始时冻结。普通工具循环只追加 history，
+        # 不允许后台注册表或运行态变化在中途改写请求外壳。
+        request_system_message = self._static_system_message(
+            enabled_tools=enabled_tools_snapshot,
         )
-        # Plan Mode: 过滤 tools schema（移除写入工具 + 追加使用限制描述）
         tools_schema = self._stable_tools_schema(
-            self._filter_tools_schema_for_plan_mode(tools_schema)
+            self._filter_tools_schema_for_plan_mode(
+                self.registry.get_tools_description_openai_schema()
+                if self.llm.is_Function_Calling else None
+            )
         )
-        logger.info(
-            "chat prepare: tools schema built tools=%s elapsed=%.2fs total=%.2fs",
-            len(tools_schema or []),
-            time.perf_counter() - stage_started,
-            time.perf_counter() - chat_started,
+        candidate_messages = self._provider_request_messages(
+            prepared.messages,
+            system_message=request_system_message,
         )
-        logger.info(
-            "chat start: query_chars=%s attachments=%s history=%s messages=%s tools=%s function_calling=%s",
-            len(user_query),
-            len(multimodal_prompt.attachments),
-            len(self.history),
-            len(messages),
-            len(tools_schema or []),
-            self.llm.is_Function_Calling,
-        )
-        logger.debug(
-            "chat request estimate: tokens=%s context=%s",
-            self._estimate_request_tokens(messages, tools_schema),
-            self.context_window_usage(),
-        )
-
-        # 预检完整请求体，而不只看 state/history。原因是工具 schema、系统提示、
-        # Skill 列表和当前用户输入也会占用真实模型窗口；如果这里达到动态 soft limit，
-        # 就先 compact 当前跨轮 history/state，再重建 messages，让
-        # 本轮第一次 think 就使用压缩后的上下文。
+        auto_compactions: List[Dict[str, Any]] = []
         preflight = self._maybe_auto_compact_preflight(
             user_query=user_query,
-            system_instructions=system_instructions,
-            messages=messages,
+            system_instructions=runtime_guidance,
+            messages=candidate_messages,
             tools_schema=tools_schema,
         )
         if preflight is not None:
             auto_compactions.append(preflight)
-            logger.info("auto compact before first think: %s", preflight)
-            # blocking_limit 命中:autocompact 已经无法继续释放空间,本轮拒绝
-            # 进入 _tool_loop。Error 事件已在 preflight 内 emit,这里再 emit
-            # Done 让前端正常关闭本次 chat 渲染,然后返回友好提示文本。
             if preflight.get("blocked"):
                 blocked_message = (
-                    "[上下文窗口已满] 自动 compact 已无法继续释放空间,"
-                    "本轮无法继续。请使用 /clear 或 /compact 后重试。"
+                    "[上下文窗口已满] 自动 compact 已无法为本轮输入释放足够空间。"
                 )
                 self.event_bus.emit(Done(
                     final_answer=blocked_message,
                     rounds_used=0,
                     cancelled=False,
                     context_window=self.context_window_usage(),
-                    auto_compact={
-                        "compacted": True,
-                        "events": auto_compactions,
-                    },
+                    auto_compact={"compacted": True, "events": auto_compactions},
                 ))
                 return blocked_message
-            messages = self._build_chat_messages(
+            # pre-turn compact 会重置 world-state baseline，必须重新生成完整现场批次。
+            prepared = self._prepare_turn_input(
                 user_content=request_content,
-                system_instructions=system_instructions,
+                runtime_guidance=runtime_guidance,
                 memory_query=history_user_text,
-            )
-            # Plan Mode: preflight compact 后重建 messages，也要重建过滤后的 tools schema
-            tools_schema = self._stable_tools_schema(
-                self._filter_tools_schema_for_plan_mode(
-                    self.registry.get_tools_description_openai_schema()
-                    if self.llm.is_Function_Calling
-                    else None
-                )
+                hook_context=hook_extra_context,
+                extra_evidence=explicit_skill_evidence,
+                enabled_tools=enabled_tools_snapshot,
             )
 
-        if self.session_store is not None:
-            try:
-                # pending_user.json 仍然负责“刚收到用户消息”的极早期兜底；
-                # active_turn.jsonl 从这里开始接管本轮运行中检查点，因为此时
-                # context_update 已由 _build_chat_messages 暂存，恢复后能重建
-                # 与本轮请求一致的 context/user 前缀。
-                context_message = (
-                    _make_context_update_message(
-                        self._pending_context_update_text,
-                        self._pending_world_state,
-                    )
-                    if self._pending_context_update_text else None
-                )
-                self.session_store.begin_active_turn(
-                    user_query=history_user_text,
-                    turn_id=turn_id,
-                    context_update_message=context_message,
-                )
-            except Exception:
-                logger.exception("开始 active turn 检查点失败")
-
-        # 记录本轮初始消息（含 system/user/history）
+        self._append_history(
+            prepared.messages,
+            turn_id=turn_id,
+            event_kind="turn_input",
+        )
+        self._world_state_baseline = prepared.world_state
+        request_messages = self._provider_request_messages(
+            system_message=request_system_message,
+        )
         if self.message_logger is not None:
             try:
                 self.message_logger.log(
-                    messages,
+                    request_messages,
                     tools=tools_schema,
                     label=f"会话开始 | query=\"{history_user_text[:100]}\"",
                 )
             except Exception:
                 logger.exception("message_logger 写入失败")
 
-        # 记录 tool_loop 开始前 messages 的长度。loop 内会原地累积本轮 assistant
-        # (含 tool_calls)/role=tool/最终 assistant，commit 到 history 时只取这之后
-        # 新增的部分，避免把 system / state user / 历史轮次重复推回。
-        commit_offset = len(messages)
-        committed_context_text = self._pending_context_update_text
-        committed_world_state = self._pending_world_state
-        turn_prefix_messages: List[Message] = []
-        if committed_context_text:
-            turn_prefix_messages.append(_make_context_update_message(
-                committed_context_text,
-                committed_world_state,
-            ))
-        turn_prefix_messages.append(Message(role=MessageRole.USER, content=history_user_text))
-        loop_state: Dict[str, Any] = {
-            "commit_offset": commit_offset,
-            "history_replaced": False,
-            "audit_protocol": [],
-            "turn_prefix_messages": turn_prefix_messages,
-            # 运行时通知和图片只属于当前请求；mid-turn compact 后要重新挂回请求，
-            # 但绝不能进入摘要 source、replacement history 或 transcript。
-            "request_only_inflight": [],
-            "turn_id": turn_id,
-        }
-
-        # 工具调用次数，最终回答，工具轨迹，本轮压缩事件。
-        # provider 失败会抛 LLMRequestError：保留 active/pending checkpoint，
-        # 不把半截 user-only 回合提交进正式 history/transcript。
-        history_before_turn = list(self.history)
-        baseline_before_turn = self._world_state_baseline
+        logger.info(
+            "chat start: query_chars=%s attachments=%s history=%s tools=%s generation=%s",
+            len(user_query),
+            len(multimodal_prompt.attachments),
+            len(self.history),
+            len(tools_schema or []),
+            self.history.generation,
+        )
         try:
             rounds_used, final_answer, trace_collector, loop_compactions = self._tool_loop(
-                messages, tools_schema, token, loop_state=loop_state,
+                tools_schema,
+                token,
+                turn_id=turn_id,
+                request_system_message=request_system_message,
+                request_enabled_tools=enabled_tools_snapshot,
             )
         except LLMRequestError as exc:
-            auto_compactions.extend(list(loop_state.get("auto_compactions") or []))
-            # 回滚可能在 overflow compact 路径被替换的 history；失败回合不提交。
-            if not loop_state.get("history_replaced"):
-                self.history = history_before_turn
-            self._pending_context_update_text = ""
-            self._pending_world_state = EMPTY_WORLD_STATE
-            # baseline 只在成功提交后推进；失败保持回合开始时的值。
-            self._world_state_baseline = baseline_before_turn
             error_text = self._format_llm_request_error(exc)
+            partial = str(getattr(exc, "partial_answer", "") or "")
+            failure_content = (
+                "<turn_failed>\n"
+                f"{error_text}\n"
+                + (f"已收到但未完成的模型文本：\n{partial}\n" if partial else "")
+                + "本轮没有得到完整模型响应；不要假设未记录的工具已经执行。\n"
+                "</turn_failed>"
+            )
+            self._append_history([
+                Message(
+                    role=MessageRole.USER,
+                    content=failure_content,
+                    metadata={"kind": "turn_failed", "reason": type(exc).__name__},
+                )
+            ], turn_id=turn_id, event_kind="turn_failed")
             self.event_bus.emit(Error(
                 where="llm",
                 message=error_text,
@@ -1694,114 +1816,20 @@ class AgentSession:
                     "events": auto_compactions,
                 } if auto_compactions else None,
             ))
-            logger.error(
-                "chat aborted by provider error without committing turn: type=%s status=%s",
-                type(exc).__name__,
-                getattr(exc, "status_code", None),
-            )
             return error_text
 
         auto_compactions.extend(loop_compactions)
 
-        # CC 模式跨轮累积：把本轮 _tool_loop 内新增的 user/assistant/tool 消息
-        # 全部 commit 到 self.history（含 assistant.tool_calls 和 role=tool 的原始
-        # 工具结果）。下一轮 _build_chat_messages 会从 history 恢复这些原始块,
-        # 模型可以直接看到上一轮真实工具调用细节,不再依赖摘要文本。
-        # 注意 history 里第一条仍是用户原始输入的 text 形态(不带多模态 base64),
-        # 跨轮 image_url/data URI 不进 history 以免撑爆 token 估算和 transcript。
-        history_commit_start = len(self.history)
-        # context_update 在用户消息之前写入 history。
-        # 顺序是: [...旧 history] → ctx_update(本轮环境) → user(本轮输入) → tool loop messages
-        # 下一轮 _build_chat_messages 的 _sliced_history_dicts() 会按同样顺序读出,
-        # 保证前缀 [system] + [ctx_update(N-1)] + [user(N-1)] 完全不变 → 缓存命中。
-        if not loop_state["history_replaced"]:
-            self.history.extend(turn_prefix_messages)
-        new_protocol_messages = self._extract_protocol_messages(
-            messages,
-            int(loop_state["commit_offset"]),
-        )
-        if new_protocol_messages:
-            self.history.extend(new_protocol_messages)
-        # 兜底:如果工具循环结束时 final_answer 没作为最后一条 assistant 进入
-        # messages(例如某些 cancel 路径),手动补一条最终回答,保证下一轮恢复时
-        # 仍然能看到本轮的最终输出。
-        if final_answer and not self._history_tail_is_final_answer(final_answer):
-            self.history.append(Message.create_assistant_message(final_answer))
-        if loop_state["history_replaced"]:
-            # replacement history 已包含当前回合的一部分，transcript 仍要保存完整原链。
-            committed_turn_messages = [
-                *turn_prefix_messages,
-                *list(loop_state["audit_protocol"]),
-                *new_protocol_messages,
-            ]
-            if final_answer and not self._messages_tail_is_final_answer(
-                committed_turn_messages,
-                final_answer,
-            ):
-                committed_turn_messages.append(Message.create_assistant_message(final_answer))
-        else:
-            committed_turn_messages = list(self.history[history_commit_start:])
-
-        if token.is_cancelled():
-            # 中断标记进入模型 history 和 transcript，但 export_history 会过滤它，
-            # 因此前端不会把内部控制消息误画成用户输入。标记必须位于所有工具
-            # 终态之后，下一轮模型才能把它解释为整个回合的最终边界。
-            cancel_reason = (
-                token.reason.value
-                if getattr(token, "reason", None) is not None
-                else "user_cancelled"
-            )
-            abort_marker = Message(
-                role=MessageRole.USER,
-                content=f"<turn_aborted reason=\"{cancel_reason}\" />",
-                metadata={
-                    "kind": "turn_aborted",
-                    "reason": cancel_reason,
-                    "interrupted": True,
-                },
-            )
-            self.history.append(abort_marker)
-            committed_turn_messages.append(abort_marker)
-            if self.session_store is not None:
-                try:
-                    self.session_store.record_active_turn_aborted(reason=cancel_reason)
-                except Exception:
-                    logger.exception("记录 active turn 中断标记失败")
-
-        # trace_collector 来自本轮工具循环,只服务 state.json 结构化字段提取
-        # (files_seen / files_modified / recent_commands / decisions / pending)。
-        # 不再生成 work_record 文本,因为原始工具消息已通过 history 累积传递。
         work_record = self._make_work_record(
             user_query=history_user_text,
             final_answer=final_answer,
             trace_collector=trace_collector,
         )
-        # transcript 是本轮对话恢复的事实来源，必须先于记忆/state 等旁路更新提交。
-        # 即使后续记忆写回期间进程退出，用户已经看到的最终回答也不会从历史中消失。
-        self._persist_turn(
-            history_user_text,
-            final_answer,
-            work_record,
-            committed_turn_messages,
-            turn_id=turn_id,
-        )
-        if loop_state["history_replaced"] and self.session_store is not None:
-            try:
-                from agent.work_context import _message_to_persist_payload
-                self.session_store.align_compaction_transcript_offset(
-                    history_payload=[
-                        _message_to_persist_payload(message)
-                        for message in self.history
-                    ],
-                )
-            except Exception:
-                logger.exception("对齐 mid-turn compact 的 transcript offset 失败")
-        # 只有当前回合已经进入 history/transcript 后才推进现场基线。这样 provider
-        # 失败或 preflight 重建请求都不会让本地状态领先于模型实际看到的内容。
-        if committed_context_text:
-            self._world_state_baseline = committed_world_state
-        self._pending_context_update_text = ""
-        self._pending_world_state = EMPTY_WORLD_STATE
+        if self.session_store is not None:
+            self.session_store.commit_turn_state(
+                user_query=history_user_text,
+                work_record=work_record,
+            )
         # 自动记忆更新:现在只驱动 MEMORY.md 长期记忆(KnowledgeBase.capture_turn
         # 内按用户显式"请记住"类触发写入)。结构化知识页改由模型显式调用
         # knowledge_write 工具写入——原先依赖 work_record 文本的自动知识页捕获
@@ -1812,9 +1840,9 @@ class AgentSession:
             final_answer=final_answer,
         )
 
-        # 本轮结束后再看一次跨轮 state/history。工具轨迹落盘和 state 合并可能让
-        # 下一轮动态上下文达到或超过安全窗口；此时自动执行与 /compact 同语义的压缩，
-        # transcript 仍保留审计，下一轮 prompt 则从 compact 快照继续。
+        # 本轮结束后再看一次 state/history。工具轨迹索引和现场变化可能让下一轮
+        # 请求达到安全窗口；此时执行正式 replacement，旧 generation 仍留在
+        # history.jsonl 供审计，下一轮从新 generation 继续追加。
         post_turn_compaction = self._maybe_auto_compact_history(
             reason="post_turn",
             round_idx=rounds_used,
@@ -1832,7 +1860,7 @@ class AgentSession:
                 round_idx=rounds_used,
             )
 
-        # 中断事件必须晚于 transcript/history 提交，前端收到后即可安全释放 busy。
+        # 中断事件必须晚于 canonical history 提交，前端收到后即可安全释放 busy。
         if token.is_cancelled():
             self.event_bus.emit(Cancelled(
                 where="session", round_idx=rounds_used,
@@ -1872,9 +1900,7 @@ class AgentSession:
                 self.subagent_task_registry.cancel_owner(owner_session_id)
             except Exception:
                 logger.exception("清理会话时取消子代理任务失败")
-        self.history.clear()
-        self._pending_context_update_text = ""
-        self._pending_world_state = EMPTY_WORLD_STATE
+        self.history.clear_memory()
         self._world_state_baseline = EMPTY_WORLD_STATE
         # Plan Mode: clear 时同步清空 plan state 并广播 PlanModeChanged
         try:
@@ -1885,6 +1911,8 @@ class AgentSession:
         if self.session_store is not None:
             try:
                 self.session_store.clear_active_session()
+                if self._history_journal is not None:
+                    self._history_journal.last_event_seq = 0
             except Exception:
                 logger.exception("清理本地会话失败")
         if self.memory_loader is not None:
@@ -1946,17 +1974,9 @@ class AgentSession:
     def _baseline_request_parts(self) -> tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
         """构造空闲态下一次请求的无副作用基线，不虚构用户输入。"""
         enabled_tools = frozenset(self._enabled_tools_for_prompt())
-        static_parts = get_static_system_prompt(enabled_tools=enabled_tools)
-        static_system = "\n\n".join(p.strip() for p in static_parts if p and p.strip())
-        if self.system_prompt_addendum.strip():
-            static_system = (
-                f"{static_system}\n\n{self.system_prompt_addendum.strip()}"
-                if static_system else self.system_prompt_addendum.strip()
-            )
-        messages: List[Dict[str, Any]] = []
-        if static_system:
-            messages.append({"role": "system", "content": static_system})
-        messages.extend(self._sliced_history_dicts())
+        # 工具执行期间 UI 仍可读取 Context；此时末尾 assistant.tool_calls 已经持久化，
+        # 对应 tool 结果尚未产生，因此诊断快照允许唯一的 pending tail。
+        messages = self._provider_request_messages(allow_pending_tool_tail=True)
 
         # 空闲态使用同一份 world state 规则计算下一请求会新增的现场内容。
         persistent_values = dict(self._world_state_baseline.sections)
@@ -1964,7 +1984,7 @@ class AgentSession:
             if not isinstance(section, DynamicSectionResult):
                 logger.error("空闲态动态上下文返回了非法类型: %s", type(section).__name__)
                 continue
-            if section.persistence != "persistent":
+            if section.scope != "world_state":
                 continue
             key = str(section.name or "").strip()
             if not key:
@@ -2121,34 +2141,32 @@ class AgentSession:
         except Exception:
             logger.exception("context_window_updated emit failed")
 
-    def _append_explicit_skill_content(self, request_content: Any, user_text: str) -> Any:
-        """Append explicitly mentioned skill manuals to this turn only."""
+    def _explicit_skill_evidence(self, user_text: str) -> List[Message]:
+        """读取用户显式点名的 Skill 正文，并返回正式回合证据消息。"""
 
         if self.skill_manager is None or not isinstance(user_text, str):
-            return request_content
+            return []
         try:
             skills = self.skill_manager.collect_explicit_mentions(user_text)
         except Exception:
             logger.exception("explicit skill mention collection failed")
-            return request_content
+            return []
         if not skills:
-            return request_content
+            return []
 
-        blocks: list[str] = []
+        evidence: List[Message] = []
         for skill in skills:
             try:
-                blocks.append(self.skill_manager.load_skill_content(skill.name))
+                content = self.skill_manager.load_skill_content(skill.name)
             except Exception:
                 logger.exception("explicit skill load failed: %s", skill.name)
-        if not blocks:
-            return request_content
-
-        skill_context = "\n\n".join(blocks)
-        if isinstance(request_content, str):
-            return f"{request_content}\n\n{skill_context}"
-        if isinstance(request_content, list):
-            return [*request_content, {"type": "text", "text": skill_context}]
-        return request_content
+                continue
+            if str(content or "").strip():
+                evidence.append(_make_context_evidence_message(
+                    f"skill:{skill.name}",
+                    str(content),
+                ))
+        return evidence
 
     # ---------- 动态上下文阈值 ----------
 
@@ -2174,8 +2192,8 @@ class AgentSession:
         轻量事件给 Done.auto_compact 渲染。``force=True`` 用于 preflight:即便
         state/history 单独看没达到 budget,也强制触发。
 
-        compact 前原始消息只保留在 transcript 审计流中；内存 history 与
-        compact.json 都直接替换为“最近完整回合 + handoff summary”。
+        compact 前原始消息仍保留在 history.jsonl 的旧 generation 事件中；成功后
+        内存 history 安装“最近完整回合 + 现场快照 + 活动回合 + handoff summary”。
         """
         before_usage = self.context_window_usage()
         budget = int(before_usage["max_tokens"])
@@ -2186,8 +2204,7 @@ class AgentSession:
         if not force and int(before_usage["used_tokens"]) < trigger_tokens:
             return None
         before_messages = len(self.history)
-        state_text = self._session_state_text()
-        if before_messages == 0 and not state_text:
+        if before_messages == 0:
             return None
 
         # PreCompact hook：在真正执行压缩前触发（已过滤掉 no-op 的早返回路径）。
@@ -2242,7 +2259,7 @@ class AgentSession:
         messages: List[Dict[str, Any]],
         tools_schema: Optional[List[Dict[str, Any]]],
     ) -> Optional[Dict[str, Any]]:
-        """Compact only when the full active-history request exceeds budget."""
+        """仅在完整 canonical history 请求超过预算时触发 preflight compact。"""
         del user_query, system_instructions  # 估算直接读 messages
         raw_request_tokens = self._estimate_request_tokens(messages, tools_schema)
         request_tokens = self._calibrated_request_tokens(raw_request_tokens)
@@ -2291,31 +2308,24 @@ class AgentSession:
 
     def _mid_turn_compact(
         self,
-        messages: List[Dict[str, Any]],
-        tools_schema: Optional[List[Dict[str, Any]]],
-        loop_state: Dict[str, Any],
         *,
         round_idx: int,
         request_tokens: int,
+        active_turn_id: str,
+        tools_schema: Optional[List[Dict[str, Any]]],
+        request_system_message: Optional[Dict[str, Any]],
+        request_enabled_tools: frozenset[str],
     ) -> Optional[Dict[str, Any]]:
-        """把已提交 history 与当前 in-flight 工具链一起做正式 compact。"""
-        offset = int(loop_state["commit_offset"])
-        inflight = self._extract_inflight_messages(messages, offset)
-        request_only = self._extract_request_only_inflight_messages(messages, offset)
-        loop_state["request_only_inflight"].extend(request_only)
-        if loop_state["history_replaced"]:
-            source_history = [*self.history, *inflight]
-        else:
-            source_history = [
-                *self.history,
-                *list(loop_state["turn_prefix_messages"]),
-                *inflight,
-            ]
-        before_messages = len(source_history)
+        """在完整工具批次边界压缩旧回合，当前活动回合始终原样保留。"""
+
+        before_messages = len(self.history)
         try:
             payload = self.compact_context(
-                source_history=source_history,
                 reason="mid_turn",
+                active_turn_id=active_turn_id,
+                request_system_message=request_system_message,
+                request_tools_schema=tools_schema,
+                request_enabled_tools=request_enabled_tools,
             )
         except Exception:
             logger.exception("工具循环 mid-turn compact 失败")
@@ -2323,20 +2333,12 @@ class AgentSession:
         if payload.get("no_op"):
             return None
 
-        # 只有 compact 成功后才推进审计偏移，防止失败重试时丢失原始协议消息。
-        loop_state["audit_protocol"].extend(inflight)
-        loop_state["history_replaced"] = True
-        system_messages = [
-            message for message in messages
-            if isinstance(message, dict) and message.get("role") == "system"
-        ][:1]
-        messages[:] = [
-            *system_messages,
-            *self._sliced_history_dicts(),
-            *copy.deepcopy(loop_state["request_only_inflight"]),
-        ]
-        loop_state["commit_offset"] = len(messages)
-        after_raw = self._estimate_request_tokens(messages, tools_schema)
+        # replacement 安装完成后，从唯一 history 重新派生 provider 请求。
+        # 这是本轮唯一允许发生的前缀重建边界。
+        after_messages = self._provider_request_messages(
+            system_message=request_system_message,
+        )
+        after_raw = self._estimate_request_tokens(after_messages, tools_schema)
         return {
             "reason": "mid_turn",
             "round_idx": round_idx,
@@ -2354,125 +2356,103 @@ class AgentSession:
 
     def _tool_loop(
         self,
-        messages: List[Dict[str, Any]],
         tools_schema: Optional[List[Dict[str, Any]]],
         token: CancelToken,
         *,
-        loop_state: Dict[str, Any],
+        turn_id: str,
+        request_system_message: Optional[Dict[str, Any]],
+        request_enabled_tools: frozenset[str],
     ) -> tuple[int, str, TraceCollector, List[Dict[str, Any]]]:
-        """工具调用主循环。返回 (rounds_used, final_answer, trace_collector, auto_compactions)。
+        """从唯一 history 驱动工具循环，并在每个协议边界立即持久化。
 
-        每轮：
-        1. 检查 token：进新一轮前已被 cancel → 立刻收尾
-        2. emit RoundStart
-        3. llm.think(event_bus=self.event_bus, cancel_event=token.event)
-        4. 若有 tool_calls：assistant 回灌 → executor.execute → tool 回灌
-           → emit RoundEnd(has_tool_calls=True)。期间 token 被 set 后，
-           ToolExecutor 在工具间会跳过未跑的并 emit Cancelled
-        5. 若没 tool_calls：emit RoundEnd(final=True)，返回 answer
-        6. 超过 MAX_TOOL_ROUNDS 仍未收敛 → emit Error 并兜底
+        provider 所需的 ``messages`` 只在一次请求开始前生成快照。普通重试复用同一
+        快照；assistant、tool 和运行时证据一旦完整产生，就先写 journal，再进入
+        下一次请求。这样不存在回合末尾反向提取或二次提交。
         """
-        partial_answer = ""  # 中断时已经流式打了一部分答案，要回传给前端
-        # trace_collector 仅服务 state.json 结构化字段提取(files_seen 等)。
-        # 本轮 messages 在循环结束后会被 _chat_impl 提取协议消息 commit 到
-        # self.history,跨轮恢复时模型直接看到原始 tool_calls + tool_result。
+
+        last_answer = ""
         trace_collector = TraceCollector()
-        # 工具循环只向 messages 尾部追加协议消息，不改写已经发送过的旧工具结果。
-        # 返回空事件列表是为了保持 _tool_loop 的既有返回契约；窗口压力统一交给
-        # 回合前预检、回合后自动 compact 和这里的硬阻断检查处理。
         loop_compactions: List[Dict[str, Any]] = []
         max_rounds = self.max_tool_rounds
 
-        def _append_final_checkpoint(
-            answer: str,
+        def _append_assistant(
+            raw_answer: str,
             *,
-            round_idx: int,
+            tool_calls: Optional[List[Dict[str, Any]]] = None,
             reasoning_content: Optional[str] = None,
         ) -> None:
-            """把完整最终回答加入本轮协议消息，并立即写运行中检查点。"""
-            if not answer:
-                return
-            assistant_message = Message.create_assistant_message(
-                input_text=answer,
-                reasoning_content=reasoning_content,
+            """保存 provider 的完整 assistant 结果，不使用 UI 过滤后的文本。"""
+
+            self._append_history(
+                [Message.create_assistant_message(
+                    input_text=raw_answer,
+                    tool_calls=tool_calls,
+                    reasoning_content=reasoning_content,
+                )],
+                turn_id=turn_id,
+                event_kind="assistant",
             )
-            messages.append(assistant_message.to_dict())
-            if self.session_store is None:
-                return
-            try:
-                self.session_store.record_active_assistant_final(
-                    round_idx=round_idx,
-                    assistant_message=assistant_message,
-                )
-            except Exception:
-                logger.exception("记录 active 最终回答检查点失败")
 
         for round_idx in range(1, max_rounds + 1):
-            # 进入新一轮前先看 token
             if token.is_cancelled():
                 final_round_idx = round_idx - 1 if round_idx > 1 else 1
-                _append_final_checkpoint(
-                    partial_answer,
-                    round_idx=final_round_idx,
-                )
                 self.event_bus.emit(RoundEnd(
                     round_idx=final_round_idx,
                     has_tool_calls=False, final=True,
                 ))
-                return (
-                    final_round_idx,
-                    partial_answer,
-                    trace_collector,
-                    loop_compactions,
-                )
+                return final_round_idx, last_answer, trace_collector, loop_compactions
 
-            # 后台子代理进度和子代理消息邮箱都在模型调用边界注入。这样主 Agent
-            # 不需要 wait，也能在继续工作的下一轮及时看到当前工具与完成结果。
-            self._inject_runtime_messages(messages)
+            # 通知在真正发请求前才消费，并立即进入 canonical history。即使它只对
+            # 当前工具轮有意义，也不能在下一次请求中从旧位置消失。
+            self._inject_runtime_history(turn_id)
 
             self.event_bus.emit(RoundStart(
                 round_idx=round_idx,
                 max_rounds=max_rounds,
             ))
-            # 直接使用追加式消息列表，确保连续工具轮次的请求前缀保持字节稳定。
-            # 若当前请求已接近完整窗口，则停止本轮并提示正式 compact，不在循环
-            # 中间替换任何旧消息内容。
-            request_tokens_est = self._estimate_request_tokens(messages, tools_schema)
+
+            request_messages = self._provider_request_messages(
+                system_message=request_system_message,
+            )
+            request_tokens_est = self._estimate_request_tokens(request_messages, tools_schema)
             calibrated_tokens = self._calibrated_request_tokens(request_tokens_est)
             self._emit_context_window_update(
                 reason="round_start",
                 round_idx=round_idx,
-                messages=messages,
+                messages=request_messages,
                 tools_schema=tools_schema,
                 used_tokens=request_tokens_est,
             )
             if calibrated_tokens >= self._auto_compact_trigger_tokens():
                 compact_event = self._mid_turn_compact(
-                    messages,
-                    tools_schema,
-                    loop_state,
                     round_idx=round_idx,
                     request_tokens=calibrated_tokens,
+                    active_turn_id=turn_id,
+                    tools_schema=tools_schema,
+                    request_system_message=request_system_message,
+                    request_enabled_tools=request_enabled_tools,
                 )
                 if compact_event is not None:
                     loop_compactions.append(compact_event)
-                    request_tokens_est = self._estimate_request_tokens(messages, tools_schema)
+                    request_messages = self._provider_request_messages(
+                        system_message=request_system_message,
+                    )
+                    request_tokens_est = self._estimate_request_tokens(
+                        request_messages,
+                        tools_schema,
+                    )
                     calibrated_tokens = self._calibrated_request_tokens(request_tokens_est)
                     self._emit_context_window_update(
                         reason="mid_turn_compact",
                         round_idx=round_idx,
-                        messages=messages,
+                        messages=request_messages,
                         tools_schema=tools_schema,
                         used_tokens=request_tokens_est,
                     )
             if calibrated_tokens >= self._full_window_blocking_threshold():
                 overflow_answer = (
-                    partial_answer
+                    last_answer
                     or "[上下文窗口已满] 工具循环中的请求过大，已停止本轮。"
-                )
-                _append_final_checkpoint(
-                    overflow_answer,
-                    round_idx=round_idx,
                 )
                 self.event_bus.emit(Error(
                     where="session",
@@ -2496,14 +2476,14 @@ class AgentSession:
             logger.info(
                 "round start: round=%s messages=%s request_tokens_est=%s calibrated_tokens=%s",
                 round_idx,
-                len(messages),
+                len(request_messages),
                 request_tokens_est,
                 calibrated_tokens,
             )
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        messages,
+                        sanitize_multimodal_payload(request_messages),
                         tools=tools_schema,
                         label=f"第 {round_idx} 轮 think 前",
                     )
@@ -2513,82 +2493,77 @@ class AgentSession:
             # Plan Mode: 用 _PlanParsingEventBus 代理替换真实 event_bus。
             # 这样 LLM 的流式输出 TextDelta 会被实时解析，<proposed_plan> 块内的
             # 文本自动路由为 PlanDelta 事件，块外文本继续走正常 TextDelta。
-            plan_bus = _PlanParsingEventBus(self) if self.collaboration_mode() == "plan" else None
-            self._request_token_estimates[round_idx] = request_tokens_est
-            try:
-                result = self.llm.think(
-                    messages,
-                    tools=tools_schema,
-                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
-                    cancel_event=token.event,
-                    round_idx=round_idx,
-                )
-            except LLMContextOverflowError as exc:
-                # 本轮最多自动 compact + 重试一次；再次 overflow 则上抛保留 checkpoint。
-                if loop_state.get("provider_overflow_retried"):
+            plan_bus = (
+                _PlanParsingEventBus(self)
+                if self.collaboration_mode() == "plan"
+                else None
+            )
+            overflow_retried = False
+            rate_limit_retried = False
+            transport_retried = False
+            while True:
+                self._request_token_estimates[round_idx] = request_tokens_est
+                try:
+                    result = self.llm.think(
+                        request_messages,
+                        tools=tools_schema,
+                        event_bus=plan_bus if plan_bus is not None else self.event_bus,
+                        cancel_event=token.event,
+                        round_idx=round_idx,
+                    )
+                    break
+                except LLMContextOverflowError as exc:
+                    if overflow_retried:
+                        exc.round_idx = round_idx
+                        raise
+                    compact_event = self._mid_turn_compact(
+                        round_idx=round_idx,
+                        request_tokens=calibrated_tokens,
+                        active_turn_id=turn_id,
+                        tools_schema=tools_schema,
+                        request_system_message=request_system_message,
+                        request_enabled_tools=request_enabled_tools,
+                    )
+                    if compact_event is None:
+                        exc.round_idx = round_idx
+                        raise
+                    loop_compactions.append(compact_event)
+                    overflow_retried = True
+                    # overflow compact 是正式 replacement，成功后才生成新快照。
+                    request_messages = self._provider_request_messages(
+                        system_message=request_system_message,
+                    )
+                    request_tokens_est = self._estimate_request_tokens(
+                        request_messages,
+                        tools_schema,
+                    )
+                    calibrated_tokens = self._calibrated_request_tokens(request_tokens_est)
+                except LLMRateLimitError as exc:
+                    if rate_limit_retried:
+                        exc.round_idx = round_idx
+                        raise
+                    rate_limit_retried = True
+                    time.sleep(min(
+                        2.0,
+                        max(0.2, float(exc.details.get("retry_after") or 0.5)),
+                    ))
+                    # 限流重试必须复用同一个 request_messages 对象快照。
+                except LLMTransportError as exc:
+                    if transport_retried or (exc.partial_answer or "").strip():
+                        exc.round_idx = round_idx
+                        raise
+                    transport_retried = True
+                    # 没有产生正文时允许一次幂等重试，仍复用原请求快照。
+                except LLMRequestError as exc:
                     exc.round_idx = round_idx
                     raise
-                compact_event = self._mid_turn_compact(
-                    messages=messages,
-                    tools_schema=tools_schema,
-                    loop_state=loop_state,
-                    round_idx=round_idx,
-                    request_tokens=calibrated_tokens,
-                )
-                if compact_event is None:
-                    exc.round_idx = round_idx
-                    raise
-                loop_compactions.append(compact_event)
-                loop_state["provider_overflow_retried"] = True
-                loop_state.setdefault("auto_compactions", []).append(compact_event)
-                # compact 后消息前缀已变，重新 think 同一轮语义。
-                result = self.llm.think(
-                    messages,
-                    tools=tools_schema,
-                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
-                    cancel_event=token.event,
-                    round_idx=round_idx,
-                )
-            except LLMRateLimitError as exc:
-                # 有界重试一次；不提交失败回合。
-                if loop_state.get("provider_rate_limit_retried"):
-                    exc.round_idx = round_idx
-                    raise
-                loop_state["provider_rate_limit_retried"] = True
-                time.sleep(min(2.0, max(0.2, float(exc.details.get("retry_after") or 0.5))))
-                result = self.llm.think(
-                    messages,
-                    tools=tools_schema,
-                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
-                    cancel_event=token.event,
-                    round_idx=round_idx,
-                )
-            except LLMTransportError as exc:
-                # 仅在尚未产生可见正文时允许一次幂等重试，避免用户看到重复流式文本。
-                if (
-                    loop_state.get("provider_transport_retried")
-                    or (exc.partial_answer or "").strip()
-                ):
-                    exc.round_idx = round_idx
-                    raise
-                loop_state["provider_transport_retried"] = True
-                result = self.llm.think(
-                    messages,
-                    tools=tools_schema,
-                    event_bus=plan_bus if plan_bus is not None else self.event_bus,
-                    cancel_event=token.event,
-                    round_idx=round_idx,
-                )
-            except LLMRequestError as exc:
-                # 鉴权 / invalid / 未知错误：不自动重试。
-                exc.round_idx = round_idx
-                raise
+
             # 流式结束后，flush 解析器缓冲区中残留的计划块内容
             if plan_bus is not None:
                 plan_bus.finish(round_idx)
             if self.message_logger is not None:
                 try:
-                    logged_messages = list(messages)
+                    logged_messages = sanitize_multimodal_payload(request_messages)
                     assistant_payload = _llm_result_to_assistant_payload(result)
                     if assistant_payload is not None:
                         logged_messages.append(assistant_payload)
@@ -2603,19 +2578,22 @@ class AgentSession:
 
             # 不支持 FC 的模型返回 [text, None]
             if isinstance(result, list):
-                # Plan Mode: 非流式模型可能把 <proposed_plan> 嵌在回答文本里，
-                # 需要分离计划块和可见文本
-                final = self._handle_plan_blocks_in_answer(
-                    result[0] or "",
+                raw_answer = str(result[0] or "")
+                visible_answer = self._handle_plan_blocks_in_answer(
+                    raw_answer,
                     round_idx=round_idx,
                     plan_bus=plan_bus,
                 )
-                _append_final_checkpoint(final, round_idx=round_idx)
-                logger.info("round final without tools: round=%s answer_chars=%s", round_idx, len(final))
+                _append_assistant(raw_answer)
+                logger.info(
+                    "round final without tools: round=%s answer_chars=%s",
+                    round_idx,
+                    len(visible_answer),
+                )
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, final, trace_collector, loop_compactions
+                return round_idx, visible_answer, trace_collector, loop_compactions
 
             if not isinstance(result, dict):
                 # think() 已不再返回 None；非 dict/list 视为实现错误，上抛不提交回合。
@@ -2628,73 +2606,60 @@ class AgentSession:
                     retryable=False,
                 )
 
-            # Plan Mode: FC 模型的 answer 字段也可能包含 <proposed_plan> 块。
-            # 流式解析（plan_bus）处理增量输出，这里处理完整 answer 中的残余块。
-            answer = self._handle_plan_blocks_in_answer(
-                result.get("answer", "") or "",
+            raw_answer = str(result.get("answer", "") or "")
+            visible_answer = self._handle_plan_blocks_in_answer(
+                raw_answer,
                 round_idx=round_idx,
                 plan_bus=plan_bus,
             )
             tool_calls = result.get("tool_calls") or []
             reasoning = result.get("reasoning_content")
-            # 流式中途被 cancel：cb_agents 已 emit Cancelled，answer 是已收的部分
-            if answer:
-                partial_answer = answer
+            if visible_answer:
+                last_answer = visible_answer
 
-            # 流式过程中被 cancel → 不再发起新一轮工具调用，直接收尾
             if token.is_cancelled():
-                _append_final_checkpoint(
-                    answer,
-                    round_idx=round_idx,
-                    reasoning_content=reasoning,
+                # 未完成的流式响应不是 provider 的完整协议项，不能伪装成已完成
+                # assistant 写回 history。可见部分只作为本次 UI 返回值。
+                logger.info(
+                    "round cancelled after llm stream: round=%s answer_chars=%s",
+                    round_idx,
+                    len(visible_answer),
                 )
-                logger.info("round cancelled after llm stream: round=%s answer_chars=%s", round_idx, len(answer))
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, answer, trace_collector, loop_compactions
+                return round_idx, visible_answer, trace_collector, loop_compactions
 
             if not tool_calls:
-                _append_final_checkpoint(
-                    answer,
-                    round_idx=round_idx,
+                _append_assistant(
+                    raw_answer,
                     reasoning_content=reasoning,
                 )
-                logger.info("round final: round=%s answer_chars=%s", round_idx, len(answer))
+                logger.info(
+                    "round final: round=%s answer_chars=%s",
+                    round_idx,
+                    len(visible_answer),
+                )
                 self.event_bus.emit(RoundEnd(
                     round_idx=round_idx, has_tool_calls=False, final=True,
                 ))
-                return round_idx, answer, trace_collector, loop_compactions
+                return round_idx, visible_answer, trace_collector, loop_compactions
 
-            # assistant 的 tool_calls 消息回灌
-            assistant_msg: Dict[str, Any] = {
-                "role": "assistant",
-                "content": answer or None,
-                "tool_calls": tool_calls,
-            }
-            if reasoning:
-                # thinking 模式要求 reasoning_content 回传，否则下一轮 400
-                assistant_msg["reasoning_content"] = reasoning
-            messages.append(assistant_msg)
-            if self.session_store is not None:
-                try:
-                    # 只在 LLM 完整返回 tool_calls 后记录规划；流式文本/reasoning
-                    # 增量不作为恢复边界。恢复时 store 还会按已完成工具过滤这里
-                    # 的 tool_calls，确保不会留下有声明无结果的半截调用。
-                    self.session_store.record_active_assistant_tool_calls(
-                        round_idx=round_idx,
-                        assistant_message=Message.create_assistant_message(
-                            input_text=answer or None,
-                            tool_calls=tool_calls,
-                            reasoning_content=reasoning,
-                        ),
-                    )
-                except Exception:
-                    logger.exception("记录 active assistant tool_calls 失败")
+            # 工具执行前先持久化 assistant.tool_calls。若 journal 写失败，工具不会
+            # 启动；进程崩溃后恢复器会为未配对调用补明确失败结果。
+            _append_assistant(
+                raw_answer,
+                tool_calls=tool_calls,
+                reasoning_content=reasoning,
+            )
+            current_messages = self._provider_request_messages(
+                allow_pending_tool_tail=True,
+                system_message=request_system_message,
+            )
             self._emit_context_window_update(
                 reason="tool_calls_planned",
                 round_idx=round_idx,
-                messages=messages,
+                messages=current_messages,
                 tools_schema=tools_schema,
             )
             tool_names = [
@@ -2706,86 +2671,52 @@ class AgentSession:
                 round_idx,
                 len(tool_calls),
                 tool_names,
-                len(answer),
+                len(raw_answer),
                 len(reasoning or ""),
             )
 
-            # 调度执行（事件由 ToolExecutor 自己 emit ToolStart/ToolComplete）
-            # token 透传给 executor：串行/并发模式下都在工具间做 cancel 检查
-            # Plan Mode: 传入 PlanExecutionPolicy，在 executor 层硬拒绝写入工具。
-            # execute 模式下 _plan_execution_policy() 返回 None，正常执行。
-            def _record_tool_started_checkpoint(exec_context, arguments) -> None:
-                """工具进入运行函数前立即写开始检查点。"""
-                if self.session_store is None:
-                    return
-                try:
-                    self.session_store.record_active_tool_started(
-                        round_idx=round_idx,
-                        tool_call_id=str(exec_context.call_id or ""),
-                        tool_name=str(exec_context.tool_name or ""),
-                        arguments=dict(arguments or {}),
-                    )
-                except Exception:
-                    logger.exception("记录 active tool 开始检查点失败")
+            def _checkpoint_tool_result(exec_result) -> None:
+                """把单个工具终态写入 journal，供进程中断后的协议恢复。"""
 
-            def _record_terminal_tool_checkpoint(exec_result) -> None:
-                """单个工具进入唯一终态后立即写运行中检查点。"""
-                if self.session_store is None:
+                if self._history_journal is None:
                     return
-                try:
-                    # 并行完成顺序不固定，call_id 是唯一稳定配对键。
-                    self.session_store.record_active_tool_terminal(
-                        round_idx=round_idx,
-                        tool_message=Message.create_tool_message(
-                            tool_call_id=str(exec_result.call_id or ""),
-                            tool_name=str(exec_result.name),
-                            tool_output=(
-                                exec_result.result
-                                if isinstance(exec_result.result, str)
-                                else str(exec_result.result)
-                            ),
-                            is_error=exec_result.is_error,
-                        ),
-                        status=exec_result.status.value,
-                        effect_state=exec_result.effect_state.value,
-                        cancel_reason=(
-                            exec_result.cancel_reason.value
-                            if exec_result.cancel_reason is not None else ""
-                        ),
+                tool_content = (
+                    exec_result.result
+                    if isinstance(exec_result.result, str)
+                    else str(exec_result.result)
+                )
+                self._history_journal.checkpoint_tool_result(
+                    self.history,
+                    Message.create_tool_message(
+                        tool_call_id=str(exec_result.call_id or ""),
+                        tool_name=str(exec_result.name),
+                        tool_output=tool_content,
                         is_error=exec_result.is_error,
-                    )
-                except Exception:
-                    logger.exception("记录 active tool 终态检查点失败")
+                    ),
+                    turn_id=turn_id,
+                )
 
             results = self.executor.execute(
                 tool_calls,
                 round_idx=round_idx,
                 cancel_token=token,
                 execution_policy=self.tool_execution_policy or self._plan_execution_policy(),
-                result_callback=_record_terminal_tool_checkpoint,
-                start_callback=_record_tool_started_checkpoint,
-                turn_id=str(loop_state.get("turn_id") or ""),
+                result_callback=_checkpoint_tool_result,
+                turn_id=turn_id,
             )
+            tool_messages: List[Message] = []
             for call, exec_result in zip(tool_calls, results):
-                # 完整工具结果按 OpenAI tool calling 协议回灌给本轮 messages,
-                # 同时这一条会在轮末被 _chat_impl 提取并 commit 到 self.history,
-                # 下一轮 _build_chat_messages 重新注入,模型继续看到原始结果。
-                # result_cap.py 已经在 executor 层对超大输出做过持久化截断,
-                # 这里不需要再次压缩。
                 tool_content = (
                     exec_result.result
                     if isinstance(exec_result.result, str)
                     else str(exec_result.result)
                 )
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": call.get("id", ""),
-                    "name": exec_result.name,
-                    "content": tool_content,
-                }
-                messages.append(tool_message)
-                # trace_collector 用于本轮末尾驱动 state.json 结构化字段更新
-                # (files_seen / files_modified / recent_commands 等)。
+                tool_messages.append(Message.create_tool_message(
+                    tool_call_id=str(call.get("id") or exec_result.call_id or ""),
+                    tool_name=str(exec_result.name),
+                    tool_output=tool_content,
+                    is_error=exec_result.is_error,
+                ))
                 trace_collector.add_tool_result(
                     call=call,
                     name=exec_result.name,
@@ -2793,25 +2724,28 @@ class AgentSession:
                     is_error=exec_result.is_error,
                     round_idx=round_idx,
                 )
-                self._emit_context_window_update(
-                    reason="tool_result",
-                    round_idx=round_idx,
-                    messages=messages,
-                    tools_schema=tools_schema,
-                )
 
-            #TODO:现在是一轮工具执行完后塞入image消息？
-            # load_image 多模态分支：图片不能塞进 role=tool（中转站多不接受），
-            # 工具把 image_url 块排进 pending_images 缓冲，这里在全部 tool 消息回灌
-            # 之后追加一条 role=user 消息把图片送给模型。base64 只活在当轮 messages：
-            # _extract_protocol_messages 只 commit assistant / role=tool，user 消息
-            # 不进 history，与用户附件图片同一条安全边界（base64 绝不落 history）。
-            self._inject_pending_images(messages)
+            # 一批工具结果必须按模型声明顺序原子追加，避免并行完成顺序改变协议。
+            self._append_history(
+                tool_messages,
+                turn_id=turn_id,
+                event_kind="tool_results",
+            )
+            self._append_pending_images_to_history(turn_id)
+            current_messages = self._provider_request_messages(
+                system_message=request_system_message,
+            )
+            self._emit_context_window_update(
+                reason="tool_result",
+                round_idx=round_idx,
+                messages=current_messages,
+                tools_schema=tools_schema,
+            )
 
             if self.message_logger is not None:
                 try:
                     self.message_logger.log(
-                        messages,
+                        sanitize_multimodal_payload(current_messages),
                         tools=tools_schema,
                         label=f"round {round_idx} after tool results",
                     )
@@ -2824,7 +2758,7 @@ class AgentSession:
             self._emit_context_window_update(
                 reason="round_end",
                 round_idx=round_idx,
-                messages=messages,
+                messages=current_messages,
                 tools_schema=tools_schema,
             )
             logger.info("round end with tools: round=%s tool_results=%s", round_idx, len(results))
@@ -2836,9 +2770,14 @@ class AgentSession:
             round_idx=max_rounds,
         ))
         max_rounds_answer = "（工具调用次数过多，已终止本轮）"
-        _append_final_checkpoint(
-            max_rounds_answer,
-            round_idx=max_rounds,
+        self._append_history(
+            [Message(
+                role=MessageRole.ASSISTANT,
+                content=max_rounds_answer,
+                metadata={"kind": "turn_failed", "reason": "max_tool_rounds"},
+            )],
+            turn_id=turn_id,
+            event_kind="turn_failed",
         )
         return (
             max_rounds,
@@ -2849,21 +2788,15 @@ class AgentSession:
 
     # ---------- 辅助 ----------
 
-    def _inject_pending_images(self, messages: List[Dict[str, Any]]) -> None:
-        """把 load_image 排队的图片作为一条 role=user 消息注入当轮 messages。
+    def _append_pending_images_to_history(self, turn_id: str) -> None:
+        """把 ``load_image`` 产生的图片桥接消息正式追加到唯一 history。
 
         load_image 工具在视觉模型下不能用返回值带图（role=tool 不接受 image_url），
-        而是把 image_url 内容块排进 pending_images 缓冲。这里在本轮全部 tool 消息
-        回灌之后 drain 缓冲，拼成 [{type:text, "图片加载成功："}, {type:image_url}, ...]
-        的 user 消息，下一轮 think 时模型即可看到原图。
-
-        base64 只存在于当轮 messages：_extract_protocol_messages 只把 assistant /
-        role=tool commit 进 history，user 消息不进 history，因此 data URI 不会落盘，
-        与用户附件图片的安全边界一致。
+        因而仍需合成 user 消息。关键变化是：它不能只存在于临时请求数组，否则
+        下一工具轮或下一用户回合会失去模型已经看过的图片证据。
         """
         try:
             from tools.tools.pending_images import drain_images
-            # 从 pending_images 缓冲中读取所有图片
             pending = drain_images()
         except Exception:
             logger.exception("drain pending images 失败，已忽略")
@@ -2882,123 +2815,23 @@ class AgentSession:
         if not content:
             return
 
-        messages.append({"role": "user", "content": content})
-        logger.info("injected %s pending image(s) as user message", len(pending))
-
-    def _extract_protocol_messages(
-        self,
-        messages: List[Dict[str, Any]],
-        offset: int,
-    ) -> List[Message]:
-        """从本轮 _tool_loop 累积的 messages 中抽出新增的协议消息。
-
-        offset 是 _tool_loop 启动前 messages 的长度。从 offset 到末尾的消息里，
-        我们只保留可以安全跨轮 commit 的部分：
-        - assistant（含 tool_calls / reasoning_content）
-        - role=tool（必须有 tool_call_id）
-        其它（system / user 等）通常不会出现在 _tool_loop 内部，跳过即可。
-
-        多模态 user 消息不在这里处理：本轮 user_query 由 _chat_impl 直接以
-        text 形式 append 到 history，base64 图片不进 history。
-        """
-        out: List[Message] = []
-        for raw in messages[offset:]:
-            if not isinstance(raw, dict):
-                continue
-            role = raw.get("role")
-            if role == "assistant":
-                content = raw.get("content")
-                tool_calls = raw.get("tool_calls")
-                # content 为 None 但 tool_calls 非空时也合法（纯工具调用回合）
-                text = content if isinstance(content, str) else None
-                if not text and not tool_calls:
-                    continue
-                out.append(Message.create_assistant_message(
-                    input_text=text,
-                    tool_calls=tool_calls if isinstance(tool_calls, list) else None,
-                    reasoning_content=(
-                        str(raw.get("reasoning_content"))
-                        if raw.get("reasoning_content") is not None else None
-                    ),
-                ))
-            elif role == "tool":
-                tool_call_id = raw.get("tool_call_id") or ""
-                if not tool_call_id:
-                    continue
-                content = raw.get("content")
-                tool_name = raw.get("name") or raw.get("tool_name") or ""
-                out.append(Message.create_tool_message(
-                    tool_call_id=str(tool_call_id),
-                    tool_name=str(tool_name),
-                    tool_output=str(content or ""),
-                ))
-        return out
-
-    def _extract_inflight_messages(
-        self,
-        messages: List[Dict[str, Any]],
-        offset: int,
-    ) -> List[Message]:
-        """提取当前回合尚未进入 history 的 durable assistant/tool 协议链。
-
-        offset 后出现的 user 都是运行时通知或图片；真实用户输入已经由
-        turn_prefix_messages 单独表示，不能在这里仅凭 role=user 纳入 compact。
-        """
-        out: List[Message] = []
-        for raw in messages[offset:]:
-            if not isinstance(raw, dict):
-                continue
-            role = raw.get("role")
-            if role == "assistant":
-                content = raw.get("content")
-                tool_calls = raw.get("tool_calls")
-                if not content and not tool_calls:
-                    continue
-                out.append(Message.create_assistant_message(
-                    input_text=content if isinstance(content, str) else None,
-                    tool_calls=tool_calls if isinstance(tool_calls, list) else None,
-                    reasoning_content=(
-                        str(raw.get("reasoning_content"))
-                        if raw.get("reasoning_content") is not None else None
-                    ),
-                ))
-            elif role == "tool" and raw.get("tool_call_id"):
-                out.append(Message.create_tool_message(
-                    tool_call_id=str(raw.get("tool_call_id") or ""),
-                    tool_name=str(raw.get("name") or raw.get("tool_name") or ""),
-                    tool_output=str(raw.get("content") or ""),
-                ))
-        return out
-
-    @staticmethod
-    def _extract_request_only_inflight_messages(
-        messages: List[Dict[str, Any]],
-        offset: int,
-    ) -> List[Dict[str, Any]]:
-        """提取工具循环中新追加的 request-only user 消息。
-
-        这些消息在 compact 成功后仍需供当前回合下一次 think 使用，所以保留原始
-        多模态结构；它们只回挂到内存请求，不参与任何持久化。
-        """
-        return [
-            copy.deepcopy(raw)
-            for raw in messages[offset:]
-            if isinstance(raw, dict) and raw.get("role") == "user"
-        ]
-
-    @staticmethod
-    def _messages_tail_is_final_answer(messages: Sequence[Message], final_answer: str) -> bool:
-        """判断任意消息序列末尾是否已经包含最终 assistant 回答。"""
-        if not messages:
-            return False
-        last = messages[-1]
-        role = last.role.value if hasattr(last.role, "value") else str(last.role)
-        return (
-            role == "assistant"
-            and not last.tool_calls
-            and isinstance(last.content, str)
-            and last.content == final_answer
+        self._append_history(
+            [Message(
+                role=MessageRole.USER,
+                content=content,
+                metadata={
+                    "kind": "tool_image_bridge",
+                    "tool_call_ids": [
+                        str(item.get("call_id") or "")
+                        for item in pending
+                        if item.get("call_id")
+                    ],
+                },
+            )],
+            turn_id=turn_id,
+            event_kind="tool_images",
         )
+        logger.info("injected %s pending image(s) as user message", len(pending))
 
     @staticmethod
     def _format_llm_request_error(exc: LLMRequestError) -> str:
@@ -3017,39 +2850,6 @@ class AgentSession:
             detail = detail[:240] + "…"
         return f"[LLM {kind}{status}{model}] {detail}"
 
-    def _history_tail_is_final_answer(self, final_answer: str) -> bool:
-        """判断 history 末尾是否已经是本轮最终 assistant 回答。
-
-        正常路径下 _tool_loop 最后一条 assistant 消息（无 tool_calls）就是 final
-        answer，已经被 _extract_protocol_messages 收进去了；只有 cancel 等异常
-        路径才需要兜底再追加一条 assistant。
-        """
-        if not self.history:
-            return False
-        last = self.history[-1]
-        last_role = last.role.value if hasattr(last.role, "value") else str(last.role)
-        if last_role != "assistant":
-            return False
-        if last.tool_calls:
-            return False
-        last_content = last.content if isinstance(last.content, str) else ""
-        return last_content == final_answer
-
-    def _session_state_text(self) -> str:
-        """读取当前本地会话 state 的可注入文本。
-
-        这个方法和 _build_state_packet() 的读取逻辑保持一致，但返回纯字符串，
-        供 /compact 摘要器使用。它吞掉 store 读取异常，是因为 compact 属于管理
-        命令：state 读失败时仍可压缩内存 history，不能让一次磁盘异常阻断用户。
-        """
-        if self.session_store is None:
-            return ""
-        try:
-            return self.session_store.state_text() or ""
-        except Exception:
-            logger.exception("本地会话状态读取失败")
-            return ""
-
     def _make_work_record(
         self,
         *,
@@ -3057,62 +2857,14 @@ class AgentSession:
         final_answer: str,
         trace_collector: TraceCollector,
     ):
-        """把本轮压缩工具轨迹转换成一条 WorkRecord。
-
-        小 trace 直接用规则总结；大 trace 优先走静默 LLM 总结。无论哪条路径
-        失败，都回退到规则总结，并且不影响本轮最终回答和 Done 事件。
-        """
+        """把本轮工具轨迹转换成只供 state.json 使用的结构化索引。"""
         if not trace_collector.entries:
             return None
-        try:
-            if trace_collector.needs_summary() and self.trace_summarizer is not None:
-                return self.trace_summarizer.summarize(
-                    user_query=user_query,
-                    final_answer=final_answer,
-                    trace_entries=trace_collector.entries,
-                )
-            return self.rule_trace_summarizer.summarize(
-                user_query=user_query,
-                final_answer=final_answer,
-                trace_entries=trace_collector.entries,
-            )
-        except Exception:
-            logger.exception("工具轨迹总结失败，使用规则压缩兜底")
-            return self.rule_trace_summarizer.summarize(
-                user_query=user_query,
-                final_answer=final_answer,
-                trace_entries=trace_collector.entries,
-            )
-
-    def _persist_turn(
-        self,
-        user_query: str,
-        final_answer: str,
-        work_record,
-        committed_messages: List[Message],
-        *,
-        turn_id: Optional[str] = None,
-    ) -> None:
-        """把本轮对话和工作记录写入项目级 session store。
-
-        committed_messages 是本轮 _tool_loop 实际进入 self.history 的消息序列
-        (含 user / assistant 含 tool_calls / role=tool / 最终 assistant)。
-        透传给 LocalSessionStore.append_turn 用于 transcript 落盘,跨进程恢复
-        时模型仍能看到原始工具调用细节。
-        """
-        if self.session_store is None:
-            return
-        try:
-            self.session_store.append_turn(
-                user_query=user_query,
-                final_answer=final_answer,
-                committed_messages=committed_messages,
-                work_record=work_record,
-                turn_id=turn_id,
-            )
-        except Exception:
-            logger.exception("本地会话落盘失败")
-            raise
+        return self.trace_state_indexer.summarize(
+            user_query=user_query,
+            final_answer=final_answer,
+            trace_entries=trace_collector.entries,
+        )
 
     def _auto_update_memory_and_knowledge(
         self,
@@ -3121,7 +2873,7 @@ class AgentSession:
         final_answer: str,
         work_record_text: str = "",
     ) -> None:
-        """Best-effort long-term memory and structured knowledge update."""
+        """尽力更新长期记忆与结构化知识，不影响主回合结果。"""
         if not self.memory_writeback_enabled:
             return
         if self.memory_loader is None or not self.ctx_enabled:
@@ -3150,11 +2902,11 @@ class AgentSession:
         # 避免 hook 拦截或预检失败时提前推进事件游标并丢失通知。
         return self._prepend_background_notifications(user_query)
 
-    def _inject_runtime_messages(self, messages: List[Dict[str, Any]]) -> None:
-        """在每轮 think 前注入父任务进度或子任务邮箱消息。
+    def _inject_runtime_history(self, turn_id: str) -> None:
+        """消费父任务进度和邮箱消息，并把模型可见原文追加到 history。
 
-        这些合成 user 消息只活在当前工具循环中，``_extract_protocol_messages``
-        不会把它们提交到跨轮 history，避免高频运行态永久污染会话。
+        通知是某一时刻发生过的回合证据，不属于 world-state baseline；但只要下一次
+        provider 请求会看到它，就必须先持久化，不能在后续请求中悄悄消失。
         """
 
         parts: List[str] = []
@@ -3181,10 +2933,14 @@ class AgentSession:
             except Exception:
                 logger.exception("读取运行中补充消息失败")
         if parts:
-            messages.append({
-                "role": "user",
-                "content": "<runtime-update>\n" + "\n\n".join(parts) + "\n</runtime-update>",
-            })
+            self._append_history(
+                [_make_context_evidence_message(
+                    "runtime_update",
+                    "\n\n".join(parts),
+                )],
+                turn_id=turn_id,
+                event_kind="runtime_update",
+            )
 
     def _prepend_background_notifications(self, user_query: str) -> str:
         """每轮 chat 前 drain 后台任务通知，挂到 user_query 前作为 system reminder。

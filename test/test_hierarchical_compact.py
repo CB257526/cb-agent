@@ -99,7 +99,6 @@ def test_single_pass_when_history_fits_hard_limit():
     )
     assert result.strategy == "single_pass"
     assert result.summary_requests == 1
-    assert result.dropped_messages == 0
     assert result.source_message_count == 2
     assert result.covered_message_count == 2
     assert "full handoff" in result.summary
@@ -131,7 +130,6 @@ def test_hierarchical_covers_all_unique_markers():
         estimate_request_tokens=_estimate_by_char_budget,
     )
     assert result.strategy == "hierarchical"
-    assert result.dropped_messages == 0
     assert result.summary_requests >= 2
     assert result.covered_message_count == result.source_message_count == 6
 

@@ -19,16 +19,16 @@ class DynamicSectionResult:
       - absent:  读取成功但确认不存在（如可选 section 无内容）
       - error:   读取失败，不会生成 removed 更新
 
-    persistence:
-      - persistent:   进入 history context_update，后续回合可比较 baseline diff
-      - request_only: 仅加入本轮请求，不进入 history、transcript 或 compact baseline
+    scope:
+      - world_state:  当前仍然成立的环境状态，参与 baseline diff
+      - turn_evidence: 某个回合实际提供给模型的证据，不参与 baseline，但同样进入 history
     """
 
     name: str
     status: Literal["present", "absent", "error"] = "present"
     text: str = ""
     error: str = ""
-    persistence: Literal["persistent", "request_only"] = "persistent"
+    scope: Literal["world_state", "turn_evidence"] = "world_state"
 
     @classmethod
     def present(
@@ -36,18 +36,18 @@ class DynamicSectionResult:
         name: str,
         text: str,
         *,
-        persistence: Literal["persistent", "request_only"] = "persistent",
+        scope: Literal["world_state", "turn_evidence"] = "world_state",
     ) -> "DynamicSectionResult":
-        return cls(name=name, status="present", text=str(text or "").strip(), persistence=persistence)
+        return cls(name=name, status="present", text=str(text or "").strip(), scope=scope)
 
     @classmethod
     def absent(
         cls,
         name: str,
         *,
-        persistence: Literal["persistent", "request_only"] = "persistent",
+        scope: Literal["world_state", "turn_evidence"] = "world_state",
     ) -> "DynamicSectionResult":
-        return cls(name=name, status="absent", persistence=persistence)
+        return cls(name=name, status="absent", scope=scope)
 
     @classmethod
     def error_result(
@@ -55,13 +55,13 @@ class DynamicSectionResult:
         name: str,
         error: str = "",
         *,
-        persistence: Literal["persistent", "request_only"] = "persistent",
+        scope: Literal["world_state", "turn_evidence"] = "world_state",
     ) -> "DynamicSectionResult":
         return cls(
             name=name,
             status="error",
             error=str(error or ""),
-            persistence=persistence,
+            scope=scope,
         )
 
 

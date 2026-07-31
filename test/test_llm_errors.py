@@ -103,7 +103,7 @@ class _Registry:
         return []
 
 
-class TestSessionDoesNotCommitFailedTurns(unittest.TestCase):
+class TestSessionRecordsFailedTurns(unittest.TestCase):
     def _session(self, store: LocalSessionStore, llm: Any) -> AgentSession:
         session = AgentSession(
             llm=llm,
@@ -114,46 +114,42 @@ class TestSessionDoesNotCommitFailedTurns(unittest.TestCase):
             ctx_enabled=False,
             max_tool_rounds=2,
         )
-        session.history = [
+        session._append_history([
             Message.create_user_message("旧问题"),
             Message.create_assistant_message("旧回答"),
-        ]
+        ], turn_id="old-turn")
         return session
 
-    def test_provider_failure_does_not_append_turn(self):
+    def test_provider_failure_keeps_user_and_appends_failure_boundary(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
-            # 先写入一笔成功回合，便于对比 transcript 行数。
-            store.append_turn(
-                user_query="旧问题",
-                final_answer="旧回答",
-                committed_messages=[
-                    Message.create_user_message("旧问题"),
-                    Message.create_assistant_message("旧回答"),
-                ],
-            )
-            before_lines = (store.active_dir / "transcript.jsonl").read_text(encoding="utf-8").count("\n")
             llm = _FailingLLM(LLMInvalidRequestError(message="bad request", status_code=400, retryable=False))
             session = self._session(store, llm)
-            history_before = list(session.history)
+            history_before = [message.to_dict() for message in session.history]
 
             events: List[Any] = []
             session.event_bus.subscribe(lambda e: events.append(e))
             answer = session.chat("新问题")
 
             self.assertIn("请求无效", answer)
-            self.assertEqual([type(m) for m in session.history], [type(m) for m in history_before])
-            self.assertEqual(len(session.history), len(history_before))
-            after_lines = (store.active_dir / "transcript.jsonl").read_text(encoding="utf-8").count("\n")
-            self.assertEqual(after_lines, before_lines)
+            self.assertEqual(
+                [message.to_dict() for message in session.history[:2]],
+                history_before,
+            )
+            self.assertTrue(any(
+                message.role.value == "user" and "新问题" in str(message.content)
+                for message in session.history
+            ))
+            self.assertEqual(
+                (session.history[-1].metadata or {}).get("kind"),
+                "turn_failed",
+            )
             self.assertTrue(any(isinstance(e, Error) for e in events))
             self.assertTrue(any(isinstance(e, Done) for e in events))
-            # active/pending 保留：begin_active_turn 后失败不应清 checkpoint。
-            self.assertTrue((store.active_dir / "active_turn.jsonl").exists() or (store.active_dir / "pending_user.json").exists())
+            self.assertTrue((store.active_dir / "history.jsonl").exists())
 
-    def test_think_none_no_longer_commits_empty_assistant(self):
-        """回归：think 不再返回 None；若返回非 dict 也不得提交回合。"""
+    def test_think_none_appends_failure_boundary_instead_of_empty_assistant(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -168,7 +164,11 @@ class TestSessionDoesNotCommitFailedTurns(unittest.TestCase):
             before = len(session.history)
             answer = session.chat("应失败")
             self.assertIn("请求", answer)
-            self.assertEqual(len(session.history), before)
+            self.assertGreater(len(session.history), before)
+            self.assertEqual(
+                (session.history[-1].metadata or {}).get("kind"),
+                "turn_failed",
+            )
 
 
 if __name__ == "__main__":

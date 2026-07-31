@@ -471,10 +471,14 @@ class TestGatewayDispatch(unittest.TestCase):
                 coro.close()
             bus.unsubscribe(gateway._on_event)
 
-    def test_gateway_ready_includes_active_turn_history(self):
+    def test_gateway_ready_includes_canonical_history(self):
         with tempfile.TemporaryDirectory() as td:
             store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
-            store.begin_active_turn(user_query="ready 恢复输入")
+            seed, _ = _make_session_for_gateway(FakeLLM([]), session_store=store)
+            seed._append_history(
+                [Message(role="user", content="ready 恢复输入")],
+                turn_id="ready-turn",
+            )
 
             msgs = self._run_gateway_with_msgs(
                 FakeLLM([]),
@@ -486,7 +490,6 @@ class TestGatewayDispatch(unittest.TestCase):
             ready = [m for m in msgs if m.get("params", {}).get("type") == "gateway_ready"][0]
             history = ready["params"]["history"]
             self.assertTrue(any(item["content"] == "ready 恢复输入" for item in history))
-            self.assertTrue(any(item.get("interrupted") for item in history))
 
     def test_gateway_unknown_method(self):
         llm = FakeLLM([])
@@ -587,24 +590,23 @@ class TestGatewayDispatch(unittest.TestCase):
         self.assertEqual(replies[0]["result"]["cleared"], True)
 
     def test_gateway_compact_context(self):
-        """session.compact 返回压缩 payload，并写入当前 session 的 compact 快照。"""
+        """session.compact 返回压缩 payload，并写入 v4 replace 事件。"""
         with tempfile.TemporaryDirectory() as td:
             store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
-            store.append_turn(
-                user_query="旧问题一",
-                final_answer="旧回答一",
-                committed_messages=[
+            seed, _ = _make_session_for_gateway(FakeLLM([]), session_store=store)
+            seed._append_history(
+                [
                     Message.create_user_message("旧问题一"),
                     Message.create_assistant_message("旧回答一"),
                 ],
+                turn_id="turn-one",
             )
-            store.append_turn(
-                user_query="旧问题二",
-                final_answer="旧回答二",
-                committed_messages=[
+            seed._append_history(
+                [
                     Message.create_user_message("旧问题二"),
                     Message.create_assistant_message("旧回答二"),
                 ],
+                turn_id="turn-two",
             )
 
             # 默认动态预算下这段小历史应 no-op；测试通过收紧预算验证 RPC 的
@@ -626,7 +628,8 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertIn("context_window", result)
             self.assertGreater(result["context_window"]["used_tokens"], 0)
             self.assertTrue(result["persisted"])
-            self.assertTrue((store.active_dir / "compact.json").exists())
+            self.assertTrue((store.active_dir / "history.jsonl").exists())
+            self.assertFalse((store.active_dir / "compact.json").exists())
 
     def test_gateway_compact_keeps_reader_responsive(self):
         """compact 阻塞期间 list_models 仍应立即返回，状态变更则明确返回 busy。"""
@@ -1087,23 +1090,22 @@ class TestGatewayDispatch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
             first_id = store.active_session_id
-            store.append_turn(
-                user_query="第一会话问题",
-                final_answer="第一轮回答",
-                committed_messages=[
+            seed, _ = _make_session_for_gateway(FakeLLM([]), session_store=store)
+            seed._append_history(
+                [
                     Message.create_user_message("第一会话问题"),
                     Message.create_assistant_message("第一轮回答"),
                 ],
+                turn_id="first-turn",
             )
-            second = store.create_session()
-            second_id = second["session_id"]
-            store.append_turn(
-                user_query="第二会话问题",
-                final_answer="第二轮回答",
-                committed_messages=[
+            second = seed.create_session()
+            second_id = second["session"]["session_id"]
+            seed._append_history(
+                [
                     Message.create_user_message("第二会话问题"),
                     Message.create_assistant_message("第二轮回答"),
                 ],
+                turn_id="second-turn",
             )
 
             msgs = self._run_gateway_with_msgs(
@@ -1137,12 +1139,16 @@ class TestGatewayDispatch(unittest.TestCase):
             self.assertIn("第一轮回答", history_text)
             self.assertNotIn("第二会话问题", history_text)
 
-    def test_gateway_session_switch_restores_active_turn_history(self):
+    def test_gateway_session_switch_restores_canonical_history(self):
         with tempfile.TemporaryDirectory() as td:
             store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
             first_id = store.active_session_id
-            store.begin_active_turn(user_query="切回未完成会话")
-            store.create_session()
+            seed, _ = _make_session_for_gateway(FakeLLM([]), session_store=store)
+            seed._append_history(
+                [Message(role="user", content="切回已保存会话")],
+                turn_id="saved-turn",
+            )
+            seed.create_session()
 
             msgs = self._run_gateway_with_msgs(
                 FakeLLM([]),
@@ -1160,8 +1166,7 @@ class TestGatewayDispatch(unittest.TestCase):
 
             switch_reply = [m for m in msgs if m.get("id") == "sw-active"][0]
             history = switch_reply["result"]["history"]
-            self.assertTrue(any(item["content"] == "切回未完成会话" for item in history))
-            self.assertTrue(any(item.get("interrupted") for item in history))
+            self.assertTrue(any(item["content"] == "切回已保存会话" for item in history))
 
 
 if __name__ == "__main__":

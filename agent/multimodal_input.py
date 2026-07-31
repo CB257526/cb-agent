@@ -1,8 +1,8 @@
 """多模态用户输入归一化。
 
-这一层是“当前轮模型请求”和“跨轮上下文持久化”的安全边界：
-- 当前轮请求可以在多模态模型上携带 image_url data URI；
-- history/state/compact/transcript 只能保存文本摘要和元数据，绝不保存 base64。
+这一层只生成模型真正接收的用户 content。调用方把该 content 原样追加到 canonical
+history，因此当前轮和后续轮不存在两种表示。日志与 UI 可以使用脱敏副本，但不得
+用脱敏内容反向覆盖模型历史。
 """
 
 from __future__ import annotations
@@ -106,7 +106,6 @@ class ProcessedAttachment:
 @dataclass
 class ProcessedMultimodalPrompt:
     request_content: Union[str, List[Dict[str, Any]]]
-    history_text: str
     attachments: List[ProcessedAttachment]
 
     def attachments_payload(self) -> List[Dict[str, Any]]:
@@ -147,22 +146,19 @@ def process_multimodal_prompt(
     model: Optional[str] = None,
     cwd: Optional[Path] = None,
     processor: Optional[MultimodalProcessor] = None,
-    history_text: Optional[str] = None,
     soft_limit_tokens: Optional[int] = None,
     image_ability: Optional[bool] = None,
 ) -> ProcessedMultimodalPrompt:
-    """把用户文本和附件转换成“请求内容 + 跨轮摘要”。
+    """把用户文本和附件转换成唯一的模型可见请求内容。
 
-    ``request_content`` 供本轮 OpenAI messages 使用；``history_text`` 供 history、
-    transcript、compact 和 context_window_usage 使用。二者分开可以避免 data URI
-    被长期保存或参与动态上下文估算。
+    ``request_content`` 会直接进入 canonical history。原生图片因此保留稳定 data
+    URI；日志和 UI 只能通过 ``sanitize_multimodal_payload`` 生成脱敏副本。
 
     文本/文档附件：完整 Markdown 写入
-    ``.cbagent/attachments/<content_hash>/content.md``；请求与 history 只注入
-    manifest + 聚合预算内的 preview，不再整文 120K 注入。
+    ``.cbagent/attachments/<content_hash>/content.md``；请求只注入 manifest 与聚合
+    预算内的 preview，不再整文 120K 注入。
     """
     clean_text = str(text or "").strip()
-    clean_history_text = str(history_text if history_text is not None else clean_text).strip()
     raw_attachments = list(attachments or [])
     if not clean_text and not raw_attachments:
         raise MultimodalInputError("请输入文本或至少添加一个附件。")
@@ -170,7 +166,6 @@ def process_multimodal_prompt(
     if not raw_attachments:
         return ProcessedMultimodalPrompt(
             request_content=clean_text,
-            history_text=clean_history_text,
             attachments=[],
         )
 
@@ -190,13 +185,10 @@ def process_multimodal_prompt(
     # 缺少该值时才按 model id 回退全局默认。
     image_native = bool(image_ability) if image_ability is not None else model_supports_image(model)
     request_parts: List[Dict[str, Any]] = []
-    history_lines: List[str] = []
     processed: List[ProcessedAttachment] = []
 
     if clean_text:
         request_parts.append({"type": "text", "text": clean_text})
-    if clean_history_text:
-        history_lines.append(clean_history_text)
 
     aggregate_budget = _attachment_aggregate_budget_chars(
         soft_limit_tokens=soft_limit_tokens,
@@ -224,9 +216,8 @@ def process_multimodal_prompt(
                 "原生图片聚合视觉预算超限："
                 f"estimated={visual_tokens_used} tokens, budget={visual_budget} tokens。"
                 "请减少图片数量、降低分辨率或分批发送。"
-            )
+        )
         processed.append(attachment)
-        history_lines.extend(_history_lines_for_attachment(idx, attachment))
 
     if attachment_notes:
         request_parts.insert(0, {
@@ -236,12 +227,9 @@ def process_multimodal_prompt(
 
     if not clean_text:
         request_parts.insert(0, {"type": "text", "text": "请根据以下附件回答用户问题。"})
-    if not clean_history_text:
-        history_lines.insert(0, "请根据以下附件回答用户问题。")
 
     return ProcessedMultimodalPrompt(
         request_content=request_parts,
-        history_text="\n".join(line for line in history_lines if line).strip(),
         attachments=processed,
     )
 
@@ -288,7 +276,7 @@ def _process_one_attachment(
         base.estimated_tokens = _estimate_native_image_tokens(path, len(file_bytes))
         attachment_notes.append(
             f"[附件 #{index}: image {path.name}] 图片将作为视觉输入发送给模型；"
-            "跨轮历史只保留此摘要，base64 不会进入 history/transcript。"
+            "后续请求继续使用 canonical history 中同一份图像内容。"
         )
         return base
 
@@ -429,11 +417,10 @@ def _read_limited_bytes(path: Path) -> bytes:
 
 
 def _convert_attachment_to_markdown(path: Path, *, modality: str) -> str:
-    """Convert text/document attachments into Markdown using MarkItDown.
+    """使用 MarkItDown 把文本或文档附件转换为 Markdown。
 
-    The Python backend is launched from the project environment, so importing
-    MarkItDown here uses the same runtime as the agent. Plain text files fall
-    back to direct decoding if MarkItDown is unavailable or cannot parse them.
+    Python 后端从项目环境启动，因此这里导入的 MarkItDown 与 Agent 使用同一运行
+    环境。MarkItDown 不可用或无法解析普通文本时，回退为直接解码文件。
     """
     try:
         with warnings.catch_warnings():
@@ -606,23 +593,6 @@ def _sanitize_data_uri(value: str) -> str:
         return value
     mime = value[5:value.find(";base64,")] or "application/octet-stream"
     return f"[data-uri omitted: {mime}, chars={len(value)}]"
-
-
-def _history_lines_for_attachment(index: int, item: ProcessedAttachment) -> List[str]:
-    """history 只保留 manifest + 短 preview，不保存完整 Markdown 正文。"""
-    header = (
-        f"[附件摘要 #{index}] modality={item.modality} file={item.file_name} "
-        f"source={item.source} routed_as={item.routed_as} "
-        f"size={item.size} hash={item.content_hash}"
-    )
-    if item.artifact_path:
-        header += f" artifact={item.artifact_path} full_chars={item.full_chars}"
-    lines = [header]
-    if item.text:
-        # history 再限一次，避免 OCR/ASR 过长
-        preview = item.text if len(item.text) <= 2000 else item.text[:2000] + "…"
-        lines.append(preview)
-    return lines
 
 
 __all__ = [

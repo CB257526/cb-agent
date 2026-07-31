@@ -4,7 +4,7 @@
 - 支持视觉的主模型：图片以 image_url 进入当前请求；
 - 纯文本主模型：图片先转成文本摘要；
 - 音频始终转 ASR 文本；
-- history/token/log 侧只能看到文本摘要或脱敏占位符，不能保存 data URI。
+- canonical history 保存真实模型输入；token/log 侧使用脱敏副本。
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ class TestMultimodalInput(unittest.TestCase):
         else:
             ConstantLLM.llm_dict["text-test"] = self._old_text
 
-    def test_image_native_route_keeps_history_text_only(self) -> None:
+    def test_image_native_route_builds_model_visible_data_uri(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "shot.png"
             path.write_bytes(b"png bytes")
@@ -99,8 +99,6 @@ class TestMultimodalInput(unittest.TestCase):
         image_parts = [p for p in prompt.request_content if p.get("type") == "image_url"]
         self.assertEqual(len(image_parts), 1)
         self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
-        self.assertIn("图片已原生发送", prompt.history_text)
-        self.assertNotIn("base64", prompt.history_text)
         self.assertEqual(prompt.attachments[0].routed_as, "image_url")
 
     def test_text_model_image_route_uses_processor_text(self) -> None:
@@ -119,7 +117,6 @@ class TestMultimodalInput(unittest.TestCase):
 
         self.assertEqual(len(processor.images), 1)
         self.assertIn("图像 OCR 文本", str(prompt.request_content))
-        self.assertIn("图像 OCR 文本", prompt.history_text)
         self.assertEqual(prompt.attachments[0].routed_as, "ocr")
 
     def test_active_model_image_ability_overrides_duplicate_model_id_default(self) -> None:
@@ -171,8 +168,8 @@ class TestMultimodalInput(unittest.TestCase):
             )
 
         self.assertEqual(len(processor.audio), 1)
-        self.assertIn("请根据以下附件回答用户问题。", prompt.history_text)
-        self.assertIn("音频 ASR 文本", prompt.history_text)
+        self.assertIn("请根据以下附件回答用户问题。", str(prompt.request_content))
+        self.assertIn("音频 ASR 文本", str(prompt.request_content))
         self.assertEqual(prompt.attachments[0].routed_as, "asr")
 
     def test_text_attachment_uses_markdown_route(self) -> None:
@@ -194,8 +191,7 @@ class TestMultimodalInput(unittest.TestCase):
 
             convert.assert_called_once()
             self.assertIn("# Note", str(prompt.request_content))
-            # history 含 preview/manifest，完整正文在 artifact
-            self.assertIn("# Note", prompt.history_text)
+            # 请求含 preview/manifest，完整正文在 artifact。
             self.assertEqual(prompt.attachments[0].modality, "text")
             self.assertEqual(prompt.attachments[0].routed_as, "markdown")
             self.assertTrue(prompt.attachments[0].artifact_path)
@@ -224,7 +220,6 @@ class TestMultimodalInput(unittest.TestCase):
 
             convert.assert_called_once()
             self.assertIn("# Paper", str(prompt.request_content))
-            self.assertIn("# Paper", prompt.history_text)
             self.assertEqual(prompt.attachments[0].modality, "document")
             self.assertEqual(prompt.attachments[0].routed_as, "markdown")
             self.assertTrue(prompt.attachments[0].artifact_path)
@@ -247,11 +242,10 @@ class TestMultimodalInput(unittest.TestCase):
             full = Path(art).read_text(encoding="utf-8")
             self.assertIn(tail, full)
             self.assertEqual(len(full), len(body))
-            # history / request 不得包含整份 200K 正文
-            self.assertLess(len(prompt.history_text), 50_000)
-            self.assertNotIn(tail, prompt.history_text)
-            self.assertIn("artifact=", prompt.history_text)
+            # canonical history 使用的 request content 不得包含整份 200K 正文。
             req = str(prompt.request_content)
+            self.assertLess(len(req), 50_000)
+            self.assertNotIn(tail, req)
             self.assertIn("artifact=", req)
             self.assertIn("file_read", req)
 

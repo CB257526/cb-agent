@@ -363,9 +363,9 @@ class Gateway:
     def _handle_compact(self, rpc_id: Any) -> None:
         """压缩当前会话上下文。
 
-        compact 会重写内存 history，并写 compact.json 快照。它和 create/switch 一样
-        不能在 chat 忙碌时执行，否则当前 chat 可能一边读取旧 history，一边被另
-        一个 RPC 改写并落盘，造成上下文和 transcript 的对应关系变乱。
+        compact 会安装新的 history generation，并写入 v4 replace 事件。它和
+        create/switch 一样不能在 chat 忙碌时执行，否则当前 chat 可能一边读取旧
+        generation，一边被另一个 RPC 替换并落盘。
         """
         if rpc_id is None:
             return
@@ -467,7 +467,7 @@ class Gateway:
     def _handle_list_sessions(self, rpc_id: Any) -> None:
         """列出项目级本地会话。
 
-        返回值只包含轻量摘要，不包含 transcript 全文。TUI 用它渲染会话切换面板；
+        返回值只包含轻量摘要，不包含 history journal 全文。TUI 用它渲染会话面板；
         真正切换时再通过 ``session.switch`` 拿对应会话的最近 history。
         """
         if rpc_id is None:

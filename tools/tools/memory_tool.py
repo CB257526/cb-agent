@@ -289,7 +289,7 @@ class MemoryTool(Tool):
             )
 
             if not results:
-                # 命中 0 条时返回空串而非人类提示语，便于上游（如 ContextBuilder）
+                # 命中 0 条时返回空串而非人类提示语，便于动态上下文组装层
                 # 用 None/空串契约判定无结果，避免下游做字面匹配
                 return ""
 

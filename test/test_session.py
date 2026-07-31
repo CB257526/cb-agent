@@ -46,7 +46,7 @@ from agent.executor import ToolExecutor
 from agent.session import AgentSession
 from agent.work_context import LocalSessionStore
 from constant.llm.constant_llm import ConstantLLM
-from core.message import Message
+from core.message import Message, MessageRole
 
 
 # ========== fakes ==========
@@ -240,8 +240,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(updates[-1].context_window["source"], "provider")
             self.assertAlmostEqual(updates[-1].context_window["calibration_ratio"], 100 / 120, places=3)
 
-    def test_image_capable_model_sends_image_but_history_keeps_summary(self):
-        """支持视觉的模型当前轮收到 image_url，但跨轮 history 不保存 data URI。"""
+    def test_image_message_remains_exact_prefix_across_user_turns(self):
+        """普通 append 流程不会在下一用户回合改写已经发送过的图片消息。"""
         original = ConstantLLM.llm_dict.get("fake")
         ConstantLLM.llm_dict["fake"] = {
             "is_tool": True,
@@ -253,10 +253,14 @@ class TestAgentSessionBasic(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 image = Path(td) / "shot.png"
                 image.write_bytes(b"image bytes")
-                llm = FakeLLM([{"answer": "看到了", "tool_calls": []}])
+                llm = FakeLLM([
+                    {"answer": "看到了", "tool_calls": []},
+                    {"answer": "继续", "tool_calls": []},
+                ])
                 s = self._make_session(llm)
 
                 s.chat("图里有什么", attachments=[{"path": str(image), "source": "direct"}])
+                s.chat("继续说明")
 
             first_messages = llm.calls[0]["messages"]
             last_user = first_messages[-1]
@@ -265,10 +269,10 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(len(image_parts), 1)
             self.assertTrue(image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,"))
 
+            second_messages = llm.calls[1]["messages"]
+            self.assertEqual(first_messages, second_messages[:len(first_messages)])
             history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
-            self.assertIn("图片已原生发送", history_dump)
-            self.assertNotIn("data:image", history_dump)
-            self.assertNotIn("base64", history_dump)
+            self.assertIn("data:image/png;base64,", history_dump)
 
         finally:
             if original is None:
@@ -486,6 +490,54 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
+    def test_tool_loop_freezes_system_and_tools_schema_for_current_turn(self):
+        """注册表中途变化不能改写同一用户回合的请求外壳。"""
+
+        llm = FakeLLM([
+            {
+                "answer": "",
+                "tool_calls": [_tc("file_read", '{"path":"a.txt"}', call_id="call-a")],
+            },
+            {"answer": "完成", "tool_calls": []},
+        ])
+        schema_v1 = [{
+            "type": "function",
+            "function": {
+                "name": "file_read",
+                "description": "v1",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        schema_v2 = [*schema_v1, {
+            "type": "function",
+            "function": {
+                "name": "new_tool",
+                "description": "v2",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        schema_reads = iter([schema_v1])
+        tool_reads = iter([["file_read"]])
+        self.registry.get_tools_description_openai_schema.side_effect = (
+            lambda: next(schema_reads, schema_v2)
+        )
+        self.registry.list_tools.side_effect = (
+            lambda: next(tool_reads, ["new_tool", "file_read"])
+        )
+
+        def execute_and_change_registry(*_args, **_kwargs):
+            return json.dumps({"path": "a.txt", "content": "ok"})
+
+        self.registry.execute_tool = MagicMock(side_effect=execute_and_change_registry)
+        self.executor = ToolExecutor(self.registry.execute_tool, self.bus)
+        session = self._make_session(llm)
+        session.chat("读取文件")
+
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(llm.calls[0]["messages"][0], llm.calls[1]["messages"][0])
+        self.assertEqual(llm.calls[0]["tools"], llm.calls[1]["tools"])
+        self.assertNotIn("new_tool", str(llm.calls[1]["tools"]))
+
     def test_dynamic_context_counts_tool_call_arguments(self):
         """P1 回归:Context% 估算必须把纯 tool_calls 的 arguments 计入。
 
@@ -541,16 +593,18 @@ class TestAgentSessionBasic(unittest.TestCase):
                 event_bus=self.bus, ctx_enabled=False,
             )
             from core.message import Message
-            s.history.append(Message.create_user_message("早期问题 " + "A" * 3000))
-            s.history.append(Message.create_assistant_message("早期回答 " + "B" * 3000))
+            s._append_history([
+                Message.create_user_message("早期问题 " + "A" * 3000),
+                Message.create_assistant_message("早期回答 " + "B" * 3000),
+            ], turn_id="old")
             text_before = s._dynamic_context_text()
             self.assertIn("A" * 100, text_before)
 
             # compact 会直接替换 active history，不再依赖 boundary 切片。
-            s.history = [
+            s._replace_history([
                 Message.create_user_message("新问题"),
                 make_summary_message("摘要", reason="auto"),
-            ]
+            ], reason="test")
 
             text_after = s._dynamic_context_text()
             # 早期长消息已被切片排除,不再出现在估算文本里
@@ -564,7 +618,7 @@ class TestAgentSessionBasic(unittest.TestCase):
                 ConstantLLM.llm_dict["fake"] = original
 
     def test_replacement_history_is_not_message_count_trimmed(self):
-        """验证 active replacement history 按全量发送，不按消息数截断。"""
+        """验证 canonical history 按全量发送，不按消息数截断。"""
         original = ConstantLLM.llm_dict.get("fake")
         try:
             ConstantLLM.llm_dict["fake"] = {
@@ -579,10 +633,13 @@ class TestAgentSessionBasic(unittest.TestCase):
             from core.message import Message
             # 构造 summary + 6 条尾部消息，应全部进入请求。
             for i in range(6):
-                s.history.append(Message.create_user_message(f"tail-{i}"))
-            s.history.append(make_summary_message("ANCHOR_SUMMARY", reason="auto"))
+                s._append_history(
+                    [Message.create_user_message(f"tail-{i}")],
+                    turn_id=f"turn-{i}",
+                )
+            s._append_history([make_summary_message("ANCHOR_SUMMARY", reason="auto")])
 
-            dicts = s._sliced_history_dicts()
+            dicts = s.history.provider_messages()
 
             # 应该返回完整 active history：6 条 tail + summary。
             self.assertEqual(len(dicts), 7)
@@ -618,36 +675,16 @@ class TestAgentSessionBasic(unittest.TestCase):
                     event_bus=self.bus, ctx_enabled=False, session_store=store,
                 )
                 s.plan_store.save_pending_plan(plan)
-                s.plan_store.approve()
-
-                # 模拟旧版本已经把 plan 段写进历史 context_update 的情况。
-                from core.message import Message, MessageRole
-                s.history.append(Message(
-                    role=MessageRole.USER,
-                    content=(
-                        "<context-update>\n"
-                        "[Plan Mode State]\n"
-                        "Approved plan for implementation:\n"
-                        f"{unique}\n\n"
-                        "[Local SessionState]\n"
-                        "keep-this-state\n"
-                        "</context-update>"
-                    ),
-                    metadata={"kind": "context_update"},
-                ))
-                # 旧格式只在加载迁移边界规范化；请求组装本身不再运行正则改写。
-                from agent.work_context import _normalize_legacy_plan_context
-                s.history = _normalize_legacy_plan_context(s.history)
-
-                sliced = json.dumps(s._sliced_history_dicts(), ensure_ascii=False)
-                self.assertNotIn(unique, sliced)
-                self.assertIn("keep-this-state", sliced)
+                s.approve_plan()
+                self.assertEqual(
+                    (s.history[-1].metadata or {}).get("kind"),
+                    "plan_state",
+                )
 
                 s.chat("first")
                 first_request = json.dumps(llm.calls[0]["messages"], ensure_ascii=False)
                 self.assertEqual(first_request.count(unique), 1)
 
-                # 迁移后的旧 plan 已删除，新格式只保留一份具名 plan section。
                 history_dump = json.dumps([m.to_dict() for m in s.history], ensure_ascii=False)
                 self.assertEqual(history_dump.count(unique), 1)
 
@@ -690,8 +727,10 @@ class TestAgentSessionBasic(unittest.TestCase):
             # 单条超大用户消息会按无丢失策略直接失败，不再静默缩短正文。
             chunk = "word " * 2200
             for idx in range(4):
-                s.history.append(Message.create_user_message(f"turn-{idx} {chunk}"))
-                s.history.append(Message.create_assistant_message(f"reply-{idx} {chunk}"))
+                s._append_history([
+                    Message.create_user_message(f"turn-{idx} {chunk}"),
+                    Message.create_assistant_message(f"reply-{idx} {chunk}"),
+                ], turn_id=f"turn-{idx}")
             answer = s.chat("continue")
 
             self.assertEqual(answer, "ok")
@@ -778,12 +817,12 @@ class TestAgentSessionBasic(unittest.TestCase):
             ))
 
             # state.json 已通过结构化字段提取记录 a.txt
-            self.assertIn("a.txt", store.state_text())
+            self.assertIn("a.txt", json.dumps(store.state, ensure_ascii=False))
 
-            # transcript 落盘的是原始 messages
-            transcript = store.active_dir / "transcript.jsonl"
-            raw_transcript = transcript.read_text(encoding="utf-8")
-            self.assertIn("file_read", raw_transcript)
+            # canonical journal 落盘的是原始协议消息。
+            journal = store.active_dir / "history.jsonl"
+            raw_journal = journal.read_text(encoding="utf-8")
+            self.assertIn("file_read", raw_journal)
 
             # 第 3 轮再问,模型仍然能在 history 里看到上一轮原始 tool_calls / tool_result
             s.chat("继续分析")
@@ -856,8 +895,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             else:
                 ConstantLLM.llm_dict["fake"] = original
 
-    def test_mid_turn_compact_rebuilds_request_and_continues(self):
-        """工具结果把请求推过 soft limit 后执行正式 compact，并继续得到最终回答。"""
+    def test_mid_turn_does_not_summarize_the_only_active_turn(self):
+        """只有当前活动回合时，soft-limit 检查不能压缩正在执行的工具现场。"""
         original = ConstantLLM.llm_dict.get("fake")
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
@@ -892,21 +931,24 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(answer, "done")
             self.assertEqual(len(llm.calls), 2)
             second_messages = llm.calls[1]["messages"]
-            self.assertTrue(any(
+            self.assertFalse(any(
                 SUMMARY_PREFIX in str(message.get("content") or "")
                 for message in second_messages
             ))
             dones = [event for event in self.events if isinstance(event, Done)]
             compact_events = (dones[-1].auto_compact or {}).get("events", [])
-            self.assertTrue(any(event.get("reason") == "mid_turn" for event in compact_events))
+            self.assertFalse(any(event.get("reason") == "mid_turn" for event in compact_events))
 
-            restored = LocalSessionStore(session_root).load_latest_history()
-            restored_text = [str(message.content or "") for message in restored]
-            self.assertTrue(any(SUMMARY_PREFIX in text for text in restored_text))
+            restored = AgentSession(
+                llm=FakeLLM([]),
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=EventBus(),
+                ctx_enabled=False,
+                session_store=LocalSessionStore(session_root),
+            )
+            restored_text = [str(message.content or "") for message in restored.history]
             self.assertEqual(sum(text == "done" for text in restored_text), 1)
-            transcript = next(session_root.glob("session_*/transcript.jsonl"))
-            transcript_text = transcript.read_text(encoding="utf-8")
-            self.assertEqual(transcript_text.count('"user_query": "读取大文件后继续"'), 1)
         finally:
             if original is None:
                 ConstantLLM.llm_dict.pop("fake", None)
@@ -929,8 +971,13 @@ class TestAgentSessionBasic(unittest.TestCase):
                 ctx_enabled=False,
                 session_store=store,
             )
+            session._append_history([
+                Message(role=MessageRole.USER, content="旧问题"),
+                Message.create_assistant_message("旧回答"),
+            ], turn_id="old-turn")
 
-            answer = session.chat("请在 provider 超窗后继续")
+            with patch("agent.session.dynamic_retained_token_target", return_value=0):
+                answer = session.chat("请在 provider 超窗后继续")
 
             self.assertEqual(answer, "重试成功")
             self.assertEqual(len(llm.calls), 2)
@@ -998,24 +1045,42 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertFalse((root / "index.json").exists())
 
     def test_session_store_restores_active_turn_completed_tool_checkpoint(self):
+        """没有 v4 journal 时，旧 active-turn 只迁移一次。"""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
             call = _tc("file_read", '{"path":"active.txt"}', call_id="call_active")
-            store.begin_active_turn(user_query="恢复工具检查点")
-            store.record_active_assistant_tool_calls(
-                round_idx=1,
-                assistant_message=Message.create_assistant_message(tool_calls=[call]),
-            )
-            store.record_active_tool_terminal(
-                round_idx=1,
-                tool_message=Message.create_tool_message(
-                    tool_call_id="call_active",
-                    tool_name="file_read",
-                    tool_output=json.dumps({"path": "active.txt", "content": "abc"}, ensure_ascii=False),
-                ),
-                status="completed",
-                effect_state="completed",
+            events = [
+                {
+                    "type": "turn_started",
+                    "turn_id": "legacy-turn",
+                    "user_query": "恢复工具检查点",
+                    "user_payload": {"role": "user", "content": "恢复工具检查点"},
+                },
+                {
+                    "type": "assistant_tool_calls",
+                    "round_idx": 1,
+                    "assistant_payload": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                },
+                {
+                    "type": "tool_terminal",
+                    "round_idx": 1,
+                    "tool_call_id": "call_active",
+                    "tool_payload": {
+                        "role": "tool",
+                        "tool_call_id": "call_active",
+                        "tool_name": "file_read",
+                        "content": '{"content":"abc"}',
+                    },
+                },
+            ]
+            (store.active_dir / "active_turn.jsonl").write_text(
+                "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
+                encoding="utf-8",
             )
 
             restored = AgentSession(
@@ -1028,39 +1093,29 @@ class TestAgentSessionBasic(unittest.TestCase):
             exported_text = "\n".join(item["content"] for item in exported)
             self.assertIn("恢复工具检查点", exported_text)
             self.assertIn("【工具完成】file_read", exported_text)
-            self.assertTrue(any(item.get("interrupted") for item in exported))
             self.assertTrue(any(item.get("tool", {}).get("call_id") == "call_active" for item in exported))
 
-            sliced = restored._sliced_history_dicts()
+            sliced = restored.history.provider_messages()
             roles = [m.get("role") for m in sliced]
             self.assertEqual(roles, ["user", "assistant", "tool", "user"])
             self.assertEqual(sliced[1]["tool_calls"][0]["id"], "call_active")
             self.assertEqual(sliced[2]["tool_call_id"], "call_active")
+            self.assertTrue((store.active_dir / "history.jsonl").exists())
 
-    def test_recovered_tool_checkpoint_survives_continue_and_second_restart(self):
-        """中断轮恢复后输入“继续”，再次重启仍应保留中断轮及新一轮。"""
+    def test_canonical_history_survives_continue_and_second_restart(self):
+        """v4 journal 连续重启时不会重复或漏掉已完成回合。"""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
-            call = _tc("bash", '{"command":"python search_download.py"}', call_id="call_download")
-            store.begin_active_turn(
-                user_query="你刚才下载的图片全都是无效的，重新下载真实的产品图",
-                turn_id="turn_interrupted",
+            first = AgentSession(
+                llm=FakeLLM([{"answer": "第一轮完成", "tool_calls": []}]),
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=self.bus,
+                ctx_enabled=False,
+                session_store=store,
             )
-            store.record_active_assistant_tool_calls(
-                round_idx=1,
-                assistant_message=Message.create_assistant_message(tool_calls=[call]),
-            )
-            store.record_active_tool_terminal(
-                round_idx=1,
-                tool_message=Message.create_tool_message(
-                    tool_call_id="call_download",
-                    tool_name="bash",
-                    tool_output="已创建 search_download.py",
-                ),
-                status="completed",
-                effect_state="completed",
-            )
+            first.chat("第一轮问题")
 
             resumed = AgentSession(
                 llm=FakeLLM([{"answer": "继续处理完成", "tool_calls": []}]),
@@ -1083,14 +1138,10 @@ class TestAgentSessionBasic(unittest.TestCase):
             ]
             text = "\n".join(str(message.content) for message in visible)
 
-            self.assertEqual(text.count("你刚才下载的图片全都是无效的"), 1)
+            self.assertEqual(text.count("第一轮问题"), 1)
+            self.assertEqual(text.count("第一轮完成"), 1)
             self.assertEqual(text.count("继续"), 2)  # 用户输入与最终回答各出现一次。
-            self.assertIn("已创建 search_download.py", text)
             self.assertIn("继续处理完成", text)
-            self.assertTrue(any(
-                (message.metadata or {}).get("interrupted")
-                for message in visible
-            ))
 
     def test_completed_tool_checkpoint_survives_later_tool_process_exit(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1117,7 +1168,15 @@ class TestAgentSessionBasic(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 s.chat("先读文件再跑长命令")
 
-            restored = LocalSessionStore(root).load_latest_history()
+            restarted = AgentSession(
+                llm=FakeLLM([]),
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=EventBus(),
+                ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+            restored = list(restarted.history)
             visible = [
                 m for m in restored
                 if (m.metadata or {}).get("kind") != "context_update"
@@ -1125,17 +1184,17 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             self.assertEqual(
                 [m.role.value if hasattr(m.role, "value") else str(m.role) for m in visible],
-                ["user", "assistant", "tool", "tool", "user"],
+                ["user", "assistant", "tool", "tool"],
             )
             self.assertEqual(
                 [tc["id"] for tc in visible[1].tool_calls],
                 ["call_first", "call_second"],
             )
             self.assertEqual(visible[2].tool_call_id, "call_first")
-            self.assertEqual(json.loads(str(visible[3].content))["status"], "unknown")
-            self.assertEqual((visible[4].metadata or {}).get("kind"), "turn_aborted")
+            self.assertEqual(json.loads(str(visible[2].content))["content"], "abc")
+            self.assertTrue(json.loads(str(visible[3].content))["recovered"])
 
-    def test_final_answer_checkpoint_survives_transcript_commit_interruption(self):
+    def test_final_answer_survives_state_commit_interruption(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -1148,7 +1207,7 @@ class TestAgentSessionBasic(unittest.TestCase):
                 llm=llm, registry=self.registry, executor=self.executor,
                 event_bus=self.bus, ctx_enabled=False, session_store=store,
             )
-            s._persist_turn = MagicMock(side_effect=KeyboardInterrupt())
+            store.commit_turn_state = MagicMock(side_effect=KeyboardInterrupt())
 
             with self.assertRaises(KeyboardInterrupt):
                 s.chat("需要可靠恢复的回答")
@@ -1161,7 +1220,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             visible = [
                 message for message in restored.history
                 if (message.metadata or {}).get("kind")
-                not in {"context_update", "turn_aborted"}
+                not in {"context_update"}
             ]
 
             self.assertEqual(
@@ -1170,9 +1229,8 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             self.assertEqual(visible[-1].content, "已经展示给用户的回答")
             self.assertEqual(visible[-1].reasoning_content, "最终思考")
-            self.assertTrue((visible[-1].metadata or {}).get("interrupted"))
 
-    def test_transcript_is_committed_before_memory_writeback(self):
+    def test_canonical_history_is_committed_before_memory_writeback(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
@@ -1189,9 +1247,16 @@ class TestAgentSessionBasic(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 s.chat("提交顺序")
 
-            self.assertFalse((store.active_dir / "active_turn.jsonl").exists())
-            restored = LocalSessionStore(root).load_latest_history()
-            restored_text = "\n".join(str(message.content) for message in restored)
+            self.assertTrue((store.active_dir / "history.jsonl").exists())
+            restored = AgentSession(
+                llm=FakeLLM([]),
+                registry=self.registry,
+                executor=self.executor,
+                event_bus=EventBus(),
+                ctx_enabled=False,
+                session_store=LocalSessionStore(root),
+            )
+            restored_text = "\n".join(str(message.content) for message in restored.history)
             self.assertEqual(restored_text.count("提交顺序"), 1)
             self.assertEqual(restored_text.count("先提交的回答"), 1)
 
@@ -1200,22 +1265,23 @@ class TestAgentSessionBasic(unittest.TestCase):
             root = Path(td) / ".cbagent" / "sessions"
             store = LocalSessionStore(root)
             call = _tc("file_read", call_id="call_error")
-            store.begin_active_turn(user_query="恢复失败工具")
-            store.record_active_assistant_tool_calls(
-                round_idx=1,
-                assistant_message=Message.create_assistant_message(tool_calls=[call]),
+            active = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
             )
-            store.record_active_tool_terminal(
-                round_idx=1,
-                tool_message=Message.create_tool_message(
+            active._append_history([
+                Message(role=MessageRole.USER, content="恢复失败工具"),
+                Message.create_assistant_message(tool_calls=[call]),
+            ], turn_id="turn-error")
+            active._history_journal.checkpoint_tool_result(
+                active.history,
+                Message.create_tool_message(
                     "call_error",
                     "file_read",
                     '{"error":"denied"}',
                     is_error=True,
                 ),
-                status="failed",
-                effect_state="unknown",
-                is_error=True,
+                turn_id="turn-error",
             )
 
             restored = AgentSession(
@@ -1300,9 +1366,9 @@ class TestAgentSessionBasic(unittest.TestCase):
             )
             self.assertIn("旧问题二", str(s.history[0].content))
             self.assertIn("旧回答二", str(s.history[1].content))
-            self.assertTrue((store.active_dir / "compact.json").exists())
-            self.assertTrue((store.active_dir / "compactions.jsonl").exists())
-            self.assertTrue((store.active_dir / "transcript.jsonl").exists())
+            self.assertTrue((store.active_dir / "history.jsonl").exists())
+            self.assertFalse((store.active_dir / "compact.json").exists())
+            self.assertFalse((store.active_dir / "transcript.jsonl").exists())
 
             s.chat("继续")
             next_turn_messages = llm.calls[2]["messages"]
@@ -1339,16 +1405,20 @@ class TestAgentSessionBasic(unittest.TestCase):
             s.chat("旧问题二")
             before = s.export_history()
 
-            def fail_save_compaction(**kwargs):
-                raise OSError("disk full")
-
-            store.save_compaction = fail_save_compaction  # type: ignore[method-assign]
-
-            with patch("agent.session.dynamic_retained_token_target", return_value=20):
+            generation = s.history.generation
+            with (
+                patch("agent.session.dynamic_retained_token_target", return_value=20),
+                patch.object(
+                    s._history_journal,
+                    "_append_event",
+                    side_effect=OSError("disk full"),
+                ),
+            ):
                 with self.assertRaises(OSError):
                     s.compact_context()
 
             self.assertEqual(s.export_history(), before)
+            self.assertEqual(s.history.generation, generation)
 
     def test_compact_context_resets_memory_loader_cache(self):
         """手动 compact 完成 replacement history 后清理 MemoryLoader cache。"""
@@ -1452,9 +1522,9 @@ class TestAgentSessionBasic(unittest.TestCase):
         s = self._make_session(llm)
         ans = s.chat("test")
         self.assertEqual(ans, "")
-        # user 入了，assistant 因为空字符串没入
-        self.assertEqual(len(s.history), 2)
-        self.assertEqual(len(s.export_history()), 1)
+        # 完整 provider 响应即使文本为空，也属于不可变 assistant 协议项。
+        self.assertEqual(len(s.history), 3)
+        self.assertEqual(len(s.export_history()), 2)
 
     def test_clear_history(self):
         llm = FakeLLM([{"answer": "a", "tool_calls": []}])
@@ -1493,11 +1563,11 @@ class TestAgentSessionBasic(unittest.TestCase):
         llm = FakeLLM(["bad string result"])
         s = self._make_session(llm)
         ans = s.chat("q")
-        # provider/结构错误不再提交空 assistant 回合，而是返回结构化错误文案。
+        # 用户输入已先进入 canonical history，最终失败追加明确 turn_failed。
         self.assertIn("请求无效", ans)
         errors = [e for e in self.events if isinstance(e, Error)]
         self.assertTrue(any(err.where == "llm" for err in errors))
-        self.assertEqual(s.history, [])
+        self.assertEqual((s.history[-1].metadata or {}).get("kind"), "turn_failed")
 
 
 if __name__ == "__main__":
