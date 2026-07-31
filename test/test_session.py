@@ -29,7 +29,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from agent.cancel import get_current_cancel_token
+from agent.cancel import CancelToken, get_current_cancel_token
 from agent.compaction import (
     COMPACTION_SUMMARY_KIND,
     SUMMARY_PREFIX,
@@ -390,6 +390,34 @@ class TestAgentSessionBasic(unittest.TestCase):
         dones = [e for e in self.events if isinstance(e, Done)]
         self.assertTrue(dones)
         self.assertTrue(dones[-1].cancelled)
+        self.assertEqual((s.history[-1].metadata or {}).get("kind"), "turn_aborted")
+        self.assertIn("不得自动重放", str(s.history[-1].content))
+        self.assertFalse(any(
+            item.get("kind") == "turn_aborted"
+            for item in s.export_history()
+        ))
+
+    def test_cancelled_non_fc_partial_text_is_not_committed_as_assistant(self):
+        """非 FC 流取消后的部分文本只用于 UI，canonical history 只写中止边界。"""
+
+        token = CancelToken()
+
+        class CancellingLLM(FakeLLM):
+            def think(self, messages, **kwargs):
+                self.calls.append({"messages": list(messages), **kwargs})
+                token.cancel()
+                return ["部分回答", None]
+
+        llm = CancellingLLM([])
+        llm.is_Function_Calling = False
+        s = self._make_session(llm)
+
+        answer = s.chat("请回答", cancel_token=token)
+
+        self.assertEqual(answer, "部分回答")
+        assistants = [message for message in s.history if message.role == MessageRole.ASSISTANT]
+        self.assertEqual(assistants, [])
+        self.assertEqual((s.history[-1].metadata or {}).get("kind"), "turn_aborted")
 
     def test_tool_loop_keeps_raw_tool_result_for_next_round(self):
         """CC 模式:工具结果原样回灌进下一轮 messages,result_cap 持久化超大输出,
@@ -1184,7 +1212,7 @@ class TestAgentSessionBasic(unittest.TestCase):
 
             self.assertEqual(
                 [m.role.value if hasattr(m.role, "value") else str(m.role) for m in visible],
-                ["user", "assistant", "tool", "tool"],
+                ["user", "assistant", "tool", "tool", "user"],
             )
             self.assertEqual(
                 [tc["id"] for tc in visible[1].tool_calls],
@@ -1193,6 +1221,7 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertEqual(visible[2].tool_call_id, "call_first")
             self.assertEqual(json.loads(str(visible[2].content))["content"], "abc")
             self.assertTrue(json.loads(str(visible[3].content))["recovered"])
+            self.assertEqual((visible[4].metadata or {}).get("kind"), "turn_aborted")
 
     def test_final_answer_survives_state_commit_interruption(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1324,6 +1353,64 @@ class TestAgentSessionBasic(unittest.TestCase):
             self.assertIn("第一会话回答", restored)
             self.assertNotIn("第二会话问题", restored)
             self.assertEqual(store.active_session_id, first_id)
+
+    def test_switch_session_rejects_corrupt_target_without_changing_active_history(self):
+        """目标 journal 损坏时 active 指针和当前内存 history 都必须保持不变。"""
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / ".cbagent" / "sessions"
+            store = LocalSessionStore(root)
+            first_id = store.active_session_id
+            s = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s._append_history(
+                [Message(role=MessageRole.USER, content="当前会话")],
+                turn_id="turn-current",
+            )
+            before = s.history.provider_messages()
+
+            target = store.create_session()
+            target_id = str(target["session_id"])
+            (store.active_dir / "history.jsonl").write_text("", encoding="utf-8")
+            store.switch_session(str(first_id))
+
+            with self.assertRaisesRegex(RuntimeError, "journal 为空"):
+                s.switch_session(target_id)
+
+            self.assertEqual(store.active_session_id, first_id)
+            self.assertEqual(s.history.provider_messages(), before)
+
+    def test_create_and_clear_failures_keep_canonical_history(self):
+        """会话创建或清理的磁盘失败不能先清空当前 canonical history。"""
+
+        with tempfile.TemporaryDirectory() as td:
+            store = LocalSessionStore(Path(td) / ".cbagent" / "sessions")
+            s = AgentSession(
+                llm=FakeLLM([]), registry=self.registry, executor=self.executor,
+                event_bus=self.bus, ctx_enabled=False, session_store=store,
+            )
+            s._append_history(
+                [Message(role=MessageRole.USER, content="必须保留")],
+                turn_id="turn-current",
+            )
+            before = s.history.provider_messages()
+            active_id = store.active_session_id
+
+            with patch.object(store, "create_session", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    s.create_session()
+            self.assertEqual(store.active_session_id, active_id)
+            self.assertEqual(s.history.provider_messages(), before)
+
+            with patch.object(
+                store, "clear_active_session", side_effect=OSError("permission denied")
+            ):
+                with self.assertRaisesRegex(OSError, "permission denied"):
+                    s.clear_history()
+            self.assertEqual(store.active_session_id, active_id)
+            self.assertEqual(s.history.provider_messages(), before)
 
     def test_compact_context_replaces_history_and_retains_latest_turn(self):
         """compact_context 替换 active history，并保留最新完整回合。"""

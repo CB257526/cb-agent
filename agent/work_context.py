@@ -308,27 +308,53 @@ class LocalSessionStore:
     def create_session(self) -> Dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.active_session_id = f"session_{stamp}_{uuid.uuid4().hex[:8]}"
-        self.state = self._new_state()
-        self.active_dir.mkdir(parents=True, exist_ok=True)
-        self._write_json(self.active_dir / "state.json", self.state)
-        self._write_json(self.active_dir / "usage.json", self._empty_usage())
-        self._write_index()
+        next_session_id = f"session_{stamp}_{uuid.uuid4().hex[:8]}"
+        next_dir = self.root / next_session_id
+        next_state = self._new_state(session_id=next_session_id)
+        try:
+            next_dir.mkdir(parents=True, exist_ok=False)
+            self._write_json(next_dir / "state.json", next_state)
+            self._write_json(next_dir / "usage.json", self._empty_usage())
+            self._write_json(self.index_path, {
+                "active_session_id": next_session_id,
+                "updated_at": _now_iso(),
+            })
+        except Exception:
+            # 新目录尚未成为进程内 active session，可以安全清理失败事务；旧会话
+            # 的 active 指针和 state 仍保持原样。
+            shutil.rmtree(next_dir, ignore_errors=True)
+            raise
+        self.active_session_id = next_session_id
+        self.state = next_state
         return self.current_session_summary() or {}
 
     def switch_session(self, session_id: str) -> Dict[str, Any]:
+        target = self.resolve_session_dir(session_id)
+        state = self._read_json(target / "state.json", {})
+        next_state = state if isinstance(state, dict) and state else self._new_state()
+        next_state = dict(next_state)
+        next_state["session_id"] = session_id
+
+        # 先把目标状态和 active 索引完整写盘，最后再切换进程内指针。这样写盘失败
+        # 时当前会话仍保持原状，不会出现 store 指向目标而 Agent history 仍是旧会话。
+        self._write_json(target / "state.json", next_state)
+        self._write_json(self.index_path, {
+            "active_session_id": session_id,
+            "updated_at": _now_iso(),
+        })
+        self.active_session_id = session_id
+        self.state = next_state
+        return self.current_session_summary() or {}
+
+    def resolve_session_dir(self, session_id: str) -> Path:
+        """只读校验会话 ID，并返回受 sessions 根目录约束的目标目录。"""
+
         if not self._is_valid_session_id(session_id):
             raise ValueError(f"invalid session_id: {session_id!r}")
         target = self.root / session_id
         if not target.is_dir():
             raise ValueError(f"session not found: {session_id}")
-        self.active_session_id = session_id
-        state = self._read_json(target / "state.json", {})
-        self.state = state if isinstance(state, dict) and state else self._new_state()
-        self.state["session_id"] = session_id
-        self.save_state(self.state)
-        self._write_index()
-        return self.current_session_summary() or {}
+        return target
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -469,20 +495,37 @@ class LocalSessionStore:
         self._write_json(self.active_dir / "state.json", self.state)
 
     def clear_active_session(self) -> None:
-        if self.active_session_id:
-            target = self.root / self.active_session_id
-            if target.exists():
-                self._assert_safe_session_dir(target)
-                shutil.rmtree(target)
-        if self.index_path.exists():
-            self.index_path.unlink()
+        active_session_id = self.active_session_id
+        target = self.root / active_session_id if active_session_id else None
+        tombstone: Optional[Path] = None
+        if target is not None and target.exists():
+            self._assert_safe_session_dir(target)
+            tombstone = self.root / f".clearing-{active_session_id}-{uuid.uuid4().hex[:8]}"
+            target.rename(tombstone)
+        try:
+            if self.index_path.exists():
+                self.index_path.unlink()
+        except Exception:
+            # active 目录已原子改名但索引尚未提交时，恢复原目录即可继续使用旧会话。
+            if tombstone is not None and tombstone.exists() and target is not None:
+                tombstone.rename(target)
+            raise
         self.active_session_id = None
         self.state = {}
+        if tombstone is not None:
+            try:
+                shutil.rmtree(tombstone)
+            except Exception:
+                # active 指针和可见会话目录已经提交清理；隐藏墓碑仅保留审计数据，
+                # 不能让上层误以为 canonical history 仍然处于活动状态。
+                logger.exception("清理会话墓碑目录失败: %s", tombstone)
 
-    def _new_state(self) -> Dict[str, Any]:
+    def _new_state(self, *, session_id: Optional[str] = None) -> Dict[str, Any]:
         now = _now_iso()
         return {
-            "session_id": self.active_session_id,
+            "session_id": (
+                self.active_session_id if session_id is None else session_id
+            ),
             "project_root": str(self.root.parent.parent.resolve()),
             "created_at": now,
             "updated_at": now,

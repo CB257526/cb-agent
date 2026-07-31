@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.history_journal import HistoryJournal
+from agent.history_journal import HistoryJournal, HistoryJournalCorruptionError
 from agent.legacy_history_migrator import load_legacy_history
 from agent.work_context import (
     LocalSessionStore,
@@ -96,6 +96,29 @@ def test_session_store_clear_removes_only_active_session():
         assert second_id not in {item["session_id"] for item in store.list_sessions()}
 
 
+def test_session_store_create_failure_keeps_previous_active_session(monkeypatch):
+    """新会话落盘失败时不得提前切换 active 指针或工作状态。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        store = LocalSessionStore(Path(td) / "sessions")
+        previous_id = store.active_session_id
+        previous_state = dict(store.state)
+        original_write = store._write_json
+
+        def _fail_usage(path, data):
+            if path.name == "usage.json":
+                raise OSError("disk full")
+            return original_write(path, data)
+
+        monkeypatch.setattr(store, "_write_json", _fail_usage)
+        with pytest.raises(OSError, match="disk full"):
+            store.create_session()
+
+        assert store.active_session_id == previous_id
+        assert store.state == previous_state
+        assert {item["session_id"] for item in store.list_sessions()} == {previous_id}
+
+
 def test_token_calibration_is_persisted_by_provider_model_key():
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "sessions"
@@ -181,6 +204,35 @@ def test_history_journal_recovers_completed_and_unknown_tools_in_call_order():
         assert tools[0].content == "done"
         assert tools[1].is_error is True
         assert "禁止自动重放" in str(tools[1].content)
+        assert (recovered.history[-1].metadata or {}).get("kind") == "turn_aborted"
+        assert "不得自动重放" in str(recovered.history[-1].content)
+
+
+def test_history_journal_marks_user_only_crash_as_aborted_once():
+    """用户输入落盘后进程退出时，恢复器必须补一次明确的中止终态。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        journal = HistoryJournal(lambda: root)
+        history = ConversationHistory()
+        journal.append(
+            history,
+            [Message(role="user", content="尚未得到回答")],
+            turn_id="turn-pending",
+            event_kind="turn_input",
+        )
+
+        recovered = HistoryJournal(lambda: root).recover()
+        assert (recovered.history[-1].metadata or {}).get("kind") == "turn_aborted"
+        assert (recovered.history[-1].metadata or {}).get("turn_id") == "turn-pending"
+
+        recovered_again = HistoryJournal(lambda: root).recover()
+        markers = [
+            message
+            for message in recovered_again.history
+            if (message.metadata or {}).get("kind") == "turn_aborted"
+        ]
+        assert len(markers) == 1
 
 
 def test_history_journal_separates_partial_tail_before_next_event():
@@ -190,7 +242,7 @@ def test_history_journal_separates_partial_tail_before_next_event():
         root = Path(td)
         journal = HistoryJournal(lambda: root)
         history = ConversationHistory()
-        journal.append(history, [Message(role="user", content="first")], turn_id="a")
+        journal.append(history, [Message.create_assistant_message("first")], turn_id="a")
         with journal.path.open("ab") as handle:
             handle.write(b'{"version":4,"type":"append"')
 
@@ -208,6 +260,83 @@ def test_history_journal_separates_partial_tail_before_next_event():
             "first",
             "second",
         ]
+        assert not any(
+            "corrupt_line" in warning
+            for warning in recovered_again.warnings
+        )
+
+
+def test_history_journal_rejects_empty_or_middle_corruption():
+    """已有 journal 为空或完整事件链中段损坏时必须阻止静默恢复。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        journal = HistoryJournal(lambda: root)
+        journal.path.touch()
+        with pytest.raises(HistoryJournalCorruptionError, match="journal 为空"):
+            journal.recover()
+
+        journal.path.unlink()
+        history = ConversationHistory()
+        journal.append(history, [Message.create_assistant_message("first")], turn_id="a")
+        with journal.path.open("ab") as handle:
+            handle.write(b'{"version":4,"type":"append"}\n')
+        journal.append(history, [Message.create_assistant_message("second")], turn_id="a")
+
+        with pytest.raises(HistoryJournalCorruptionError, match="non_monotonic:2"):
+            HistoryJournal(lambda: root).recover()
+
+
+def test_history_journal_preserves_valid_event_without_final_newline():
+    """完整事件只缺最后换行时应保留事件，并把 journal 修复为可继续追加。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        journal = HistoryJournal(lambda: root)
+        history = ConversationHistory()
+        journal.append(history, [Message.create_assistant_message("first")], turn_id="a")
+        journal.path.write_bytes(journal.path.read_bytes().rstrip(b"\n"))
+
+        restarted = HistoryJournal(lambda: root)
+        recovery = restarted.recover()
+        assert [message.content for message in recovery.history] == ["first"]
+        assert journal.path.read_bytes().endswith(b"\n")
+
+        restarted.append(
+            recovery.history,
+            [Message.create_assistant_message("second")],
+            turn_id="a",
+        )
+        recovered_again = HistoryJournal(lambda: root).recover()
+        assert [message.content for message in recovered_again.history] == [
+            "first",
+            "second",
+        ]
+
+
+def test_history_journal_rejects_logically_broken_tool_protocol():
+    """checksum 合法也不能接受 assistant/tool 协议中段断裂。"""
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        journal = HistoryJournal(lambda: root)
+        history = ConversationHistory()
+        call = {
+            "id": "call-a",
+            "type": "function",
+            "function": {"name": "read", "arguments": "{}"},
+        }
+        journal.append(
+            history,
+            [Message.create_assistant_message(tool_calls=[call])],
+            turn_id="turn-a",
+        )
+        with pytest.raises(ValueError, match="缺少完整 tool 结果"):
+            journal.append(
+                history,
+                [Message(role="user", content="不能跨过 pending 工具调用")],
+                turn_id="turn-b",
+            )
 
 
 def test_history_journal_does_not_reuse_completed_tool_checkpoint():

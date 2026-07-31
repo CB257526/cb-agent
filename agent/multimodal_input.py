@@ -126,9 +126,9 @@ def sanitize_multimodal_payload(value: Any) -> Any:
     """复制并脱敏可能包含二进制数据的多模态 payload。
 
     图片原生路由时，本轮 OpenAI message 会包含 ``data:image/...;base64,...``。
-    这份内容只能进入模型请求，不能进入 token 估算、messages dump、日志或任何长期
-    上下文。这里用递归复制的方式替换 data URI，调用方拿到的是安全副本，不会改动
-    真正要发给模型的 ``messages``。
+    canonical history 会保存模型实际看见的 data URI，以维持下一请求的协议前缀。
+    token 文本估算、messages dump 和日志使用本函数生成的递归安全副本；替换只发生
+    在副本中，不会改动真正要发给模型或写入 history 的 ``messages``。
     """
     if isinstance(value, str):
         return _sanitize_data_uri(value)

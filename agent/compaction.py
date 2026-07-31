@@ -18,6 +18,7 @@ from agent.llm_errors import (
     LLMRequestError,
     classify_llm_exception,
 )
+from agent.multimodal_input import sanitize_multimodal_payload
 from context import count_tokens
 from core.message import Message, MessageRole
 
@@ -45,6 +46,7 @@ NON_TURN_USER_KINDS = {
     "plan_state",
     "tool_image_bridge",
     "turn_failed",
+    "turn_aborted",
 }
 
 
@@ -153,7 +155,7 @@ def is_real_user_message(message: Message) -> bool:
 
 
 def estimate_message_tokens(messages: Sequence[Message]) -> int:
-    """估算一组完整协议消息的 token 数。"""
+    """估算一组完整协议消息的文本 token 数，不把 data URI 当正文。"""
 
     if not messages:
         return 0
@@ -161,7 +163,7 @@ def estimate_message_tokens(messages: Sequence[Message]) -> int:
 
     return count_tokens(
         json.dumps(
-            [message.to_dict() for message in messages],
+            sanitize_multimodal_payload([message.to_dict() for message in messages]),
             ensure_ascii=False,
             default=str,
         )

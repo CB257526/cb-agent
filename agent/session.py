@@ -585,19 +585,6 @@ class AgentSession:
         )
         return prepared
 
-    def _reload_history(self) -> None:
-        """会话切换后从当前 active journal 恢复唯一历史。"""
-
-        if self.session_store is None or self._history_journal is None:
-            self.history = ConversationHistory()
-            return
-        recovery = self._history_journal.recover(
-            legacy_loader=lambda: load_legacy_history(self.session_store.active_dir),
-        )
-        self.history = recovery.history
-        if recovery.warnings:
-            logger.warning("canonical history 恢复警告: %s", recovery.warnings)
-
     # ---------- 公共入口 ----------
 
     def export_history(self) -> List[Dict[str, Any]]:
@@ -859,9 +846,9 @@ class AgentSession:
         新会话的隔离语义是：磁盘 active 指针切到新目录，同时内存 history 清空。
         后续 chat 会写入新目录，不会继续追加旧 history journal。
         """
-        self.history.clear_memory()
-        self._world_state_baseline = EMPTY_WORLD_STATE
         if self.session_store is None:
+            self.history.clear_memory()
+            self._world_state_baseline = EMPTY_WORLD_STATE
             return {
                 "session": None,
                 "history": [],
@@ -870,7 +857,11 @@ class AgentSession:
                 "plan_state": self.plan_state(),
                 "subagent_tasks": self._subagent_tasks_payload(),
             }
+        # store 完整创建目标目录和 active 索引后，内存 canonical history 才切到空
+        # 会话。磁盘失败时旧会话仍可继续使用，不会产生 history/journal 分叉。
         summary = self.session_store.create_session()
+        self.history.clear_memory()
+        self._world_state_baseline = EMPTY_WORLD_STATE
         if self._history_journal is not None:
             self._history_journal.last_event_seq = 0
         return {
@@ -891,8 +882,19 @@ class AgentSession:
         """
         if self.session_store is None:
             raise RuntimeError("local session store is not enabled")
+        target_dir = self.session_store.resolve_session_dir(session_id)
+        # 先用独立 journal 对目标目录完成校验和必要的崩溃恢复。只有恢复成功后才
+        # 提交 active session 指针，避免目标损坏时把旧内存 history 留在新目录下。
+        target_journal = HistoryJournal(lambda: target_dir)
+        recovery = target_journal.recover(
+            legacy_loader=lambda: load_legacy_history(target_dir),
+        )
         summary = self.session_store.switch_session(session_id)
-        self._reload_history()
+        self.history = recovery.history
+        if self._history_journal is not None:
+            self._history_journal.last_event_seq = recovery.last_event_seq
+        if recovery.warnings:
+            logger.warning("canonical history 恢复警告: %s", recovery.warnings)
         self._world_state_baseline = _world_state_from_history(self.history)
         # MemoryLoader 自身仍缓存文件解析结果，切换会话后需要显式失效。
         if self.memory_loader is not None:
@@ -1820,6 +1822,34 @@ class AgentSession:
 
         auto_compactions.extend(loop_compactions)
 
+        if token.is_cancelled():
+            # 中断标记必须晚于已经完成的 tool results，并早于 Cancelled/Done 事件。
+            # 下一轮模型据此知道上一条 user 已明确终止，不能把它当作待继续任务；
+            # export_history 会过滤该内部控制消息，不会在前端伪装成用户输入。
+            cancel_reason = (
+                token.reason.value
+                if getattr(token, "reason", None) is not None
+                else "user_cancelled"
+            )
+            self._append_history(
+                [Message(
+                    role=MessageRole.USER,
+                    content=(
+                        f'<turn_aborted reason="{cancel_reason}">\n'
+                        "本轮已中止；已记录的工具结果可能已经产生副作用，"
+                        "不得自动重放。\n"
+                        "</turn_aborted>"
+                    ),
+                    metadata={
+                        "kind": "turn_aborted",
+                        "reason": cancel_reason,
+                        "interrupted": True,
+                    },
+                )],
+                turn_id=turn_id,
+                event_kind="turn_aborted",
+            )
+
         work_record = self._make_work_record(
             user_query=history_user_text,
             final_answer=final_answer,
@@ -1900,21 +1930,25 @@ class AgentSession:
                 self.subagent_task_registry.cancel_owner(owner_session_id)
             except Exception:
                 logger.exception("清理会话时取消子代理任务失败")
+        if self.session_store is not None:
+            # 删除 active session 是清理事务的磁盘提交点。失败必须向上抛出，且在
+            # 此之前不能清空内存 history，否则后续请求会在旧 journal 上追加空基线。
+            self.session_store.clear_active_session()
         self.history.clear_memory()
         self._world_state_baseline = EMPTY_WORLD_STATE
-        # Plan Mode: clear 时同步清空 plan state 并广播 PlanModeChanged
-        try:
-            state = self.plan_store.clear()
-            self.event_bus.emit(PlanModeChanged(mode=state.get("mode", "execute"), plan_state=state))
-        except Exception:
-            logger.exception("Plan state clear failed")
-        if self.session_store is not None:
-            try:
-                self.session_store.clear_active_session()
-                if self._history_journal is not None:
-                    self._history_journal.last_event_seq = 0
-            except Exception:
-                logger.exception("清理本地会话失败")
+        if self._history_journal is not None:
+            self._history_journal.last_event_seq = 0
+        # 持久化会话已整体删除，PlanStateStore 此时读取到自然空状态；无 session
+        # store 的嵌入入口仍显式清理 fallback plan 目录。
+        state = (
+            self.plan_store.load(include_content=True)
+            if self.session_store is not None
+            else self.plan_store.clear()
+        )
+        self.event_bus.emit(PlanModeChanged(
+            mode=state.get("mode", "execute"),
+            plan_state=state,
+        ))
         if self.memory_loader is not None:
             try:
                 self.memory_loader.reset_cache(reason="clear_history")
@@ -2584,6 +2618,13 @@ class AgentSession:
                     round_idx=round_idx,
                     plan_bus=plan_bus,
                 )
+                if token.is_cancelled():
+                    # 非 FC 流同样可能在读取中途被取消，部分文本只能给 UI 展示，
+                    # 不能写成一个已经完整结束的 assistant 协议项。
+                    self.event_bus.emit(RoundEnd(
+                        round_idx=round_idx, has_tool_calls=False, final=True,
+                    ))
+                    return round_idx, visible_answer, trace_collector, loop_compactions
                 _append_assistant(raw_answer)
                 logger.info(
                     "round final without tools: round=%s answer_chars=%s",

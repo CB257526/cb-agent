@@ -12,6 +12,8 @@ from typing import Any, Callable, Optional, Sequence
 
 from core.conversation_history import ConversationHistory, freeze_history_message
 from core.message import Message
+from agent.message_protocol import validate_tool_protocol
+from agent.compaction import is_real_user_message
 
 
 JOURNAL_VERSION = 4
@@ -92,12 +94,43 @@ def _recovery_tool_results(
     return recovered, pending_turn_id
 
 
+def _incomplete_latest_turn_id(items: Sequence[Message]) -> str:
+    """识别最新真实用户回合是否缺少完整终态。"""
+
+    latest_user_index = next(
+        (
+            index
+            for index in range(len(items) - 1, -1, -1)
+            if is_real_user_message(items[index])
+            and ConversationHistory.turn_id(items[index])
+        ),
+        -1,
+    )
+    if latest_user_index < 0:
+        return ""
+    turn_id = ConversationHistory.turn_id(items[latest_user_index])
+    for message in items[latest_user_index + 1:]:
+        if ConversationHistory.turn_id(message) != turn_id:
+            continue
+        role = message.role.value if hasattr(message.role, "value") else str(message.role)
+        kind = ConversationHistory.kind(message)
+        if kind in {"turn_failed", "turn_aborted"}:
+            return ""
+        if role == "assistant" and not message.tool_calls:
+            return ""
+    return turn_id
+
+
 @dataclass
 class JournalRecovery:
     history: ConversationHistory
     last_event_seq: int = 0
     warnings: list[str] = field(default_factory=list)
     migrated: bool = False
+
+
+class HistoryJournalCorruptionError(RuntimeError):
+    """表示 journal 的完整事件链已经损坏，不能静默按残缺前缀恢复。"""
 
 
 class HistoryJournal:
@@ -143,51 +176,97 @@ class HistoryJournal:
                 migrated=True,
             )
 
+        try:
+            journal_text = path.read_text(encoding="utf-8")
+        except Exception as error:
+            raise HistoryJournalCorruptionError(
+                f"无法读取 canonical history journal: {path}"
+            ) from error
+        physical_lines = journal_text.splitlines()
+        if not any(line.strip() for line in physical_lines):
+            raise HistoryJournalCorruptionError(
+                f"canonical history journal 为空: {path}"
+            )
+
         items: list[Message] = []
         generation = 0
         last_event_seq = 0
         warnings: list[str] = []
         tool_checkpoints: dict[str, Message] = {}
-        for physical_line, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        discard_partial_tail = False
+
+        def _reject_or_tolerate_partial_tail(physical_line: int, reason: str) -> bool:
+            """只容忍进程崩溃留下的最后一条未换行半写事件。"""
+
+            nonlocal discard_partial_tail
+            is_partial_tail = (
+                physical_line == len(physical_lines)
+                and not journal_text.endswith("\n")
+            )
+            if is_partial_tail:
+                warnings.append(f"{reason}:{physical_line}")
+                discard_partial_tail = True
+                return True
+            raise HistoryJournalCorruptionError(
+                f"canonical history journal 损坏: {reason}:{physical_line}"
+            )
+
+        for physical_line, line in enumerate(physical_lines, start=1):
             raw = line.strip()
             if not raw:
                 continue
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:
-                warnings.append(f"history_journal_corrupt_line:{physical_line}")
-                continue
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_corrupt_line"
+                ):
+                    continue
             if not isinstance(event, dict) or event.get("version") != JOURNAL_VERSION:
-                warnings.append(f"history_journal_invalid_event:{physical_line}")
-                continue
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_invalid_event"
+                ):
+                    continue
             try:
                 event_seq = int(event.get("event_seq") or 0)
             except (TypeError, ValueError):
-                warnings.append(f"history_journal_invalid_seq:{physical_line}")
-                continue
-            # journal 只接受连续事件前缀。损坏事件本身不推进序号；同次恢复后新写入
-            # 的事件会复用缺口序号，因此后续重启仍能越过保留下来的坏行继续恢复。
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_invalid_seq"
+                ):
+                    continue
+            # 完整事件必须形成严格连续链。中段事件一旦损坏或缺失，继续使用前缀会
+            # 静默遗失模型已经看过的消息，因此必须阻止会话启动。
             if event_seq != last_event_seq + 1:
-                warnings.append(f"history_journal_non_monotonic:{physical_line}")
-                continue
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_non_monotonic"
+                ):
+                    continue
             raw_items = event.get("items")
             if not isinstance(raw_items, list) or _checksum(raw_items) != event.get("checksum"):
-                warnings.append(f"history_journal_checksum_failed:{physical_line}")
-                continue
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_checksum_failed"
+                ):
+                    continue
             restored = [message for value in raw_items if (message := _message_from_payload(value))]
             if len(restored) != len(raw_items):
-                warnings.append(f"history_journal_message_invalid:{physical_line}")
-                continue
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_message_invalid"
+                ):
+                    continue
             event_type = str(event.get("type") or "")
             try:
                 event_generation = int(event.get("generation") or 0)
             except (TypeError, ValueError):
-                warnings.append(f"history_journal_invalid_generation:{physical_line}")
-                continue
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_invalid_generation"
+                ):
+                    continue
             if event_type == "append":
                 if event_generation != generation:
-                    warnings.append(f"history_journal_generation_mismatch:{physical_line}")
-                    continue
+                    if _reject_or_tolerate_partial_tail(
+                        physical_line, "history_journal_generation_mismatch"
+                    ):
+                        continue
                 items.extend(restored)
                 # 工具结果正式进入 canonical history 后，对应 checkpoint 已完成使命。
                 # call id 理论上应全局唯一，但恢复层不能依赖 provider 永不复用 id。
@@ -201,39 +280,114 @@ class HistoryJournal:
                         tool_checkpoints.pop(str(message.tool_call_id), None)
             elif event_type == "tool_checkpoint":
                 if event_generation != generation:
-                    warnings.append(f"history_journal_generation_mismatch:{physical_line}")
-                    continue
+                    if _reject_or_tolerate_partial_tail(
+                        physical_line, "history_journal_generation_mismatch"
+                    ):
+                        continue
                 for message in restored:
                     if message.tool_call_id:
                         tool_checkpoints[str(message.tool_call_id)] = message
-            elif event_type in {"replace", "migration"}:
-                if event_type == "replace" and event_generation <= generation:
-                    warnings.append(f"history_journal_stale_replace:{physical_line}")
-                    continue
+            elif event_type == "replace":
+                try:
+                    from_generation = int(event.get("from_generation"))
+                except (TypeError, ValueError):
+                    if _reject_or_tolerate_partial_tail(
+                        physical_line, "history_journal_invalid_from_generation"
+                    ):
+                        continue
+                if (
+                    from_generation != generation
+                    or event_generation != generation + 1
+                ):
+                    if _reject_or_tolerate_partial_tail(
+                        physical_line, "history_journal_generation_gap"
+                    ):
+                        continue
+                items = restored
+                generation = event_generation
+                tool_checkpoints = {}
+            elif event_type == "migration":
+                if last_event_seq != 0 or event_generation != 1:
+                    if _reject_or_tolerate_partial_tail(
+                        physical_line, "history_journal_invalid_migration"
+                    ):
+                        continue
                 items = restored
                 generation = event_generation
                 tool_checkpoints = {}
             else:
-                warnings.append(f"history_journal_unknown_event:{physical_line}")
-                continue
+                if _reject_or_tolerate_partial_tail(
+                    physical_line, "history_journal_unknown_event"
+                ):
+                    continue
             last_event_seq = event_seq
+
+        if not journal_text.endswith("\n"):
+            # 合法 JSON 事件可能恰好在最后换行写入前崩溃，此时只补换行；若尾部
+            # 没通过完整校验，则删除该半写行。修复必须早于工具终态恢复的追加事件。
+            with path.open("rb+") as handle:
+                if discard_partial_tail:
+                    raw_bytes = handle.read()
+                    last_newline = raw_bytes.rfind(b"\n")
+                    handle.seek(last_newline + 1)
+                    handle.truncate()
+                else:
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(b"\n")
+                handle.flush()
+                if os.getenv("CBAGENT_HISTORY_FSYNC", "").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }:
+                    os.fsync(handle.fileno())
 
         self.last_event_seq = last_event_seq
         history = ConversationHistory(items, generation=generation)
+        try:
+            validate_tool_protocol(
+                history.provider_messages(),
+                allow_pending_tail=True,
+            )
+        except ValueError as error:
+            raise HistoryJournalCorruptionError(
+                f"canonical history 工具协议损坏: {error}"
+            ) from error
         recovered_tools, recovered_turn_id = _recovery_tool_results(
             items,
             tool_checkpoints,
         )
-        if recovered_tools:
+        incomplete_turn_id = _incomplete_latest_turn_id(items)
+        if recovered_tools or incomplete_turn_id:
+            # 工具终态和回合中止边界必须同事件提交。若进程在写入中途再次崩溃，
+            # 下一次恢复会丢弃半写尾行并根据 checkpoints 重建同一批消息。
+            recovery_batch = [
+                *recovered_tools,
+                Message(
+                    role="user",
+                    content=(
+                        '<turn_aborted reason="process_interrupted">\n'
+                        "进程在本轮完成前退出；已记录的工具结果可能已经产生副作用，"
+                        "不得自动重放。\n"
+                        "</turn_aborted>"
+                    ),
+                    metadata={
+                        "kind": "turn_aborted",
+                        "reason": "process_interrupted",
+                        "interrupted": True,
+                    },
+                ),
+            ]
             self.append(
                 history,
-                recovered_tools,
-                turn_id=recovered_turn_id,
+                recovery_batch,
+                turn_id=recovered_turn_id or incomplete_turn_id,
                 event_kind="recovery_tool_results",
             )
-            warnings.append(
-                f"history_journal_recovered_tool_results:{len(recovered_tools)}"
-            )
+            if recovered_tools:
+                warnings.append(
+                    f"history_journal_recovered_tool_results:{len(recovered_tools)}"
+                )
+            if incomplete_turn_id:
+                warnings.append("history_journal_recovered_incomplete_turn:1")
         return JournalRecovery(
             history=history,
             last_event_seq=self.last_event_seq,
@@ -251,6 +405,17 @@ class HistoryJournal:
         prepared = history.prepare_batch(messages, turn_id=turn_id)
         if not prepared:
             return []
+        prospective = [
+            *history.provider_messages(),
+            *(message.to_dict() for message in prepared),
+        ]
+        tail = prepared[-1]
+        tail_role = tail.role.value if hasattr(tail.role, "value") else str(tail.role)
+        allow_pending_tail = bool(tail_role == "assistant" and tail.tool_calls)
+        validate_tool_protocol(
+            prospective,
+            allow_pending_tail=allow_pending_tail,
+        )
         payloads = [_message_payload(message) for message in prepared]
         event = {
             "version": JOURNAL_VERSION,
@@ -277,6 +442,7 @@ class HistoryJournal:
         metadata: Optional[dict[str, Any]] = None,
     ) -> list[Message]:
         prepared = [freeze_history_message(message) for message in messages]
+        validate_tool_protocol([message.to_dict() for message in prepared])
         payloads = [_message_payload(message) for message in prepared]
         next_generation = history.generation + 1
         event = {
@@ -332,8 +498,8 @@ class HistoryJournal:
             json.dumps(event, ensure_ascii=False, default=str) + "\n"
         ).encode("utf-8")
         with path.open("ab+") as handle:
-            # 进程可能在上一条 JSON 尚未写完时崩溃。若末尾没有换行，先隔开损坏
-            # 尾段，避免下一条合法事件与其粘成一整条不可恢复的物理行。
+            # 正常启动恢复已经校验并清理过半写尾段。这里仍防御性补换行，避免
+            # 外部工具在运行期移除了末尾换行后把两条 JSON 粘在一起。
             handle.seek(0, os.SEEK_END)
             if handle.tell() > 0:
                 handle.seek(-1, os.SEEK_END)
@@ -347,4 +513,9 @@ class HistoryJournal:
                 os.fsync(handle.fileno())
 
 
-__all__ = ["HistoryJournal", "JournalRecovery", "JOURNAL_VERSION"]
+__all__ = [
+    "HistoryJournal",
+    "HistoryJournalCorruptionError",
+    "JournalRecovery",
+    "JOURNAL_VERSION",
+]

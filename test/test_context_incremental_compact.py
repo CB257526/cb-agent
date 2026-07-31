@@ -296,6 +296,34 @@ def test_mid_turn_compact_never_summarizes_only_active_turn():
     assert session.llm.compact_calls == []
 
 
+def test_turn_aborted_is_not_treated_as_new_real_user_turn():
+    """中止边界属于维护消息，不能在 compact 分段时开启一个伪用户回合。"""
+
+    from agent.compaction import is_real_user_message
+
+    marker = Message(
+        role=MessageRole.USER,
+        content="<turn_aborted />",
+        metadata={"kind": "turn_aborted"},
+    )
+    assert is_real_user_message(marker) is False
+
+
+def test_compaction_message_estimate_does_not_count_data_uri_as_text():
+    """图片编码只作为稳定协议内容保留，不能按 base64 字符估算文本 token。"""
+
+    image = Message(
+        role=MessageRole.USER,
+        content=[{
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64," + ("x" * 100_000),
+            },
+        }],
+    )
+    assert estimate_message_tokens([image]) < 1000
+
+
 def test_compact_failure_keeps_history_and_generation_unchanged():
     session = _session()
     session._append_history([_user("OLD"), _assistant("OLD-A")], turn_id="old")
